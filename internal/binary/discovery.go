@@ -2,6 +2,7 @@
 package binary
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,10 +12,14 @@ import (
 // Search order: (1) same directory as the running plugin binary,
 // (2) PATH lookup. Returns error if not found.
 func Discover() (string, error) {
-	// TODO: Phase 2 — implement binary discovery
-	// Search order: (1) same directory as the running plugin binary,
-	// (2) PATH lookup.
-	return "", nil
+	// Search order: (1) same directory as the running binary, (2) PATH lookup
+	if path := findNextToSelf(); path != "" {
+		return path, nil
+	}
+	if path := findInPath(); path != "" {
+		return path, nil
+	}
+	return "", fmt.Errorf("datum-connect binary not found: not next to plugin binary and not in PATH")
 }
 
 // binaryName returns the platform-appropriate binary name.
