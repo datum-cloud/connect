@@ -119,16 +119,15 @@ func handleListen(jsonOut bool) {
 
 	if os.Getenv("FAKE_DUMMY_MODE") == "expired-token" {
 		if jsonOut {
-			fmt.Println(`{"id":"tun-123","status":"expired","message":"token expired"}`)
+			fmt.Println(`{"type":"error","message":"token expired"}`)
+		} else {
+			fmt.Fprintln(os.Stderr, "error: token expired")
 		}
-		return
+		os.Exit(1)
 	}
 
-	if jsonOut {
-		fmt.Println(`{"id":"tun-123","status":"ready","url":"https://tun-123.datum.dev"}`)
-	} else {
-		fmt.Println("Tunnel ready: https://tun-123.datum.dev")
-	}
+	// Always emit typed JSON (listen command reads stdout regardless of --json flag)
+	fmt.Println(`{"type":"ready","id":"tun-123","label":"dev-server","endpoint":"localhost:8080","hostnames":["tun-123.datum.dev"],"status":"ready"}`)
 
 	// Block until SIGINT
 	sigCh := make(chan os.Signal, 1)
