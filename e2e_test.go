@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -218,6 +220,19 @@ func buildFakeBinary(t *testing.T, src string) string {
 	return bin
 }
 
+// buildFakeDatumConnect builds the fake binary as "fake-datum-connect" for
+// use with binary.Discover() which looks up "fake-datum-connect" in PATH.
+func buildFakeDatumConnect(t *testing.T) string {
+	t.Helper()
+	bin := "fake-datum-connect"
+	cmd := exec.Command("go", "build", "-o", bin, "./testdata/fake-datum-connect")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build fake-datum-connect: %v\n%s", err, out)
+	}
+	t.Cleanup(func() { os.Remove(bin) })
+	return bin
+}
+
 func buildFakeHelper(t *testing.T, src string) string {
 	t.Helper()
 	bin := src + "-test"
@@ -227,4 +242,216 @@ func buildFakeHelper(t *testing.T, src string) string {
 	}
 	t.Cleanup(func() { os.Remove(bin) })
 	return bin
+}
+
+// --- Plan 04-02 CRUD e2e tests ---
+
+func TestListCommandWithFakeBinary(t *testing.T) {
+	// CRUD-01: list delegates to Rust, renders table/json/yaml
+	fakeBin := buildFakeDatumConnect(t)
+	fakeHelper := buildFakeHelper(t, "testdata/fake-credentials-helper")
+	pluginBin := buildPlugin(t)
+
+	connectDir, _ := os.Getwd()
+	cmd := exec.Command(pluginBin, "tunnel", "list")
+	cmd.Env = append(os.Environ(),
+		"FAKE_DATUM_CONNECT="+fakeBin,
+		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
+		"DATUM_SESSION=dev",
+		"PATH="+connectDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list exited non-zero: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !strings.Contains(output, "dev-server") {
+		t.Errorf("table output should contain tunnel label 'dev-server': %s", output)
+	}
+	if !strings.Contains(output, "localhost:8080") {
+		t.Errorf("table output should contain endpoint 'localhost:8080': %s", output)
+	}
+
+	// Test JSON output
+	cmd = exec.Command(pluginBin, "tunnel", "list", "--output", "json")
+	cmd.Env = append(os.Environ(),
+		"FAKE_DATUM_CONNECT="+fakeBin,
+		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
+		"DATUM_SESSION=dev",
+		"PATH="+connectDir+":"+os.Getenv("PATH"))
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list --output json exited non-zero: %v\n%s", err, out)
+	}
+	var tunnels []map[string]interface{}
+	if err := json.Unmarshal(out, &tunnels); err != nil {
+		t.Fatalf("json output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(tunnels) != 2 {
+		t.Errorf("expected 2 tunnels, got %d", len(tunnels))
+	}
+}
+
+func TestDeleteCommandWithFakeBinary(t *testing.T) {
+	// CRUD-04: delete delegates to Rust with correct output
+	fakeBin := buildFakeDatumConnect(t)
+	fakeHelper := buildFakeHelper(t, "testdata/fake-credentials-helper")
+	pluginBin := buildPlugin(t)
+
+	connectDir, _ := os.Getwd()
+	cmd := exec.Command(pluginBin, "tunnel", "delete", "--id", "tun-123")
+	cmd.Env = append(os.Environ(),
+		"FAKE_DATUM_CONNECT="+fakeBin,
+		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
+		"DATUM_SESSION=dev",
+		"PATH="+connectDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("delete exited non-zero: %v\n%s", err, out)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("delete output is not valid JSON: %v\n%s", err, out)
+	}
+	if deleted, ok := result["deleted"].(bool); !ok || !deleted {
+		t.Error("delete should return {\"deleted\": true}")
+	}
+}
+
+func TestDeleteCommandMissingID(t *testing.T) {
+	// EXIT-02: missing required flag exits with POSIX code 64
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "delete")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Error("delete without --id should exit non-zero")
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 64 {
+			t.Errorf("expected exit code 64 (semantic rejection), got %d", exitErr.ExitCode())
+		}
+	}
+	if !bytes.Contains(out, []byte("required")) {
+		t.Error("delete without --id should show 'required' error message")
+	}
+}
+
+// --- Plan 04-03 listen e2e tests ---
+
+func TestListenCommandWithFakeBinary(t *testing.T) {
+	// CRUD-02, CRUD-06: listen creates tunnel, blocks, handles signals
+	fakeBin := buildFakeDatumConnect(t)
+	fakeHelper := buildFakeHelper(t, "testdata/fake-credentials-helper")
+	pluginBin := buildPlugin(t)
+
+	connectDir, _ := os.Getwd()
+	// Start listen command
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080")
+	cmd.Env = append(os.Environ(),
+		"FAKE_DATUM_CONNECT="+fakeBin,
+		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
+		"DATUM_SESSION=dev",
+		"PATH="+connectDir+":"+os.Getenv("PATH"))
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("failed to get stdout pipe: %v", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("listen failed to start: %v", err)
+	}
+
+	// Read output until we see "Tunnel ready" or "Press Ctrl+C"
+	scanner := bufio.NewScanner(stdout)
+	var foundReady bool
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "ready") || strings.Contains(line, "Tunnel") {
+			foundReady = true
+			break
+		}
+	}
+	if !foundReady {
+		t.Error("listen should print tunnel ready message")
+	}
+
+	// Send SIGINT to stop
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("failed to send SIGINT: %v", err)
+	}
+
+	// Wait for child to exit
+	if err := cmd.Wait(); err != nil {
+		// Non-nil error is expected (signal termination)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			// SIGINT typically gives exit code 130
+			if exitErr.ExitCode() != 130 && exitErr.ExitCode() != 0 {
+				t.Logf("listen exited with code %d (expected 0 or 130)", exitErr.ExitCode())
+			}
+		}
+	}
+}
+
+func TestListenJSONMode(t *testing.T) {
+	// CRUD-05: listen --json emits single JSON object on ready
+	fakeBin := buildFakeDatumConnect(t)
+	fakeHelper := buildFakeHelper(t, "testdata/fake-credentials-helper")
+	pluginBin := buildPlugin(t)
+
+	connectDir, _ := os.Getwd()
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080", "--output", "json")
+	cmd.Env = append(os.Environ(),
+		"FAKE_DATUM_CONNECT="+fakeBin,
+		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
+		"DATUM_SESSION=dev",
+		"PATH="+connectDir+":"+os.Getenv("PATH"))
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("failed to get stdout pipe: %v", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("listen --json failed to start: %v", err)
+	}
+
+	// Read first line — should be the ready JSON
+	scanner := bufio.NewScanner(stdout)
+	if !scanner.Scan() {
+		t.Fatal("listen --json should output ready JSON")
+	}
+	firstLine := scanner.Bytes()
+
+	var ready map[string]interface{}
+	if err := json.Unmarshal(firstLine, &ready); err != nil {
+		t.Fatalf("first line is not valid JSON: %s", firstLine)
+	}
+	if ready["status"] != "ready" {
+		t.Errorf("expected status='ready', got '%v'", ready["status"])
+	}
+
+	// Send SIGINT to stop
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("failed to send SIGINT: %v", err)
+	}
+	cmd.Wait()
+}
+
+func TestListenMissingEndpoint(t *testing.T) {
+	// EXIT-02: missing --endpoint exits with code 64
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "listen")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Error("listen without --endpoint should exit non-zero")
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 64 {
+			t.Errorf("expected exit code 64 (semantic rejection), got %d", exitErr.ExitCode())
+		}
+	}
+	if !bytes.Contains(out, []byte("required")) {
+		t.Error("listen without --endpoint should show 'required' error message")
+	}
 }
