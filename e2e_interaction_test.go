@@ -282,6 +282,49 @@ func TestStatus_StoppedTunnel(t *testing.T) {
 	}
 }
 
+// --- Plan 06-02 service install e2e tests ---
+
+func TestInstall_RequiresName(t *testing.T) {
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "install")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Error("install with no flags should exit non-zero")
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 64 {
+			t.Errorf("expected exit code 64, got %d", exitErr.ExitCode())
+		}
+	}
+	if !strings.Contains(string(out), "--name is required") {
+		t.Errorf("install with no flags should show '--name is required':\n%s", out)
+	}
+}
+
+func TestInstall_RequiresEndpoint(t *testing.T) {
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "install", "--name", "test-tun")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Error("install without --endpoint should exit non-zero")
+	}
+	if !strings.Contains(string(out), "--endpoint is required") {
+		t.Errorf("install without --endpoint should show '--endpoint is required':\n%s", out)
+	}
+}
+
+func TestInstall_RequiresSession(t *testing.T) {
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "install", "--name", "test-tun", "--endpoint", "localhost:8080")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Error("install without --session should exit non-zero")
+	}
+	if !strings.Contains(string(out), "--session is required") {
+		t.Errorf("install without --session should show '--session is required':\n%s", out)
+	}
+}
+
 // Helper functions
 
 func buildPlugin(t *testing.T) string {
