@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"go.datum.net/datumctl-plugins/connect/internal/pidfile"
 )
 
 // TestDatumctlContextEnvVars verifies that the datumctl plugin SDK reads
@@ -200,6 +203,83 @@ func TestFullChainEnvVarPropagation(t *testing.T) {
 	cmd = exec.Command(pluginBin, "tunnel", "list")
 	cmd.Env = append(os.Environ(), "DATUM_CREDENTIALS_HELPER="+fakeHelper)
 	_ = cmd.Run()
+}
+
+// --- Plan 05-03 process command e2e tests ---
+
+func TestPS_WithFakePIDFiles(t *testing.T) {
+	// Create temp state dir with a fake PID file
+	stateDir := t.TempDir()
+
+	pidPath := filepath.Join(stateDir, "datumctl", "connect", "tunnels", "test-tun.pid")
+	os.MkdirAll(filepath.Dir(pidPath), 0755)
+
+	startTime := time.Now().Add(-10 * time.Minute)
+	if err := pidfile.Write(pidPath, 99999, 10000, startTime, "/usr/bin/fake"); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "ps")
+	cmd.Env = []string{
+		"XDG_STATE_HOME=" + stateDir,
+		"DATUM_ACCESS_TOKEN=test-token",
+		"HOME=" + os.Getenv("HOME"),
+		"PATH=" + os.Getenv("PATH"),
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ps exited non-zero: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(string(out), "test-tun") {
+		t.Errorf("ps output should contain tunnel name 'test-tun':\n%s", out)
+	}
+}
+
+func TestPS_JSONOutput(t *testing.T) {
+	stateDir := t.TempDir()
+
+	pidPath := filepath.Join(stateDir, "datumctl", "connect", "tunnels", "json-tun.pid")
+	os.MkdirAll(filepath.Dir(pidPath), 0755)
+
+	_ = pidfile.Write(pidPath, 99999, 10000, time.Now(), "/usr/bin/fake")
+
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "ps", "--json")
+	cmd.Env = []string{
+		"XDG_STATE_HOME=" + stateDir,
+		"DATUM_ACCESS_TOKEN=test-token",
+		"HOME=" + os.Getenv("HOME"),
+		"PATH=" + os.Getenv("PATH"),
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ps --json exited non-zero: %v\n%s", err, out)
+	}
+
+	var tunnels []map[string]interface{}
+	if err := json.Unmarshal(out, &tunnels); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(tunnels) == 0 {
+		t.Error("expected at least 1 tunnel in JSON output")
+	}
+}
+
+func TestStatus_StoppedTunnel(t *testing.T) {
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "status", "--name", "nonexistent")
+	cmd.Env = []string{
+		"DATUM_ACCESS_TOKEN=test-token",
+		"HOME=" + os.Getenv("HOME"),
+		"PATH=" + os.Getenv("PATH"),
+	}
+	out, _ := cmd.CombinedOutput()
+
+	if !strings.Contains(string(out), "Stopped") {
+		t.Errorf("status for nonexistent tunnel should show Stopped:\n%s", out)
+	}
 }
 
 // Helper functions
