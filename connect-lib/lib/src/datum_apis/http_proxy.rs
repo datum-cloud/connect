@@ -20,7 +20,6 @@ pub struct HTTPRouteRulesMatchesHeaders {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub enum HTTPRouteRulesMatchesHeadersType {
     Exact,
    RegularExpression,
@@ -34,14 +33,13 @@ pub struct HTTPRouteRulesMatchesPath {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub enum HTTPRouteRulesMatchesPathType {
     PathPrefix,
     Exact,
     RegularExpression,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HTTPRouteMatch {
     pub path: Option<HTTPRouteRulesMatchesPath>,
     pub headers: Option<Vec<HTTPRouteRulesMatchesHeaders>>,
@@ -62,7 +60,6 @@ pub struct HTTPRouteRulesMatchesQueryParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub enum HTTPRouteRulesMatchesQueryParamsType {
     Exact,
     RegularExpression,
@@ -75,8 +72,8 @@ pub struct HTTPRouteRulesMatchesTimeOfDay {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HTTPRouteRulesFiltersRequestRedirect {
-    #[serde(rename = "scheme")]
     pub scheme: Option<String>,
     pub status_code: Option<u16>,
     pub hostname: Option<String>,
@@ -85,6 +82,7 @@ pub struct HTTPRouteRulesFiltersRequestRedirect {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HTTPRouteRulesFilters {
     pub request_redirect: Option<HTTPRouteRulesFiltersRequestRedirect>,
     #[serde(rename = "type")]
@@ -97,7 +95,6 @@ pub struct HTTPRouteRulesFilters {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub enum HTTPRouteRulesFiltersType {
     RequestRedirect,
     RequestHeaderModifier,

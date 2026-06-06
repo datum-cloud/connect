@@ -116,7 +116,7 @@ impl HeartbeatAgent {
                         if res.is_err() {
                             return;
                         }
-                        let login_state = *login_rx.borrow();
+                        let login_state = login_rx.borrow().clone();
                         match login_state {
                             crate::datum_cloud::LoginState::Missing => {
                                 this.clear_projects().await;
@@ -186,8 +186,8 @@ impl HeartbeatAgent {
     }
 
     pub async fn refresh_projects(&self) -> Result<()> {
-        let orgs = self.inner.datum.orgs_and_projects().await?;
-        let mut next_projects = HashSet::new();
+        let orgs = self.inner.datum.orgs_projects_cache();
+        let mut next_projects: HashSet<String> = HashSet::new();
         for org in orgs {
             for project in org.projects {
                 next_projects.insert(project.resource_id);
@@ -212,10 +212,10 @@ impl HeartbeatAgent {
             }
         }
 
-        for project_id in next_projects {
+        for project_id in &next_projects {
             let should_probe = {
                 let projects = self.inner.projects.lock().await;
-                !projects.contains_key(&project_id)
+                !projects.contains_key(project_id.as_str())
             };
             if !should_probe {
                 continue;
@@ -227,7 +227,7 @@ impl HeartbeatAgent {
             )
             .await
             {
-                Ok(true) => self.register_project(project_id).await,
+                Ok(true) => self.register_project(project_id.clone()).await,
                 Ok(false) => {
                     debug!(%project_id, "heartbeat: no connector yet");
                 }

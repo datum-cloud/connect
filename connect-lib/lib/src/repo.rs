@@ -20,6 +20,7 @@ impl Repo {
     }
 
     const CONFIG_FILE: &str = "config.yml";
+    const CONNECT_KEY_FILE: &str = "connect_key";
     const LISTEN_KEY_FILE: &str = "listen_key";
     const STATE_FILE: &str = "state.yml";
 
@@ -101,6 +102,11 @@ impl Repo {
             return Ok(config.selected_context);
         }
         Ok(None)
+    }
+
+    pub async fn connect_key(&self) -> Result<SecretKey> {
+        let key_file_path = self.0.join(Self::CONNECT_KEY_FILE);
+        self.secret_key(key_file_path).await
     }
 
     pub async fn listen_key(&self) -> Result<SecretKey> {

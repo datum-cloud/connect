@@ -10,7 +10,8 @@ use secrecy::SecretString;
 use tokio::sync::watch;
 use tracing::warn;
 
-use crate::datum_cloud::{DatumCloudClient, ExternalTokenSource, LoginState};
+use crate::datum_cloud::DatumCloudClient;
+use crate::datum_cloud::LoginState;
 use crate::http_user_agent::datum_http_user_agent;
 
 #[derive(derive_more::Debug, Clone)]
@@ -49,7 +50,7 @@ impl ProjectControlPlaneClient {
     pub fn new_with_token_source(
         project_id: String,
         server_url: String,
-        token_source: ExternalTokenSource,
+        token_source: crate::datum_cloud::external_token_source::ExternalTokenSource,
     ) -> Result<Self> {
         let initial_token = token_source.token();
         let client = Self::build_kube_client(&server_url, &initial_token)?;
@@ -118,12 +119,11 @@ impl ProjectControlPlaneClient {
 
     async fn refresh_client_from_update(&self) -> Result<()> {
         if self.datum.is_plugin_mode() {
-            return Ok(());
+            let token = self.datum.token();
+            return self.rebuild_if_changed(&token);
         }
-        let auth_state = self.datum.auth().load();
-        let Ok(auth) = auth_state.get() else {
-            return Ok(());
-        };
+        let auth_state = self.datum.auth_state();
+        let auth = auth_state.load();
         self.rebuild_if_changed(&auth.tokens.access_token.secret().to_string())
     }
 
@@ -148,7 +148,7 @@ impl ProjectControlPlaneClient {
                     }
                 }
             } else {
-                let mut login_rx = client.datum.auth().login_state_watch();
+                let mut login_rx = client.datum.login_state_watch();
                 let mut auth_update_rx = client.datum.auth_update_watch();
                 if *login_rx.borrow() != LoginState::Missing
                     && let Err(err) = client.refresh_client_from_update().await
@@ -183,6 +183,7 @@ impl ProjectControlPlaneClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExternalTokenSource;
     use base64::Engine;
 
     fn make_jwt_with_exp(exp: u64) -> String {

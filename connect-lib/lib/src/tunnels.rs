@@ -28,7 +28,7 @@ use crate::datum_apis::traffic_protection_policy::{
     TrafficProtectionPolicyRuleSetType, TrafficProtectionPolicySpec,
 };
 use crate::datum_cloud::DatumCloudClient;
-use crate::{Advertisment, ListenNode, ProxyState, TcpProxyData};
+use crate::{Advertisment, ListenNode, TcpProxyData, state::ProxyState};
 
 const DEFAULT_PCP_NAMESPACE: &str = "default";
 const DEFAULT_CONNECTOR_CLASS_NAME: &str = "datum-connect";

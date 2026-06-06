@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 const STAGING_API_URL: &str = "https://api.staging.env.datum.net";
 const PROD_API_URL: &str = "https://api.datum.net";
+const STAGING_WEB_URL: &str = "https://cloud.staging.env.datum.net";
+const PROD_WEB_URL: &str = "https://cloud.datum.net";
 
 /// Environment for Datum API. Use [`ApiEnv::from_env()`] or `ApiEnv::default()` to respect `DATUM_API_ENV`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,18 @@ impl ApiEnv {
             ApiEnv::Custom { api_url } => Cow::Owned(api_url.clone()),
         }
     }
+
+    pub fn web_url(&self) -> Cow<'static, str> {
+        match self {
+            ApiEnv::Staging => Cow::Borrowed(STAGING_WEB_URL),
+            ApiEnv::Production => Cow::Borrowed(PROD_WEB_URL),
+            ApiEnv::Custom { api_url } => Cow::Owned(
+                api_url
+                    .replace("api.", "app.")
+                    .replace("//api.", "//app."),
+            ),
+        }
+    }
 }
 
 impl Default for ApiEnv {
@@ -62,6 +76,7 @@ mod tests {
 
     #[test]
     fn from_env_defaults_to_production() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         cleanup_env();
         let env = ApiEnv::from_env();
         assert!(matches!(env, ApiEnv::Production));
@@ -69,6 +84,7 @@ mod tests {
 
     #[test]
     fn from_env_staging_when_set() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         cleanup_env();
         unsafe { std::env::set_var("DATUM_API_ENV", "staging"); }
         let env = ApiEnv::from_env();
@@ -77,6 +93,7 @@ mod tests {
 
     #[test]
     fn from_env_with_host_override_uses_datum_api_host() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         cleanup_env();
         unsafe { std::env::set_var("DATUM_API_HOST", "https://custom.example.com"); }
         let env = ApiEnv::from_env_with_host_override();

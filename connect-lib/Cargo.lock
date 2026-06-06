@@ -822,6 +822,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "connect-lib",
+ "n0-error",
+ "rustls",
  "serde_json",
  "tokio",
  "tracing",

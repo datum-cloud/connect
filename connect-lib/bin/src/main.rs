@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use n0_error::StdResultExt;
 
 use connect_lib::datum_cloud::env::ApiEnv;
 use connect_lib::datum_cloud::external_token_source::ExternalTokenSource;
@@ -67,6 +68,10 @@ async fn main() {
 }
 
 async fn run() -> n0_error::Result<()> {
+    let _ = rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| n0_error::anyerr!("failed to install ring crypto provider for rustls"))?;
+
     let _ = std::env::var("DATUM_ACCESS_TOKEN").map_err(|_| {
         n0_error::anyerr!("DATUM_ACCESS_TOKEN not set — this binary runs in plugin mode only")
     })?;
@@ -127,13 +132,13 @@ async fn run() -> n0_error::Result<()> {
                 })
                 .collect();
             if json {
-                println!("{}", serde_json::to_string_pretty(&output)?);
+                println!("{}", serde_json::to_string_pretty(&output).anyerr()?);
             } else {
                 if output.is_empty() {
                     println!("No tunnels found.");
                 }
                 for t in &output {
-                    println!("{}", serde_json::to_string(t)?);
+                    println!("{}", serde_json::to_string(t).anyerr()?);
                 }
             }
         }

@@ -23,12 +23,20 @@ pub enum ExternalTokenError {
 
 /// Manages a bearer token provided from an external source (env var + credentials helper).
 ///
-/// Used in plugin mode instead of [`AuthClient`] / OIDC.
+/// Used in plugin mode.
 #[derive(Clone)]
 pub struct ExternalTokenSource {
     token: std::sync::Arc<ArcSwap<SecretString>>,
     token_tx: std::sync::Arc<watch::Sender<String>>,
     api_host: String,
+}
+
+impl std::fmt::Debug for ExternalTokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalTokenSource")
+            .field("api_host", &self.api_host)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExternalTokenSource {
@@ -202,6 +210,7 @@ mod tests {
 
     #[test]
     fn from_env_requires_datum_access_token() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("DATUM_ACCESS_TOKEN");
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
@@ -212,6 +221,7 @@ mod tests {
 
     #[test]
     fn from_env_requires_datum_credentials_helper() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
             std::env::remove_var("DATUM_CREDENTIALS_HELPER");
@@ -222,6 +232,7 @@ mod tests {
 
     #[test]
     fn from_env_succeeds_with_valid_token_and_helper() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
@@ -234,6 +245,7 @@ mod tests {
 
     #[test]
     fn from_env_uses_datum_api_host_when_set() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
@@ -245,6 +257,7 @@ mod tests {
 
     #[test]
     fn from_env_falls_back_to_production_when_no_api_host() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("DATUM_API_HOST");
             std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
@@ -256,6 +269,7 @@ mod tests {
 
     #[test]
     fn swap_token_updates_and_notifies_watch() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
@@ -272,6 +286,7 @@ mod tests {
 
     #[test]
     fn swap_token_multiple_times() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
@@ -287,6 +302,7 @@ mod tests {
 
     #[test]
     fn watch_receiver_initial_value() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
@@ -298,6 +314,7 @@ mod tests {
 
     #[test]
     fn clone_preserves_state() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");

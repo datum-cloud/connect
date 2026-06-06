@@ -11,8 +11,7 @@ pub mod tunnels;
 
 pub use config::{Config, DiscoveryMode};
 pub use datum_cloud::external_token_source::{ExternalTokenError, ExternalTokenSource};
-pub use datum_cloud::env::ApiEnv;
-pub use datum_cloud::auth::{AuthClient, AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
+pub use datum_cloud::{ApiEnv, AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
 pub use heartbeat::HeartbeatAgent;
 pub use http_user_agent::datum_http_user_agent;
 pub use node::{build_endpoint, ConnectNode, ListenNode};
@@ -24,3 +23,7 @@ pub use tunnels::{TunnelDeleteOutcome, TunnelService, TunnelSummary};
 /// The root domain for datum connect URLs to subdomain from. A proxy URL will
 /// be a three-word-codename subdomain off this URL. eg: "https://vast-gold-mine.iroh.datum.net"
 pub const DATUM_CONNECT_GATEWAY_DOMAIN_NAME: &str = "iroh.datum.net";
+
+/// Serializes env-dependent tests (std::env::set_var is not thread-safe).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

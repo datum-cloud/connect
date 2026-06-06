@@ -24,7 +24,7 @@ use tokio::{
 };
 use tracing::{Instrument, debug, error_span, info, instrument, warn};
 
-use crate::{ProxyState, Repo, StateWrapper, TcpProxyData, config::Config};
+use crate::{Repo, StateWrapper, TcpProxyData, config::Config, state::ProxyState};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetricsUpdate {
@@ -291,7 +291,7 @@ impl OutboundProxyHandle {
     }
 }
 
-pub(crate) async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<Endpoint> {
+pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<Endpoint> {
     let relay_mode = relay_mode_from_env_or_build().await?;
     let mut builder = match common.discovery_mode {
         crate::config::DiscoveryMode::Dns => {
