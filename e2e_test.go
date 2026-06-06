@@ -54,7 +54,7 @@ func TestPluginManifestExitsBeforeCobraParses(t *testing.T) {
 }
 
 func TestAll12SubcommandsScaffolded(t *testing.T) {
-	// PLUG-06: All 12 subcommands scaffolded as stubs
+	// PLUG-06: All 12 subcommands available in help
 	cmd := exec.Command("./connect", "tunnel", "--help")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -75,35 +75,32 @@ func TestAll12SubcommandsScaffolded(t *testing.T) {
 	}
 }
 
-func TestSubcommandStubsPrintNotImplemented(t *testing.T) {
-	// Each stub prints "not implemented" with its target phase
-	stubs := map[string]string{
-		"list":        "Phase 4",
-		"listen":      "Phase 4",
-		"update":      "Phase 4",
-		"delete":      "Phase 4",
-		"ps":          "Phase 5",
-		"stop":        "Phase 5",
-		"logs":        "Phase 5",
-		"status":      "Phase 5",
-		"install":     "Phase 6",
-		"uninstall":   "Phase 6",
-		"start":       "Phase 6",
-		"run":         "Phase 6",
+func TestAllSubcommandsRunWithoutCrash(t *testing.T) {
+	// All 12 subcommands should run without crashing (may exit non-zero for
+	// missing required flags, but should not panic or produce stack traces)
+	subcommands := []string{
+		"list", "listen", "update", "delete",
+		"ps", "stop", "logs", "status",
+		"install", "uninstall", "start", "run",
 	}
 
-	for subcmd, expectedPhase := range stubs {
+	for _, subcmd := range subcommands {
 		t.Run(subcmd, func(t *testing.T) {
 			cmd := exec.Command("./connect", "tunnel", subcmd)
 			out, err := cmd.CombinedOutput()
+			// May exit non-zero due to missing required flags — that's OK
+			// as long as there's no panic/stack trace
 			if err != nil {
-				t.Fatalf("%s exited non-zero: %v\n%s", subcmd, err, out)
+				if bytes.Contains(out, []byte("panic:")) {
+					t.Fatalf("%s panicked:\n%s", subcmd, out)
+				}
 			}
-			if !bytes.Contains(out, []byte("not implemented")) {
-				t.Errorf("%s should print 'not implemented'", subcmd)
-			}
-			if !bytes.Contains(out, []byte(expectedPhase)) {
-				t.Errorf("%s should reference %s", subcmd, expectedPhase)
+			if !bytes.Contains(out, []byte(subcmd)) && !bytes.Contains(out, []byte("Error:")) {
+				// Some commands show usage on missing flags, others show "Error:"
+				// Just verify output isn't empty
+				if len(bytes.TrimSpace(out)) == 0 {
+					t.Errorf("%s produced no output", subcmd)
+				}
 			}
 		})
 	}
