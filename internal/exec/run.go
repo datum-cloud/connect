@@ -183,9 +183,13 @@ func ParseTypedMessage(line []byte) (TypedMessage, bool) {
 	}
 
 	typeStr, _ := typeField.(string)
+	var message string
+	if msgData, ok := msg["message"]; ok {
+		message, _ = msgData.(string)
+	}
 	return TypedMessage{
 		Type:    typeStr,
-		Message: msg["message"].(string),
+		Message: message,
 		Fields:  msg,
 	}, true
 }

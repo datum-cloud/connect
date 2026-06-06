@@ -130,3 +130,64 @@ func TestRunWithOutputModeTable(t *testing.T) {
 		t.Errorf("expected table output to contain 'localhost:8080', got: %s", tableStr)
 	}
 }
+
+func TestParseTypedMessage(t *testing.T) {
+	// Verify ParseTypedMessage handles typed messages correctly.
+	// Rust-side contract guarantees every message has a "type" field.
+	// Malformed JSON returns false; caller treats as fatal error.
+	tests := []struct {
+		name       string
+		line       []byte
+		expectType string
+		expectOk   bool
+	}{
+		{
+			name:       "ready message",
+			line:       []byte(`{"type":"ready","id":"tun-123","status":"ready"}`),
+			expectType: "ready",
+			expectOk:   true,
+		},
+		{
+			name:       "error message",
+			line:       []byte(`{"type":"error","message":"something failed"}`),
+			expectType: "error",
+			expectOk:   true,
+		},
+		{
+			name:       "heartbeat message without message field",
+			line:       []byte(`{"type":"heartbeat"}`),
+			expectType: "heartbeat",
+			expectOk:   true,
+		},
+		{
+			name:       "malformed JSON",
+			line:       []byte(`{invalid json}`),
+			expectType: "",
+			expectOk:   false,
+		},
+		{
+			name:       "empty line",
+			line:       []byte(``),
+			expectType: "",
+			expectOk:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg, ok := ParseTypedMessage(tt.line)
+			if ok != tt.expectOk {
+				t.Errorf("ParseTypedMessage(%q) ok=%v, want %v", tt.line, ok, tt.expectOk)
+			}
+			if tt.expectOk && msg.Type != tt.expectType {
+				t.Errorf("ParseTypedMessage(%q) type=%q, want %q", tt.line, msg.Type, tt.expectType)
+			}
+			// Verify no panic on messages without "message" field
+			if tt.expectOk && tt.name == "heartbeat message without message field" {
+				if msg.Message != "" {
+					t.Errorf("expected empty message for heartbeat, got %q", msg.Message)
+				}
+			}
+		})
+	}
+}
