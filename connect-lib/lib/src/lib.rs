@@ -2,25 +2,23 @@ pub mod config;
 pub mod datum_apis;
 pub mod datum_cloud;
 pub mod http_user_agent;
+pub mod node;
+pub mod project_control_plane;
 pub mod repo;
 pub mod state;
-
-// Business logic modules — populated in Wave 2
-pub mod datum_cloud_client;
-pub mod project_control_plane;
 pub mod tunnels;
 
-// Node and heartbeat — populated in Wave 3
-pub mod node;
+// HeartbeatAgent — full implementation in Wave 3
 pub mod heartbeat;
 
 pub use config::{Config, DiscoveryMode};
 pub use datum_cloud::external_token_source::{ExternalTokenError, ExternalTokenSource};
 pub use datum_cloud::env::ApiEnv;
+pub use datum_cloud::auth::{AuthClient, AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
 pub use http_user_agent::datum_http_user_agent;
 pub use project_control_plane::ProjectControlPlaneClient;
 pub use repo::Repo;
-pub use state::{SelectedContext, State, StateWrapper};
+pub use state::{Advertisment, SelectedContext, State, StateWrapper, TcpProxyData};
 pub use tunnels::{TunnelDeleteOutcome, TunnelService, TunnelSummary};
 
 /// The root domain for datum connect URLs to subdomain from. A proxy URL will
