@@ -43,7 +43,7 @@ func TestListRunningTunnels_WithFiles(t *testing.T) {
 
 	// Create a PID file for current process (should show as Running)
 	path := filepath.Join(tunnelsDir, "mytun.pid")
-	if err := Write(path, os.Getpid(), os.Getppid(), time.Now(), "/bin/fake"); err != nil {
+	if err := Write(path, os.Getpid(), os.Getpid(), time.Now(), "/bin/fake"); err != nil {
 		t.Fatalf("Write() failed: %v", err)
 	}
 
