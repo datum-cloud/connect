@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"go.datum.net/datumctl-plugins/connect/internal/binary"
+	"go.datum.net/datumctl-plugins/connect/internal/daemon"
 	"go.datum.net/datumctl-plugins/connect/internal/env"
 	rexec "go.datum.net/datumctl-plugins/connect/internal/exec"
 	"go.datum.net/datumctl/plugin"
@@ -45,6 +46,9 @@ func NewCmd() *cobra.Command {
 	cmd.Flags().String("label", "", "Display name for the tunnel")
 	cmd.Flags().String("endpoint", "", "Local address to expose (host:port, required)")
 	cmd.Flags().Bool("yes", false, "Skip confirmation prompt")
+	cmd.Flags().Bool("detach", false, "Run in background (daemon mode)")
+	cmd.Flags().String("name", "", "Tunnel name (required with --detach)")
+	cmd.Flags().String("log-file", "", "Path for Rust debug log output")
 	return cmd
 }
 
@@ -52,12 +56,32 @@ func runListen(cmd *cobra.Command, args []string) error {
 	label, _ := cmd.Flags().GetString("label")
 	endpoint, _ := cmd.Flags().GetString("endpoint")
 	yes, _ := cmd.Flags().GetBool("yes")
+	detach, _ := cmd.Flags().GetBool("detach")
+	name, _ := cmd.Flags().GetString("name")
+	logFile, _ := cmd.Flags().GetString("log-file")
 
 	if endpoint == "" {
 		// Custom validation — Cobra MarkFlagRequired exits with code 1,
 		// not the POSIX 64 we need for semantic rejection.
 		fmt.Fprintln(os.Stderr, "Error: --endpoint is required")
 		os.Exit(64) // POSIX: semantic rejection (EXIT-02)
+	}
+
+	// Detach mode: spawn background daemon and exit
+	if detach {
+		if name == "" {
+			fmt.Fprintln(os.Stderr, "Error: --name is required with --detach")
+			os.Exit(64)
+		}
+		exe := daemon.SelfExe()
+		childArgs := daemon.ForegroundArgs(name, logFile, endpoint, label, yes)
+		pid, err := daemon.Daemonize(exe, append([]string{exe}, childArgs...))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: daemonize: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Tunnel '%s' started in background (pid %d)\n", name, pid)
+		return nil
 	}
 
 	// Discover binary
