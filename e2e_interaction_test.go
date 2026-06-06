@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.datum.net/datumctl-plugins/connect/internal/pidfile"
+	"go.datum.net/datumctl-plugins/connect/internal/svcconfig"
 )
 
 // TestDatumctlContextEnvVars verifies that the datumctl plugin SDK reads
@@ -322,6 +323,68 @@ func TestInstall_RequiresSession(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "--session is required") {
 		t.Errorf("install without --session should show '--session is required':\n%s", out)
+	}
+}
+
+func TestInstallConfigPersistence(t *testing.T) {
+	// Verify config is written to the correct path and can be loaded back
+	t.Setenv("DATUM_ACCESS_TOKEN", "test-token")
+
+	configDir := t.TempDir()
+	t.Setenv("HOME", configDir) // os.UserConfigDir uses HOME for XDG
+
+	cfg := svcconfig.TunnelConfig{
+		Name:     "test-svc",
+		Label:    "Test Service",
+		Endpoint: "localhost:8080",
+		Session:  "my-session",
+	}
+
+	configPath := svcconfig.ConfigFilePath("test-svc")
+	if err := svcconfig.Save(cfg, configPath); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+
+	loaded, err := svcconfig.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+	if loaded.Name != "test-svc" {
+		t.Errorf("Name = %q, want %q", loaded.Name, "test-svc")
+	}
+	if loaded.Session != "my-session" {
+		t.Errorf("Session = %q, want %q", loaded.Session, "my-session")
+	}
+}
+
+func TestStatus_WithConfig(t *testing.T) {
+	// Verify status output includes installed info when config file exists
+	t.Setenv("DATUM_ACCESS_TOKEN", "test-token")
+
+	// Create a config file for an installed-but-not-running tunnel
+	configDir := t.TempDir()
+	t.Setenv("HOME", configDir)
+
+	cfg := svcconfig.TunnelConfig{
+		Name:     "installed-tun",
+		Endpoint: "localhost:9090",
+		Session:  "svc-session",
+	}
+	if err := svcconfig.Save(cfg, svcconfig.ConfigFilePath("installed-tun")); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+
+	// Run status — should show Stopped and installed info
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "status", "--name", "installed-tun")
+	out, _ := cmd.CombinedOutput()
+
+	output := string(out)
+	if !strings.Contains(output, "Stopped") {
+		t.Errorf("status should show Stopped:\n%s", output)
+	}
+	if !strings.Contains(output, "Installed") {
+		t.Errorf("status should show installed info:\n%s", output)
 	}
 }
 
