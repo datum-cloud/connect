@@ -22,6 +22,7 @@ func NewCmd() *cobra.Command {
 		Short: "List active tunnels",
 		RunE:  runList,
 	}
+	cmd.Flags().StringP("output", "o", "table", "Output format: table, json, yaml")
 	return cmd
 }
 

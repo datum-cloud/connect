@@ -25,6 +25,7 @@ func NewCmd() *cobra.Command {
 	cmd.Flags().String("id", "", "Tunnel ID to update (required)")
 	cmd.Flags().String("label", "", "New display name")
 	cmd.Flags().String("endpoint", "", "New local address (host:port)")
+	cmd.Flags().StringP("output", "o", "table", "Output format: table, json, yaml")
 	return cmd
 }
 

@@ -23,7 +23,7 @@ import (
 const (
 	// startupTimeout is the maximum time to wait for the first typed message
 	// (ready or error) from the Rust binary.
-	startupTimeout = 60 * time.Second
+	startupTimeout = 5 * time.Minute
 	// gracePeriod is the time to wait for clean shutdown after sending SIGINT.
 	gracePeriod = 30 * time.Second
 )
@@ -49,6 +49,7 @@ func NewCmd() *cobra.Command {
 	cmd.Flags().Bool("detach", false, "Run in background (daemon mode)")
 	cmd.Flags().String("name", "", "Tunnel name (required with --detach)")
 	cmd.Flags().String("log-file", "", "Path for Rust debug log output")
+	cmd.Flags().StringP("output", "o", "table", "Output format: table, json, yaml")
 	return cmd
 }
 
@@ -156,9 +157,10 @@ func runListen(cmd *cobra.Command, args []string) error {
 			}
 
 			switch msg.Type {
-			case "ready":
+			case "tunnel_ready":
 				readyData, _ := json.Marshal(msg.Fields)
 				json.Unmarshal(readyData, &ready)
+				gotReady = true
 
 				if isJSON {
 					// JSON mode: print ready JSON and stop reading

@@ -23,6 +23,7 @@ func NewCmd() *cobra.Command {
 		RunE:  runDelete,
 	}
 	cmd.Flags().String("id", "", "Tunnel ID to delete (required)")
+	cmd.Flags().StringP("output", "o", "table", "Output format: table, json, yaml")
 	return cmd
 }
 

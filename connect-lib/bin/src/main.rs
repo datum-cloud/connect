@@ -13,7 +13,7 @@ use connect_lib::{HeartbeatAgent, ListenNode, Repo, SelectedContext, TunnelServi
 struct Args {
     #[clap(long, env = "DATUM_CONNECT_REPO")]
     repo: Option<std::path::PathBuf>,
-    #[clap(long)]
+    #[clap(long, env = "DATUM_PROJECT")]
     project: Option<String>,
     #[clap(long, global = true)]
     json: bool,
