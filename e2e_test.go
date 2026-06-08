@@ -435,13 +435,15 @@ func TestListenJSONMode(t *testing.T) {
 	cmd.Wait()
 }
 
-func TestListenMissingEndpoint(t *testing.T) {
-	// EXIT-02: missing --endpoint exits with code 64
+func TestListenMissingEndpointAndId(t *testing.T) {
+	// EXIT-02: missing both --endpoint and --id exits with code 64.
+	// 12-02 expanded the validation: either --endpoint or --id satisfies
+	// the requirement; neither still rejects.
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "listen")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Error("listen without --endpoint should exit non-zero")
+		t.Error("listen without --endpoint or --id should exit non-zero")
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		if exitErr.ExitCode() != 64 {
@@ -449,6 +451,6 @@ func TestListenMissingEndpoint(t *testing.T) {
 		}
 	}
 	if !bytes.Contains(out, []byte("required")) {
-		t.Error("listen without --endpoint should show 'required' error message")
+		t.Error("listen without --endpoint or --id should show 'required' error message")
 	}
 }

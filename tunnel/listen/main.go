@@ -45,6 +45,7 @@ func NewCmd() *cobra.Command {
 	}
 	cmd.Flags().String("label", "", "Display name for the tunnel")
 	cmd.Flags().String("endpoint", "", "Local address to expose (host:port, required)")
+	cmd.Flags().String("id", "", "Existing tunnel resource name to resume (mutually inclusive with optional --endpoint)")
 	cmd.Flags().Bool("yes", false, "Skip confirmation prompt")
 	cmd.Flags().Bool("detach", false, "Run in background (daemon mode)")
 	cmd.Flags().String("name", "", "Tunnel name (required with --detach)")
@@ -56,20 +57,27 @@ func NewCmd() *cobra.Command {
 func runListen(cmd *cobra.Command, args []string) error {
 	label, _ := cmd.Flags().GetString("label")
 	endpoint, _ := cmd.Flags().GetString("endpoint")
+	id, _ := cmd.Flags().GetString("id")
 	yes, _ := cmd.Flags().GetBool("yes")
 	detach, _ := cmd.Flags().GetBool("detach")
 	name, _ := cmd.Flags().GetString("name")
 	logFile, _ := cmd.Flags().GetString("log-file")
 
-	if endpoint == "" {
-		// Custom validation — Cobra MarkFlagRequired exits with code 1,
-		// not the POSIX 64 we need for semantic rejection.
-		fmt.Fprintln(os.Stderr, "Error: --endpoint is required")
+	if endpoint == "" && id == "" {
+		// Neither flag given — semantic rejection (EXIT-02).
+		// The Rust binary requires at least one of --endpoint or --id;
+		// when neither is set and stdin is non-interactive the picker
+		// also can't run, so reject here for a faster, clearer error.
+		fmt.Fprintln(os.Stderr, "Error: --endpoint or --id is required")
 		os.Exit(64) // POSIX: semantic rejection (EXIT-02)
 	}
 
 	// Detach mode: spawn background daemon and exit
 	if detach {
+		if id != "" {
+			fmt.Fprintln(os.Stderr, "Error: --id is not yet supported with --detach (phase 13 will wire this through tunnel run)")
+			os.Exit(64)
+		}
 		if name == "" {
 			fmt.Fprintln(os.Stderr, "Error: --name is required with --detach")
 			os.Exit(64)
@@ -104,7 +112,13 @@ func runListen(cmd *cobra.Command, args []string) error {
 	childEnv := env.Build(pluginCtx, token)
 
 	// Build args
-	rustArgs := []string{"--json", "listen", "--endpoint", endpoint}
+	rustArgs := []string{"--json", "listen"}
+	if endpoint != "" {
+		rustArgs = append(rustArgs, "--endpoint", endpoint)
+	}
+	if id != "" {
+		rustArgs = append(rustArgs, "--id", id)
+	}
 	if label != "" {
 		rustArgs = append(rustArgs, "--label", label)
 	}
