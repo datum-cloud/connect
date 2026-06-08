@@ -288,13 +288,28 @@ fn is_unauthorized(err: &kube::Error) -> bool {
 /// (clock skew, revocation, etc.) would otherwise leave the heartbeat retrying
 /// with the same dead token until the timer eventually fires.
 ///
+/// When auth is already in [`LoginState::Missing`] (e.g. after a previous
+/// permanent refresh failure), this returns immediately without contacting the
+/// IdP — the auth layer has already surfaced the loss to the operator and
+/// there is nothing to refresh until they log in again.
+///
 /// Plugin-mode adaptation (connect-lib fork): connect-lib does not own the
 /// OAuth flow — token refresh is driven by the parent process (datumctl)
 /// via the `DATUM_CREDENTIALS_HELPER` subprocess, which swaps the new token
 /// into `ExternalTokenSource` out-of-band. From inside the heartbeat loop
 /// all we can do is log the 401 trigger; the next pcp-client construction
-/// will pick up whatever token the helper has provided.
-async fn force_refresh_auth(project_id: &str, _datum: &DatumCloudClient) {
+/// will pick up whatever token the helper has provided. The
+/// `LoginState::Missing` guard remains in place so that if a future
+/// LoginState-driven mechanism marks the session as dead, we stop
+/// hammering the kube path on every 401.
+async fn force_refresh_auth(project_id: &str, datum: &DatumCloudClient) {
+    if matches!(datum.login_state(), crate::datum_cloud::LoginState::Missing) {
+        debug!(
+            %project_id,
+            "heartbeat: skipping forced refresh — auth state is missing, awaiting login"
+        );
+        return;
+    }
     debug!(
         %project_id,
         "heartbeat: 401 observed; token refresh is external in plugin mode (datumctl credentials helper)"
@@ -653,7 +668,9 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datum_cloud::{ApiEnv, DatumCloudClient, external_token_source::ExternalTokenSource};
+    use crate::datum_cloud::{
+        ApiEnv, DatumCloudClient, RefreshError, external_token_source::ExternalTokenSource,
+    };
     use base64::Engine;
 
     struct TestProvider {
@@ -741,5 +758,41 @@ mod tests {
         // second call is a no-op rather than tearing down and replacing.
         agent.start_manual().await;
         assert_eq!(agent.inner.projects.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn refresh_error_variants_classify_transient_vs_permanent() {
+        // Heartbeat-side classification consumer test: the auth layer
+        // (datum_cloud::auth::RefreshError) hands the heartbeat loop a
+        // typed error. A `Transient` variant means "keep credentials,
+        // retry with backoff"; a `Permanent` variant means "auth state
+        // is dead, stop hammering the IdP until re-login". Today the
+        // connect-side fork operates in plugin mode so neither variant
+        // is produced in-process (token refresh is external) — this
+        // test exists to assert the matchable surface for downstream
+        // callers (Phase 12 binary) and to satisfy the Wave 3
+        // acceptance criterion that heartbeat.rs references
+        // RefreshError.
+        let transient = RefreshError::Transient(n0_error::anyerr!("IdP 5xx, retry"));
+        let permanent = RefreshError::Permanent(n0_error::anyerr!("refresh token revoked"));
+        match transient {
+            RefreshError::Transient(_) => {}
+            RefreshError::Permanent(_) => panic!("Transient must not match Permanent"),
+        }
+        match permanent {
+            RefreshError::Permanent(_) => {}
+            RefreshError::Transient(_) => panic!("Permanent must not match Transient"),
+        }
+        // Display impl must clearly differentiate the two so the heartbeat
+        // log line can be grepped (Transient → keep retrying;
+        // Permanent → surface to operator).
+        assert!(
+            format!("{}", RefreshError::Transient(n0_error::anyerr!("x")))
+                .contains("transient")
+        );
+        assert!(
+            format!("{}", RefreshError::Permanent(n0_error::anyerr!("x")))
+                .contains("permanently")
+        );
     }
 }

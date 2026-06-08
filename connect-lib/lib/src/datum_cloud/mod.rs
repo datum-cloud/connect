@@ -116,7 +116,49 @@ pub(crate) mod auth {
             Ok(self)
         }
     }
+
+    /// Outcome classification for a token refresh attempt.
+    ///
+    /// The distinction matters for the heartbeat loop and the listener: a
+    /// `Transient` failure should keep auth state intact and let the next retry
+    /// recover, while a `Permanent` failure means the OAuth provider has
+    /// definitively rejected our credentials and only a fresh interactive login
+    /// can recover. Treating every refresh failure as permanent — which the
+    /// previous implementation did — meant a 30-second IdP wobble would log a
+    /// long-running tunnel out.
+    ///
+    /// Connect-lib note: this fork operates in plugin mode where token refresh
+    /// is performed by the parent process (datumctl) via the
+    /// DATUM_CREDENTIALS_HELPER subprocess. The OIDC machinery that produced
+    /// these errors upstream does not exist in connect-lib. The enum is
+    /// nevertheless exposed at `pub(crate)` so heartbeat/binary callers can
+    /// classify any future in-process refresh attempts (Phase 12 work) and so
+    /// the surface matches upstream for downstream merge compatibility.
+    #[derive(Debug)]
+    pub enum RefreshError {
+        /// The IdP definitively rejected the refresh (typically `invalid_grant`,
+        /// `invalid_client`, etc.). Auth state has been cleared; the operator
+        /// must log in again.
+        Permanent(n0_error::AnyError),
+        /// Transient failure (network, IdP 5xx, parse error, ID-token claim
+        /// verification). Auth state is preserved; the caller should retry with
+        /// backoff.
+        Transient(n0_error::AnyError),
+    }
+
+    impl std::fmt::Display for RefreshError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Permanent(e) => write!(f, "refresh permanently rejected by IdP: {e:#}"),
+                Self::Transient(e) => write!(f, "transient refresh failure: {e:#}"),
+            }
+        }
+    }
+
+    impl std::error::Error for RefreshError {}
 }
+
+pub(crate) use self::auth::RefreshError;
 
 pub use self::auth::{AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
 
