@@ -71,7 +71,9 @@ enum Commands {
         #[clap(long)]
         label: Option<String>,
         #[clap(long)]
-        endpoint: String,
+        endpoint: Option<String>,
+        #[clap(long)]
+        id: Option<String>,
     },
     /// Update an existing tunnel.
     Update {
@@ -185,10 +187,66 @@ async fn run() -> n0_error::Result<()> {
                 }
             }
         }
-        Commands::Listen { label, endpoint } => {
+        Commands::Listen { label, endpoint, id } => {
             let node = ListenNode::new(repo.clone()).await?;
             let service = TunnelService::new(datum.clone(), node.clone());
             let endpoint_id = node.endpoint_id();
+
+            // Plan 12-01 resolution rules:
+            //   --endpoint only        → existing behaviour (no picker, no --id consumption)
+            //   --id only              → stub error pointing at plan 12-02
+            //   neither flag           → picker with auto-adopt on len==1, error on len==0
+            //   --id + --endpoint      → stub error pointing at plan 12-02
+            let (endpoint, _picked_id_for_plan_12_02) = match (endpoint, id) {
+                (Some(ep), None) => (ep, None),
+                (None, Some(_id)) => {
+                    return Err(n0_error::anyerr!(
+                        "--id alone is implemented in plan 12-02"
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(n0_error::anyerr!(
+                        "--id+--endpoint validation is implemented in plan 12-02"
+                    ));
+                }
+                (None, None) => {
+                    let tunnels = service.list_active().await?;
+                    if tunnels.is_empty() {
+                        return Err(n0_error::anyerr!(
+                            "No tunnels exist in project {project_id}. Pass --endpoint to create one."
+                        ));
+                    }
+                    if tunnels.len() == 1 {
+                        // Auto-adopt the only candidate without popping a picker
+                        // (informed by datum-cloud/app@cff37e7).
+                        let picked = tunnels.into_iter().next().unwrap();
+                        (picked.endpoint.clone(), Some(picked.id.clone()))
+                    } else {
+                        // Multiple candidates: silence tracing, prompt with inquire,
+                        // restore tracing. inquire is sync, so call from a
+                        // blocking task to keep the tokio runtime healthy.
+                        let prev_filter = current_filter_string();
+                        silence_tracing();
+                        let choices: Vec<String> = tunnels
+                            .iter()
+                            .map(|t| format!("{}  ({})  → {}", t.label, t.id, t.endpoint))
+                            .collect();
+                        let chosen_idx_res = tokio::task::spawn_blocking(move || {
+                            inquire::Select::new("Select a tunnel:", choices)
+                                .with_starting_cursor(0)
+                                .raw_prompt()
+                                .map(|item| item.index)
+                        })
+                        .await
+                        .map_err(|e| n0_error::anyerr!("picker task join failed: {e}"))?;
+                        restore_tracing(&prev_filter);
+                        let idx = chosen_idx_res
+                            .map_err(|e| n0_error::anyerr!("picker error: {e}"))?;
+                        let picked = tunnels.into_iter().nth(idx).unwrap();
+                        (picked.endpoint.clone(), Some(picked.id.clone()))
+                    }
+                }
+            };
 
             let existing = service.get_active_by_endpoint(&endpoint).await?;
             let tunnel_id = if let Some(t) = existing {
