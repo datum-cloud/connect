@@ -188,39 +188,65 @@ async fn run() -> n0_error::Result<()> {
             }
         }
         Commands::Listen { label, endpoint, id } => {
-            let node = ListenNode::new(repo.clone()).await?;
-            let service = TunnelService::new(datum.clone(), node.clone());
-            let endpoint_id = node.endpoint_id();
-
-            // Plan 12-01 resolution rules:
-            //   --endpoint only        → existing behaviour (no picker, no --id consumption)
-            //   --id only              → stub error pointing at plan 12-02
+            // Plan 12-02 resolution rules (replaces plan 12-01 stubs):
+            //   --endpoint only        → existing behaviour (no node/service yet)
+            //   --id only              → real resolution via TunnelService::get_active;
+            //                            inherit endpoint from the existing tunnel
+            //   --id + --endpoint      → validate that the named tunnel already
+            //                            references that endpoint; error otherwise
             //   neither flag           → picker with auto-adopt on len==1, error on len==0
-            //   --id + --endpoint      → stub error pointing at plan 12-02
-            let (endpoint, _picked_id_for_plan_12_02) = match (endpoint, id) {
-                (Some(ep), None) => (ep, None),
-                (None, Some(_id)) => {
-                    return Err(n0_error::anyerr!(
-                        "--id alone is implemented in plan 12-02"
-                    ));
+            //
+            // Informed by datum-cloud/app@ca4470f (tunnel listen --id pins existing
+            // tunnel and preserves its hostname) and @a68d8ae (--id alone resumes
+            // an existing tunnel; --id+--endpoint must agree).
+            //
+            // The id branches pre-build (node, service) so we can call
+            // get_active(&id). They stash the result in `preresolved_ns` so the
+            // downstream block reuses them instead of re-creating.
+            let mut preresolved_ns: Option<(ListenNode, TunnelService, connect_lib::TunnelSummary)> =
+                None;
+            let endpoint: String = match (endpoint, id) {
+                (Some(ep), None) => ep,
+                (None, Some(id)) => {
+                    let node = ListenNode::new(repo.clone()).await?;
+                    let service = TunnelService::new(datum.clone(), node.clone());
+                    let t = service.get_active(&id).await?.ok_or_else(|| {
+                        n0_error::anyerr!("Tunnel '{id}' not found in project {project_id}")
+                    })?;
+                    // Inherit endpoint from the existing tunnel.
+                    let ep = t.endpoint.clone();
+                    preresolved_ns = Some((node, service, t));
+                    ep
                 }
-                (Some(_), Some(_)) => {
-                    return Err(n0_error::anyerr!(
-                        "--id+--endpoint validation is implemented in plan 12-02"
-                    ));
+                (Some(endpoint_val), Some(id_val)) => {
+                    let node = ListenNode::new(repo.clone()).await?;
+                    let service = TunnelService::new(datum.clone(), node.clone());
+                    let t = service.get_active(&id_val).await?.ok_or_else(|| {
+                        n0_error::anyerr!("Tunnel '{id_val}' not found in project {project_id}")
+                    })?;
+                    if t.endpoint != endpoint_val {
+                        return Err(n0_error::anyerr!(
+                            "--id '{id_val}' references endpoint '{}' but --endpoint was '{endpoint_val}' — they must agree (or omit --endpoint to inherit from the tunnel)",
+                            t.endpoint
+                        ));
+                    }
+                    preresolved_ns = Some((node, service, t));
+                    endpoint_val
                 }
                 (None, None) => {
+                    // Picker codepath needs a service to call list_active.
+                    let node = ListenNode::new(repo.clone()).await?;
+                    let service = TunnelService::new(datum.clone(), node.clone());
                     let tunnels = service.list_active().await?;
                     if tunnels.is_empty() {
                         return Err(n0_error::anyerr!(
                             "No tunnels exist in project {project_id}. Pass --endpoint to create one."
                         ));
                     }
-                    if tunnels.len() == 1 {
+                    let picked = if tunnels.len() == 1 {
                         // Auto-adopt the only candidate without popping a picker
                         // (informed by datum-cloud/app@cff37e7).
-                        let picked = tunnels.into_iter().next().unwrap();
-                        (picked.endpoint.clone(), Some(picked.id.clone()))
+                        tunnels.into_iter().next().unwrap()
                     } else {
                         // Multiple candidates: silence tracing, prompt with inquire,
                         // restore tracing. inquire is sync, so call from a
@@ -242,13 +268,28 @@ async fn run() -> n0_error::Result<()> {
                         restore_tracing(&prev_filter);
                         let idx = chosen_idx_res
                             .map_err(|e| n0_error::anyerr!("picker error: {e}"))?;
-                        let picked = tunnels.into_iter().nth(idx).unwrap();
-                        (picked.endpoint.clone(), Some(picked.id.clone()))
-                    }
+                        tunnels.into_iter().nth(idx).unwrap()
+                    };
+                    let ep = picked.endpoint.clone();
+                    preresolved_ns = Some((node, service, picked));
+                    ep
                 }
             };
 
-            let existing = service.get_active_by_endpoint(&endpoint).await?;
+            // Reuse the (node, service, existing-tunnel) tuple if one of the
+            // resolution branches above already built it; otherwise build now
+            // and look up the existing tunnel by endpoint.
+            let (node, service, existing) = match preresolved_ns {
+                Some((n, s, t)) => (n, s, Some(t)),
+                None => {
+                    let n = ListenNode::new(repo.clone()).await?;
+                    let s = TunnelService::new(datum.clone(), n.clone());
+                    let existing = s.get_active_by_endpoint(&endpoint).await?;
+                    (n, s, existing)
+                }
+            };
+            let endpoint_id = node.endpoint_id();
+
             let tunnel_id = if let Some(t) = existing {
                 if let Some(label) = label.filter(|l| l != &t.label) {
                     let updated = service.update_active(&t.id, &label, &endpoint).await?;
