@@ -18,7 +18,10 @@ pub use node::{build_endpoint, ConnectNode, ListenNode};
 pub use project_control_plane::ProjectControlPlaneClient;
 pub use repo::Repo;
 pub use state::{Advertisment, SelectedContext, State, StateWrapper, TcpProxyData};
-pub use tunnels::{TunnelDeleteOutcome, TunnelService, TunnelSummary};
+pub use tunnels::{
+    ProgressStep, ProgressStepKind, StepStatus, TunnelDeleteOutcome, TunnelProgress, TunnelService,
+    TunnelSummary,
+};
 
 /// The root domain for datum connect URLs to subdomain from. A proxy URL will
 /// be a three-word-codename subdomain off this URL. eg: "https://vast-gold-mine.iroh.datum.net"
