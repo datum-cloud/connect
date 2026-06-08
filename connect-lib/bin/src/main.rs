@@ -1,12 +1,53 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use n0_error::StdResultExt;
+use tracing_subscriber::{
+    filter::EnvFilter,
+    layer::SubscriberExt,
+    reload::{self, Handle},
+    util::SubscriberInitExt,
+    Registry,
+};
 
 use connect_lib::datum_cloud::env::ApiEnv;
 use connect_lib::datum_cloud::external_token_source::ExternalTokenSource;
 use connect_lib::datum_cloud::DatumCloudClient;
 use connect_lib::{HeartbeatAgent, ListenNode, Repo, SelectedContext, TunnelService};
+
+type ReloadHandle = Handle<EnvFilter, Registry>;
+static RELOAD_HANDLE: OnceLock<ReloadHandle> = OnceLock::new();
+
+fn init_tracing() {
+    let default_directive = "datum_connect=info";
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_directive));
+    let (filter_layer, handle) = reload::Layer::new(filter);
+    // Best-effort: if a subscriber is already installed (e.g. duplicate call in tests),
+    // skip without panicking.
+    let _ = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .try_init();
+    let _ = RELOAD_HANDLE.set(handle);
+}
+
+fn silence_tracing() {
+    if let Some(handle) = RELOAD_HANDLE.get() {
+        let _ = handle.modify(|f| *f = EnvFilter::new("off"));
+    }
+}
+
+fn restore_tracing(prev: &str) {
+    if let Some(handle) = RELOAD_HANDLE.get() {
+        let _ = handle.modify(|f| *f = EnvFilter::new(prev));
+    }
+}
+
+fn current_filter_string() -> String {
+    std::env::var("RUST_LOG").unwrap_or_else(|_| "datum_connect=info".to_string())
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "datum-connect", about = "Datum Connect tunnel agent (plugin mode)")]
@@ -71,6 +112,8 @@ async fn run() -> n0_error::Result<()> {
     let _ = rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| n0_error::anyerr!("failed to install ring crypto provider for rustls"))?;
+
+    init_tracing();
 
     let _ = std::env::var("DATUM_ACCESS_TOKEN").map_err(|_| {
         n0_error::anyerr!("DATUM_ACCESS_TOKEN not set — this binary runs in plugin mode only")
