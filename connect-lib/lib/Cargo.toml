@@ -38,3 +38,6 @@ iroh-proxy-utils = { git = "https://github.com/n0-computer/iroh-proxy-utils", re
 
 # postcard for ticket serialization
 postcard = "1"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
