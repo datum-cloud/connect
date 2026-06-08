@@ -86,6 +86,13 @@ impl HeartbeatAgent {
         }
     }
 
+    /// Start in auto-enroll mode: watch login + projects state and keep
+    /// heartbeats running for every project the user has access to.
+    /// Intended for multi-project consumers like the UI.
+    ///
+    /// For the CLI tunnel use case where there is exactly one project of
+    /// interest, prefer [`Self::start_manual`] — auto-enroll silently
+    /// maintains presence in projects the user didn't ask about.
     pub async fn start(&self) {
         let mut guard = self.inner.login_task.lock().await;
         if guard.is_some() {
@@ -141,6 +148,24 @@ impl HeartbeatAgent {
                 }
             }
         });
+        *guard = Some(AbortOnDropHandle::new(task));
+    }
+
+    /// Start in manual mode: do not watch login state and do not auto-enroll
+    /// projects. Callers are responsible for [`Self::register_project`] /
+    /// [`Self::deregister_project`] for the projects they want heartbeats
+    /// for. Per-project loops still handle 401s via their own
+    /// force-refresh logic, so transient auth blips are tolerated; a
+    /// permanent logout is surfaced separately by the CLI's own login
+    /// watcher.
+    pub async fn start_manual(&self) {
+        let mut guard = self.inner.login_task.lock().await;
+        if guard.is_some() {
+            return;
+        }
+        // Park a completed task so future start() / start_manual() calls
+        // remain no-ops, matching start()'s "single-start" contract.
+        let task = tokio::spawn(async {});
         *guard = Some(AbortOnDropHandle::new(task));
     }
 
@@ -565,5 +590,99 @@ impl Backoff {
 
     fn reset(&mut self) {
         self.current = BACKOFF_INITIAL;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datum_cloud::{ApiEnv, DatumCloudClient, external_token_source::ExternalTokenSource};
+    use base64::Engine;
+
+    struct TestProvider {
+        endpoint_id: String,
+    }
+
+    impl HeartbeatDetailsProvider for TestProvider {
+        fn endpoint_id(&self) -> String {
+            self.endpoint_id.clone()
+        }
+
+        fn connection_details(
+            &self,
+            _fallback_home_relay: Option<&str>,
+        ) -> Option<ConnectorConnectionDetails> {
+            None
+        }
+    }
+
+    fn make_jwt_with_exp(exp: u64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({"alg":"HS256","typ":"JWT"}).to_string().as_bytes());
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({"exp": exp, "sub":"test"}).to_string().as_bytes());
+        format!("{header}.{payload}.fake_sig")
+    }
+
+    fn setup_plugin_env() -> ExternalTokenSource {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
+            std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
+            std::env::remove_var("DATUM_API_HOST");
+        }
+        ExternalTokenSource::from_env().expect("should create ExternalTokenSource")
+    }
+
+    fn test_datum_client() -> DatumCloudClient {
+        let token_source = setup_plugin_env();
+        DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source)
+    }
+
+    #[tokio::test]
+    async fn start_manual_does_not_auto_enroll() {
+        // Manual mode is the CLI tunnel-listen path: only the project the
+        // caller explicitly registers should get a heartbeat task. Auto-
+        // enroll would have probed `orgs_and_projects()` on bootstrap and
+        // registered every accessible project — we verify it didn't by
+        // checking the projects map stays empty until we register one.
+        //
+        // Adapted from upstream test (datum-cloud/app@b7e9d6b): the upstream
+        // version constructed the client via `DatumCloudClient::with_repo`
+        // (an OIDC path that does not exist on the connect-side fork —
+        // connect-lib uses ExternalTokenSource in plugin mode). The
+        // assertion semantics are identical.
+        let datum = test_datum_client();
+        let provider = Arc::new(TestProvider {
+            endpoint_id: "test-endpoint".to_string(),
+        });
+        let runner: ProjectRunner = Arc::new(|_project_id, _datum, _provider, cancel| {
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+            })
+        });
+        let agent = HeartbeatAgent::new_with_runner(datum, provider, runner);
+
+        agent.start_manual().await;
+        // Give any background bootstrap a chance to run; manual mode
+        // shouldn't have spawned one, but if it did this would expose it.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            agent.inner.projects.lock().await.len(),
+            0,
+            "manual mode must not auto-enroll any project"
+        );
+
+        agent.register_project("explicit-project").await;
+        assert_eq!(
+            agent.inner.projects.lock().await.len(),
+            1,
+            "register_project still works in manual mode"
+        );
+
+        // start_manual is idempotent (matches start()'s contract): a
+        // second call is a no-op rather than tearing down and replacing.
+        agent.start_manual().await;
+        assert_eq!(agent.inner.projects.lock().await.len(), 1);
     }
 }
