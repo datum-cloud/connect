@@ -16,7 +16,12 @@
 //!  - `Mode::Json` writes JSON event objects to stdout (so the Go supervisor's
 //!    line-oriented stdin reader sees one event per line)
 
-use connect_lib::{ProgressStep, ProgressStepKind, StepStatus};
+use std::collections::HashMap;
+use std::time::Duration;
+
+use connect_lib::{ProgressStep, ProgressStepKind, StepStatus, TunnelProgress, TunnelService};
+use n0_error::Result;
+use tokio::time::{sleep, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -123,7 +128,177 @@ pub fn render_verify(mode: Mode, url: &str, event: VerifyEvent) {
     }
 }
 
-// (await_tunnel_progress and verify_endpoints implemented in Task 3 of this plan.)
+// --- URL builder for verify_endpoints ---
+
+pub fn build_probe_urls(endpoint: &str, hostname: &str) -> (String, String) {
+    let origin = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{}", endpoint)
+    };
+    let proxy = format!("https://{}", hostname);
+    (origin, proxy)
+}
+
+// --- await_tunnel_progress ---
+
+/// Poll `service.get_active_progress(tunnel_id)` on a 250ms cadence; emit a
+/// transition callback for every step whose status changed since the previous
+/// poll. Returns the final `TunnelProgress` when all steps are Ready, returns
+/// an error formatted via `format_terminal_failure` when a terminal-failure
+/// step is observed, and returns an error if the tunnel disappears upstream
+/// during setup. Emits a one-shot stderr warning when a step has been Pending
+/// for ≥ 30 seconds.
+///
+/// No overall timeout: the caller (Listen handler) bounds total time via the
+/// 60-second Go-supervisor startup window in `connect/tunnel/listen/main.go`.
+pub async fn await_tunnel_progress<F>(
+    service: &TunnelService,
+    tunnel_id: &str,
+    progress_cb: F,
+) -> Result<TunnelProgress>
+where
+    F: Fn(&ProgressStep, StepStatus),
+{
+    let mut last_seen: HashMap<ProgressStepKind, StepStatus> = HashMap::new();
+    let mut pending_since: HashMap<ProgressStepKind, Instant> = HashMap::new();
+    let mut warned_stuck: HashMap<ProgressStepKind, bool> = HashMap::new();
+
+    loop {
+        let progress_opt = service
+            .get_active_progress(tunnel_id)
+            .await
+            .map_err(|e| n0_error::anyerr!("polling tunnel {tunnel_id} progress: {e}"))?;
+        let Some(progress) = progress_opt else {
+            return Err(n0_error::anyerr!(
+                "Tunnel {tunnel_id} disappeared during setup"
+            ));
+        };
+
+        // Diff and emit transitions.
+        for step in &progress.steps {
+            let prev = last_seen
+                .get(&step.kind)
+                .copied()
+                .unwrap_or(StepStatus::Unknown);
+            if prev != step.status {
+                progress_cb(step, prev);
+                last_seen.insert(step.kind, step.status);
+            }
+            // Track Pending duration; emit a one-shot stuck warning at 30s.
+            if step.status == StepStatus::Pending {
+                pending_since.entry(step.kind).or_insert_with(Instant::now);
+                if let Some(start) = pending_since.get(&step.kind) {
+                    let secs = start.elapsed().as_secs();
+                    if secs >= 30 && !warned_stuck.get(&step.kind).copied().unwrap_or(false) {
+                        eprintln!(
+                            "warning: step {} stuck in Pending for {}s ({})",
+                            step.kind.label(),
+                            secs,
+                            step.resource.as_deref().unwrap_or("(no resource)")
+                        );
+                        warned_stuck.insert(step.kind, true);
+                    }
+                }
+            } else {
+                pending_since.remove(&step.kind);
+                warned_stuck.remove(&step.kind);
+            }
+        }
+
+        // Check terminal failure.
+        if let Some(failed) = progress.terminal_failure() {
+            return Err(n0_error::anyerr!("{}", format_terminal_failure(failed)));
+        }
+
+        if progress.all_ready() {
+            return Ok(progress);
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+// --- verify_endpoints ---
+
+/// Probe the origin endpoint (HTTP) and proxy URL (HTTPS) via reqwest, with a
+/// shared time budget split between the two. Origin probe failure is
+/// non-fatal (emits a stderr warning); proxy probe failure is fatal.
+/// On each probe, fires `verify_cb(url, VerifyEvent::Verifying)` before the
+/// first attempt and `verify_cb(url, VerifyEvent::Verified)` on success.
+///
+/// "Reachable" means any HTTP response (2xx/3xx/4xx all count); only
+/// network errors / connection timeouts retry. Exponential backoff
+/// (250ms → 500ms → 1s → 2s ceiling) bounded by the per-probe budget.
+pub async fn verify_endpoints<F>(
+    origin_endpoint: &str,
+    hostname: &str,
+    budget: Duration,
+    verify_cb: F,
+) -> Result<()>
+where
+    F: Fn(&str, VerifyEvent),
+{
+    let (origin_url, proxy_url) = build_probe_urls(origin_endpoint, hostname);
+
+    let per_attempt_timeout = std::cmp::min(budget / 4, Duration::from_secs(5));
+    let client = reqwest::Client::builder()
+        .timeout(per_attempt_timeout)
+        .danger_accept_invalid_certs(false)
+        .build()
+        .map_err(|e| n0_error::anyerr!("building reqwest client for verify_endpoints: {e}"))?;
+
+    // Origin probe — non-fatal on failure.
+    verify_cb(&origin_url, VerifyEvent::Verifying);
+    match probe_until_reachable(&client, &origin_url, budget / 2).await {
+        Ok(()) => verify_cb(&origin_url, VerifyEvent::Verified),
+        Err(_e) => {
+            eprintln!(
+                "warning: origin {} did not respond within budget — continuing",
+                origin_url
+            );
+        }
+    }
+
+    // Proxy probe — fatal on failure.
+    verify_cb(&proxy_url, VerifyEvent::Verifying);
+    match probe_until_reachable(&client, &proxy_url, budget / 2).await {
+        Ok(()) => {
+            verify_cb(&proxy_url, VerifyEvent::Verified);
+            Ok(())
+        }
+        Err(_e) => Err(n0_error::anyerr!(
+            "Tunnel did not become reachable at {} within {:?}",
+            proxy_url,
+            budget
+        )),
+    }
+}
+
+async fn probe_until_reachable(
+    client: &reqwest::Client,
+    url: &str,
+    budget: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(250);
+    loop {
+        if start.elapsed() >= budget {
+            return Err(n0_error::anyerr!("probe budget exhausted"));
+        }
+        match client.get(url).send().await {
+            Ok(_resp) => return Ok(()), // any status = reachable
+            Err(_e) => {
+                let remaining = budget.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Err(n0_error::anyerr!("probe budget exhausted"));
+                }
+                sleep(std::cmp::min(backoff, remaining)).await;
+                backoff = std::cmp::min(backoff * 2, Duration::from_secs(2));
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -162,6 +337,19 @@ mod tests {
         assert!(out.contains("Tunnel setup failed at step"));
         assert!(out.contains("resource: HTTPProxy/x"));
         assert!(!out.contains("Another connector with the same iroh key"));
+    }
+
+    #[test]
+    fn build_probe_urls_adds_http_prefix_to_bare_endpoint() {
+        let (origin, proxy) = build_probe_urls("localhost:8080", "x.example.com");
+        assert_eq!(origin, "http://localhost:8080");
+        assert_eq!(proxy, "https://x.example.com");
+    }
+
+    #[test]
+    fn build_probe_urls_keeps_scheme_when_present() {
+        let (origin, _) = build_probe_urls("https://api.example.com", "x.example.com");
+        assert_eq!(origin, "https://api.example.com");
     }
 
     #[test]
