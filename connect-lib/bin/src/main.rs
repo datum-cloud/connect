@@ -93,6 +93,15 @@ enum Commands {
     },
 }
 
+/// Why the Listen handler's runtime select-loop terminated. Drives the
+/// final exit status: CtrlC = clean exit 0; TerminalFailure / DeletedUpstream
+/// = exit 1 with an n0_error::anyerr! message.
+enum ExitReason {
+    CtrlC,
+    TerminalFailure,
+    DeletedUpstream,
+}
+
 fn resolve_project(project_id: &str) -> SelectedContext {
     SelectedContext {
         project_id: project_id.to_string(),
@@ -398,14 +407,123 @@ async fn run() -> n0_error::Result<()> {
                 }
             }
 
-            tokio::signal::ctrl_c().await?;
-            service.set_enabled_active(&tunnel_id, false).await?;
+            // --- Mid-session watch loop (Plan 12-04) ---
+            // After tunnel_ready, watch three signals concurrently:
+            //   1. ctrl_c        — user-initiated clean shutdown (exit 0)
+            //   2. login_state   — credential expiry/revocation guidance
+            //                      (text or JSON; does NOT exit so user can read)
+            //   3. 10s poll      — detect mid-session terminal failure
+            //                      (e.g. iroh-DNS collision flips post-Ready)
+            //                      or upstream deletion (HTTPProxy removed)
+            //
+            // Cleanup (set_enabled_active false + tunnel_disabled) runs for
+            // ALL exit paths via the post-loop block. Informed by upstream
+            // datum-cloud/app@6264818 (runtime select-loop precedent).
+            let mut login_rx = datum.login_state_watch();
+            let mut runtime_poll =
+                tokio::time::interval(std::time::Duration::from_secs(10));
+            // First tick fires immediately; consume it so the first real poll
+            // happens 10s after tunnel_ready (not concurrently with it).
+            runtime_poll.tick().await;
+
+            let exit_reason: ExitReason = loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        break ExitReason::CtrlC;
+                    }
+                    res = login_rx.changed() => {
+                        if res.is_err() {
+                            // Sender dropped — treat as a transient error, continue.
+                            continue;
+                        }
+                        let state = login_rx.borrow().clone();
+                        if state == connect_lib::LoginState::Missing {
+                            let guidance =
+                                "Datum login has expired or been revoked. \
+                                 Stop this command and run `datum login` to refresh credentials. \
+                                 The tunnel will continue running on cached credentials until they expire.";
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "type": "tunnel_login_lost",
+                                        "id": tunnel_id,
+                                        "message": guidance
+                                    })
+                                );
+                            } else {
+                                eprintln!("{}", guidance);
+                            }
+                            // Do NOT break — keep the tunnel running so the user has time to read.
+                        }
+                    }
+                    _ = runtime_poll.tick() => {
+                        match service.get_active_progress(&tunnel_id).await {
+                            Ok(Some(progress)) => {
+                                if let Some(failed) = progress.terminal_failure() {
+                                    let msg = progress::format_terminal_failure(failed);
+                                    if json {
+                                        println!(
+                                            "{}",
+                                            serde_json::json!({
+                                                "type": "tunnel_terminal_failure",
+                                                "id": tunnel_id,
+                                                "message": msg
+                                            })
+                                        );
+                                    } else {
+                                        eprintln!("{}", msg);
+                                    }
+                                    break ExitReason::TerminalFailure;
+                                }
+                            }
+                            Ok(None) => {
+                                let msg = format!(
+                                    "Tunnel {tunnel_id} no longer exists on the server"
+                                );
+                                if json {
+                                    println!(
+                                        "{}",
+                                        serde_json::json!({
+                                            "type": "tunnel_deleted_upstream",
+                                            "id": tunnel_id,
+                                            "message": &msg
+                                        })
+                                    );
+                                } else {
+                                    eprintln!("{}", msg);
+                                }
+                                break ExitReason::DeletedUpstream;
+                            }
+                            Err(e) => {
+                                tracing::warn!("transient progress query error: {e}");
+                            }
+                        }
+                    }
+                }
+            };
+
+            // --- Cleanup (runs for all exit paths) ---
+            if let Err(e) = service.set_enabled_active(&tunnel_id, false).await {
+                tracing::warn!("failed to disable tunnel on shutdown: {e}");
+            }
             if json {
                 println!(
                     "{}",
                     serde_json::json!({"type": "tunnel_disabled", "id": tunnel_id})
                 );
             }
+
+            // Non-zero exit for terminal failures.
+            return match exit_reason {
+                ExitReason::CtrlC => Ok(()),
+                ExitReason::TerminalFailure => {
+                    Err(n0_error::anyerr!("tunnel exited with terminal failure"))
+                }
+                ExitReason::DeletedUpstream => {
+                    Err(n0_error::anyerr!("tunnel deleted upstream"))
+                }
+            };
         }
         Commands::Update { id, label, endpoint } => {
             let node = ListenNode::new(repo.clone()).await?;
