@@ -196,6 +196,33 @@ func runListen(cmd *cobra.Command, args []string) error {
 				}
 			case "heartbeat", "status":
 				// Internal messages — no output
+			case "tunnel_progress", "tunnel_verifying", "tunnel_verified":
+				// Per-step setup-time status events from the Rust binary's
+				// await_tunnel_progress / verify_endpoints (Phase 12-03).
+				// Currently no-op at the supervisor layer — the human-friendly
+				// ready line is what we surface. Phase 13 may forward these
+				// to a future progress UI.
+				_ = msg
+			case "tunnel_terminal_failure", "tunnel_login_lost", "tunnel_deleted_upstream":
+				// Mid-session degradation signals from the Rust binary's runtime
+				// poll loop (Phase 12-04). Forward the message field to stderr so
+				// the user sees it; the child will exit on its own shortly.
+				if msg.Message != "" {
+					fmt.Fprintln(os.Stderr, msg.Message)
+				}
+			case "tunnel_disabled":
+				// Emitted by the Rust binary's cleanup block (Phase 12-04).
+				// No-op at supervisor layer; the child is about to exit.
+				_ = msg
+			case "tunnel_created", "tunnel_updated":
+				// Lifecycle events from create/update paths. No supervisor
+				// action needed in plugin/listen mode; tunnel_ready still
+				// drives gotReady.
+				_ = msg
+			case "tunnel_deleted":
+				// Emitted only by the `delete` subcommand. Not seen on the
+				// listen path.
+				_ = msg
 			default:
 				// Unknown type — skip
 			}
