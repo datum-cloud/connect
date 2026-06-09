@@ -58,14 +58,10 @@ impl Repo {
     const STATE_FILE: &str = "state.yml";
     const PROJECTS_DIR: &str = "projects";
 
-    pub fn default_location() -> PathBuf {
-        match std::env::var("DATUM_CONNECT_REPO") {
-            Ok(path) => path.into(),
-            Err(_) => {
-                let base = dirs_next::data_local_dir()
-                    .expect("Failed to get local data dir");
-                base.join("datumctl").join("connect")
-            }
+    pub fn default_location() -> Result<PathBuf, MissingConnectDir> {
+        match std::env::var("DATUM_CONNECT_DIR") {
+            Ok(path) if !path.is_empty() => Ok(PathBuf::from(path)),
+            Ok(_) | Err(_) => Err(MissingConnectDir),
         }
     }
 

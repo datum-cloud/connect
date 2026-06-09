@@ -16,7 +16,7 @@ pub use heartbeat::HeartbeatAgent;
 pub use http_user_agent::datum_http_user_agent;
 pub use node::{build_endpoint, ConnectNode, ListenNode};
 pub use project_control_plane::ProjectControlPlaneClient;
-pub use repo::Repo;
+pub use repo::{MissingConnectDir, Repo};
 pub use state::{Advertisment, SelectedContext, State, StateWrapper, TcpProxyData};
 pub use tunnels::{
     ProgressStep, ProgressStepKind, StepStatus, TunnelDeleteOutcome, TunnelProgress, TunnelService,

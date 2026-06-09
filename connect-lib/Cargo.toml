@@ -7,7 +7,6 @@ arc-swap = "1.8.0"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"] }
 derive_more = { version = "2.1.1", features = ["display"] }
-dirs-next = "2"
 gethostname = "1.1.0"
 hex = "0.4.3"
 http = "1"
