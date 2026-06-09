@@ -52,7 +52,7 @@ fn current_filter_string() -> String {
 #[derive(Parser, Debug)]
 #[command(name = "datum-connect", about = "Datum Connect tunnel agent (plugin mode)")]
 struct Args {
-    #[clap(long, env = "DATUM_CONNECT_REPO")]
+    #[clap(long, env = "DATUM_CONNECT_DIR")]
     repo: Option<std::path::PathBuf>,
     #[clap(long, env = "DATUM_PROJECT")]
     project: Option<String>,
