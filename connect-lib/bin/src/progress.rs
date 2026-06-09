@@ -7,14 +7,27 @@
 //!   owner-collision (`IrohDnsPublished: Pending` with `DeferredToOwner`).
 //! * `render_progress_step` / `render_verify` — mode-aware callbacks that emit
 //!   text-mode log lines on stderr or JSON event objects on stdout.
-//! * `await_tunnel_progress` / `verify_endpoints` — async drivers (implemented
-//!   in Task 3 of plan 12-03) that own the polling loop and HTTP probes,
-//!   invoking the callbacks above on transitions.
+//! * `await_tunnel_progress` / `verify_endpoints` — async drivers that own the
+//!   polling loop and HTTP probes, invoking the callbacks above on transitions.
 //!
 //! Mode-routing rule:
 //!  - `Mode::Text` writes to stderr (so stdout stays clean for shell composition)
 //!  - `Mode::Json` writes JSON event objects to stdout (so the Go supervisor's
 //!    line-oriented stdin reader sees one event per line)
+//!
+//! # JSON EVENT CONTRACT (emitted by this module)
+//!
+//! | Event type           | When                          | Fields                                                          |
+//! |----------------------|-------------------------------|-----------------------------------------------------------------|
+//! | `tunnel_progress`    | per step status transition    | `step` (snake_case kind), `status`, `resource` (Option<String>) |
+//! | `tunnel_verifying`   | start of HTTP probe per URL   | `url`                                                           |
+//! | `tunnel_verified`    | HTTP probe success per URL    | `url`                                                           |
+//!
+//! All events go to stdout (one JSON object per line) when `Mode::Json` is
+//! selected. In `Mode::Text`, transitions are printed to stderr in human form.
+//! The Go supervisor (`connect/tunnel/listen/main.go`) acknowledges all three
+//! types via explicit case arms but currently no-ops them — only
+//! `tunnel_ready` (emitted from main.rs) drives `gotReady`.
 
 use std::collections::HashMap;
 use std::time::Duration;

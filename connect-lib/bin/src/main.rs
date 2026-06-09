@@ -1,3 +1,28 @@
+//! Plugin-mode tunnel agent (`datum-connect`). The Go-side `datumctl connect`
+//! plugin spawns this binary as a subprocess and communicates over stdout
+//! (line-delimited JSON when `--json`, human text otherwise).
+//!
+//! # JSON EVENT CONTRACT (emitted by this binary's main handler)
+//!
+//! See `progress.rs` for setup-phase events (`tunnel_progress`,
+//! `tunnel_verifying`, `tunnel_verified`).
+//!
+//! | Event type                | When                                       | Fields                                                                            |
+//! |---------------------------|--------------------------------------------|-----------------------------------------------------------------------------------|
+//! | `tunnel_created`          | new HTTPProxy created                      | `id`                                                                              |
+//! | `tunnel_updated`          | label/endpoint changed                     | `id`, `label`, `endpoint`, `hostnames`                                            |
+//! | `tunnel_ready`            | setup complete AND verify_endpoints OK     | `id`, `label`, `endpoint`, `hostnames`, `endpoint_id`, `status`, `elapsed_secs`   |
+//! | `tunnel_login_lost`       | LoginState::Missing observed mid-run       | `id`, `message`                                                                   |
+//! | `tunnel_terminal_failure` | progress.terminal_failure() Some mid-run   | `id`, `message`                                                                   |
+//! | `tunnel_deleted_upstream` | get_active_progress -> None mid-run        | `id`, `message`                                                                   |
+//! | `tunnel_disabled`         | cleanup before exit                        | `id`                                                                              |
+//! | `tunnel_deleted`          | `delete` subcommand only                   | `id`, `deleted: true`                                                             |
+//!
+//! `tunnel_ready` is the single event that drives the Go supervisor's
+//! `gotReady` handshake (`connect/tunnel/listen/main.go:160-176`, established
+//! in commit `1bb9552`). It MUST NOT be removed, renamed, or have its emission
+//! site moved without coordinating the Go side.
+
 use std::sync::OnceLock;
 use std::time::Duration;
 
