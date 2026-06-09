@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -56,6 +57,21 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 	if err := svcconfig.Remove(name); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: remove config: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Phase 11.5 D-13: remove the per-service state subdirectory
+	// (matches the path baked into the unit file by svcunit.buildConfig).
+	// Best-effort: report errors but do not fail uninstall — the systemd
+	// unit and svcconfig entry are already gone, refusing to consider the
+	// tunnel uninstalled because of a directory-permission issue would
+	// be surprising.
+	if home, err := os.UserHomeDir(); err == nil {
+		stateDir := filepath.Join(home, ".datumctl", "connect", "services", name)
+		if err := os.RemoveAll(stateDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", stateDir, err)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: could not compute service state dir for cleanup: %v\n", err)
 	}
 
 	fmt.Fprintf(cmd.OutOrStdout(), "Tunnel '%s' uninstalled\n", name)
