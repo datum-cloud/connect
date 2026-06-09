@@ -333,16 +333,49 @@ async fn run() -> n0_error::Result<()> {
             service.set_enabled_active(&tunnel_id, true).await?;
 
             let setup_start = std::time::Instant::now();
-            let tunnel = loop {
-                let t = service.get_active(&tunnel_id).await?;
-                let Some(t) = t else {
-                    return Err(n0_error::anyerr!("Tunnel {} not found after creation", tunnel_id));
-                };
-                if t.accepted && t.programmed && !t.hostnames.is_empty() {
-                    break t;
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Plan 12-03: drive setup through await_tunnel_progress (per-step
+            // observability + terminal-failure short-circuit) followed by
+            // verify_endpoints (probe origin + proxy URL before declaring ready).
+            // Mode (Text/Json) routes callback output:
+            //   Text → stderr (one transition line per change, prefixed by resource)
+            //   Json → stdout (one tunnel_progress / tunnel_verifying /
+            //                  tunnel_verified event per transition)
+            // The Go supervisor's 'default: skip' case in connect/tunnel/listen/main.go
+            // ignores the new event types; only the final tunnel_ready event
+            // unblocks its gotReady handshake.
+            let mode = if json { progress::Mode::Json } else { progress::Mode::Text };
+            let progress_cb = |step: &connect_lib::ProgressStep,
+                               prev: connect_lib::StepStatus| {
+                progress::render_progress_step(mode, step, prev);
             };
+            let final_progress =
+                progress::await_tunnel_progress(&service, &tunnel_id, &progress_cb).await?;
+            let hostname = final_progress
+                .hostnames
+                .first()
+                .cloned()
+                .ok_or_else(|| {
+                    n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
+                })?;
+
+            // Verify endpoints reachable. Total budget = remaining 60s startup
+            // window minus what setup already consumed.
+            let setup_elapsed = setup_start.elapsed();
+            let total_budget = std::time::Duration::from_secs(60);
+            let verify_budget = total_budget.saturating_sub(setup_elapsed);
+            let verify_cb = |url: &str, ev: progress::VerifyEvent| {
+                progress::render_verify(mode, url, ev);
+            };
+            progress::verify_endpoints(&endpoint, &hostname, verify_budget, &verify_cb).await?;
+
+            // Re-fetch the up-to-date TunnelSummary for the tunnel_ready
+            // payload (existing contract — id, label, endpoint, hostnames,
+            // endpoint_id, status, elapsed_secs).
+            let tunnel = service
+                .get_active(&tunnel_id)
+                .await?
+                .ok_or_else(|| n0_error::anyerr!("Tunnel {tunnel_id} not found after setup"))?;
 
             let elapsed = setup_start.elapsed().as_secs();
             if json {
