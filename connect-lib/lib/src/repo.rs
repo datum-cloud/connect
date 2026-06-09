@@ -9,6 +9,39 @@ use crate::{
     state::State,
 };
 
+/// Error returned by [`Repo::default_location`] when the
+/// `DATUM_CONNECT_DIR` environment variable is not set.
+///
+/// Phase 11.5 D-09/D-10: the binary refuses to invent a default
+/// location. The `Display` impl prints the multi-line directive
+/// message that tells the user how to fix the situation.
+#[derive(Debug, Clone)]
+pub struct MissingConnectDir;
+
+impl std::fmt::Display for MissingConnectDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(MISSING_CONNECT_DIR_MSG)
+    }
+}
+
+impl std::error::Error for MissingConnectDir {}
+
+const MISSING_CONNECT_DIR_MSG: &str = "error: DATUM_CONNECT_DIR is not set
+
+The datum-connect binary expects this variable to point to its state
+directory (where it stores the iroh listen_key, config, and per-project
+state). It is normally set by the datumctl plugin host.
+
+To run via datumctl (preferred):
+  datumctl connect tunnel <subcommand> ...
+
+To run datum-connect directly (development):
+  export DATUM_CONNECT_DIR=\"$HOME/.datumctl/connect\"
+  datum-connect <subcommand> ...
+
+(exit 64)
+";
+
 // Repo builds up a series of file path conventions from a root directory path.
 #[derive(Debug, Clone)]
 pub struct Repo(PathBuf);
@@ -238,5 +271,82 @@ mod tests {
             .join(Repo::LISTEN_KEY_FILE);
         assert!(project_path.exists());
         assert_eq!(tokio::fs::read(&project_path).await.unwrap(), key.to_bytes());
+    }
+}
+
+#[cfg(test)]
+mod default_location_tests {
+    use super::*;
+
+    // Both crates are Rust edition 2024 — std::env::set_var /
+    // remove_var require the `unsafe` block. The shared ENV_LOCK
+    // serializes against the other env-mutating tests in the crate
+    // (datum_cloud/external_token_source.rs, datum_cloud/mod.rs).
+
+    #[test]
+    fn returns_ok_when_var_set() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("DATUM_CONNECT_DIR").ok();
+        unsafe { std::env::set_var("DATUM_CONNECT_DIR", "/tmp/test-connect-dir"); }
+
+        let got = Repo::default_location();
+
+        // Restore before asserting so a panic doesn't leak the mutation.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("DATUM_CONNECT_DIR", v),
+                None => std::env::remove_var("DATUM_CONNECT_DIR"),
+            }
+        }
+
+        match got {
+            Ok(p) => assert_eq!(p, PathBuf::from("/tmp/test-connect-dir")),
+            Err(e) => panic!("expected Ok, got Err({e})"),
+        }
+    }
+
+    #[test]
+    fn returns_err_when_var_empty() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("DATUM_CONNECT_DIR").ok();
+        unsafe { std::env::set_var("DATUM_CONNECT_DIR", ""); }
+
+        let got = Repo::default_location();
+
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("DATUM_CONNECT_DIR", v),
+                None => std::env::remove_var("DATUM_CONNECT_DIR"),
+            }
+        }
+
+        assert!(matches!(got, Err(MissingConnectDir)));
+    }
+
+    #[test]
+    fn returns_err_when_var_unset() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("DATUM_CONNECT_DIR").ok();
+        unsafe { std::env::remove_var("DATUM_CONNECT_DIR"); }
+
+        let got = Repo::default_location();
+
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("DATUM_CONNECT_DIR", v);
+            }
+        }
+
+        assert!(matches!(got, Err(MissingConnectDir)));
+    }
+
+    #[test]
+    fn missing_connect_dir_display_contains_directive() {
+        // Pure formatting check — no env mutation needed.
+        let msg = format!("{}", MissingConnectDir);
+        assert!(msg.contains("DATUM_CONNECT_DIR is not set"), "msg = {msg}");
+        assert!(msg.contains("datumctl connect tunnel"), "msg = {msg}");
+        assert!(msg.contains("export DATUM_CONNECT_DIR=\"$HOME/.datumctl/connect\""), "msg = {msg}");
+        assert!(msg.contains("(exit 64)"), "msg = {msg}");
     }
 }
