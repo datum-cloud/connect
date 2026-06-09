@@ -147,7 +147,16 @@ async fn run() -> n0_error::Result<()> {
     let ctx = resolve_project(&project_id);
     datum.set_selected_context(Some(ctx)).await?;
 
-    let repo_path = args.repo.unwrap_or_else(Repo::default_location);
+    let repo_path = match args.repo {
+        Some(p) => p,
+        None => match Repo::default_location() {
+            Ok(p) => p,
+            Err(e) => {
+                eprint!("{e}");
+                std::process::exit(64);
+            }
+        },
+    };
     let repo = Repo::open_or_create(repo_path).await?;
 
     match args.command {
