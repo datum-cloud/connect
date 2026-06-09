@@ -177,8 +177,10 @@ func runListen(cmd *cobra.Command, args []string) error {
 				gotReady = true
 
 				if isJSON {
-					// JSON mode: print ready JSON and stop reading
-					fmt.Fprint(cmd.OutOrStdout(), string(line))
+					// JSON mode: print ready JSON and stop reading.
+					// Add newline — the bufio.Scanner stripped it, and
+					// pipe-buffered stdout won't flush without one.
+					fmt.Fprintln(cmd.OutOrStdout(), string(line))
 					close(readyCh)
 					return
 				}

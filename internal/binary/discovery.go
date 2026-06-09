@@ -22,17 +22,16 @@ func Discover() (string, error) {
 	return "", fmt.Errorf("datum-connect binary not found: not next to plugin binary and not in PATH")
 }
 
-// binaryName returns the platform-appropriate binary name.
+// binaryName returns the platform-appropriate binary name. When
+// FAKE_DATUM_CONNECT is set (test mode), returns the fake binary name.
+//
+// Phase 11.5 D-07: the legacy switch on DATUM_CONNECT_REPO was dead
+// (both arms returned "datum-connect") and is removed.
 func binaryName() string {
 	if os.Getenv("FAKE_DATUM_CONNECT") != "" {
 		return "fake-datum-connect"
 	}
-	switch os.Getenv("DATUM_CONNECT_REPO") {
-	case "local":
-		return "datum-connect"
-	default:
-		return "datum-connect"
-	}
+	return "datum-connect"
 }
 
 // findNextToSelf returns the path to datum-connect in the same

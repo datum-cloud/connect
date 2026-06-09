@@ -27,6 +27,7 @@ func TestDatumctlContextEnvVars(t *testing.T) {
 		"DATUM_PLUGIN_API_VERSION=1",
 		"DATUM_CREDENTIALS_HELPER=/fake/credentials-helper",
 		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR=" + t.TempDir(),
 	}
 
 	cmd := exec.Command(bin, "--help")
@@ -126,6 +127,7 @@ func TestPluginPassesContextToSubcommand(t *testing.T) {
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
 		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR="+connectDir,
 		"PATH="+connectDir+":"+os.Getenv("PATH"))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -149,6 +151,7 @@ func TestCredentialsHelperTokenFlow(t *testing.T) {
 		"DATUM_CREDENTIALS_HELPER=" + fakeHelper,
 		"DATUM_SESSION=dev",
 		"FAKE_DATUM_CONNECT=" + fakeBin,
+		"DATUM_CONNECT_DIR=" + connectDir,
 		"PATH=" + connectDir + ":" + os.Getenv("PATH"),
 	}
 
@@ -225,6 +228,7 @@ func TestPS_WithFakePIDFiles(t *testing.T) {
 	cmd.Env = []string{
 		"XDG_STATE_HOME=" + stateDir,
 		"DATUM_ACCESS_TOKEN=test-token",
+		"DATUM_CONNECT_DIR=" + t.TempDir(),
 		"HOME=" + os.Getenv("HOME"),
 		"PATH=" + os.Getenv("PATH"),
 	}
@@ -251,6 +255,7 @@ func TestPS_JSONOutput(t *testing.T) {
 	cmd.Env = []string{
 		"XDG_STATE_HOME=" + stateDir,
 		"DATUM_ACCESS_TOKEN=test-token",
+		"DATUM_CONNECT_DIR=" + t.TempDir(),
 		"HOME=" + os.Getenv("HOME"),
 		"PATH=" + os.Getenv("PATH"),
 	}
@@ -273,6 +278,7 @@ func TestStatus_StoppedTunnel(t *testing.T) {
 	cmd := exec.Command(pluginBin, "tunnel", "status", "--name", "nonexistent")
 	cmd.Env = []string{
 		"DATUM_ACCESS_TOKEN=test-token",
+		"DATUM_CONNECT_DIR=" + t.TempDir(),
 		"HOME=" + os.Getenv("HOME"),
 		"PATH=" + os.Getenv("PATH"),
 	}
@@ -288,6 +294,7 @@ func TestStatus_StoppedTunnel(t *testing.T) {
 func TestInstall_RequiresName(t *testing.T) {
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "install")
+	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Error("install with no flags should exit non-zero")
@@ -305,6 +312,7 @@ func TestInstall_RequiresName(t *testing.T) {
 func TestInstall_RequiresEndpoint(t *testing.T) {
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "install", "--name", "test-tun")
+	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Error("install without --endpoint should exit non-zero")
@@ -317,6 +325,7 @@ func TestInstall_RequiresEndpoint(t *testing.T) {
 func TestInstall_RequiresSession(t *testing.T) {
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "install", "--name", "test-tun", "--endpoint", "localhost:8080")
+	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Error("install without --session should exit non-zero")
@@ -377,6 +386,7 @@ func TestStatus_WithConfig(t *testing.T) {
 	// Run status — should show Stopped and installed info
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "status", "--name", "installed-tun")
+	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, _ := cmd.CombinedOutput()
 
 	output := string(out)

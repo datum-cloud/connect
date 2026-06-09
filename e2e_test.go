@@ -255,6 +255,7 @@ func TestListCommandWithFakeBinary(t *testing.T) {
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
 		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR="+connectDir,
 		"PATH="+connectDir+":"+os.Getenv("PATH"))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -274,6 +275,7 @@ func TestListCommandWithFakeBinary(t *testing.T) {
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
 		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR="+connectDir,
 		"PATH="+connectDir+":"+os.Getenv("PATH"))
 	out, err = cmd.CombinedOutput()
 	if err != nil {
@@ -300,6 +302,7 @@ func TestDeleteCommandWithFakeBinary(t *testing.T) {
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
 		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR="+connectDir,
 		"PATH="+connectDir+":"+os.Getenv("PATH"))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -319,6 +322,7 @@ func TestDeleteCommandMissingID(t *testing.T) {
 	// EXIT-02: missing required flag exits with POSIX code 64
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "delete")
+	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Error("delete without --id should exit non-zero")
@@ -348,6 +352,7 @@ func TestListenCommandWithFakeBinary(t *testing.T) {
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
 		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR="+connectDir,
 		"PATH="+connectDir+":"+os.Getenv("PATH"))
 
 	stdout, err := cmd.StdoutPipe()
@@ -402,6 +407,7 @@ func TestListenJSONMode(t *testing.T) {
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
 		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR="+connectDir,
 		"PATH="+connectDir+":"+os.Getenv("PATH"))
 
 	stdout, err := cmd.StdoutPipe()
@@ -507,6 +513,7 @@ func TestListenMissingEndpointAndId(t *testing.T) {
 	// the requirement; neither still rejects.
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "listen")
+	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Error("listen without --endpoint or --id should exit non-zero")

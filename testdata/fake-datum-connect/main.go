@@ -130,12 +130,12 @@ func handleListen(jsonOut bool) {
 	// This simulates the Rust binary when launched by the daemon supervisor
 	// in daemon-listen test mode.
 	if os.Getenv("FAKE_DUMMY_MODE") == "daemon-listen" {
-		fmt.Println(`{"type":"ready","id":"tun-dmon","label":"daemon-test","endpoint":"localhost:8080","hostnames":["tun-dmon.datum.dev"],"status":"ready"}`)
+		fmt.Println(`{"type":"tunnel_ready","id":"tun-dmon","label":"daemon-test","endpoint":"localhost:8080","hostnames":["tun-dmon.datum.dev"],"status":"ready"}`)
 		return
 	}
 
 	// Always emit typed JSON (listen command reads stdout regardless of --json flag)
-	fmt.Println(`{"type":"ready","id":"tun-123","label":"dev-server","endpoint":"localhost:8080","hostnames":["tun-123.datum.dev"],"status":"ready"}`)
+	fmt.Println(`{"type":"tunnel_ready","id":"tun-123","label":"dev-server","endpoint":"localhost:8080","hostnames":["tun-123.datum.dev"],"status":"ready"}`)
 
 	// Block until SIGINT
 	sigCh := make(chan os.Signal, 1)
