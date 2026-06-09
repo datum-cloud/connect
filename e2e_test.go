@@ -435,6 +435,72 @@ func TestListenJSONMode(t *testing.T) {
 	cmd.Wait()
 }
 
+func TestPluginRequiresConnectDir(t *testing.T) {
+	// Phase 11.5 D-09/D-10/D-11: invoking the plugin without
+	// DATUM_CONNECT_DIR in env should fail with the directive message
+	// and exit 64. The --plugin-manifest probe stays working because
+	// ServeManifest self-exits before our check runs; that case is
+	// covered by TestPluginManifestProbeWorksWithoutConnectDir.
+	pluginBin := buildPlugin(t)
+
+	// Strip DATUM_CONNECT_DIR (and the legacy DATUM_CONNECT_REPO, just
+	// in case the host system has it set) from the env we hand the child.
+	env := []string{}
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "DATUM_CONNECT_DIR=") {
+			continue
+		}
+		if strings.HasPrefix(e, "DATUM_CONNECT_REPO=") {
+			continue
+		}
+		env = append(env, e)
+	}
+
+	cmd := exec.Command(pluginBin, "tunnel", "list")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected non-zero exit when DATUM_CONNECT_DIR is unset; got success with output:\n%s", out)
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected *exec.ExitError, got %T: %v", err, err)
+	}
+	if exitErr.ExitCode() != 64 {
+		t.Errorf("expected exit code 64, got %d", exitErr.ExitCode())
+	}
+	if !bytes.Contains(out, []byte("DATUM_CONNECT_DIR is not set")) {
+		t.Errorf("expected 'DATUM_CONNECT_DIR is not set' in stderr; got:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("datumctl connect tunnel")) {
+		t.Errorf("expected directive to mention 'datumctl connect tunnel'; got:\n%s", out)
+	}
+}
+
+func TestPluginManifestProbeWorksWithoutConnectDir(t *testing.T) {
+	// The --plugin-manifest probe must work even when DATUM_CONNECT_DIR
+	// is unset (datumctl probes plugins before injecting env).
+	// plugin.ServeManifest self-exits 0 before our RequireConnectDir
+	// check runs; this test pins that ordering.
+	pluginBin := buildPlugin(t)
+	env := []string{}
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "DATUM_CONNECT_DIR=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	cmd := exec.Command(pluginBin, "--plugin-manifest")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--plugin-manifest must exit 0 even without DATUM_CONNECT_DIR; err=%v, out=%s", err, out)
+	}
+	if !bytes.Contains(out, []byte("{")) {
+		t.Errorf("--plugin-manifest output should be JSON; got:\n%s", out)
+	}
+}
+
 func TestListenMissingEndpointAndId(t *testing.T) {
 	// EXIT-02: missing both --endpoint and --id exits with code 64.
 	// 12-02 expanded the validation: either --endpoint or --id satisfies
