@@ -16,6 +16,8 @@ use connect_lib::datum_cloud::external_token_source::ExternalTokenSource;
 use connect_lib::datum_cloud::DatumCloudClient;
 use connect_lib::{HeartbeatAgent, ListenNode, Repo, SelectedContext, TunnelService};
 
+mod progress;
+
 type ReloadHandle = Handle<EnvFilter, Registry>;
 static RELOAD_HANDLE: OnceLock<ReloadHandle> = OnceLock::new();
 
