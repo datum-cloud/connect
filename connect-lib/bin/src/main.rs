@@ -24,7 +24,6 @@
 //! site moved without coordinating the Go side.
 
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use n0_error::StdResultExt;
@@ -153,12 +152,22 @@ async fn run() -> n0_error::Result<()> {
 
     init_tracing();
 
-    let _ = std::env::var("DATUM_ACCESS_TOKEN").map_err(|_| {
-        n0_error::anyerr!("DATUM_ACCESS_TOKEN not set — this binary runs in plugin mode only")
-    })?;
+    let session: Option<String> = std::env::var("DATUM_SESSION").ok();
+    if session.is_none() && std::env::var("DATUM_PLUGIN_MODE").map(|v| v != "1").unwrap_or(true) {
+        return Err(n0_error::anyerr!(
+            "neither DATUM_SESSION nor DATUM_PLUGIN_MODE=1 set — this binary runs in plugin mode only"
+        ));
+    }
 
-    let token_source = ExternalTokenSource::from_env()
-        .map_err(|e| n0_error::anyerr!("Failed to create ExternalTokenSource: {e}"))?;
+    let token_source = ExternalTokenSource::from_env(session.clone())
+        .map_err(|e| n0_error::anyerr!("failed to create token source: {e}"))?;
+
+    if let Some(ref s) = session {
+        if let Ok(helper) = std::env::var("DATUM_CREDENTIALS_HELPER") {
+            token_source.start_refresh(helper, s.clone());
+        }
+    }
+
     let datum = DatumCloudClient::with_external_token_source(ApiEnv::default(), token_source);
 
     let args = Args::parse();
