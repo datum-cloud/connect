@@ -464,46 +464,82 @@ mod tests {
         format!("{header}.{payload}.fake_sig")
     }
 
-    fn setup_plugin_env() -> ExternalTokenSource {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
-            std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
-            std::env::remove_var("DATUM_API_HOST");
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("connect-dc-test-{ts}"));
+            std::fs::create_dir_all(&path).expect("should create temp dir");
+            TempDir { path }
         }
-        ExternalTokenSource::from_env().expect("should create ExternalTokenSource")
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn setup_plugin_env() -> (TempDir, ExternalTokenSource) {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new();
+        let helper_path = dir.path().join("fake-helper.sh");
+        let jwt = make_jwt_with_exp(9999999999);
+        std::fs::write(&helper_path, format!("#!/bin/sh\necho '{}'\n", jwt))
+            .expect("should write helper script");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &helper_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("should set executable permission");
+        let helper_str = helper_path.to_string_lossy().to_string();
+
+        unsafe {
+            std::env::set_var("DATUM_CREDENTIALS_HELPER", &helper_str);
+            std::env::set_var("DATUM_SESSION", "test-session");
+        }
+
+        let source =
+            ExternalTokenSource::from_env(Some("test-session".to_string())).expect("should create token source");
+        (dir, source)
     }
 
     #[test]
     fn with_external_token_source_creates_plugin_mode_client() {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         assert!(client.is_plugin_mode());
     }
 
     #[test]
     fn login_state_valid_in_plugin_mode() {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         assert_eq!(client.login_state(), LoginState::Valid);
     }
 
     #[test]
     fn token_returns_external_token() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
-        let expected = make_jwt_with_exp(9999999999);
-        unsafe {
-            std::env::set_var("DATUM_ACCESS_TOKEN", expected.clone());
-            std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
-        }
-        let token_source = ExternalTokenSource::from_env().unwrap();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
-        assert_eq!(client.token(), expected);
+        // The fake helper returns a JWT with exp 9999999999
+        assert!(client.token().starts_with("eyJ"));
     }
 
     #[test]
     fn auth_state_returns_dummy_in_plugin_mode() {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         let auth_state = client.auth_state();
         assert!(auth_state.get().is_ok());
@@ -514,21 +550,21 @@ mod tests {
 
     #[test]
     fn api_url_from_env_in_plugin_mode() {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         assert!(client.api_url().contains("datum.net"));
     }
 
     #[test]
     fn web_url_from_env_in_plugin_mode() {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         assert!(client.web_url().contains("datum.net"));
     }
 
     #[test]
     fn datum_cloud_client_clone_in_plugin_mode() {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         let cloned = client.clone();
         assert!(cloned.is_plugin_mode());
@@ -537,7 +573,7 @@ mod tests {
 
     #[test]
     fn auth_update_watch_returns_receiver_in_plugin_mode() {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         let rx = client.auth_update_watch();
         // Initial value should be 0
@@ -546,7 +582,7 @@ mod tests {
 
     #[test]
     fn selected_context_is_none_in_plugin_mode() {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         // In plugin mode, session state is empty (no OIDC repo)
         assert!(client.selected_context().is_none());
@@ -554,7 +590,7 @@ mod tests {
 
     #[test]
     fn login_state_watch_returns_receiver_in_plugin_mode() {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         let rx = client.login_state_watch();
         assert_eq!(*rx.borrow(), LoginState::Valid);

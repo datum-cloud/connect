@@ -732,18 +732,59 @@ mod tests {
         format!("{header}.{payload}.fake_sig")
     }
 
-    fn setup_plugin_env() -> ExternalTokenSource {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("DATUM_ACCESS_TOKEN", make_jwt_with_exp(9999999999));
-            std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/false");
-            std::env::remove_var("DATUM_API_HOST");
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("connect-hb-test-{ts}"));
+            std::fs::create_dir_all(&path).expect("should create temp dir");
+            TempDir { path }
         }
-        ExternalTokenSource::from_env().expect("should create ExternalTokenSource")
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn setup_plugin_env() -> (TempDir, ExternalTokenSource) {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new();
+        let helper_path = dir.path().join("fake-helper.sh");
+        let jwt = make_jwt_with_exp(9999999999);
+        std::fs::write(&helper_path, format!("#!/bin/sh\necho '{}'\n", jwt))
+            .expect("should write helper script");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &helper_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("should set executable permission");
+        let helper_str = helper_path.to_string_lossy().to_string();
+
+        unsafe {
+            std::env::set_var("DATUM_CREDENTIALS_HELPER", &helper_str);
+            std::env::set_var("DATUM_SESSION", "test-session");
+        }
+
+        let source =
+            ExternalTokenSource::from_env(Some("test-session".to_string())).expect("should create token source");
+        (dir, source)
     }
 
     fn test_datum_client() -> DatumCloudClient {
-        let token_source = setup_plugin_env();
+        let (_dir, token_source) = setup_plugin_env();
         DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source)
     }
 
