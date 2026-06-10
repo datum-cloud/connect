@@ -257,9 +257,9 @@ where
 /// On failure, logs a warning for origin probes and returns an error for
 /// proxy probes.
 ///
-/// "Reachable" means any HTTP response (2xx/3xx/4xx all count); only
-/// network errors / connection timeouts retry. Exponential backoff
-/// (250ms → 500ms → 1s → 2s ceiling) bounded by the per-probe budget.
+/// "Reachable" means a 2xx/3xx/4xx HTTP response; 5xx and network errors
+/// retry with exponential backoff (250ms → 500ms → 1s → 2s ceiling)
+/// bounded by the per-probe budget.
 pub async fn verify_endpoints<F>(
     origin_endpoint: &str,
     hostname: &str,
@@ -319,16 +319,20 @@ async fn probe_until_reachable(
             return Err(n0_error::anyerr!("probe budget exhausted"));
         }
         match client.get(url).send().await {
-            Ok(resp) => return Ok((start.elapsed(), resp.status().as_u16())),
-            Err(_e) => {
-                let remaining = budget.saturating_sub(start.elapsed());
-                if remaining.is_zero() {
-                    return Err(n0_error::anyerr!("probe budget exhausted"));
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status < 500 {
+                    return Ok((start.elapsed(), status));
                 }
-                sleep(std::cmp::min(backoff, remaining)).await;
-                backoff = std::cmp::min(backoff * 2, Duration::from_secs(2));
             }
+            Err(_e) => {}
         }
+        let remaining = budget.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(n0_error::anyerr!("probe budget exhausted"));
+        }
+        sleep(std::cmp::min(backoff, remaining)).await;
+        backoff = std::cmp::min(backoff * 2, Duration::from_secs(2));
     }
 }
 
