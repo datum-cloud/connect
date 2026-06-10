@@ -75,7 +75,7 @@ func runListen(cmd *cobra.Command, args []string) error {
 	// Detach mode: spawn background daemon and exit
 	if detach {
 		if id != "" {
-			fmt.Fprintln(os.Stderr, "Error: --id is not yet supported with --detach (phase 13 will wire this through tunnel run)")
+			fmt.Fprintln(os.Stderr, "Error: --id is not supported with --detach. Use 'tunnel run --name N' for detached named tunnels")
 			os.Exit(64)
 		}
 		if name == "" {
@@ -84,12 +84,12 @@ func runListen(cmd *cobra.Command, args []string) error {
 		}
 		exe := daemon.SelfExe()
 		childArgs := daemon.ForegroundArgs(name, logFile, endpoint, label, yes)
-		pid, err := daemon.Daemonize(exe, append([]string{exe}, childArgs...))
+		_, err := daemon.Daemonize(exe, append([]string{exe}, childArgs...))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: daemonize: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "Tunnel '%s' started in background (pid %d)\n", name, pid)
+		fmt.Fprintf(cmd.OutOrStdout(), "Tunnel '%s' setting up in background; tunnel status will show progress\n", name)
 		return nil
 	}
 
