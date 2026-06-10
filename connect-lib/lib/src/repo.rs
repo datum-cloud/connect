@@ -56,8 +56,6 @@ impl Repo {
     const CONNECT_KEY_FILE: &str = "connect_key";
     const LISTEN_KEY_FILE: &str = "listen_key";
     const STATE_FILE: &str = "state.yml";
-    const PROJECTS_DIR: &str = "projects";
-
     pub fn default_location() -> Result<PathBuf, MissingConnectDir> {
         match std::env::var("DATUM_CONNECT_DIR") {
             Ok(path) if !path.is_empty() => Ok(PathBuf::from(path)),
@@ -155,7 +153,7 @@ impl Repo {
     /// with whatever Connector that key was registered as. Subsequent projects
     /// (no legacy file left) get freshly generated keys.
     pub async fn listen_key_for_project(&self, project_id: &str) -> Result<SecretKey> {
-        let project_dir = self.0.join(Self::PROJECTS_DIR).join(project_id);
+        let project_dir = self.0.join(project_id);
         let key_file_path = project_dir.join(Self::LISTEN_KEY_FILE);
         if !key_file_path.exists() {
             let legacy = self.0.join(Self::LISTEN_KEY_FILE);
@@ -229,7 +227,6 @@ mod tests {
         assert!(!legacy_path.exists(), "legacy file must be gone after migration");
         let p1_path = repo
             .0
-            .join(Repo::PROJECTS_DIR)
             .join("project-a")
             .join(Repo::LISTEN_KEY_FILE);
         assert!(p1_path.exists(), "key must now live under the project dir");
@@ -262,7 +259,6 @@ mod tests {
         assert!(!legacy_path.exists(), "no legacy must be created");
         let project_path = repo
             .0
-            .join(Repo::PROJECTS_DIR)
             .join("only-project")
             .join(Repo::LISTEN_KEY_FILE);
         assert!(project_path.exists());
