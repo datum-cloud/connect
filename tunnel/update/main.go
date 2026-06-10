@@ -30,6 +30,12 @@ func NewCmd() *cobra.Command {
 }
 
 func runUpdate(cmd *cobra.Command, args []string) error {
+	// Server-of-truth (Phase 13 D-04, resolution table Item #11):
+	// This function delegates to the Rust binary which mutates the server-side
+	// HTTPProxy resource. It does NOT rewrite the local YAML config — the YAML
+	// is an install-time snapshot only. Runtime values (label, endpoint) come
+	// from the server.
+
 	id, _ := cmd.Flags().GetString("id")
 	label, _ := cmd.Flags().GetString("label")
 	endpoint, _ := cmd.Flags().GetString("endpoint")
