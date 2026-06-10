@@ -73,6 +73,7 @@ tasks:
 
   install:go:
     desc: "Copy the Go plugin binary to $HOME/.datumctl/plugins"
+    dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
     cmds:
       - mkdir -p $HOME/.datumctl/plugins
       - cp {{.PLUGIN_BINARY}} $HOME/.datumctl/plugins/
