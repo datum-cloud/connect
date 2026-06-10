@@ -5,6 +5,11 @@
 //	linux:   $XDG_CONFIG_HOME/datumctl/connect/config/  (default ~/.config/...)
 //	darwin:  ~/Library/Application Support/datumctl/connect/config/
 //	windows: %AppData%/datumctl/connect/config/
+//
+// Schema (9 fields, Phase 13 D-04):
+//   - name, label, endpoint, project, session — required on install
+//   - org, api_host, created_at — optional metadata
+//   - credentials_helper_path — captured at install time, used at unit run time
 package svcconfig
 
 import (
@@ -19,14 +24,15 @@ import (
 
 // TunnelConfig represents a persisted tunnel configuration.
 type TunnelConfig struct {
-	Name      string `yaml:"name"`
-	Label     string `yaml:"label"`
-	Endpoint  string `yaml:"endpoint"`
-	Project   string `yaml:"project"`
-	Session   string `yaml:"session"`
-	Org       string `yaml:"org,omitempty"`
-	APIHost   string `yaml:"api_host,omitempty"`
-	CreatedAt string `yaml:"created_at,omitempty"`
+	Name                  string `yaml:"name"`
+	Label                 string `yaml:"label"`
+	Endpoint              string `yaml:"endpoint"`
+	Project               string `yaml:"project"`
+	Session               string `yaml:"session"`
+	Org                   string `yaml:"org,omitempty"`
+	APIHost               string `yaml:"api_host,omitempty"`
+	CreatedAt             string `yaml:"created_at,omitempty"`
+	CredentialsHelperPath string `yaml:"credentials_helper_path,omitempty"`
 }
 
 // ConfigDir returns the plugin config directory path.
