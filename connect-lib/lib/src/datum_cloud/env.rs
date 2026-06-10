@@ -30,9 +30,18 @@ impl ApiEnv {
     ///
     /// In plugin mode, the Go plugin sets `DATUM_API_HOST` to point at a
     /// specific API host. This method honors that override.
+    ///
+    /// If the host value does not have a scheme (`http://` or `https://`),
+    /// `https://` is prepended automatically so that downstream URL
+    /// construction always produces valid absolute URLs.
     pub fn from_env_with_host_override() -> Self {
         if let Ok(host) = env::var("DATUM_API_HOST") {
-            return ApiEnv::Custom { api_url: host };
+            let api_url = if host.starts_with("http://") || host.starts_with("https://") {
+                host
+            } else {
+                format!("https://{}", host)
+            };
+            return ApiEnv::Custom { api_url };
         }
         Self::from_env()
     }
@@ -97,6 +106,24 @@ mod tests {
     fn api_url_custom_returns_host() {
         let env = ApiEnv::Custom { api_url: "https://my.api.com".to_string() };
         assert_eq!(env.api_url(), "https://my.api.com");
+    }
+
+    #[test]
+    fn from_env_with_host_override_adds_https_scheme_when_missing() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        cleanup_env();
+        unsafe { std::env::set_var("DATUM_API_HOST", "api.datum.net"); }
+        let env = ApiEnv::from_env_with_host_override();
+        assert!(matches!(&env, ApiEnv::Custom { api_url } if api_url == "https://api.datum.net"));
+    }
+
+    #[test]
+    fn from_env_with_host_override_preserves_existing_scheme() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        cleanup_env();
+        unsafe { std::env::set_var("DATUM_API_HOST", "http://internal.api.datum.net"); }
+        let env = ApiEnv::from_env_with_host_override();
+        assert!(matches!(&env, ApiEnv::Custom { api_url } if api_url == "http://internal.api.datum.net"));
     }
 
     #[test]
