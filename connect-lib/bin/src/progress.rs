@@ -105,58 +105,50 @@ pub(crate) fn status_to_str(s: StepStatus) -> &'static str {
 // --- callbacks ---
 
 pub fn render_progress_step(mode: Mode, step: &ProgressStep, _prev: StepStatus, elapsed: Duration) {
-    match mode {
-        Mode::Text => {
-            if step.status == StepStatus::Ready {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "  \u{2713} {} ({:.1}s) [{}]",
-                    step.kind.label(),
-                    elapsed.as_secs_f64(),
-                    step.resource.as_deref().unwrap_or(""),
-                );
-                let _ = std::io::stderr().flush();
-            }
-        }
-        Mode::Json => {
-            let v = serde_json::json!({
-                "type": "tunnel_progress",
-                "step": step_kind_to_str(step.kind),
-                "status": status_to_str(step.status),
-                "resource": step.resource,
-            });
-            println!("{}", v);
-        }
+    if step.status == StepStatus::Ready {
+        let _ = writeln!(
+            std::io::stderr(),
+            "  \u{2713} {} ({:.1}s) [{}]",
+            step.kind.label(),
+            elapsed.as_secs_f64(),
+            step.resource.as_deref().unwrap_or(""),
+        );
+        let _ = std::io::stderr().flush();
+    }
+    if mode == Mode::Json {
+        let v = serde_json::json!({
+            "type": "tunnel_progress",
+            "step": step_kind_to_str(step.kind),
+            "status": status_to_str(step.status),
+            "resource": step.resource,
+        });
+        println!("{}", v);
     }
 }
 
 pub fn render_verify(mode: Mode, label: &str, url: &str, elapsed: Duration, status: Option<u16>) {
-    match mode {
-        Mode::Text => {
-            let status_str = match status {
-                Some(s) => format!(": HTTP {}", s),
-                None => String::new(),
-            };
-            let _ = writeln!(
-                std::io::stderr(),
-                "  \u{2713} {} ({:.1}s) [{}]{}",
-                label,
-                elapsed.as_secs_f64(),
-                url,
-                status_str,
-            );
-            let _ = std::io::stderr().flush();
-        }
-        Mode::Json => {
-            let json_type = match status {
-                Some(_) => "tunnel_verified",
-                None => "tunnel_verifying",
-            };
-            println!(
-                "{}",
-                serde_json::json!({ "type": json_type, "url": url })
-            );
-        }
+    let status_str = match status {
+        Some(s) => format!(": HTTP {}", s),
+        None => String::new(),
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "  \u{2713} {} ({:.1}s) [{}]{}",
+        label,
+        elapsed.as_secs_f64(),
+        url,
+        status_str,
+    );
+    let _ = std::io::stderr().flush();
+    if mode == Mode::Json {
+        let json_type = match status {
+            Some(_) => "tunnel_verified",
+            None => "tunnel_verifying",
+        };
+        println!(
+            "{}",
+            serde_json::json!({ "type": json_type, "url": url })
+        );
     }
 }
 

@@ -344,11 +344,9 @@ async fn run() -> n0_error::Result<()> {
                 }
             };
             let endpoint_id = node.endpoint_id();
-            if !json {
-                let _ = writeln!(std::io::stderr(), "Your endpoint ID: {}", endpoint_id.to_string());
-                let _ = writeln!(std::io::stderr(), "Setting up tunnel...");
-                let _ = std::io::stderr().flush();
-            }
+            let _ = writeln!(std::io::stderr(), "Your endpoint ID: {}", endpoint_id.to_string());
+            let _ = writeln!(std::io::stderr(), "Setting up tunnel...");
+            let _ = std::io::stderr().flush();
 
             let setup_start = std::time::Instant::now();
             let step_started_at = std::cell::RefCell::new(
@@ -431,10 +429,8 @@ async fn run() -> n0_error::Result<()> {
                 total_budget.saturating_sub(setup_elapsed),
                 min_budget,
             );
-            if !json {
-                let _ = writeln!(std::io::stderr(), "Verifying connectivity...");
-                let _ = std::io::stderr().flush();
-            }
+            let _ = writeln!(std::io::stderr(), "Verifying connectivity...");
+            let _ = std::io::stderr().flush();
             let verify_cb = |label: &str, url: &str, elapsed: std::time::Duration, status: Option<u16>| {
                 progress::render_verify(mode, label, url, elapsed, status);
             };
