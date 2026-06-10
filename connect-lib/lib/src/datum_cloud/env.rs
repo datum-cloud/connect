@@ -7,7 +7,8 @@ const PROD_API_URL: &str = "https://api.datum.net";
 const STAGING_WEB_URL: &str = "https://cloud.staging.env.datum.net";
 const PROD_WEB_URL: &str = "https://cloud.datum.net";
 
-/// Environment for Datum API. Use [`ApiEnv::from_env()`] or `ApiEnv::default()` to respect `DATUM_API_ENV`.
+/// Environment for Datum API. Use [`ApiEnv::default()`] to respect `DATUM_API_HOST` first,
+/// then `DATUM_API_ENV`. Use [`ApiEnv::from_env_with_host_override()`] for explicit host override.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ApiEnv {
     Staging,
@@ -18,7 +19,7 @@ pub enum ApiEnv {
 
 impl ApiEnv {
     /// Uses `DATUM_API_ENV`: `staging` → Staging, anything else (including unset) → Production.
-    pub fn from_env() -> Self {
+    fn from_env() -> Self {
         match env::var("DATUM_API_ENV").as_deref() {
             Ok("staging") => ApiEnv::Staging,
             _ => ApiEnv::Production,
@@ -59,7 +60,7 @@ impl ApiEnv {
 
 impl Default for ApiEnv {
     fn default() -> Self {
-        Self::from_env()
+        Self::from_env_with_host_override()
     }
 }
 
@@ -75,20 +76,12 @@ mod tests {
     }
 
     #[test]
-    fn from_env_defaults_to_production() {
+    fn default_respects_datum_api_env_when_no_host() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         cleanup_env();
-        let env = ApiEnv::from_env();
-        assert!(matches!(env, ApiEnv::Production));
-    }
-
-    #[test]
-    fn from_env_staging_when_set() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
-        cleanup_env();
+        assert!(matches!(ApiEnv::default(), ApiEnv::Production));
         unsafe { std::env::set_var("DATUM_API_ENV", "staging"); }
-        let env = ApiEnv::from_env();
-        assert!(matches!(env, ApiEnv::Staging));
+        assert!(matches!(ApiEnv::default(), ApiEnv::Staging));
     }
 
     #[test]
