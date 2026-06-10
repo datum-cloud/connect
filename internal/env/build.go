@@ -18,12 +18,15 @@ import (
 // removed — it was the root cause of stray ./<project-slug>/ listen_key
 // dirs (Phase 12 plan 12-02 scenario 6).
 //
+// Phase 13-06: DATUM_ACCESS_TOKEN line removed — the Rust binary now
+// obtains its token from the credentials helper at startup. The helper
+// receives DATUM_SESSION from the child env.
+//
 // Caller responsibility: check RequireConnectDir() before calling Build;
 // if it returns an error, write FailConnectDirUnset() to stderr and
 // os.Exit(64).
-func Build(ctx plugin.PluginContext, token string) []string {
+func Build(ctx plugin.PluginContext) []string {
 	result := os.Environ()
-	result = append(result, "DATUM_ACCESS_TOKEN="+token)
 	result = append(result, "DATUM_API_HOST="+ctx.APIHost)
 	result = append(result, "DATUM_CREDENTIALS_HELPER="+ctx.CredentialsHelper)
 	result = append(result, "DATUM_SESSION="+ctx.Session)

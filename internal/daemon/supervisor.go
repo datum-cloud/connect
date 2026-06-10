@@ -41,15 +41,11 @@ func RunSupervisor(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("binary discovery: %w", err)
 	}
 
-	// Get token
+	// Get plugin context
 	pluginCtx := plugin.Context()
-	token, err := plugin.Token()
-	if err != nil {
-		return fmt.Errorf("token: %w", err)
-	}
 
-	// Build environment
-	childEnv := env.Build(pluginCtx, token)
+	// Build environment (no DATUM_ACCESS_TOKEN — binary obtains token via credentials helper)
+	childEnv := env.Build(pluginCtx)
 
 	// Build Rust args
 	rustArgs := []string{"--json", "listen", "--endpoint", cfg.Endpoint}

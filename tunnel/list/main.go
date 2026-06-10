@@ -34,16 +34,11 @@ func runList(cmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 
-	// Get context and token
+	// Get plugin context
 	pluginCtx := plugin.Context()
-	token, err := plugin.Token()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
 
-	// Build environment
-	childEnv := env.Build(pluginCtx, token)
+	// Build environment (no DATUM_ACCESS_TOKEN — binary obtains token via credentials helper)
+	childEnv := env.Build(pluginCtx)
 
 	// Determine output mode
 	outputFlag, _ := cmd.Flags().GetString("output")

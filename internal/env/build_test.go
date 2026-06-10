@@ -17,7 +17,7 @@ func TestBuild_PassesThroughOsEnviron(t *testing.T) {
 		CredentialsHelper: "helper",
 		Session:           "sess",
 	}
-	got := Build(ctx, "tok")
+	got := Build(ctx)
 	found := false
 	for _, e := range got {
 		if e == "MY_CUSTOM_PASSTHROUGH_VAR_FOR_TEST=hello-passthrough" {
@@ -33,7 +33,7 @@ func TestBuild_PassesThroughOsEnviron(t *testing.T) {
 func TestBuild_DoesNotInjectConnectDir(t *testing.T) {
 	t.Setenv("DATUM_CONNECT_DIR", "/tmp/should-be-inherited")
 	ctx := plugin.PluginContext{Project: "should-not-appear"}
-	got := Build(ctx, "tok")
+	got := Build(ctx)
 	// Count occurrences of DATUM_CONNECT_DIR= — must be 1 (the one we
 	// set via t.Setenv, passed through os.Environ()). If Build appends
 	// its own, we'd see 2.
@@ -53,7 +53,7 @@ func TestBuild_DoesNotEmitLegacyConnectRepo(t *testing.T) {
 	// the produced slice unless the inherited env already had it.
 	os.Unsetenv("DATUM_CONNECT_REPO")
 	ctx := plugin.PluginContext{Project: "test-project-slug"}
-	got := Build(ctx, "tok")
+	got := Build(ctx)
 	for _, e := range got {
 		if strings.HasPrefix(e, "DATUM_CONNECT_REPO=") {
 			t.Errorf("Build must not emit DATUM_CONNECT_REPO; got %q", e)
@@ -61,10 +61,11 @@ func TestBuild_DoesNotEmitLegacyConnectRepo(t *testing.T) {
 	}
 }
 
-func TestBuild_AppendsExactlyFourPluginVars(t *testing.T) {
-	// Lock the contract: Build adds 4 vars (token, api-host, helper,
-	// session). DATUM_CONNECT_DIR comes via os.Environ() pass-through.
-	os.Unsetenv("DATUM_ACCESS_TOKEN")
+func TestBuild_AppendsExactlyThreePluginVars(t *testing.T) {
+	// Lock the contract: Build adds 3 vars (api-host, helper, session).
+	// DATUM_ACCESS_TOKEN was removed in Phase 13-06 (binary obtains token
+	// via credentials helper, not env). DATUM_CONNECT_DIR comes via
+	// os.Environ() pass-through.
 	os.Unsetenv("DATUM_API_HOST")
 	os.Unsetenv("DATUM_CREDENTIALS_HELPER")
 	os.Unsetenv("DATUM_SESSION")
@@ -73,9 +74,8 @@ func TestBuild_AppendsExactlyFourPluginVars(t *testing.T) {
 		CredentialsHelper: "c",
 		Session:           "s",
 	}
-	got := Build(ctx, "t")
+	got := Build(ctx)
 	wantPrefixes := []string{
-		"DATUM_ACCESS_TOKEN=t",
 		"DATUM_API_HOST=h",
 		"DATUM_CREDENTIALS_HELPER=c",
 		"DATUM_SESSION=s",

@@ -42,16 +42,11 @@ func runDelete(cmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 
-	// Get token
+	// Get plugin context
 	pluginCtx := plugin.Context()
-	token, err := plugin.Token()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
 
-	// Build env
-	childEnv := env.Build(pluginCtx, token)
+	// Build env (no DATUM_ACCESS_TOKEN — binary obtains token via credentials helper)
+	childEnv := env.Build(pluginCtx)
 
 	// Run: --json delete --id X
 	result, err := exec.Run(context.Background(), binaryPath, []string{"--json", "delete", "--id", id}, childEnv, exec.OutputModeJSON)
