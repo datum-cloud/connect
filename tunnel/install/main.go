@@ -21,13 +21,14 @@ The tunnel will be configured to start automatically on boot and
 restart on failure. Use 'tunnel start' to start it immediately.
 
 Requires a service-account session (created via 'datumctl login
---credentials key.json --session <name>'). Interactive sessions
-are rejected with exit code 78.`,
+--credentials key.json --session <name>') and a project ID
+(--project). Interactive sessions are rejected with exit code 78.`,
 		RunE: runInstall,
 	}
 	cmd.Flags().String("name", "", "Tunnel name (required)")
 	cmd.Flags().String("label", "", "Display name")
 	cmd.Flags().String("endpoint", "", "Local address to expose (host:port, required)")
+	cmd.Flags().String("project", "", "Project ID (required)")
 	cmd.Flags().String("session", "", "Service-account session name (required)")
 	cmd.Flags().Bool("yes", false, "Skip confirmation")
 	return cmd
@@ -37,6 +38,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	name, _ := cmd.Flags().GetString("name")
 	label, _ := cmd.Flags().GetString("label")
 	endpoint, _ := cmd.Flags().GetString("endpoint")
+	project, _ := cmd.Flags().GetString("project")
 	session, _ := cmd.Flags().GetString("session")
 	yes, _ := cmd.Flags().GetBool("yes")
 
@@ -50,6 +52,10 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	}
 	if session == "" {
 		fmt.Fprintln(os.Stderr, "Error: --session is required")
+		os.Exit(64)
+	}
+	if project == "" {
+		fmt.Fprintln(os.Stderr, "Error: --project is required")
 		os.Exit(64)
 	}
 
@@ -75,6 +81,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		Name:     name,
 		Label:    label,
 		Endpoint: endpoint,
+		Project:  project,
 		Session:  session,
 	}
 
