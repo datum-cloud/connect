@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"go.datum.net/datumctl-plugins/connect/internal/rbaccheck"
 	"go.datum.net/datumctl-plugins/connect/internal/svcconfig"
 	"go.datum.net/datumctl-plugins/connect/internal/svcunit"
 )
@@ -63,6 +64,16 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	if err := validateSession(session); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: session validation: %v\n", err)
 		os.Exit(78) // SVC-07: config error
+	}
+
+	// Phase 13 D-05: SSAR — validate service-account has required RBAC permissions
+	if k8sAPI := os.Getenv("DATUM_K8S_API"); k8sAPI != "" {
+		if err := runSSARCheck(k8sAPI, session); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: RBAC check failed: %v\n", err)
+			os.Exit(78) // Config error (SVC-07)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "Warning: DATUM_K8S_API not set — skipping RBAC validation. Install will proceed without permission checks.")
 	}
 
 	// Validate: no duplicate name
@@ -135,6 +146,21 @@ func validateSession(session string) error {
 	// For now, if get-token succeeds, accept it
 	_ = out
 	return nil
+}
+
+// runSSARCheck performs SelfSubjectAccessReview checks via the rbaccheck package.
+func runSSARCheck(k8sAPI, session string) error {
+	helper := os.Getenv("DATUM_CREDENTIALS_HELPER")
+	if helper == "" {
+		return fmt.Errorf("DATUM_CREDENTIALS_HELPER not set")
+	}
+
+	token, err := rbaccheck.GetToken(helper, session)
+	if err != nil {
+		return fmt.Errorf("get token: %w", err)
+	}
+
+	return rbaccheck.CheckAll(k8sAPI, token, rbaccheck.DefaultChecks())
 }
 
 // resolveBinaryPath returns the path to the current plugin binary.
