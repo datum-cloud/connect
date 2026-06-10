@@ -90,6 +90,17 @@ func Status(tunnelName string, binaryPath string) (string, error) {
 // Separated from newService so tests can inspect the Config without
 // going through service.New.
 func buildConfig(cfg svcconfig.TunnelConfig, binaryPath string) (*service.Config, error) {
+	// Build EnvVars for the unit file.
+	envVars := make(map[string]string)
+	if cfg.CredentialsHelperPath != "" {
+		envVars["DATUM_CREDENTIALS_HELPER"] = cfg.CredentialsHelperPath
+	}
+	// DATUM_CONNECT_DIR is NOT set here — it arrives via the plugin's
+	// os.Environ() pass-through (Phase 11.5). Per-service isolation was
+	// removed in Phase 13 (D-01).
+	// DATUM_SESSION is NOT set here — it arrives via the plugin's
+	// os.Environ() or is read by the Rust binary from the YAML config.
+
 	return &service.Config{
 		Name:        ServiceName(cfg.Name),
 		DisplayName: fmt.Sprintf("Datum Connect Tunnel: %s", cfg.Name),
@@ -105,11 +116,7 @@ func buildConfig(cfg svcconfig.TunnelConfig, binaryPath string) (*service.Config
 			"Restart":     "on-failure",
 			"RestartSec":  "5",
 		},
-		// EnvVars is intentionally nil — DATUM_CONNECT_DIR arrives via datumctl's
-		// os.Environ() pass-through (Phase 11.5). Per-service isolation was removed
-		// in Phase 13 (D-01) because project_id (not tunnel name) is the state
-		// discriminator. The unit inherits the plugin's full environment.
-		EnvVars: nil,
+		EnvVars: envVars,
 	}, nil
 }
 
