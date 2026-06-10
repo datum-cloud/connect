@@ -76,13 +76,17 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		os.Exit(64)
 	}
 
+	// Capture credentials helper path at install time for unit env vars
+	credentialsHelperPath := os.Getenv("DATUM_CREDENTIALS_HELPER")
+
 	// Build config
 	cfg := svcconfig.TunnelConfig{
-		Name:     name,
-		Label:    label,
-		Endpoint: endpoint,
-		Project:  project,
-		Session:  session,
+		Name:                  name,
+		Label:                 label,
+		Endpoint:              endpoint,
+		Project:               project,
+		Session:               session,
+		CredentialsHelperPath: credentialsHelperPath,
 	}
 
 	// Write config
