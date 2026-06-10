@@ -11,6 +11,7 @@ import (
 
 	"go.datum.net/datumctl-plugins/connect/internal/daemon"
 	"go.datum.net/datumctl-plugins/connect/internal/state"
+	"go.datum.net/datumctl-plugins/connect/internal/svcconfig"
 )
 
 func NewCmd() *cobra.Command {
@@ -26,6 +27,7 @@ systemd/launchd service units in Phase 6.`,
 	cmd.Flags().String("endpoint", "", "Local address to expose")
 	cmd.Flags().String("label", "", "Display name")
 	cmd.Flags().String("log-file", "", "Path for Rust debug log output")
+	cmd.Flags().String("project", "", "Project ID (checked against persisted config)")
 	cmd.Flags().String("session", "", "Service-account session name")
 	cmd.Flags().Bool("yes", false, "Skip confirmation")
 	return cmd
@@ -38,6 +40,20 @@ func runRun(cmd *cobra.Command, args []string) error {
 	logFile, _ := cmd.Flags().GetString("log-file")
 	session, _ := cmd.Flags().GetString("session")
 	yes, _ := cmd.Flags().GetBool("yes")
+
+	// Load persisted config
+	cfgPath := svcconfig.ConfigFilePath(name)
+	svcCfg, err := svcconfig.Load(cfgPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: load config for '%s': %v\n", name, err)
+		os.Exit(1)
+	}
+
+	// Check --project mismatch (install-time project is authoritative for services)
+	if projectFlag, _ := cmd.Flags().GetString("project"); projectFlag != "" && projectFlag != svcCfg.Project {
+		fmt.Fprintf(os.Stderr, "Error: --project '%s' does not match installed project '%s'. Reinstall to change project.\n", projectFlag, svcCfg.Project)
+		os.Exit(64)
+	}
 
 	// If --session provided, obtain token directly from credentials helper
 	if session != "" {
