@@ -247,19 +247,11 @@ where
 
 // --- verify_endpoints ---
 
-/// Probe the origin endpoint (HTTP) and proxy URL (HTTPS) via reqwest, with a
-/// shared time budget split between the two. Origin probe failure is
-/// non-fatal (emits a stderr warning); proxy probe failure is fatal.
-/// On each probe, fires `verify_cb(url, VerifyEvent::Verifying)` before the
-/// first attempt and `verify_cb(url, VerifyEvent::Verified)` on success.
-///
-/// On success, calls `verify_cb(label, url, elapsed, Some(status))`.
-/// On failure, logs a warning for origin probes and returns an error for
-/// proxy probes.
-///
-/// "Reachable" means a 2xx/3xx/4xx HTTP response; 5xx and network errors
-/// retry with exponential backoff (250ms → 500ms → 1s → 2s ceiling)
-/// bounded by the per-probe budget.
+/// Probe the origin endpoint (HTTP, best-effort) and proxy URL (HTTPS,
+/// indefinite). Origin is bounded by `budget` and is non-fatal on failure.
+/// Proxy retries indefinitely with exponential backoff and prints a status
+/// message every 10s (e.g. `"  waiting for proxy [url] (30s) ... HTTP 503"`)
+/// so the user sees progress even during long settling times.
 pub async fn verify_endpoints<F>(
     origin_endpoint: &str,
     hostname: &str,
@@ -271,14 +263,14 @@ where
 {
     let (origin_url, proxy_url) = build_probe_urls(origin_endpoint, hostname);
 
-    let per_attempt_timeout = std::cmp::min(budget / 4, Duration::from_secs(5));
+    let per_attempt_timeout = Duration::from_secs(5);
     let client = reqwest::Client::builder()
         .timeout(per_attempt_timeout)
         .danger_accept_invalid_certs(false)
         .build()
         .map_err(|e| n0_error::anyerr!("building reqwest client for verify_endpoints: {e}"))?;
 
-    // Origin probe — non-fatal on failure.
+    // Origin probe — best-effort with budget, non-fatal on failure.
     match probe_until_reachable(&client, &origin_url, budget / 2).await {
         Ok((elapsed, status)) => {
             verify_cb("origin reachable", &origin_url, elapsed, Some(status));
@@ -293,17 +285,46 @@ where
         }
     }
 
-    // Proxy probe — fatal on failure.
-    match probe_until_reachable(&client, &proxy_url, budget / 2).await {
-        Ok((elapsed, status)) => {
-            verify_cb("proxy responding", &proxy_url, elapsed, Some(status));
-            Ok(())
+    // Proxy probe — indefinite retry with periodic status every 10s.
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(250);
+    let mut last_status = Instant::now();
+    loop {
+        match client.get(&proxy_url).send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status < 500 {
+                    verify_cb("proxy responding", &proxy_url, start.elapsed(), Some(status));
+                    return Ok(());
+                }
+                if last_status.elapsed() >= Duration::from_secs(10) {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  waiting for proxy [{}] ({:.0}s) ... HTTP {}",
+                        proxy_url,
+                        start.elapsed().as_secs_f64(),
+                        status,
+                    );
+                    let _ = std::io::stderr().flush();
+                    last_status = Instant::now();
+                }
+            }
+            Err(_e) => {
+                if last_status.elapsed() >= Duration::from_secs(10) {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  waiting for proxy [{}] ({:.0}s) ... no response",
+                        proxy_url,
+                        start.elapsed().as_secs_f64(),
+                    );
+                    let _ = std::io::stderr().flush();
+                    last_status = Instant::now();
+                }
+            }
         }
-        Err(_e) => Err(n0_error::anyerr!(
-            "Tunnel did not become reachable at {} within {:?}",
-            proxy_url,
-            budget
-        )),
+        let sleep_dur = std::cmp::min(backoff, Duration::from_secs(2));
+        sleep(sleep_dur).await;
+        backoff = std::cmp::min(backoff * 2, Duration::from_secs(2));
     }
 }
 

@@ -11,7 +11,7 @@
 //! |---------------------------|--------------------------------------------|-----------------------------------------------------------------------------------|
 //! | `tunnel_created`          | new HTTPProxy created                      | `id`                                                                              |
 //! | `tunnel_updated`          | label/endpoint changed                     | `id`, `label`, `endpoint`, `hostnames`                                            |
-//! | `tunnel_ready`            | setup complete AND verify_endpoints OK     | `id`, `label`, `endpoint`, `hostnames`, `endpoint_id`, `status`, `elapsed_secs`   |
+//! | `tunnel_ready`            | setup complete AND proxy reachable (non-5xx) | `id`, `label`, `endpoint`, `hostnames`, `endpoint_id`, `status`, `elapsed_secs` |
 //! | `tunnel_login_lost`       | LoginState::Missing observed mid-run       | `id`, `message`                                                                   |
 //! | `tunnel_terminal_failure` | progress.terminal_failure() Some mid-run   | `id`, `message`                                                                   |
 //! | `tunnel_deleted_upstream` | get_active_progress -> None mid-run        | `id`, `message`                                                                   |
@@ -390,6 +390,7 @@ async fn run() -> n0_error::Result<()> {
             // Plan 12-03: drive setup through await_tunnel_progress (per-step
             // observability + terminal-failure short-circuit) followed by
             // verify_endpoints (probe origin + proxy URL before declaring ready).
+            // The proxy probe retries indefinitely with periodic status every 10s.
             // Mode (Text/Json) routes callback output:
             //   Text → stderr (one transition line per change, prefixed by resource)
             //   Json → stdout (one tunnel_progress / tunnel_verifying /
@@ -419,9 +420,9 @@ async fn run() -> n0_error::Result<()> {
                     n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
                 })?;
 
-            // Verify endpoints reachable. Budget = remaining time in a 60s target
-            // startup window, with a 5s floor so endpoint verification always gets
-            // a fair attempt even when provisioning was slow.
+            // Verify endpoints reachable. Budget is only used for the origin
+            // probe (best-effort, non-fatal). The proxy probe retries
+            // indefinitely with periodic status every 10s.
             let setup_elapsed = setup_start.elapsed();
             let total_budget = std::time::Duration::from_secs(60);
             let min_budget = std::time::Duration::from_secs(5);
