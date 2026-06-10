@@ -2,7 +2,9 @@ package env
 
 import (
 	"bytes"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -101,25 +103,30 @@ func TestRequireConnectDir_SetReturnsNil(t *testing.T) {
 	}
 }
 
-func TestRequireConnectDir_UnsetReturnsError(t *testing.T) {
+func TestRequireConnectDir_UnsetSetsDefault(t *testing.T) {
 	os.Unsetenv("DATUM_CONNECT_DIR")
 	err := RequireConnectDir()
-	if err == nil {
-		t.Fatal("RequireConnectDir() with var unset = nil, want error")
+	if err != nil {
+		t.Fatalf("RequireConnectDir() with var unset = %v, want nil (sets default)", err)
 	}
-	if !strings.HasPrefix(err.Error(), "DATUM_CONNECT_DIR is not set") {
-		t.Errorf("error message = %q, want prefix \"DATUM_CONNECT_DIR is not set\"", err.Error())
+	got := os.Getenv("DATUM_CONNECT_DIR")
+	if got == "" {
+		t.Fatal("RequireConnectDir() didn't set DATUM_CONNECT_DIR")
+	}
+	home, _ := os.UserHomeDir()
+	want := filepath.Join(home, ".datumctl", "connect")
+	if got != want {
+		t.Errorf("RequireConnectDir() set DATUM_CONNECT_DIR=%q, want %q", got, want)
 	}
 }
 
 func TestFailConnectDirUnset_WritesDirectiveMessage(t *testing.T) {
 	var buf bytes.Buffer
-	FailConnectDirUnset(&buf)
+	FailConnectDirUnset(&buf, fmt.Errorf("test error"))
 	out := buf.String()
 	required := []string{
-		"Error: DATUM_CONNECT_DIR is not set",
-		"datumctl connect tunnel",
-		`export DATUM_CONNECT_DIR="$HOME/.datumctl/connect"`,
+		"Error: test error",
+		".datumctl/connect",
 		"(exit 64)",
 	}
 	for _, want := range required {

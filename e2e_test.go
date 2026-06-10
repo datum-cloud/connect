@@ -441,16 +441,13 @@ func TestListenJSONMode(t *testing.T) {
 	cmd.Wait()
 }
 
-func TestPluginRequiresConnectDir(t *testing.T) {
-	// Phase 11.5 D-09/D-10/D-11: invoking the plugin without
-	// DATUM_CONNECT_DIR in env should fail with the directive message
-	// and exit 64. The --plugin-manifest probe stays working because
-	// ServeManifest self-exits before our check runs; that case is
-	// covered by TestPluginManifestProbeWorksWithoutConnectDir.
+func TestPluginDefaultsConnectDir(t *testing.T) {
+	// When DATUM_CONNECT_DIR is unset, the plugin should compute the
+	// canonical default $HOME/.datumctl/connect and proceed (not exit 64).
+	// This allows the plugin to work without datumctl host injection.
 	pluginBin := buildPlugin(t)
 
-	// Strip DATUM_CONNECT_DIR (and the legacy DATUM_CONNECT_REPO, just
-	// in case the host system has it set) from the env we hand the child.
+	// Strip DATUM_CONNECT_DIR (and the legacy DATUM_CONNECT_REPO) from env.
 	env := []string{}
 	for _, e := range os.Environ() {
 		if strings.HasPrefix(e, "DATUM_CONNECT_DIR=") {
@@ -462,24 +459,24 @@ func TestPluginRequiresConnectDir(t *testing.T) {
 		env = append(env, e)
 	}
 
+	// Run tunnel list — should NOT exit 64. Will fail with "binary not
+	// found" because no fake binary is set up, but that's a different error.
 	cmd := exec.Command(pluginBin, "tunnel", "list")
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
+
 	if err == nil {
-		t.Fatalf("expected non-zero exit when DATUM_CONNECT_DIR is unset; got success with output:\n%s", out)
+		t.Fatalf("expected non-zero exit (binary not found); got success with output:\n%s", out)
 	}
 	exitErr, ok := err.(*exec.ExitError)
 	if !ok {
 		t.Fatalf("expected *exec.ExitError, got %T: %v", err, err)
 	}
-	if exitErr.ExitCode() != 64 {
-		t.Errorf("expected exit code 64, got %d", exitErr.ExitCode())
+	if exitErr.ExitCode() == 64 {
+		t.Errorf("plugin exited 64 when DATUM_CONNECT_DIR was unset; should have computed default instead:\n%s", out)
 	}
-	if !bytes.Contains(out, []byte("DATUM_CONNECT_DIR is not set")) {
-		t.Errorf("expected 'DATUM_CONNECT_DIR is not set' in stderr; got:\n%s", out)
-	}
-	if !bytes.Contains(out, []byte("datumctl connect tunnel")) {
-		t.Errorf("expected directive to mention 'datumctl connect tunnel'; got:\n%s", out)
+	if bytes.Contains(out, []byte("DATUM_CONNECT_DIR is not set")) {
+		t.Errorf("unexpected 'DATUM_CONNECT_DIR is not set' message — plugin should have auto-computed the default:\n%s", out)
 	}
 }
 

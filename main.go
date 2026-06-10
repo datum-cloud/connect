@@ -24,7 +24,7 @@ func main() {
 	// self-exits for the --plugin-manifest probe, so by this point
 	// we are committed to running a real subcommand.
 	if err := env.RequireConnectDir(); err != nil {
-		env.FailConnectDirUnset(os.Stderr)
+		env.FailConnectDirUnset(os.Stderr, err)
 		os.Exit(64)
 	}
 

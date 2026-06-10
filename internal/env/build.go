@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"go.datum.net/datumctl/plugin"
 )
@@ -33,35 +34,36 @@ func Build(ctx plugin.PluginContext) []string {
 	return result
 }
 
-// RequireConnectDir returns nil when DATUM_CONNECT_DIR is set in the
-// current process environment, and a sentinel error otherwise.
+// RequireConnectDir ensures DATUM_CONNECT_DIR is set. When the env var
+// is already present (e.g., injected by datumctl), it is left unchanged.
+// Otherwise, the canonical default $HOME/.datumctl/connect is computed
+// and exported into the current process environment so child processes
+// inherit it.
 //
-// Phase 11.5 D-11: single failure path; no distinction between
-// "datumctl invoked me but forgot the var" and "user ran me directly".
+// Returns an error only when the env var is missing AND the home
+// directory cannot be determined — a truly broken environment.
 func RequireConnectDir() error {
-	if os.Getenv("DATUM_CONNECT_DIR") == "" {
-		return fmt.Errorf("DATUM_CONNECT_DIR is not set in the environment")
+	if os.Getenv("DATUM_CONNECT_DIR") != "" {
+		return nil
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("DATUM_CONNECT_DIR is not set and cannot determine home directory: %w", err)
+	}
+	def := filepath.Join(home, ".datumctl", "connect")
+	os.Setenv("DATUM_CONNECT_DIR", def)
 	return nil
 }
 
-// FailConnectDirUnset writes the multi-line directive error from
-// CONTEXT.md D-09 to w. The caller is responsible for os.Exit(64).
-func FailConnectDirUnset(w io.Writer) {
-	const msg = `Error: DATUM_CONNECT_DIR is not set in the environment.
+// FailConnectDirUnset writes a diagnostic error to w explaining that
+// the home directory could not be determined. The caller is responsible
+// for os.Exit(64).
+func FailConnectDirUnset(w io.Writer, err error) {
+	fmt.Fprintf(w, `Error: %v
 
-The connect plugin's state directory must be supplied by datumctl
-when invoking the plugin. Normally this happens automatically when
-you run:
-
-  datumctl connect tunnel <subcommand> ...
-
-If you are running the plugin binary directly for debugging, export
-the canonical path manually:
-
-  export DATUM_CONNECT_DIR="$HOME/.datumctl/connect"
+The connect plugin normally stores its state at $HOME/.datumctl/connect/.
+Could not determine your home directory to compute this path.
 
 (exit 64)
-`
-	fmt.Fprint(w, msg)
+`, err)
 }
