@@ -34,14 +34,19 @@ impl ApiEnv {
     /// If the host value does not have a scheme (`http://` or `https://`),
     /// `https://` is prepended automatically so that downstream URL
     /// construction always produces valid absolute URLs.
+    ///
+    /// An empty `DATUM_API_HOST` (set to `""`) is treated as unset — the
+    /// function falls through to `from_env()`.
     pub fn from_env_with_host_override() -> Self {
         if let Ok(host) = env::var("DATUM_API_HOST") {
-            let api_url = if host.starts_with("http://") || host.starts_with("https://") {
-                host
-            } else {
-                format!("https://{}", host)
-            };
-            return ApiEnv::Custom { api_url };
+            if !host.is_empty() {
+                let api_url = if host.starts_with("http://") || host.starts_with("https://") {
+                    host
+                } else {
+                    format!("https://{}", host)
+                };
+                return ApiEnv::Custom { api_url };
+            }
         }
         Self::from_env()
     }
@@ -124,6 +129,15 @@ mod tests {
         unsafe { std::env::set_var("DATUM_API_HOST", "http://internal.api.datum.net"); }
         let env = ApiEnv::from_env_with_host_override();
         assert!(matches!(&env, ApiEnv::Custom { api_url } if api_url == "http://internal.api.datum.net"));
+    }
+
+    #[test]
+    fn from_env_with_host_override_empty_falls_back_to_production() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        cleanup_env();
+        unsafe { std::env::set_var("DATUM_API_HOST", ""); }
+        let env = ApiEnv::from_env_with_host_override();
+        assert!(matches!(env, ApiEnv::Production));
     }
 
     #[test]

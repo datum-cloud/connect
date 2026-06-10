@@ -30,7 +30,13 @@
 //! `tunnel_ready` (emitted from main.rs) drives `gotReady`.
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Set to true once the first progress step has been rendered, so the
+/// test harness can detect that setup-phase output was emitted.
+pub static PROGRESS_SEEN: AtomicBool = AtomicBool::new(false);
 
 use connect_lib::{ProgressStep, ProgressStepKind, StepStatus, TunnelProgress, TunnelService};
 use n0_error::Result;
@@ -40,12 +46,6 @@ use tokio::time::{sleep, Instant};
 pub enum Mode {
     Text,
     Json,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifyEvent {
-    Verifying,
-    Verified,
 }
 
 // --- format_terminal_failure ---
@@ -104,16 +104,19 @@ pub(crate) fn status_to_str(s: StepStatus) -> &'static str {
 
 // --- callbacks ---
 
-pub fn render_progress_step(mode: Mode, step: &ProgressStep, prev: StepStatus) {
+pub fn render_progress_step(mode: Mode, step: &ProgressStep, _prev: StepStatus, elapsed: Duration) {
     match mode {
         Mode::Text => {
-            eprintln!(
-                "[{}] {}: {} -> {}",
-                step.kind.resource_kind(),
-                step.kind.label(),
-                status_to_str(prev),
-                status_to_str(step.status),
-            );
+            if step.status == StepStatus::Ready {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "  \u{2713} {} ({:.1}s) [{}]",
+                    step.kind.label(),
+                    elapsed.as_secs_f64(),
+                    step.resource.as_deref().unwrap_or(""),
+                );
+                let _ = std::io::stderr().flush();
+            }
         }
         Mode::Json => {
             let v = serde_json::json!({
@@ -127,17 +130,33 @@ pub fn render_progress_step(mode: Mode, step: &ProgressStep, prev: StepStatus) {
     }
 }
 
-pub fn render_verify(mode: Mode, url: &str, event: VerifyEvent) {
-    let (text_prefix, json_type) = match event {
-        VerifyEvent::Verifying => ("verifying", "tunnel_verifying"),
-        VerifyEvent::Verified => ("verified", "tunnel_verified"),
-    };
+pub fn render_verify(mode: Mode, label: &str, url: &str, elapsed: Duration, status: Option<u16>) {
     match mode {
-        Mode::Text => eprintln!("{} {}", text_prefix, url),
-        Mode::Json => println!(
-            "{}",
-            serde_json::json!({ "type": json_type, "url": url })
-        ),
+        Mode::Text => {
+            let status_str = match status {
+                Some(s) => format!(": HTTP {}", s),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{2713} {} ({:.1}s) [{}]{}",
+                label,
+                elapsed.as_secs_f64(),
+                url,
+                status_str,
+            );
+            let _ = std::io::stderr().flush();
+        }
+        Mode::Json => {
+            let json_type = match status {
+                Some(_) => "tunnel_verified",
+                None => "tunnel_verifying",
+            };
+            println!(
+                "{}",
+                serde_json::json!({ "type": json_type, "url": url })
+            );
+        }
     }
 }
 
@@ -204,12 +223,14 @@ where
                 if let Some(start) = pending_since.get(&step.kind) {
                     let secs = start.elapsed().as_secs();
                     if secs >= 30 && !warned_stuck.get(&step.kind).copied().unwrap_or(false) {
-                        eprintln!(
+                        let _ = writeln!(
+                            std::io::stderr(),
                             "warning: step {} stuck in Pending for {}s ({})",
                             step.kind.label(),
                             secs,
                             step.resource.as_deref().unwrap_or("(no resource)")
                         );
+                        let _ = std::io::stderr().flush();
                         warned_stuck.insert(step.kind, true);
                     }
                 }
@@ -240,6 +261,10 @@ where
 /// On each probe, fires `verify_cb(url, VerifyEvent::Verifying)` before the
 /// first attempt and `verify_cb(url, VerifyEvent::Verified)` on success.
 ///
+/// On success, calls `verify_cb(label, url, elapsed, Some(status))`.
+/// On failure, logs a warning for origin probes and returns an error for
+/// proxy probes.
+///
 /// "Reachable" means any HTTP response (2xx/3xx/4xx all count); only
 /// network errors / connection timeouts retry. Exponential backoff
 /// (250ms → 500ms → 1s → 2s ceiling) bounded by the per-probe budget.
@@ -250,7 +275,7 @@ pub async fn verify_endpoints<F>(
     verify_cb: F,
 ) -> Result<()>
 where
-    F: Fn(&str, VerifyEvent),
+    F: Fn(&str, &str, Duration, Option<u16>),
 {
     let (origin_url, proxy_url) = build_probe_urls(origin_endpoint, hostname);
 
@@ -262,22 +287,24 @@ where
         .map_err(|e| n0_error::anyerr!("building reqwest client for verify_endpoints: {e}"))?;
 
     // Origin probe — non-fatal on failure.
-    verify_cb(&origin_url, VerifyEvent::Verifying);
     match probe_until_reachable(&client, &origin_url, budget / 2).await {
-        Ok(()) => verify_cb(&origin_url, VerifyEvent::Verified),
+        Ok((elapsed, status)) => {
+            verify_cb("origin reachable", &origin_url, elapsed, Some(status));
+        }
         Err(_e) => {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "warning: origin {} did not respond within budget — continuing",
                 origin_url
             );
+            let _ = std::io::stderr().flush();
         }
     }
 
     // Proxy probe — fatal on failure.
-    verify_cb(&proxy_url, VerifyEvent::Verifying);
     match probe_until_reachable(&client, &proxy_url, budget / 2).await {
-        Ok(()) => {
-            verify_cb(&proxy_url, VerifyEvent::Verified);
+        Ok((elapsed, status)) => {
+            verify_cb("proxy responding", &proxy_url, elapsed, Some(status));
             Ok(())
         }
         Err(_e) => Err(n0_error::anyerr!(
@@ -292,7 +319,7 @@ async fn probe_until_reachable(
     client: &reqwest::Client,
     url: &str,
     budget: Duration,
-) -> Result<()> {
+) -> Result<(Duration, u16)> {
     let start = Instant::now();
     let mut backoff = Duration::from_millis(250);
     loop {
@@ -300,7 +327,7 @@ async fn probe_until_reachable(
             return Err(n0_error::anyerr!("probe budget exhausted"));
         }
         match client.get(url).send().await {
-            Ok(_resp) => return Ok(()), // any status = reachable
+            Ok(resp) => return Ok((start.elapsed(), resp.status().as_u16())),
             Err(_e) => {
                 let remaining = budget.saturating_sub(start.elapsed());
                 if remaining.is_zero() {

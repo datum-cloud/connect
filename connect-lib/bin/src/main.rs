@@ -23,6 +23,7 @@
 //! in commit `1bb9552`). It MUST NOT be removed, renamed, or have its emission
 //! site moved without coordinating the Go side.
 
+use std::io::Write;
 use std::sync::OnceLock;
 
 use clap::{Parser, Subcommand};
@@ -343,8 +344,19 @@ async fn run() -> n0_error::Result<()> {
                 }
             };
             let endpoint_id = node.endpoint_id();
+            if !json {
+                let _ = writeln!(std::io::stderr(), "Your endpoint ID: {}", endpoint_id.to_string());
+                let _ = writeln!(std::io::stderr(), "Setting up tunnel...");
+                let _ = std::io::stderr().flush();
+            }
 
             let setup_start = std::time::Instant::now();
+            let step_started_at = std::cell::RefCell::new(
+                std::collections::HashMap::<
+                    connect_lib::ProgressStepKind,
+                    std::time::Instant,
+                >::new(),
+            );
 
             let tunnel_id = if let Some(t) = existing {
                 if let Some(label) = label.filter(|l| l != &t.label) {
@@ -389,8 +401,15 @@ async fn run() -> n0_error::Result<()> {
             // unblocks its gotReady handshake.
             let mode = if json { progress::Mode::Json } else { progress::Mode::Text };
             let progress_cb = |step: &connect_lib::ProgressStep,
-                               prev: connect_lib::StepStatus| {
-                progress::render_progress_step(mode, step, prev);
+                                prev: connect_lib::StepStatus| {
+                let elapsed = {
+                    let mut map = step_started_at.borrow_mut();
+                    let timer = map
+                        .entry(step.kind.clone())
+                        .or_insert_with(std::time::Instant::now);
+                    timer.elapsed()
+                };
+                progress::render_progress_step(mode, step, prev, elapsed);
             };
             let final_progress =
                 progress::await_tunnel_progress(&service, &tunnel_id, &progress_cb).await?;
@@ -412,8 +431,12 @@ async fn run() -> n0_error::Result<()> {
                 total_budget.saturating_sub(setup_elapsed),
                 min_budget,
             );
-            let verify_cb = |url: &str, ev: progress::VerifyEvent| {
-                progress::render_verify(mode, url, ev);
+            if !json {
+                let _ = writeln!(std::io::stderr(), "Verifying connectivity...");
+                let _ = std::io::stderr().flush();
+            }
+            let verify_cb = |label: &str, url: &str, elapsed: std::time::Duration, status: Option<u16>| {
+                progress::render_verify(mode, label, url, elapsed, status);
             };
             progress::verify_endpoints(&endpoint, &hostname, verify_budget, &verify_cb).await?;
 
