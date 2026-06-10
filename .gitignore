@@ -1,4 +1,4 @@
 target/
 *.so
-datumctl-connect
+connect-plugin/datumctl-connect
 .drewr-y4nd1b/

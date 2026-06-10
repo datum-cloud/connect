@@ -12,8 +12,8 @@ cd "$CONNECT_DIR"
 
 echo "Building datum-connect plugin..."
 
-if go build -o connect . ; then
-    echo "Build successful: $CONNECT_DIR/connect"
+if go build -o datumctl-connect . ; then
+    echo "Build successful: $CONNECT_DIR/datumctl-connect"
 else
     echo "Build failed" >&2
     exit 1

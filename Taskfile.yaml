@@ -4,6 +4,7 @@ version: '3'
 
 vars:
   RUST_PROJECT: connect-lib
+  GO_PROJECT: connect-plugin
   PLUGIN_BINARY: datumctl-connect
   RUST_BINARY: datum-connect
   PLUGIN_DIR: '{{.ROOT_DIR}}/bin'
@@ -39,6 +40,7 @@ tasks:
     desc: "Build the Go plugin binary"
     cmds:
       - go build {{.GO_BUILD_FLAGS}} -o {{.PLUGIN_BINARY}} .
+    dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
 
   build:rust:
     desc: "Build the Rust binary (debug)"
@@ -105,6 +107,7 @@ tasks:
     desc: "Run Go unit tests"
     cmds:
       - go test ./... -count=1 -timeout 60s
+    dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
 
   test:rust:
     desc: "Run Rust unit tests"
@@ -125,9 +128,10 @@ tasks:
   clean:
     desc: "Remove all build artifacts"
     cmds:
-      - rm -f {{.PLUGIN_BINARY}}
-      - cargo clean
-    dir: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}'
+      - rm -f {{.ROOT_DIR}}/{{.GO_PROJECT}}/{{.PLUGIN_BINARY}}
+      - rm -f {{.ROOT_DIR}}/{{.RUST_PROJECT}}/target/debug/{{.RUST_BINARY}}
+      - rm -f {{.ROOT_DIR}}/{{.RUST_PROJECT}}/target/release/{{.RUST_BINARY}}
+      - rm -rf {{.ROOT_DIR}}/{{.RUST_PROJECT}}/target
 
   clean:all:
     desc: "Remove build artifacts, installed binaries, and tmp files"

@@ -81,7 +81,8 @@ func main() {
 
 func handleList(jsonOut bool) {
 	token := os.Getenv("DATUM_ACCESS_TOKEN")
-	if token == "" && os.Getenv("FAKE_DUMMY_MODE") != "expired-token" {
+	hasHelper := os.Getenv("DATUM_CREDENTIALS_HELPER") != ""
+	if token == "" && !hasHelper && os.Getenv("FAKE_DUMMY_MODE") != "expired-token" {
 		if os.Getenv("FAKE_DUMMY_MODE") != "missing-token" {
 			fmt.Fprintln(os.Stderr, "error: missing DATUM_ACCESS_TOKEN")
 			os.Exit(1)
@@ -112,7 +113,8 @@ func handleList(jsonOut bool) {
 
 func handleListen(jsonOut bool) {
 	token := os.Getenv("DATUM_ACCESS_TOKEN")
-	if token == "" && os.Getenv("FAKE_DUMMY_MODE") != "expired-token" {
+	hasHelper := os.Getenv("DATUM_CREDENTIALS_HELPER") != ""
+	if token == "" && !hasHelper && os.Getenv("FAKE_DUMMY_MODE") != "expired-token" {
 		fmt.Fprintln(os.Stderr, "error: missing DATUM_ACCESS_TOKEN")
 		os.Exit(1)
 	}

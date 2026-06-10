@@ -402,10 +402,19 @@ func TestStatus_WithConfig(t *testing.T) {
 
 func buildPlugin(t *testing.T) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "connect-test")
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "connect-test")
 	cmd := exec.Command("go", "build", "-o", bin, ".")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build plugin: %v\n%s", err, out)
+	}
+	// Also build and copy the fake datum-connect binary next to the plugin
+	// so binary.Discover() can find it when FAKE_DATUM_CONNECT is set.
+	fakeBin := filepath.Join(dir, "fake-datum-connect")
+	fakeCmd := exec.Command("go", "build", "-o", fakeBin, "./testdata/fake-datum-connect")
+	fakeCmd.Dir = "."
+	if out, err := fakeCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build fake-datum-connect: %v\n%s", err, out)
 	}
 	return bin
 }

@@ -10,16 +10,16 @@ import (
 
 func buildFakeBinary(t *testing.T, src string) string {
 	t.Helper()
-	// Build from connect/ module root — use absolute path for reliability
+	// Build from connect-plugin/ module root — use absolute path for reliability
 	bin := "fake-datum-connect-test"
 	cmd := exec.Command("go", "build", "-o", bin, "./"+src)
-	cmd.Dir = "/home/drewr/src/datum-connect-plugin-build/connect"
+	cmd.Dir = "/home/drewr/src/datum-connect-plugin-build/connect/connect-plugin"
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build %s: %v\n%s", src, err, out)
 	}
 	t.Cleanup(func() { os.Remove(bin) })
 	// Return absolute path so Run() can find it regardless of CWD
-	absBin := "/home/drewr/src/datum-connect-plugin-build/connect/" + bin
+	absBin := "/home/drewr/src/datum-connect-plugin-build/connect/connect-plugin/" + bin
 	return absBin
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -13,7 +14,7 @@ import (
 
 func TestPluginManifestEmitsValidJSON(t *testing.T) {
 	// PLUG-01: --plugin-manifest emits valid JSON and exits 0
-	cmd := exec.Command("./connect", "--plugin-manifest")
+	cmd := exec.Command(buildPlugin(t), "--plugin-manifest")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("--plugin-manifest exited non-zero: %v\n%s", err, out)
@@ -38,7 +39,7 @@ func TestPluginManifestEmitsValidJSON(t *testing.T) {
 func TestPluginManifestExitsBeforeCobraParses(t *testing.T) {
 	// --plugin-manifest must be handled before cobra parses args
 	// so even invalid cobra flags should not prevent manifest output
-	cmd := exec.Command("./connect", "--plugin-manifest", "--invalid-cobra-flag")
+	cmd := exec.Command(buildPlugin(t), "--plugin-manifest", "--invalid-cobra-flag")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("--plugin-manifest should exit 0 even with invalid flags: %v\n%s", err, out)
@@ -55,7 +56,7 @@ func TestPluginManifestExitsBeforeCobraParses(t *testing.T) {
 
 func TestAll12SubcommandsScaffolded(t *testing.T) {
 	// PLUG-06: All 12 subcommands available in help
-	cmd := exec.Command("./connect", "tunnel", "--help")
+	cmd := exec.Command(buildPlugin(t), "tunnel", "--help")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("tunnel help exited non-zero: %v\n%s", err, out)
@@ -83,10 +84,12 @@ func TestAllSubcommandsRunWithoutCrash(t *testing.T) {
 		"ps", "stop", "logs", "status",
 		"install", "uninstall", "start", "run",
 	}
+	pluginBin := buildPlugin(t)
 
 	for _, subcmd := range subcommands {
 		t.Run(subcmd, func(t *testing.T) {
-			cmd := exec.Command("./connect", "tunnel", subcmd)
+			cmd := exec.Command(pluginBin, "tunnel", subcmd)
+			cmd.Env = append(os.Environ(), "FAKE_DATUM_CONNECT=1")
 			out, err := cmd.CombinedOutput()
 			// May exit non-zero due to missing required flags — that's OK
 			// as long as there's no panic/stack trace
@@ -217,16 +220,16 @@ func buildFakeBinary(t *testing.T, src string) string {
 	return bin
 }
 
-// buildFakeDatumConnect builds the fake binary as "fake-datum-connect" for
-// use with binary.Discover() which looks up "fake-datum-connect" in PATH.
+// buildFakeDatumConnect builds the fake binary and returns its absolute path
+// for use with FAKE_DATUM_CONNECT env var override in binary.Discover().
 func buildFakeDatumConnect(t *testing.T) string {
 	t.Helper()
-	bin := "fake-datum-connect"
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-datum-connect")
 	cmd := exec.Command("go", "build", "-o", bin, "./testdata/fake-datum-connect")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build fake-datum-connect: %v\n%s", err, out)
 	}
-	t.Cleanup(func() { os.Remove(bin) })
 	return bin
 }
 

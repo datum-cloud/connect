@@ -9,13 +9,21 @@ import (
 )
 
 // Discover locates the datum-connect binary.
-// Search order: (1) same directory as the running plugin binary,
-// (2) PATH lookup. Returns error if not found.
+// Search order: (1) FAKE_DATUM_CONNECT env var (test mode, absolute path),
+// (2) same directory as the running plugin binary, (3) PATH lookup.
+// Returns error if not found.
 func Discover() (string, error) {
-	// Search order: (1) same directory as the running binary, (2) PATH lookup
+	// (1) Test override: FAKE_DATUM_CONNECT set to absolute path
+	if path := os.Getenv("FAKE_DATUM_CONNECT"); path != "" {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+	// (2) Same directory as the running binary
 	if path := findNextToSelf(); path != "" {
 		return path, nil
 	}
+	// (3) PATH lookup
 	if path := findInPath(); path != "" {
 		return path, nil
 	}

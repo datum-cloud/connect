@@ -2,7 +2,7 @@ module go.datum.net/datumctl-plugins/connect
 
 go 1.25.8
 
-replace go.datum.net/datumctl => ../datumctl
+replace go.datum.net/datumctl => ../../datumctl
 
 require (
 	github.com/spf13/cobra v1.10.2
