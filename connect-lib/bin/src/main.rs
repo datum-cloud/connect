@@ -344,8 +344,8 @@ async fn run() -> n0_error::Result<()> {
                 }
             };
             let endpoint_id = node.endpoint_id();
-            let _ = writeln!(std::io::stderr(), "Your endpoint ID: {}", endpoint_id.to_string());
-            let _ = writeln!(std::io::stderr(), "Setting up tunnel...");
+            let _ = writeln!(std::io::stderr(), "  \u{25CB} Your endpoint ID: {}", endpoint_id.to_string());
+            let _ = writeln!(std::io::stderr(), "  \u{25CB} Setting up tunnel...");
             let _ = std::io::stderr().flush();
 
             let setup_start = std::time::Instant::now();
@@ -430,7 +430,7 @@ async fn run() -> n0_error::Result<()> {
                 total_budget.saturating_sub(setup_elapsed),
                 min_budget,
             );
-            let _ = writeln!(std::io::stderr(), "Verifying connectivity...");
+            let _ = writeln!(std::io::stderr(), "  \u{25CB} Verifying connectivity...");
             let _ = std::io::stderr().flush();
             let verify_cb = |label: &str, url: &str, elapsed: std::time::Duration, status: Option<u16>| {
                 progress::render_verify(mode, label, url, elapsed, status);

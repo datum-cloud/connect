@@ -300,7 +300,7 @@ where
                 if last_status.elapsed() >= Duration::from_secs(10) {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "  waiting for proxy [{}] ({:.0}s) ... HTTP {}",
+                        "  \u{25CB} waiting for proxy [{}] ({:.0}s) ... HTTP {}",
                         proxy_url,
                         start.elapsed().as_secs_f64(),
                         status,
@@ -313,7 +313,7 @@ where
                 if last_status.elapsed() >= Duration::from_secs(10) {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "  waiting for proxy [{}] ({:.0}s) ... no response",
+                        "  \u{25CB} waiting for proxy [{}] ({:.0}s) ... no response",
                         proxy_url,
                         start.elapsed().as_secs_f64(),
                     );

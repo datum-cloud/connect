@@ -257,8 +257,9 @@ func runListen(cmd *cobra.Command, args []string) error {
 	}()
 
 	select {
-	case err := <-done:
-		return err
+	case <-done:
+		// Child exited after signal — intentional shutdown, not an error.
+		return nil
 	case <-time.After(gracePeriod):
 		// Grace period expired — force kill
 		_ = rustCmd.Process.Signal(syscall.SIGKILL)
