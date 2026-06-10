@@ -27,6 +27,12 @@ systemd/launchd service units in Phase 6.`,
 }
 
 func runRun(cmd *cobra.Command, args []string) error {
+	// Server-of-truth (Phase 13 D-04, resolution table Item #11):
+	// The Rust binary resolves the tunnel's label and endpoint from the
+	// server (HTTPProxy resource) via get_active_by_endpoint. The values
+	// passed through from the YAML snapshot are startup hints only — the
+	// binary overrides them with the server's live state.
+
 	name, _ := cmd.Flags().GetString("name")
 	projectFlag, _ := cmd.Flags().GetString("project")
 
