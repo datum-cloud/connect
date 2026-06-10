@@ -19,16 +19,11 @@ func ServiceName(tunnelName string) string {
 }
 
 // ServiceArgs builds the CLI arguments for the tunnel run command.
+// After Phase 13 (resolution table Item #7), tunnel run accepts only
+// --name. All runtime config (project, session, endpoint, label,
+// credentials_helper_path) comes from the YAML and server, not CLI flags.
 func ServiceArgs(cfg svcconfig.TunnelConfig) []string {
-	args := []string{"tunnel", "run", "--name", cfg.Name, "--endpoint", cfg.Endpoint}
-	if cfg.Label != "" {
-		args = append(args, "--label", cfg.Label)
-	}
-	if cfg.Session != "" {
-		args = append(args, "--session", cfg.Session)
-	}
-	args = append(args, "--yes")
-	return args
+	return []string{"tunnel", "run", "--name", cfg.Name}
 }
 
 // Install registers a user-scoped systemd unit via kardianos/service.
@@ -98,7 +93,7 @@ func buildConfig(cfg svcconfig.TunnelConfig, binaryPath string) (*service.Config
 	return &service.Config{
 		Name:        ServiceName(cfg.Name),
 		DisplayName: fmt.Sprintf("Datum Connect Tunnel: %s", cfg.Name),
-		Description: fmt.Sprintf("Datum Connect tunnel to %s (%s)", cfg.Endpoint, cfg.Name),
+		Description: fmt.Sprintf("Datum Connect tunnel %s", cfg.Name),
 		Executable:  binaryPath,
 		Arguments:   ServiceArgs(cfg),
 		Dependencies: []string{
