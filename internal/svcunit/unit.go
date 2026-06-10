@@ -6,9 +6,7 @@ package svcunit
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 
 	"github.com/kardianos/service"
 
@@ -91,17 +89,12 @@ func Status(tunnelName string, binaryPath string) (string, error) {
 	return statusString(st), nil
 }
 
-// buildConfig assembles the kardianos/service.Config for a tunnel,
-// including the per-service DATUM_CONNECT_DIR isolation subdir
-// (Phase 11.5 D-12). Separated from newService so tests can inspect
-// the Config without going through service.New.
+// buildConfig assembles the kardianos/service.Config for a tunnel.
+// The unit inherits DATUM_CONNECT_DIR from the plugin's pass-through
+// environment (Phase 11.5); no per-service override is applied.
+// Separated from newService so tests can inspect the Config without
+// going through service.New.
 func buildConfig(cfg svcconfig.TunnelConfig, binaryPath string) (*service.Config, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("compute service state dir: %w", err)
-	}
-	serviceStateDir := filepath.Join(home, ".datumctl", "connect", "services", cfg.Name)
-
 	return &service.Config{
 		Name:        ServiceName(cfg.Name),
 		DisplayName: fmt.Sprintf("Datum Connect Tunnel: %s", cfg.Name),
@@ -117,13 +110,11 @@ func buildConfig(cfg svcconfig.TunnelConfig, binaryPath string) (*service.Config
 			"Restart":     "on-failure",
 			"RestartSec":  "5",
 		},
-		// Phase 11.5 D-12: per-service state subdir prevents listen_key
-		// collisions when multiple installed services run concurrently.
-		// D-14: other DATUM_* vars (CREDENTIALS_HELPER, API_HOST, SESSION)
-		// are intentionally NOT added in 11.5 -- tracked as a follow-up.
-		EnvVars: map[string]string{
-			"DATUM_CONNECT_DIR": serviceStateDir,
-		},
+		// EnvVars is intentionally nil — DATUM_CONNECT_DIR arrives via datumctl's
+		// os.Environ() pass-through (Phase 11.5). Per-service isolation was removed
+		// in Phase 13 (D-01) because project_id (not tunnel name) is the state
+		// discriminator. The unit inherits the plugin's full environment.
+		EnvVars: nil,
 	}, nil
 }
 
