@@ -344,6 +344,8 @@ async fn run() -> n0_error::Result<()> {
             };
             let endpoint_id = node.endpoint_id();
 
+            let setup_start = std::time::Instant::now();
+
             let tunnel_id = if let Some(t) = existing {
                 if let Some(label) = label.filter(|l| l != &t.label) {
                     let updated = service.update_active(&t.id, &label, &endpoint).await?;
@@ -375,8 +377,6 @@ async fn run() -> n0_error::Result<()> {
 
             service.set_enabled_active(&tunnel_id, true).await?;
 
-            let setup_start = std::time::Instant::now();
-
             // Plan 12-03: drive setup through await_tunnel_progress (per-step
             // observability + terminal-failure short-circuit) followed by
             // verify_endpoints (probe origin + proxy URL before declaring ready).
@@ -402,11 +402,16 @@ async fn run() -> n0_error::Result<()> {
                     n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
                 })?;
 
-            // Verify endpoints reachable. Total budget = remaining 60s startup
-            // window minus what setup already consumed.
+            // Verify endpoints reachable. Budget = remaining time in a 60s target
+            // startup window, with a 5s floor so endpoint verification always gets
+            // a fair attempt even when provisioning was slow.
             let setup_elapsed = setup_start.elapsed();
             let total_budget = std::time::Duration::from_secs(60);
-            let verify_budget = total_budget.saturating_sub(setup_elapsed);
+            let min_budget = std::time::Duration::from_secs(5);
+            let verify_budget = std::cmp::max(
+                total_budget.saturating_sub(setup_elapsed),
+                min_budget,
+            );
             let verify_cb = |url: &str, ev: progress::VerifyEvent| {
                 progress::render_verify(mode, url, ev);
             };
