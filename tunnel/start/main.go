@@ -13,11 +13,12 @@ import (
 
 func NewCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "start --name N",
+		Use:   "start --name N [--project P]",
 		Short: "Start a tunnel service",
 		RunE:  runStart,
 	}
 	cmd.Flags().String("name", "", "Tunnel name (required)")
+	cmd.Flags().String("project", "", "Project ID (checked against persisted config)")
 	return cmd
 }
 
@@ -26,6 +27,20 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if name == "" {
 		fmt.Fprintln(os.Stderr, "Error: --name is required")
 		os.Exit(64)
+	}
+
+	// Check --project mismatch (install-time project is authoritative for services)
+	if projectFlag, _ := cmd.Flags().GetString("project"); projectFlag != "" {
+		cfgPath := svcconfig.ConfigFilePath(name)
+		cfg, err := svcconfig.Load(cfgPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: load config for '%s': %v\n", name, err)
+			os.Exit(1)
+		}
+		if projectFlag != cfg.Project {
+			fmt.Fprintf(os.Stderr, "Error: --project '%s' does not match installed project '%s'. Reinstall to change project.\n", projectFlag, cfg.Project)
+			os.Exit(64)
+		}
 	}
 
 	// Check installed
