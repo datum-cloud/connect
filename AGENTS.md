@@ -1,1 +1,1 @@
-new connect plugin goes here
+Read @README.md
