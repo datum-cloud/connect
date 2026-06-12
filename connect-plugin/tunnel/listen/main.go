@@ -23,7 +23,7 @@ import (
 const (
 	// startupTimeout is the maximum time to wait for the first typed message
 	// (ready or error) from the Rust binary.
-	startupTimeout = 5 * time.Minute
+	startupTimeout = 10 * time.Minute
 	// gracePeriod is the time to wait for clean shutdown after sending SIGINT.
 	gracePeriod = 30 * time.Second
 )
