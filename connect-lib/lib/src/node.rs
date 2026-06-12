@@ -56,6 +56,16 @@ impl ListenNode {
         Self::build(repo, n0des_api_secret, Some(project_id)).await
     }
 
+    /// Construct a listen node using a pre-generated iroh identity.
+    ///
+    /// The key is NOT read from disk — it is used directly. Useful when the
+    /// key is generated in memory (e.g., new tunnel creation) and needs to be
+    /// passed through without a round-trip to disk.
+    pub async fn new_with_key(repo: Repo, secret_key: SecretKey) -> Result<Self> {
+        let n0des_api_secret = n0des_api_secret_from_env()?;
+        Self::build_with_key(repo, n0des_api_secret, secret_key).await
+    }
+
     #[instrument("listen-node", skip_all)]
     pub async fn with_n0des_api_secret(
         repo: Repo,
@@ -94,6 +104,33 @@ impl ListenNode {
             _n0des: n0des,
         };
         Ok(this)
+    }
+
+    #[instrument("listen-node", skip(repo, n0des_api_secret, secret_key))]
+    async fn build_with_key(
+        repo: Repo,
+        n0des_api_secret: Option<ApiSecret>,
+        secret_key: SecretKey,
+    ) -> Result<Self> {
+        let config = repo.config().await?;
+        let endpoint = build_endpoint(secret_key, &config).await?;
+        let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
+        let state = repo.load_state().await?;
+
+        let upstream_proxy = UpstreamProxy::new(state.clone())?;
+        let metrics = upstream_proxy.metrics();
+
+        let router = Router::builder(endpoint)
+            .accept(IROH_HTTP_CONNECT_ALPN, upstream_proxy)
+            .spawn();
+
+        Ok(Self {
+            repo,
+            router,
+            state,
+            metrics,
+            _n0des: n0des,
+        })
     }
 
     pub fn state_updated(&self) -> Notified<'_> {
@@ -675,5 +712,35 @@ mod tests {
         for relay in &parsed {
             assert_eq!(relay.scheme(), "https");
         }
+    }
+
+    #[tokio::test]
+    async fn new_with_key_uses_provided_key_without_disk_read() {
+        let tmp = std::env::temp_dir();
+        let dir = tmp.join(format!("node-test-{}", uuid::Uuid::new_v4()));
+        let repo = Repo::open_or_create(&dir).await.unwrap();
+
+        // Generate a key in memory.
+        let key = SecretKey::generate(&mut rand::rng());
+        // Derive expected EndpointId by creating a temporary endpoint.
+        let expected_id = {
+            let ep = iroh::Endpoint::builder()
+                .relay_mode(iroh::endpoint::RelayMode::Default)
+                .secret_key(key.clone())
+                .bind()
+                .await
+                .unwrap();
+            ep.id()
+        };
+
+        // new_with_key should use the key directly (no disk read needed).
+        let node = ListenNode::new_with_key(repo, key).await.unwrap();
+
+        // The endpoint ID must match the provided key's derived ID.
+        assert_eq!(
+            node.endpoint_id(),
+            expected_id,
+            "endpoint ID must match the provided key"
+        );
     }
 }
