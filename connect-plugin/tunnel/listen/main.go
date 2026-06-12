@@ -106,6 +106,14 @@ func runListen(cmd *cobra.Command, args []string) error {
 	// Build environment (no DATUM_ACCESS_TOKEN — binary obtains token via credentials helper)
 	childEnv := env.Build(pluginCtx)
 
+	// Pass tunnel name to the Rust binary so it can construct the
+	// per-tunnel key path. Only set when the name is known upfront
+	// (detach mode). For --endpoint-only and picker paths, the name
+	// comes from the server after tunnel creation (handled in Rust).
+	if name != "" {
+		childEnv = append(childEnv, "DATUM_CONNECT_TUNNEL_NAME="+name)
+	}
+
 	// Build args
 	rustArgs := []string{"--json", "listen"}
 	if endpoint != "" {
