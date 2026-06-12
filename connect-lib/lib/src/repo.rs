@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use iroh::SecretKey;
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 use n0_error::{Result, StackResultExt, StdResultExt};
 
 use crate::{
@@ -170,6 +170,44 @@ impl Repo {
         self.secret_key(key_file_path).await
     }
 
+    /// Per-tunnel listen key. Each named tunnel gets its own iroh identity so
+    /// tunnels in the same project don't collide on the iroh DNS record.
+    ///
+    /// On first access, if a legacy flat `listen_key` exists at the repo root
+    /// for this project, it is moved into `<project_id>/<tunnel_name>/listen_key`
+    /// (preserving the key value for continuity with the registered Connector).
+    /// Subsequent tunnels in the same project (no legacy file left) get freshly
+    /// generated keys.
+    /// Legacy flat key location at the repo root (same as the old
+    /// `Repo::listen_key()` path).
+    const LEGACY_LISTEN_KEY: &'static str = "listen_key";
+
+    #[instrument("repo", skip_all)]
+    pub async fn listen_key_for_tunnel(
+        &self,
+        project_id: &str,
+        tunnel_name: &str,
+    ) -> Result<SecretKey> {
+        let tunnel_dir = self.0.join(project_id).join(tunnel_name);
+        let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
+
+        if !key_file_path.exists() {
+            // Check for legacy key at repo root (the old flat layout).
+            let legacy = self.0.join(Self::LEGACY_LISTEN_KEY);
+            if legacy.exists() {
+                tokio::fs::create_dir_all(&tunnel_dir).await?;
+                info!(
+                    "migrating legacy listen_key {} -> {} for project {project_id} tunnel {tunnel_name}",
+                    legacy.display(),
+                    key_file_path.display(),
+                );
+                tokio::fs::rename(&legacy, &key_file_path).await?;
+            }
+        }
+
+        self.secret_key(key_file_path).await
+    }
+
     async fn secret_key(&self, key_file_path: PathBuf) -> Result<SecretKey> {
         if !key_file_path.exists() {
             warn!("secret key does not exist. creating new key");
@@ -263,6 +301,88 @@ mod tests {
             .join(Repo::LISTEN_KEY_FILE);
         assert!(project_path.exists());
         assert_eq!(tokio::fs::read(&project_path).await.unwrap(), key.to_bytes());
+    }
+
+    // ── Per-tunnel key tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn listen_key_for_tunnel_fresh_project_generates_key_at_per_tunnel_path() {
+        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        let key = repo
+            .listen_key_for_tunnel("my-project", "my-tunnel")
+            .await
+            .unwrap();
+        let tunnel_dir = repo.0.join("my-project").join("my-tunnel");
+        let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
+        assert!(key_path.exists(), "key must exist at per-tunnel path");
+        assert_eq!(tokio::fs::read(&key_path).await.unwrap(), key.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn listen_key_for_tunnel_migrates_legacy_key_to_default_tunnel() {
+        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        // Create a legacy key at the project root.
+        let legacy_key = repo.listen_key().await.unwrap();
+        let legacy_bytes = legacy_key.to_bytes();
+        let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
+        assert!(legacy_path.exists(), "precondition: legacy key exists");
+
+        // Access per-tunnel for "default" tunnel — should migrate.
+        let key = repo
+            .listen_key_for_tunnel("proj-migrate", "default")
+            .await
+            .unwrap();
+        assert_eq!(
+            key.to_bytes(),
+            legacy_bytes,
+            "migrated key must match the legacy key value"
+        );
+        assert!(
+            !legacy_path.exists(),
+            "legacy file must be removed after migration"
+        );
+        let expected_path = repo
+            .0
+            .join("proj-migrate")
+            .join("default")
+            .join(Repo::LISTEN_KEY_FILE);
+        assert!(expected_path.exists(), "key must now live at per-tunnel path");
+    }
+
+    #[tokio::test]
+    async fn listen_key_for_tunnel_is_stable_across_calls() {
+        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        let first = repo
+            .listen_key_for_tunnel("stable-proj", "stable-tunnel")
+            .await
+            .unwrap();
+        let second = repo
+            .listen_key_for_tunnel("stable-proj", "stable-tunnel")
+            .await
+            .unwrap();
+        assert_eq!(
+            first.to_bytes(),
+            second.to_bytes(),
+            "repeat calls must return the same persisted key"
+        );
+    }
+
+    #[tokio::test]
+    async fn listen_key_for_tunnel_two_tunnels_get_distinct_keys() {
+        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        let key_a = repo
+            .listen_key_for_tunnel("multi-proj", "tunnel-a")
+            .await
+            .unwrap();
+        let key_b = repo
+            .listen_key_for_tunnel("multi-proj", "tunnel-b")
+            .await
+            .unwrap();
+        assert_ne!(
+            key_a.to_bytes(),
+            key_b.to_bytes(),
+            "two tunnels in the same project must get distinct keys"
+        );
     }
 }
 
