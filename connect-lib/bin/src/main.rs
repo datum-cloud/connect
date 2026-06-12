@@ -40,6 +40,7 @@ use connect_lib::datum_cloud::env::ApiEnv;
 use connect_lib::datum_cloud::external_token_source::ExternalTokenSource;
 use connect_lib::datum_cloud::DatumCloudClient;
 use connect_lib::{HeartbeatAgent, ListenNode, Repo, SelectedContext, TunnelService};
+use iroh::SecretKey;
 
 mod progress;
 
@@ -244,12 +245,15 @@ async fn run() -> n0_error::Result<()> {
         }
         Commands::Listen { label, endpoint, id } => {
             // Plan 12-02 resolution rules (replaces plan 12-01 stubs):
-            //   --endpoint only        → existing behaviour (no node/service yet)
+            //   --endpoint only        → generate key in memory, create tunnel
             //   --id only              → real resolution via TunnelService::get_active;
-            //                            inherit endpoint from the existing tunnel
-            //   --id + --endpoint      → validate that the named tunnel already
-            //                            references that endpoint; error otherwise
+            //                            read per-tunnel key, inherit endpoint
+            //   --id + --endpoint      → validate endpoint agreement, read per-tunnel key
             //   neither flag           → picker with auto-adopt on len==1, error on len==0
+            //
+            // Per-tunnel key layout (Phase 17):
+            //   --endpoint generates a key in memory → new_with_key() → persist after creation
+            //   --id / picker read per-tunnel key → new_with_key() → no persistence needed
             //
             // Informed by datum-cloud/app@ca4470f (tunnel listen --id pins existing
             // tunnel and preserves its hostname) and @a68d8ae (--id alone resumes
@@ -258,16 +262,45 @@ async fn run() -> n0_error::Result<()> {
             // The id branches pre-build (node, service) so we can call
             // get_active(&id). They stash the result in `preresolved_ns` so the
             // downstream block reuses them instead of re-creating.
+
+            // Optional in-memory key: Some(key) for --endpoint (generated),
+            // None for --id/picker (key read from disk).
+            let mut in_memory_key: Option<SecretKey> = None;
+
             let mut preresolved_ns: Option<(ListenNode, TunnelService, connect_lib::TunnelSummary)> =
                 None;
             let endpoint: String = match (endpoint, id) {
-                (Some(ep), None) => ep,
-                (None, Some(id)) => {
+                (Some(ep), None) => {
+                    // --endpoint only: generate key in memory, use new_with_key()
+                    let secret_key = SecretKey::generate(&mut rand::rng());
+                    in_memory_key = Some(secret_key.clone());
+                    let node = ListenNode::new_with_key(repo.clone(), secret_key).await?;
+                    let service = TunnelService::new(datum.clone(), node.clone());
+                    // No existing tunnel — preresolved_ns stays None so
+                    // the downstream block falls through to create.
+                    preresolved_ns = Some((node, service, connect_lib::TunnelSummary {
+                        id: String::new(),
+                        label: String::new(),
+                        endpoint: ep.clone(),
+                        hostnames: vec![],
+                        enabled: false,
+                        accepted: false,
+                        programmed: false,
+                    }));
+                    ep
+                }
+                (None, Some(tunnel_id)) => {
                     let node = ListenNode::new(repo.clone()).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
-                    let t = service.get_active(&id).await?.ok_or_else(|| {
-                        n0_error::anyerr!("Tunnel '{id}' not found in project {project_id}")
+                    let t = service.get_active(&tunnel_id).await?.ok_or_else(|| {
+                        n0_error::anyerr!("Tunnel '{tunnel_id}' not found in project {project_id}")
                     })?;
+                    // Read the per-tunnel key using the server-assigned tunnel name.
+                    let key = repo
+                        .listen_key_for_tunnel(&project_id, &t.id)
+                        .await?;
+                    let node = ListenNode::new_with_key(repo.clone(), key).await?;
+                    let service = TunnelService::new(datum.clone(), node.clone());
                     // Inherit endpoint from the existing tunnel.
                     let ep = t.endpoint.clone();
                     preresolved_ns = Some((node, service, t));
@@ -285,11 +318,19 @@ async fn run() -> n0_error::Result<()> {
                             t.endpoint
                         ));
                     }
+                    // Read the per-tunnel key using the server-assigned tunnel name.
+                    let key = repo
+                        .listen_key_for_tunnel(&project_id, &t.id)
+                        .await?;
+                    let node = ListenNode::new_with_key(repo.clone(), key).await?;
+                    let service = TunnelService::new(datum.clone(), node.clone());
                     preresolved_ns = Some((node, service, t));
                     endpoint_val
                 }
                 (None, None) => {
                     // Picker codepath needs a service to call list_active.
+                    // Build a temporary node for listing, then rebuild with
+                    // the per-tunnel key after the user picks.
                     let node = ListenNode::new(repo.clone()).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
                     let tunnels = service.list_active().await?;
@@ -325,6 +366,12 @@ async fn run() -> n0_error::Result<()> {
                             .map_err(|e| n0_error::anyerr!("picker error: {e}"))?;
                         tunnels.into_iter().nth(idx).unwrap()
                     };
+                    // Read the per-tunnel key using the picked tunnel's name.
+                    let key = repo
+                        .listen_key_for_tunnel(&project_id, &picked.id)
+                        .await?;
+                    let node = ListenNode::new_with_key(repo.clone(), key).await?;
+                    let service = TunnelService::new(datum.clone(), node.clone());
                     let ep = picked.endpoint.clone();
                     preresolved_ns = Some((node, service, picked));
                     ep
@@ -335,7 +382,11 @@ async fn run() -> n0_error::Result<()> {
             // resolution branches above already built it; otherwise build now
             // and look up the existing tunnel by endpoint.
             let (node, service, existing) = match preresolved_ns {
-                Some((n, s, t)) => (n, s, Some(t)),
+                Some((n, s, t)) => {
+                    // For --endpoint, t.id is empty — treat as "no existing tunnel".
+                    let existing = if t.id.is_empty() { None } else { Some(t) };
+                    (n, s, existing)
+                }
                 None => {
                     let n = ListenNode::new(repo.clone()).await?;
                     let s = TunnelService::new(datum.clone(), n.clone());
@@ -372,6 +423,16 @@ async fn run() -> n0_error::Result<()> {
             } else {
                 let label = label.unwrap_or_else(|| endpoint.clone());
                 let tunnel = service.create_active(&label, &endpoint).await?;
+                // Persist the in-memory key to the per-tunnel directory.
+                if let Some(ref secret_key) = in_memory_key {
+                    let key_path = repo
+                        .path()
+                        .join(&project_id)
+                        .join(&tunnel.id)
+                        .join(Repo::LISTEN_KEY_FILE);
+                    tokio::fs::create_dir_all(key_path.parent().unwrap()).await?;
+                    tokio::fs::write(&key_path, secret_key.to_bytes()).await?;
+                }
                 if json {
                     println!(
                         "{}",

@@ -54,7 +54,7 @@ impl Repo {
 
     const CONFIG_FILE: &str = "config.yml";
     const CONNECT_KEY_FILE: &str = "connect_key";
-    const LISTEN_KEY_FILE: &str = "listen_key";
+    pub const LISTEN_KEY_FILE: &str = "listen_key";
     const STATE_FILE: &str = "state.yml";
     pub fn default_location() -> Result<PathBuf, MissingConnectDir> {
         match std::env::var("DATUM_CONNECT_DIR") {
