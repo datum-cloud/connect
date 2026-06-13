@@ -436,12 +436,6 @@ impl TunnelService {
     }
 
     pub async fn list_project(&self, project_id: &str) -> Result<Vec<TunnelSummary>> {
-        let connector = self.find_connector_readonly(project_id).await?;
-        let Some(connector) = connector else {
-            return Ok(Vec::new());
-        };
-        let connector_name = connector.name_any();
-
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();
         let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
@@ -452,9 +446,8 @@ impl TunnelService {
             .await
             .std_context("Failed to list HTTPProxy objects")?;
 
-        let ad_selector = format!("{ADVERTISEMENT_CONNECTOR_FIELD}={connector_name}");
         let ad_list = ads
-            .list(&ListParams::default().fields(&ad_selector))
+            .list(&ListParams::default())
             .await
             .std_context("Failed to list ConnectorAdvertisement objects")?;
         let enabled_by_name: std::collections::HashMap<String, ConnectorAdvertisement> = ad_list
@@ -468,7 +461,7 @@ impl TunnelService {
             let Some(name) = proxy.metadata.name.clone() else {
                 continue;
             };
-            if !proxy_uses_connector(&proxy, &connector_name) {
+            if !name.starts_with("tunnel-") {
                 continue;
             }
             let label = proxy
