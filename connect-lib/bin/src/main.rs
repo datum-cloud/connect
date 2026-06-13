@@ -675,14 +675,44 @@ async fn run() -> n0_error::Result<()> {
         Commands::Delete { id } => {
             let node = ListenNode::new(repo.clone()).await?;
             let service = TunnelService::new(datum.clone(), node.clone());
-            service.delete_active(&id).await?;
+            let outcome = service.delete_active(&id).await?;
             if json {
+                let mut resources = Vec::new();
+                if let Some(ref name) = outcome.http_proxy {
+                    resources.push(serde_json::json!({"type": "HTTPProxy", "name": name}));
+                }
+                if let Some(ref name) = outcome.connector_ad {
+                    resources.push(serde_json::json!({"type": "ConnectorAdvertisement", "name": name}));
+                }
+                if let Some(ref name) = outcome.traffic_protection_policy {
+                    resources.push(serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}));
+                }
+                if let Some(ref name) = outcome.connector {
+                    resources.push(serde_json::json!({"type": "Connector", "name": name}));
+                }
                 println!(
                     "{}",
-                    serde_json::json!({"type": "tunnel_deleted", "id": id, "deleted": true})
+                    serde_json::json!({
+                        "type": "tunnel_deleted",
+                        "id": id,
+                        "deleted": true,
+                        "resources": resources
+                    })
                 );
             } else {
                 println!("Deleted tunnel {}", id);
+                if let Some(name) = outcome.http_proxy {
+                    println!("  HTTPProxy {}", name);
+                }
+                if let Some(name) = outcome.connector_ad {
+                    println!("  ConnectorAdvertisement {}", name);
+                }
+                if let Some(name) = outcome.traffic_protection_policy {
+                    println!("  TrafficProtectionPolicy {}", name);
+                }
+                if let Some(name) = outcome.connector {
+                    println!("  Connector {}", name);
+                }
             }
         }
     }

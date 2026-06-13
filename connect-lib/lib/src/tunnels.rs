@@ -14,6 +14,7 @@ use crate::datum_apis::connector::{
     ConnectorConnectionDetailsPublicKey, ConnectorConnectionType, ConnectorSpec,
     PublicKeyConnectorAddress, PublicKeyDiscoveryMode,
 };
+use crate::datum_apis::connector_class::ConnectorClass;
 use crate::datum_apis::connector_advertisement::{
     ConnectorAdvertisement, ConnectorAdvertisementLayer4, ConnectorAdvertisementLayer4Service,
     ConnectorAdvertisementSpec, Layer4ServiceAddress, Layer4ServicePort, Protocol,
@@ -77,7 +78,10 @@ impl TunnelSummary {
 #[derive(Debug, Clone)]
 pub struct TunnelDeleteOutcome {
     pub project_id: String,
-    pub connector_deleted: bool,
+    pub http_proxy: Option<String>,
+    pub connector_ad: Option<String>,
+    pub traffic_protection_policy: Option<String>,
+    pub connector: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -939,6 +943,7 @@ impl TunnelService {
             Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         let connectors: Api<Connector> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
 
+        let mut http_proxy_name: Option<String> = None;
         if proxies
             .get_opt(tunnel_id)
             .await
@@ -949,8 +954,10 @@ impl TunnelService {
                 .delete(tunnel_id, &DeleteParams::default())
                 .await
                 .std_context("Failed to delete HTTPProxy")?;
+            http_proxy_name = Some(tunnel_id.to_string());
         }
 
+        let mut connector_ad_name: Option<String> = None;
         if ads
             .get_opt(tunnel_id)
             .await
@@ -960,8 +967,10 @@ impl TunnelService {
             ads.delete(tunnel_id, &DeleteParams::default())
                 .await
                 .std_context("Failed to delete ConnectorAdvertisement")?;
+            connector_ad_name = Some(tunnel_id.to_string());
         }
 
+        let mut tpp_name: Option<String> = None;
         let tpps: Api<TrafficProtectionPolicy> =
             Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         if tpps
@@ -973,6 +982,7 @@ impl TunnelService {
             tpps.delete(tunnel_id, &DeleteParams::default())
                 .await
                 .std_context("Failed to delete TrafficProtectionPolicy")?;
+            tpp_name = Some(tunnel_id.to_string());
         }
 
         if self.publish_tickets {
@@ -984,7 +994,7 @@ impl TunnelService {
             warn!(%tunnel_id, "Failed to remove proxy state: {err:#}");
         }
 
-        let mut connector_deleted = false;
+        let mut connector_name_out: Option<String> = None;
         if let Some(connector_name) = connector_name {
             let remaining = proxies
                 .list(&ListParams::default())
@@ -1019,14 +1029,21 @@ impl TunnelService {
                         .delete(&connector_name, &DeleteParams::default())
                         .await
                         .std_context("Failed to delete Connector")?;
-                    connector_deleted = true;
+                    connector_name_out = Some(connector_name);
                 }
             }
         }
 
+        if let Err(err) = self.listen.repo().delete_tunnel_dir(project_id, tunnel_id).await {
+            warn!(%tunnel_id, "Failed to delete tunnel local state: {err:#}");
+        }
+
         Ok(TunnelDeleteOutcome {
             project_id: project_id.to_string(),
-            connector_deleted,
+            http_proxy: http_proxy_name,
+            connector_ad: connector_ad_name,
+            traffic_protection_policy: tpp_name,
+            connector: connector_name_out,
         })
     }
 
@@ -1036,10 +1053,29 @@ impl TunnelService {
         let connectors: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
         let endpoint_id = self.listen.endpoint_id().to_string();
         let selector = format!("{CONNECTOR_SELECTOR_FIELD}={endpoint_id}");
-        let list = connectors
+        let list = match connectors
             .list(&ListParams::default().fields(&selector))
             .await
-            .std_context("Failed to list connectors")?;
+        {
+            Ok(list) => list,
+            Err(kube::Error::Api(e)) if e.code == 403 => {
+                n0_error::bail_any!(
+                    "Permission denied listing connectors in project {project_id}. \
+                     Switch your datumctl context to this project first: \
+                     'datumctl ctx switch {project_id}'"
+                );
+            }
+            Err(kube::Error::Api(e)) if e.code == 401 => {
+                n0_error::bail_any!(
+                    "Authentication failed for project {project_id}. \
+                     Switch your datumctl context to this project first: \
+                     'datumctl ctx switch {project_id}'"
+                );
+            }
+            Err(err) => {
+                return Err(err).std_context("Failed to list connectors");
+            }
+        };
         if list.items.is_empty() {
             return Ok(None);
         }
@@ -1059,58 +1095,31 @@ impl TunnelService {
         let connectors: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
         let endpoint_id = self.listen.endpoint_id().to_string();
         let selector = format!("{CONNECTOR_SELECTOR_FIELD}={endpoint_id}");
-        let list = connectors
+        let list = match connectors
             .list(&ListParams::default().fields(&selector))
             .await
-            .std_context("Failed to list connectors")?;
+        {
+            Ok(list) => list,
+            Err(kube::Error::Api(e)) if e.code == 403 => {
+                n0_error::bail_any!(
+                    "Permission denied listing connectors in project {project_id}. \
+                     Switch your datumctl context to this project first: \
+                     'datumctl ctx switch {project_id}'"
+                );
+            }
+            Err(kube::Error::Api(e)) if e.code == 401 => {
+                n0_error::bail_any!(
+                    "Authentication failed for project {project_id}. \
+                     Switch your datumctl context to this project first: \
+                     'datumctl ctx switch {project_id}'"
+                );
+            }
+            Err(err) => {
+                return Err(err).std_context("Failed to list connectors");
+            }
+        };
         if list.items.is_empty() {
-            let fallback = connectors
-                .list(&ListParams::default())
-                .await
-                .std_context("Failed to list connectors for fallback")?;
-            if fallback.items.len() != 1 {
-                if !fallback.items.is_empty() {
-                    warn!(
-                        %project_id,
-                        count = fallback.items.len(),
-                        "Multiple connectors found without status match"
-                    );
-                }
-                return Ok(None);
-            }
-            let mut connector = fallback.items.into_iter().next().unwrap();
-            let needs_patch = connector
-                .status
-                .as_ref()
-                .and_then(|status| status.connection_details.as_ref())
-                .and_then(|details| details.public_key.as_ref())
-                .map(|details| details.id.as_str() != endpoint_id.as_str())
-                .unwrap_or(true);
-            if needs_patch && let Some(details) = build_connection_details(&self.listen) {
-                let details_value = serde_json::to_value(details)
-                    .std_context("Failed to serialize connection details")?;
-                let patch = json!({ "status": { "connectionDetails": details_value } });
-                if let Err(err) = connectors
-                    .patch_status(
-                        &connector.name_any(),
-                        &PatchParams::default(),
-                        &Patch::Merge(&patch),
-                    )
-                    .await
-                {
-                    warn!(
-                        connector = %connector.name_any(),
-                        "Failed to patch connector status: {err:#}"
-                    );
-                } else {
-                    connector = connectors
-                        .get(&connector.name_any())
-                        .await
-                        .std_context("Failed to reload connector after patch")?;
-                }
-            }
-            patch_device_annotations(&connectors, &mut connector).await;
-            return Ok(Some(connector));
+            return Ok(None);
         }
         if list.items.len() > 1 {
             debug!(
@@ -1124,6 +1133,30 @@ impl TunnelService {
         Ok(Some(connector))
     }
 
+    async fn resolve_connector_class(client: kube::Client) -> Result<String> {
+        let classes: Api<ConnectorClass> = Api::all(client);
+        let class_list = classes.list(&ListParams::default()).await
+            .std_context("Failed to list ConnectorClasses")?;
+        if class_list.items.is_empty() {
+            n0_error::bail_any!("No ConnectorClass found in cluster; cannot create tunnel");
+        }
+        for c in &class_list.items {
+            if c.name_any() == DEFAULT_CONNECTOR_CLASS_NAME {
+                return Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string());
+            }
+        }
+        let fallback = class_list
+            .items
+            .first()
+            .map(|c| c.name_any())
+            .context("No ConnectorClass available")?;
+        warn!(
+            %fallback,
+            "ConnectorClass '{DEFAULT_CONNECTOR_CLASS_NAME}' not found, using '{fallback}'"
+        );
+        Ok(fallback)
+    }
+
     async fn ensure_connector(&self, project_id: &str) -> Result<Connector> {
         if let Some(connector) = self.find_connector(project_id).await? {
             return Ok(connector);
@@ -1131,6 +1164,7 @@ impl TunnelService {
 
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();
+        let class_name = Self::resolve_connector_class(client.clone()).await?;
         let connectors: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
 
         let mut connector = Connector {
@@ -1140,7 +1174,7 @@ impl TunnelService {
                 ..Default::default()
             },
             spec: ConnectorSpec {
-                connector_class_name: DEFAULT_CONNECTOR_CLASS_NAME.to_string(),
+                connector_class_name: class_name,
                 capabilities: None,
             },
             status: None,

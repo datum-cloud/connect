@@ -115,7 +115,7 @@ func runListen(cmd *cobra.Command, args []string) error {
 	}
 
 	// Build args
-	rustArgs := []string{"--json", "listen"}
+	rustArgs := []string{"--json", "--project", pluginCtx.Project, "listen"}
 	if endpoint != "" {
 		rustArgs = append(rustArgs, "--endpoint", endpoint)
 	}

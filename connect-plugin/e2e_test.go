@@ -300,7 +300,7 @@ func TestDeleteCommandWithFakeBinary(t *testing.T) {
 	pluginBin := buildPlugin(t)
 
 	connectDir, _ := os.Getwd()
-	cmd := exec.Command(pluginBin, "tunnel", "delete", "--id", "tun-123")
+	cmd := exec.Command(pluginBin, "tunnel", "delete", "--id", "tun-123", "--output", "json")
 	cmd.Env = append(os.Environ(),
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,

@@ -108,20 +108,7 @@
           # rust-analyzer wants this to navigate to std/core sources.
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
-          shellHook = ''
-            echo "Datum Connect dev shell"
-            echo "  rustc: $(rustc --version)"
-            echo "  cargo: $(cargo --version)"
-            echo "  go:    $(go version | awk '{print $3" "$4}')"
-            echo "  task:  $(task --version 2>/dev/null || echo 'not found')"
-            echo ""
-            echo "Quick start:"
-            echo "  task build          — build Go plugin + Rust binary"
-            echo "  task test           — run Go + Rust unit tests"
-            echo "  task install        — install to ~/.datumctl/plugins"
-            echo "  task test:e2e       — run the 10-min E2E tunnel stability script"
-            echo ""
-          '';
+          shellHook = "";
         };
 
         # nix fmt

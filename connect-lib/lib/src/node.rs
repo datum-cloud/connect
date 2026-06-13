@@ -74,6 +74,10 @@ impl ListenNode {
         Self::build(repo, n0des_api_secret, None).await
     }
 
+    pub fn repo(&self) -> &Repo {
+        &self.repo
+    }
+
     #[instrument("listen-node", skip(repo, n0des_api_secret))]
     async fn build(
         repo: Repo,

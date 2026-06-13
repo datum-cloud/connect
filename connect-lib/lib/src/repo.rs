@@ -232,6 +232,15 @@ impl Repo {
     pub fn path(&self) -> &PathBuf {
         &self.0
     }
+
+    /// Delete the local state directory for a tunnel
+    pub async fn delete_tunnel_dir(&self, project_id: &str, tunnel_name: &str) -> Result<()> {
+        let tunnel_dir = self.0.join(project_id).join(tunnel_name);
+        if tunnel_dir.exists() {
+            tokio::fs::remove_dir_all(&tunnel_dir).await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -2,10 +2,10 @@ package delete
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
@@ -75,9 +75,21 @@ func runDelete(cmd *cobra.Command, args []string) error {
 			fmt.Fprint(cmd.OutOrStdout(), string(yaml))
 		}
 	default:
-		// Table mode for single object
-		w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-		if err := output.RenderTable(result.Stdout, w); err != nil {
+		// Table mode: render human-readable output for delete
+		var deleteResult map[string]interface{}
+		if err := json.Unmarshal(result.Stdout, &deleteResult); err == nil {
+			id, _ := deleteResult["id"].(string)
+			fmt.Fprintf(cmd.OutOrStdout(), "Deleted tunnel %s\n", id)
+			if resources, ok := deleteResult["resources"].([]interface{}); ok {
+				for _, r := range resources {
+					if res, ok := r.(map[string]interface{}); ok {
+						typ, _ := res["type"].(string)
+						name, _ := res["name"].(string)
+						fmt.Fprintf(cmd.OutOrStdout(), "  %s %s\n", typ, name)
+					}
+				}
+			}
+		} else {
 			fmt.Fprint(cmd.OutOrStdout(), string(result.Stdout))
 		}
 	}
