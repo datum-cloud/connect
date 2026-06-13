@@ -220,12 +220,6 @@ where
                             start.elapsed().as_secs_f64(),
                             step.resource.as_deref().unwrap_or("")
                         );
-                        if let Some(reason) = &step.reason {
-                            let _ = writeln!(std::io::stderr(), "    reason: {}", reason);
-                        }
-                        if let Some(message) = &step.message {
-                            let _ = writeln!(std::io::stderr(), "    message: {}", message);
-                        }
                         let _ = std::io::stderr().flush();
                         last_status_print.insert(step.kind, secs);
                     }
