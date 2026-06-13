@@ -624,14 +624,32 @@ async fn run() -> n0_error::Result<()> {
             };
 
             // --- Cleanup (runs for all exit paths) ---
-            if let Err(e) = service.set_enabled_active(&tunnel_id, false).await {
-                tracing::warn!("failed to disable tunnel on shutdown: {e}");
-            }
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"type": "tunnel_disabled", "id": tunnel_id})
-                );
+            let outcome = service.delete_active(&tunnel_id).await;
+            match &outcome {
+                Ok(o) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "type": "tunnel_deleted",
+                                "id": tunnel_id,
+                                "http_proxy": o.http_proxy,
+                                "connector_ad": o.connector_ad,
+                                "traffic_protection_policy": o.traffic_protection_policy,
+                                "connector": o.connector,
+                            })
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to delete tunnel on shutdown: {e}");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"type": "tunnel_deleted", "id": tunnel_id})
+                        );
+                    }
+                }
             }
 
             // Non-zero exit for terminal failures.
