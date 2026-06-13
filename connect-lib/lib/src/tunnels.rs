@@ -1135,26 +1135,33 @@ impl TunnelService {
 
     async fn resolve_connector_class(client: kube::Client) -> Result<String> {
         let classes: Api<ConnectorClass> = Api::all(client);
-        let class_list = classes.list(&ListParams::default()).await
-            .std_context("Failed to list ConnectorClasses")?;
-        if class_list.items.is_empty() {
-            n0_error::bail_any!("No ConnectorClass found in cluster; cannot create tunnel");
-        }
-        for c in &class_list.items {
-            if c.name_any() == DEFAULT_CONNECTOR_CLASS_NAME {
-                return Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string());
+        match classes.list(&ListParams::default()).await {
+            Ok(class_list) if !class_list.items.is_empty() => {
+                for c in &class_list.items {
+                    if c.name_any() == DEFAULT_CONNECTOR_CLASS_NAME {
+                        return Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string());
+                    }
+                }
+                let fallback = class_list
+                    .items
+                    .first()
+                    .map(|c| c.name_any())
+                    .context("No ConnectorClass available")?;
+                warn!(
+                    %fallback,
+                    "ConnectorClass '{DEFAULT_CONNECTOR_CLASS_NAME}' not found, using '{fallback}'"
+                );
+                Ok(fallback)
+            }
+            Ok(_) => {
+                warn!("No ConnectorClass found in cluster; using default '{DEFAULT_CONNECTOR_CLASS_NAME}'");
+                Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string())
+            }
+            Err(e) => {
+                warn!("Failed to list ConnectorClasses (using default '{DEFAULT_CONNECTOR_CLASS_NAME}'): {e:#}");
+                Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string())
             }
         }
-        let fallback = class_list
-            .items
-            .first()
-            .map(|c| c.name_any())
-            .context("No ConnectorClass available")?;
-        warn!(
-            %fallback,
-            "ConnectorClass '{DEFAULT_CONNECTOR_CLASS_NAME}' not found, using '{fallback}'"
-        );
-        Ok(fallback)
     }
 
     async fn ensure_connector(&self, project_id: &str) -> Result<Connector> {

@@ -171,11 +171,8 @@ pub fn build_probe_urls(endpoint: &str, hostname: &str) -> (String, String) {
 /// poll. Returns the final `TunnelProgress` when all steps are Ready, returns
 /// an error formatted via `format_terminal_failure` when a terminal-failure
 /// step is observed, and returns an error if the tunnel disappears upstream
-/// during setup. Emits a one-shot stderr warning when a step has been Pending
-/// for ≥ 30 seconds.
-///
-/// No overall timeout: the caller (Listen handler) bounds total time via the
-/// 60-second Go-supervisor startup window in `connect/tunnel/listen/main.go`.
+/// during setup. Prints a status line to stderr every 10s for any step that
+/// has been Pending for at least 10s.
 pub async fn await_tunnel_progress<F>(
     service: &TunnelService,
     tunnel_id: &str,
@@ -186,7 +183,7 @@ where
 {
     let mut last_seen: HashMap<ProgressStepKind, StepStatus> = HashMap::new();
     let mut pending_since: HashMap<ProgressStepKind, Instant> = HashMap::new();
-    let mut warned_stuck: HashMap<ProgressStepKind, bool> = HashMap::new();
+    let mut last_status_print: HashMap<ProgressStepKind, u64> = HashMap::new();
 
     loop {
         let progress_opt = service
@@ -209,26 +206,33 @@ where
                 progress_cb(step, prev);
                 last_seen.insert(step.kind, step.status);
             }
-            // Track Pending duration; emit a one-shot stuck warning at 30s.
+            // Track Pending duration; print status every 10s.
             if step.status == StepStatus::Pending {
                 pending_since.entry(step.kind).or_insert_with(Instant::now);
                 if let Some(start) = pending_since.get(&step.kind) {
                     let secs = start.elapsed().as_secs();
-                    if secs >= 30 && !warned_stuck.get(&step.kind).copied().unwrap_or(false) {
+                    let last_print = last_status_print.get(&step.kind).copied().unwrap_or(0);
+                    if secs >= 10 && secs - last_print >= 10 {
                         let _ = writeln!(
                             std::io::stderr(),
-                            "warning: step {} stuck in Pending for {}s ({})",
+                            "  \u{25CB} waiting for {} ({:.0}s) [{}]",
                             step.kind.label(),
-                            secs,
-                            step.resource.as_deref().unwrap_or("(no resource)")
+                            start.elapsed().as_secs_f64(),
+                            step.resource.as_deref().unwrap_or("")
                         );
+                        if let Some(reason) = &step.reason {
+                            let _ = writeln!(std::io::stderr(), "    reason: {}", reason);
+                        }
+                        if let Some(message) = &step.message {
+                            let _ = writeln!(std::io::stderr(), "    message: {}", message);
+                        }
                         let _ = std::io::stderr().flush();
-                        warned_stuck.insert(step.kind, true);
+                        last_status_print.insert(step.kind, secs);
                     }
                 }
             } else {
                 pending_since.remove(&step.kind);
-                warned_stuck.remove(&step.kind);
+                last_status_print.remove(&step.kind);
             }
         }
 

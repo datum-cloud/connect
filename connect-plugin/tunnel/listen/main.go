@@ -39,9 +39,10 @@ type TunnelReady struct {
 
 func NewCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "listen [flags]",
-		Short: "Start a tunnel and block",
-		RunE:  runListen,
+		Use:          "listen [flags]",
+		Short:        "Start a tunnel and block",
+		SilenceUsage: true,
+		RunE:         runListen,
 	}
 	cmd.Flags().String("label", "", "Display name for the tunnel")
 	cmd.Flags().String("endpoint", "", "Local address to expose (host:port, required)")
