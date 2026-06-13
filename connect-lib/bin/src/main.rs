@@ -628,17 +628,42 @@ async fn run() -> n0_error::Result<()> {
             match &outcome {
                 Ok(o) => {
                     if json {
+                        let mut resources = Vec::new();
+                        if let Some(ref name) = o.http_proxy {
+                            resources.push(serde_json::json!({"type": "HTTPProxy", "name": name}));
+                        }
+                        if let Some(ref name) = o.connector_ad {
+                            resources.push(serde_json::json!({"type": "ConnectorAdvertisement", "name": name}));
+                        }
+                        if let Some(ref name) = o.traffic_protection_policy {
+                            resources.push(serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}));
+                        }
+                        if let Some(ref name) = o.connector {
+                            resources.push(serde_json::json!({"type": "Connector", "name": name}));
+                        }
                         println!(
                             "{}",
                             serde_json::json!({
                                 "type": "tunnel_deleted",
                                 "id": tunnel_id,
-                                "http_proxy": o.http_proxy,
-                                "connector_ad": o.connector_ad,
-                                "traffic_protection_policy": o.traffic_protection_policy,
-                                "connector": o.connector,
+                                "deleted": true,
+                                "resources": resources
                             })
                         );
+                    } else {
+                        println!("Deleted tunnel {}", tunnel_id);
+                        if let Some(ref name) = o.http_proxy {
+                            println!("  HTTPProxy {}", name);
+                        }
+                        if let Some(ref name) = o.connector_ad {
+                            println!("  ConnectorAdvertisement {}", name);
+                        }
+                        if let Some(ref name) = o.traffic_protection_policy {
+                            println!("  TrafficProtectionPolicy {}", name);
+                        }
+                        if let Some(ref name) = o.connector {
+                            println!("  Connector {}", name);
+                        }
                     }
                 }
                 Err(e) => {
