@@ -9,11 +9,15 @@ import (
 	"go.datum.net/datumctl/plugin"
 )
 
+// Overridden at release time via -ldflags "-X main.version=vX.Y.Z".
+// See .goreleaser.yaml.
+var version = "v0.1.0"
+
 func main() {
 	// Serve manifest before cobra parses anything
 	m := plugin.Manifest{
 		Name:        "connect",
-		Version:     "v0.1.0",
+		Version:     version,
 		Description: "Manage Datum Connect tunnels",
 		APIVersion:  1,
 	}

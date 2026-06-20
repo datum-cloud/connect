@@ -75,36 +75,90 @@ connect/
 └── README.md
 ```
 
-## Build
-
-Requires Go toolchain and Rust/Cargo (provided via `nix develop`):
+## Install
 
 ```bash
-# Development build (debug)
-nix develop ~/src/datum-cloud/datumctl  # Go toolchain
+datumctl plugin install datum-cloud/connect
+```
+
+Downloads the pre-built archive from the [latest GitHub release](https://github.com/datum-cloud/connect/releases) and places both binaries in `~/.datumctl/plugins/`.
+
+## Components
+
+### connect-plugin — Go supervisor (`connect-plugin/`)
+
+The datumctl plugin binary. Parses JSON events from the Rust subprocess's stdout, forwards signals, manages startup/grace timeout.
+
+```bash
+# Build (debug)
+cd connect-plugin && go build -o datumctl-connect .
+
+# Test
+cd connect-plugin && go test -timeout 5m ./internal/...
+
+# Install to ~/.datumctl/plugins/
+cp connect-plugin/datumctl-connect ~/.datumctl/plugins/
+```
+
+Requires **Go ~1.25.8+** (see `connect-plugin/go.mod`).
+
+### connect-lib — Rust library + binary (`connect-lib/`)
+
+The tunnel agent. The `datum-connect` binary is a headless tunnel daemon driven by iroh + HTTPProxy APIs. It is also published as a **library crate** (`connect-lib/lib/`) exposing shared types, Kube API client, DatumCloud API bindings, heartbeat agent, and tunnel service — suitable for embedding in other clients such as [Datum Desktop](https://github.com/datum-cloud/app).
+
+```bash
+# Build binary (debug)
+cd connect-lib && cargo build -p datum-connect
+
+# Run unit tests across the workspace
+cd connect-lib && cargo test
+
+# Package crate for downstream use
+cd connect-lib && cargo package -p connect-lib
+```
+
+Requires **Rust stable** (see `connect-lib/rust-toolchain.toml`).
+
+## Developing
+
+The canonical build and test commands are in `Taskfile.yaml`. Each task delegates to the underlying Go or Rust toolchain in the relevant subdirectory.
+
+```bash
+# Build both binaries (debug)
 task build
 
 # Release build with LTO + strip
 task build:release
 
-# Build and install to ~/.datumctl/plugins/
-task install:release
+# Run all tests
+task test
+
+# Run Go or Rust tests individually
+task test:go
+task test:rust
 ```
 
-Or use the helper scripts in `scripts/`.
+Helper scripts are also available in `connect-plugin/scripts/`.
 
-## Testing
+## Nix
+
+A dev shell with Go, Rust, task, pkg-config, and openssl is available:
 
 ```bash
-# Go unit tests
-task test:go
-
-# Rust unit tests
-task test:rust
-
-# Both
-task test
+nix develop
 ```
+
+The packaged Rust binary can also be built with Nix:
+
+```bash
+nix build
+```
+
+## Releases
+
+Push a semver tag (`vX.Y.Z`); `.github/workflows/release.yml` cross-compiles `datum-connect` (Rust) via a matrix of OS runners, then runs GoReleaser to produce per-platform archives containing both `datumctl-connect` and `datum-connect`, plus `checksums.txt`.
+
+The plugin is versioned independently of both `datumctl` and the `datum-connect` Rust binary. After a release, update the `Plugin` manifest at `datum-cloud/datumctl-plugins/index.yaml`.
 
 ## Key Design Decisions
 
