@@ -142,7 +142,7 @@ fn resolve_project(project_id: &str) -> SelectedContext {
 async fn main() {
     let result = run().await;
     if let Err(err) = result {
-        eprintln!("{}", err);
+        eprintln!("{:#}", err);
         std::process::exit(1);
     }
 }
@@ -214,7 +214,7 @@ async fn run() -> n0_error::Result<()> {
             let output: Vec<serde_json::Value> = tunnels
                 .iter()
                 .map(|t| {
-                    let status = if t.accepted && t.programmed {
+                    let status = if t.accepted && t.programmed && t.connector_metadata_programmed {
                         "ready"
                     } else if t.accepted {
                         "accepted"
@@ -286,6 +286,7 @@ async fn run() -> n0_error::Result<()> {
                         enabled: false,
                         accepted: false,
                         programmed: false,
+                        connector_metadata_programmed: false,
                     }));
                     ep
                 }
@@ -400,12 +401,30 @@ async fn run() -> n0_error::Result<()> {
             let _ = std::io::stderr().flush();
 
             let setup_start = std::time::Instant::now();
-            let step_started_at = std::cell::RefCell::new(
+            let step_started_at = std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::<
                     connect_lib::ProgressStepKind,
                     std::time::Instant,
                 >::new(),
-            );
+            ));
+
+            // Start heartbeat BEFORE create_active/ensure_connector so the
+            // iroh endpoint connects to the relay and populates its address
+            // before build_connection_details() runs. Without this the
+            // connector status patch has no relay URL and the operator never
+            // sees connection details → Connector/Ready stays False forever.
+            let heartbeat = HeartbeatAgent::new(datum.clone(), node.clone());
+            heartbeat.start().await;
+            heartbeat.register_project(&project_id).await;
+            // Wait up to 10s for the relay URL to appear (iroh connects fast
+            // in practice, usually <1s). This is a best-effort poll; if the
+            // relay never appears, ensure_connector will warn and proceed.
+            for _ in 0..40 {
+                if node.endpoint().addr().relay_urls().next().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
 
             let tunnel_id = if let Some(t) = existing {
                 if let Some(label) = label.filter(|l| l != &t.label) {
@@ -442,16 +461,8 @@ async fn run() -> n0_error::Result<()> {
                 tunnel.id
             };
 
-            let heartbeat = HeartbeatAgent::new(datum.clone(), node.clone());
-            heartbeat.start().await;
-            heartbeat.register_project(&project_id).await;
+            let _ = service.set_enabled_active(&tunnel_id, true).await;
 
-            service.set_enabled_active(&tunnel_id, true).await?;
-
-            // Plan 12-03: drive setup through await_tunnel_progress (per-step
-            // observability + terminal-failure short-circuit) followed by
-            // verify_endpoints (probe origin + proxy URL before declaring ready).
-            // The proxy probe retries indefinitely with periodic status every 10s.
             // Mode (Text/Json) routes callback output:
             //   Text → stderr (one transition line per change, prefixed by resource)
             //   Json → stdout (one tunnel_progress / tunnel_verifying /
@@ -460,19 +471,54 @@ async fn run() -> n0_error::Result<()> {
             // ignores the new event types; only the final tunnel_ready event
             // unblocks its gotReady handshake.
             let mode = if json { progress::Mode::Json } else { progress::Mode::Text };
-            let progress_cb = |step: &connect_lib::ProgressStep,
-                                prev: connect_lib::StepStatus| {
+
+            // Now start progress monitoring — heartbeat is already connecting,
+            // so the operator sees Pending before Ready.
+            let mode_for_cb = mode;
+            let step_started_at_for_cb = step_started_at.clone();
+            let progress_cb = move |step: &connect_lib::ProgressStep,
+                                    prev: connect_lib::StepStatus| {
                 let elapsed = {
-                    let mut map = step_started_at.borrow_mut();
+                    let mut map = step_started_at_for_cb.lock().unwrap();
                     let timer = map
                         .entry(step.kind.clone())
                         .or_insert_with(std::time::Instant::now);
                     timer.elapsed()
                 };
-                progress::render_progress_step(mode, step, prev, elapsed);
+                progress::render_progress_step(mode_for_cb, step, prev, elapsed);
             };
-            let final_progress =
-                progress::await_tunnel_progress(&service, &tunnel_id, &progress_cb).await?;
+
+            let service_for_progress = service.clone();
+            let tunnel_id_for_progress = tunnel_id.clone();
+            let progress_handle = tokio::spawn(async move {
+                progress::await_tunnel_progress(&service_for_progress, &tunnel_id_for_progress, &progress_cb).await
+            });
+
+            let mut final_progress = progress_handle.await.unwrap()?;
+
+            // Re-patch connectionDetails now that the connector is Ready:True.
+            // This triggers the replicator to re-mirror the upstream-status
+            // annotation to the downstream cluster with the current Ready:True
+            // state, which in turn triggers Envoy Gateway to re-translate xDS
+            // so the extension server injects the iroh cluster config.
+            // Without this, if the annotation was captured at Ready:False
+            // (race between replicator and lease renewal), the extension
+            // server serves 503 indefinitely.
+            let _ = service.refresh_connection_details().await;
+
+            // Hostnames are written by the gateway controller shortly after
+            // Programmed=True. Poll until one appears (usually <1s).
+            if final_progress.hostnames.is_empty() {
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Ok(Some(p)) = service.get_active_progress(&tunnel_id).await {
+                        if !p.hostnames.is_empty() {
+                            final_progress = p;
+                            break;
+                        }
+                    }
+                }
+            }
             let hostname = final_progress
                 .hostnames
                 .first()
@@ -480,23 +526,6 @@ async fn run() -> n0_error::Result<()> {
                 .ok_or_else(|| {
                     n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
                 })?;
-
-            // Verify endpoints reachable. Budget is only used for the origin
-            // probe (best-effort, non-fatal). The proxy probe retries
-            // indefinitely with periodic status every 10s.
-            let setup_elapsed = setup_start.elapsed();
-            let total_budget = std::time::Duration::from_secs(60);
-            let min_budget = std::time::Duration::from_secs(5);
-            let verify_budget = std::cmp::max(
-                total_budget.saturating_sub(setup_elapsed),
-                min_budget,
-            );
-            let _ = writeln!(std::io::stderr(), "  \u{25CB} Verifying connectivity...");
-            let _ = std::io::stderr().flush();
-            let verify_cb = |label: &str, url: &str, elapsed: std::time::Duration, status: Option<u16>| {
-                progress::render_verify(mode, label, url, elapsed, status);
-            };
-            progress::verify_endpoints(&endpoint, &hostname, verify_budget, &verify_cb).await?;
 
             // Re-fetch the up-to-date TunnelSummary for the tunnel_ready
             // payload (existing contract — id, label, endpoint, hostnames,

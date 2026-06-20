@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use iroh_proxy_utils::Authority;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -65,6 +66,7 @@ pub struct TunnelSummary {
     pub enabled: bool,
     pub accepted: bool,
     pub programmed: bool,
+    pub connector_metadata_programmed: bool,
 }
 
 impl TunnelSummary {
@@ -113,6 +115,24 @@ fn condition_is_true(
         .find(|condition| condition.type_ == kind)
         .map(|condition| condition.status == "True")
         .unwrap_or(false)
+}
+
+/// Returns true when the condition is True *or absent*. Used for
+/// ConnectorMetadataProgrammed which is deliberately not set by the operator
+/// in extension-server mode (EPP emission disabled). Absent means the
+/// extension server is managing xDS injection directly — the tunnel is ready.
+fn condition_is_true_or_absent(
+    conditions: Option<&[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]>,
+    kind: &str,
+) -> bool {
+    match conditions
+        .unwrap_or_default()
+        .iter()
+        .find(|condition| condition.type_ == kind)
+    {
+        Some(c) => c.status == "True",
+        None => true,
+    }
 }
 
 fn find_condition<'a>(
@@ -225,7 +245,18 @@ pub struct TunnelProgress {
 
 impl TunnelProgress {
     pub fn all_ready(&self) -> bool {
-        self.steps.iter().all(|s| s.status == StepStatus::Ready)
+        self.steps.iter().all(|s| {
+            // ConnectorMetadataProgrammed is absent in extension-server mode
+            // (EPP emission disabled). Treat Unknown as Ready for this step
+            // only — the extension server handles xDS injection directly and
+            // does not report back via a condition.
+            if s.kind == ProgressStepKind::ConnectorMetadataProgrammed
+                && s.status == StepStatus::Unknown
+            {
+                return true;
+            }
+            s.status == StepStatus::Ready
+        })
     }
 
     pub fn step(&self, kind: ProgressStepKind) -> Option<&ProgressStep> {
@@ -399,6 +430,44 @@ impl TunnelService {
         Ok(Some(TunnelProgress::from_resources(&proxy, connector.as_ref())))
     }
 
+    /// Re-patch the connector's connectionDetails after it becomes Ready.
+    ///
+    /// The replicator mirrors the upstream-status annotation to the downstream
+    /// connector on every spec change. When the connector first becomes
+    /// Ready:True, the connector controller touches the downstream gateway
+    /// annotation to trigger an Envoy Gateway re-translation — but if the
+    /// annotation captured Ready:False before the lease renewed, that touch
+    /// never fires. Re-patching connectionDetails triggers a spec change on
+    /// the upstream connector, which causes the replicator to re-mirror the
+    /// annotation with the current (Ready:True) status, and EG re-translates.
+    pub async fn refresh_connection_details(&self) -> Result<()> {
+        let Some(selected) = self.datum.selected_context() else {
+            return Ok(());
+        };
+        let project_id = &selected.project_id;
+        let Some(connector) = self.find_connector(project_id).await? else {
+            return Ok(());
+        };
+        let pcp = self.datum.project_control_plane_client(project_id).await?;
+        let connectors: Api<Connector> =
+            Api::namespaced(pcp.client(), DEFAULT_PCP_NAMESPACE);
+        let name = connector.name_any();
+        if let Some(details) = build_connection_details(&self.listen) {
+            let details_value = serde_json::to_value(details)
+                .std_context("Failed to serialize connection details")?;
+            let patch = json!({ "status": { "connectionDetails": details_value } });
+            if let Err(err) = connectors
+                .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await
+            {
+                warn!(%name, "Failed to refresh connector connectionDetails: {err:#}");
+            } else {
+                debug!(%name, "refreshed connector connectionDetails to trigger replicator");
+            }
+        }
+        Ok(())
+    }
+
     pub async fn create_active(&self, label: &str, endpoint: &str) -> Result<TunnelSummary> {
         let Some(selected) = self.datum.selected_context() else {
             n0_error::bail_any!("No project selected");
@@ -491,6 +560,13 @@ impl TunnelService {
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_PROGRAMMED,
             );
+            let connector_metadata_programmed = condition_is_true_or_absent(
+                proxy
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.conditions.as_deref()),
+                HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
+            );
             let enabled = enabled_by_name.contains_key(&name);
             tunnels.push(TunnelSummary {
                 id: name,
@@ -500,6 +576,7 @@ impl TunnelService {
                 enabled,
                 accepted,
                 programmed,
+                connector_metadata_programmed,
             });
         }
 
@@ -704,6 +781,13 @@ impl TunnelService {
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_PROGRAMMED,
             ),
+            connector_metadata_programmed: condition_is_true_or_absent(
+                proxy
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.conditions.as_deref()),
+                HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
+            ),
         })
     }
 
@@ -805,6 +889,13 @@ impl TunnelService {
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_PROGRAMMED,
             ),
+            connector_metadata_programmed: condition_is_true_or_absent(
+                existing
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.conditions.as_deref()),
+                HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
+            ),
         };
 
         if !self.publish_tickets
@@ -848,6 +939,28 @@ impl TunnelService {
             .and_then(|labels| labels.get(DISPLAY_NAME_ANNOTATION))
             .cloned()
             .unwrap_or_else(|| tunnel_id.to_string());
+
+        // Always patch the proxy's connector backend to reference the fresh
+        // connector. The previous connector was deleted by ensure_connector;
+        // if we don't update the proxy here the operator watches a connector
+        // that no longer exists and the Ready/IrohDNSPublished conditions
+        // never become True.
+        {
+            let target = parse_target(&endpoint)?;
+            let desired_rules = vec![https_redirect_rule(), proxy_rule(&endpoint, &connector_name)];
+            if !http_proxy_spec_matches(&proxy, &label, &desired_rules) {
+                let hostnames = proxy.spec.hostnames.clone().unwrap_or_default();
+                let patch = json!({
+                    "metadata": { "annotations": { DISPLAY_NAME_ANNOTATION: &label } },
+                    "spec": { "hostnames": hostnames, "rules": desired_rules },
+                });
+                proxies
+                    .patch(tunnel_id, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await
+                    .std_context("Failed to patch HTTPProxy connector reference")?;
+            }
+            let _ = target; // used above
+        }
 
         if enabled {
             let target = parse_target(&endpoint)?;
@@ -910,6 +1023,13 @@ impl TunnelService {
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_PROGRAMMED,
+            ),
+            connector_metadata_programmed: condition_is_true_or_absent(
+                proxy
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.conditions.as_deref()),
+                HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
             ),
         };
 
@@ -1165,14 +1285,37 @@ impl TunnelService {
     }
 
     async fn ensure_connector(&self, project_id: &str) -> Result<Connector> {
+        let pcp = self.datum.project_control_plane_client(project_id).await?;
+        let client = pcp.client();
+        let connectors: Api<Connector> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
+
+        // Reuse an existing connector rather than deleting and recreating it.
+        // Delete-and-recreate causes a new generation-1 object; the replicator
+        // mirrors the status annotation once (at Ready:False while the lease
+        // hasn't renewed yet) and then never re-mirrors when Ready flips to
+        // True, so the extension server permanently sees the connector as
+        // offline and returns 503. Patching in-place keeps the same generation
+        // and the replicator re-mirrors on spec changes, avoiding the race.
         if let Some(connector) = self.find_connector(project_id).await? {
+            let name = connector.name_any();
+            debug!(%name, "reusing existing connector, patching connectionDetails");
+            if let Some(details) = build_connection_details(&self.listen) {
+                let details_value = serde_json::to_value(details)
+                    .std_context("Failed to serialize connection details")?;
+                let patch = json!({ "status": { "connectionDetails": details_value } });
+                if let Err(err) = connectors
+                    .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await
+                {
+                    warn!(%name, "Failed to patch connector connectionDetails: {err:#}");
+                }
+            } else {
+                warn!(%name, "Missing connection details for connector status patch");
+            }
             return Ok(connector);
         }
 
-        let pcp = self.datum.project_control_plane_client(project_id).await?;
-        let client = pcp.client();
-        let class_name = Self::resolve_connector_class(client.clone()).await?;
-        let connectors: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
+        let class_name = Self::resolve_connector_class(client).await?;
 
         let mut connector = Connector {
             metadata: ObjectMeta {
