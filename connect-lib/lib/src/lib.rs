@@ -19,8 +19,8 @@ pub use project_control_plane::ProjectControlPlaneClient;
 pub use repo::{MissingConnectDir, Repo};
 pub use state::{Advertisment, SelectedContext, State, StateWrapper, TcpProxyData};
 pub use tunnels::{
-    ProgressStep, ProgressStepKind, StepStatus, TunnelDeleteOutcome, TunnelProgress, TunnelService,
-    TunnelSummary,
+    OrphanedConnector, ProgressStep, ProgressStepKind, StepStatus, TunnelDeleteOutcome,
+    TunnelProgress, TunnelService, TunnelSummary,
 };
 
 /// The root domain for datum connect URLs to subdomain from. A proxy URL will

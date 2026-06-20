@@ -67,6 +67,22 @@ pub struct TunnelSummary {
     pub accepted: bool,
     pub programmed: bool,
     pub connector_metadata_programmed: bool,
+    /// True when the backing Connector's `Ready` condition is `True`.
+    /// False means the connector lease has expired and the tunnel agent is
+    /// offline (traffic will be dropped).
+    pub connector_ready: bool,
+    /// The name of the Connector resource backing this tunnel.
+    pub connector_name: Option<String>,
+}
+
+/// A Connector that exists in the project but is not referenced by any tunnel.
+/// These are typically left over from a previous tunnel that was deleted without
+/// a clean shutdown (e.g. the agent was killed before it could run cleanup).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrphanedConnector {
+    pub name: String,
+    /// True when the connector's `Ready` condition is `True`.
+    pub ready: bool,
 }
 
 impl TunnelSummary {
@@ -509,10 +525,23 @@ impl TunnelService {
     }
 
     pub async fn list_project(&self, project_id: &str) -> Result<Vec<TunnelSummary>> {
+        let (tunnels, _) = self.list_project_with_orphans(project_id).await?;
+        Ok(tunnels)
+    }
+
+    /// Like [`list_project`] but also returns any [`OrphanedConnector`]s found
+    /// in the project — connectors that exist but are not referenced by any
+    /// tunnel's HTTPProxy. These are typically left over from a previous tunnel
+    /// that exited uncleanly.
+    pub async fn list_project_with_orphans(
+        &self,
+        project_id: &str,
+    ) -> Result<(Vec<TunnelSummary>, Vec<OrphanedConnector>)> {
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();
         let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
-        let ads: Api<ConnectorAdvertisement> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
+        let ads: Api<ConnectorAdvertisement> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
+        let connectors_api: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
 
         let proxy_list = proxies
             .list(&ListParams::default())
@@ -529,7 +558,29 @@ impl TunnelService {
             .filter_map(|item| item.metadata.name.clone().map(|name| (name, item)))
             .collect();
 
+        // Fetch all connectors so we can check their Ready condition and detect orphans.
+        let connector_list = connectors_api
+            .list(&ListParams::default())
+            .await
+            .std_context("Failed to list Connector objects")?;
+        let connector_ready_by_name: std::collections::HashMap<String, bool> = connector_list
+            .items
+            .iter()
+            .filter_map(|c| {
+                let name = c.metadata.name.clone()?;
+                let ready = condition_is_true(
+                    c.status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_deref()),
+                    CONNECTOR_CONDITION_READY,
+                );
+                Some((name, ready))
+            })
+            .collect();
+
         let mut tunnels = Vec::new();
+        let mut referenced_connector_names = std::collections::HashSet::new();
+
         for proxy in proxy_list.items {
             let Some(name) = proxy.metadata.name.clone() else {
                 continue;
@@ -568,6 +619,14 @@ impl TunnelService {
                 HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
             );
             let enabled = enabled_by_name.contains_key(&name);
+            let connector_name = proxy_connector_name(&proxy);
+            let connector_ready = connector_name
+                .as_deref()
+                .and_then(|cn| connector_ready_by_name.get(cn).copied())
+                .unwrap_or(false);
+            if let Some(cn) = &connector_name {
+                referenced_connector_names.insert(cn.clone());
+            }
             tunnels.push(TunnelSummary {
                 id: name,
                 label,
@@ -577,10 +636,37 @@ impl TunnelService {
                 accepted,
                 programmed,
                 connector_metadata_programmed,
+                connector_ready,
+                connector_name,
             });
         }
 
-        Ok(tunnels)
+        // Any connector not referenced by a tunnel is orphaned.
+        let orphans: Vec<OrphanedConnector> = connector_list
+            .items
+            .into_iter()
+            .filter_map(|c| {
+                let name = c.metadata.name?;
+                if referenced_connector_names.contains(&name) {
+                    return None;
+                }
+                let ready = *connector_ready_by_name.get(&name).unwrap_or(&false);
+                Some(OrphanedConnector { name, ready })
+            })
+            .collect();
+
+        Ok((tunnels, orphans))
+    }
+
+    /// Like [`list_active`] but also returns orphaned connectors.
+    /// Used by the `list` subcommand to show stale connector warnings.
+    pub async fn list_active_with_orphans(
+        &self,
+    ) -> Result<(Vec<TunnelSummary>, Vec<OrphanedConnector>)> {
+        let Some(selected) = self.datum.selected_context() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        self.list_project_with_orphans(&selected.project_id).await
     }
 
     pub async fn create_project(
@@ -788,6 +874,10 @@ impl TunnelService {
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
             ),
+            // connector_ready is not checked at creation time; the heartbeat
+            // agent will establish the lease shortly after.
+            connector_ready: false,
+            connector_name: Some(connector_name.clone()),
         })
     }
 
@@ -868,6 +958,7 @@ impl TunnelService {
         }
 
         let enabled = existing_ad.is_some();
+        let connector_name = proxy_connector_name(&existing);
 
         let summary = TunnelSummary {
             id: tunnel_id.to_string(),
@@ -896,6 +987,8 @@ impl TunnelService {
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
             ),
+            connector_ready: false,
+            connector_name,
         };
 
         if !self.publish_tickets
@@ -1004,6 +1097,8 @@ impl TunnelService {
                 .std_context("Failed to delete ConnectorAdvertisement")?;
         }
 
+        let connector_name = proxy_connector_name(&proxy);
+
         let summary = TunnelSummary {
             id: tunnel_id.to_string(),
             label,
@@ -1031,6 +1126,8 @@ impl TunnelService {
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
             ),
+            connector_ready: false,
+            connector_name,
         };
 
         if !self.publish_tickets

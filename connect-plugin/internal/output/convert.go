@@ -35,18 +35,30 @@ func ParseJSON(data []byte) (map[string]interface{}, error) {
 	return result, nil
 }
 
-// RenderTable takes a JSON array of tunnel objects and renders them
+// RenderTable takes a JSON array of tunnel/connector objects and renders them
 // as a human-readable table to the given writer.
-// Expected input: [{"id":"...","label":"...","endpoint":"...","status":"...","enabled":true,"hostnames":["..."]}]
+// Expected input: [{"type":"tunnel","id":"...","label":"...","endpoint":"...","status":"...","enabled":true,"hostnames":["..."],"connector":"ok|stale"}]
+// Orphaned connectors have type "orphaned_connector" and are rendered in a
+// separate section below the tunnel rows.
 func RenderTable(data []byte, w *tabwriter.Writer) error {
-	var tunnels []map[string]interface{}
-	if err := json.Unmarshal(data, &tunnels); err != nil {
+	var items []map[string]interface{}
+	if err := json.Unmarshal(data, &items); err != nil {
 		return fmt.Errorf("failed to parse tunnel list: %w", err)
 	}
 
+	var tunnels []map[string]interface{}
+	var orphans []map[string]interface{}
+	for _, item := range items {
+		if fmt.Sprintf("%v", item["type"]) == "orphaned_connector" {
+			orphans = append(orphans, item)
+		} else {
+			tunnels = append(tunnels, item)
+		}
+	}
+
 	// Header
-	fmt.Fprintln(w, "ID\tLABEL\tENDPOINT\tSTATUS\tENABLED\tHOSTNAMES")
-	fmt.Fprintln(w, "--\t-----\t--------\t------\t-------\t---------")
+	fmt.Fprintln(w, "ID\tLABEL\tENDPOINT\tSTATUS\tENABLED\tCONNECTOR\tHOSTNAMES")
+	fmt.Fprintln(w, "--\t-----\t--------\t------\t-------\t---------\t---------")
 
 	for _, t := range tunnels {
 		id := fmt.Sprintf("%v", t["id"])
@@ -57,6 +69,7 @@ func RenderTable(data []byte, w *tabwriter.Writer) error {
 		if enabledVal, ok := t["enabled"].(bool); ok && enabledVal {
 			enabled = "yes"
 		}
+		connector := fmt.Sprintf("%v", t["connector"])
 		hostnames := "\u2014"
 		if hnArr, ok := t["hostnames"].([]interface{}); ok && len(hnArr) > 0 {
 			hnStrs := make([]string, len(hnArr))
@@ -65,7 +78,19 @@ func RenderTable(data []byte, w *tabwriter.Writer) error {
 			}
 			hostnames = strings.Join(hnStrs, ",")
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", id, label, endpoint, status, enabled, hostnames)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", id, label, endpoint, status, enabled, connector, hostnames)
+	}
+
+	if len(orphans) > 0 {
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "ORPHANED CONNECTORS (no tunnel — safe to delete)")
+		fmt.Fprintln(w, "NAME\tSTATUS")
+		fmt.Fprintln(w, "----\t------")
+		for _, o := range orphans {
+			name := fmt.Sprintf("%v", o["id"])
+			connector := fmt.Sprintf("%v", o["connector"])
+			fmt.Fprintf(w, "%s\t%s\n", name, connector)
+		}
 	}
 
 	return w.Flush()

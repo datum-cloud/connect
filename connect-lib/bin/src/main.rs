@@ -210,8 +210,8 @@ async fn run() -> n0_error::Result<()> {
         Commands::List => {
             let node = ListenNode::new(repo.clone()).await?;
             let service = TunnelService::new(datum.clone(), node.clone());
-            let tunnels = service.list_active().await?;
-            let output: Vec<serde_json::Value> = tunnels
+            let (tunnels, orphans) = service.list_active_with_orphans().await?;
+            let mut output: Vec<serde_json::Value> = tunnels
                 .iter()
                 .map(|t| {
                     let status = if t.accepted && t.programmed && t.connector_metadata_programmed {
@@ -221,6 +221,7 @@ async fn run() -> n0_error::Result<()> {
                     } else {
                         "pending"
                     };
+                    let connector = if t.connector_ready { "ok" } else { "stale" };
                     serde_json::json!({
                         "type": "tunnel",
                         "id": t.id,
@@ -228,10 +229,26 @@ async fn run() -> n0_error::Result<()> {
                         "endpoint": t.endpoint,
                         "status": status,
                         "enabled": t.enabled,
-                        "hostnames": t.hostnames
+                        "hostnames": t.hostnames,
+                        "connector": connector,
+                        "connector_name": t.connector_name
                     })
                 })
                 .collect();
+            for o in &orphans {
+                let connector = if o.ready { "ok" } else { "stale" };
+                output.push(serde_json::json!({
+                    "type": "orphaned_connector",
+                    "id": o.name,
+                    "label": "",
+                    "endpoint": "",
+                    "status": "orphaned",
+                    "enabled": false,
+                    "hostnames": [],
+                    "connector": connector,
+                    "connector_name": o.name
+                }));
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&output).anyerr()?);
             } else {
@@ -287,6 +304,8 @@ async fn run() -> n0_error::Result<()> {
                         accepted: false,
                         programmed: false,
                         connector_metadata_programmed: false,
+                        connector_ready: false,
+                        connector_name: None,
                     }));
                     ep
                 }
