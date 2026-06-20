@@ -546,6 +546,20 @@ async fn run() -> n0_error::Result<()> {
                     n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
                 })?;
 
+            // Verify origin is up and poll the tunnel URL every 10 seconds
+            // until it returns a successful (non-5xx) response. Only after
+            // this do we declare the tunnel ready to the user / Go supervisor.
+            let verify_mode = mode;
+            progress::verify_endpoints(
+                &endpoint,
+                &hostname,
+                std::time::Duration::from_secs(10),
+                move |label, url, elapsed, status| {
+                    progress::render_verify(verify_mode, label, url, elapsed, status);
+                },
+            )
+            .await?;
+
             // Re-fetch the up-to-date TunnelSummary for the tunnel_ready
             // payload (existing contract — id, label, endpoint, hostnames,
             // endpoint_id, status, elapsed_secs).
@@ -571,7 +585,7 @@ async fn run() -> n0_error::Result<()> {
                 );
             } else {
                 for hostname in &tunnel.hostnames {
-                    println!("Tunnel ready after {} sec: https://{}", elapsed, hostname);
+                    println!("Tunnel ready: https://{}", hostname);
                 }
             }
 

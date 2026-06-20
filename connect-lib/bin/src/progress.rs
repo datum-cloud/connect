@@ -245,11 +245,11 @@ where
 
 // --- verify_endpoints ---
 
-/// Probe the origin endpoint (HTTP, best-effort) and proxy URL (HTTPS,
-/// indefinite). Origin is bounded by `budget` and is non-fatal on failure.
-/// Proxy retries indefinitely with exponential backoff and prints a status
-/// message every 10s (e.g. `"  waiting for proxy [url] (30s) ... HTTP 503"`)
-/// so the user sees progress even during long settling times.
+/// Probe the origin endpoint (HTTP, best-effort) and then the tunnel proxy URL
+/// (HTTPS, indefinite). Origin is bounded by `budget` and is non-fatal on
+/// failure. The proxy URL is checked on a fixed 10-second interval until it
+/// returns a non-5xx response, printing a status line on each attempt so the
+/// user sees progress during settling time.
 pub async fn verify_endpoints<F>(
     origin_endpoint: &str,
     hostname: &str,
@@ -283,10 +283,8 @@ where
         }
     }
 
-    // Proxy probe — indefinite retry with periodic status every 10s.
+    // Proxy probe — fixed 10s interval, indefinite, until non-5xx.
     let start = Instant::now();
-    let mut backoff = Duration::from_millis(250);
-    let mut last_status = Instant::now();
     loop {
         match client.get(&proxy_url).send().await {
             Ok(resp) => {
@@ -295,34 +293,26 @@ where
                     verify_cb("proxy responding", &proxy_url, start.elapsed(), Some(status));
                     return Ok(());
                 }
-                if last_status.elapsed() >= Duration::from_secs(10) {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  \u{25CB} waiting for proxy [{}] ({:.0}s) ... HTTP {}",
-                        proxy_url,
-                        start.elapsed().as_secs_f64(),
-                        status,
-                    );
-                    let _ = std::io::stderr().flush();
-                    last_status = Instant::now();
-                }
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "  \u{25CB} waiting for tunnel [{}] ({:.0}s) ... HTTP {}",
+                    proxy_url,
+                    start.elapsed().as_secs_f64(),
+                    status,
+                );
+                let _ = std::io::stderr().flush();
             }
             Err(_e) => {
-                if last_status.elapsed() >= Duration::from_secs(10) {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  \u{25CB} waiting for proxy [{}] ({:.0}s) ... no response",
-                        proxy_url,
-                        start.elapsed().as_secs_f64(),
-                    );
-                    let _ = std::io::stderr().flush();
-                    last_status = Instant::now();
-                }
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "  \u{25CB} waiting for tunnel [{}] ({:.0}s) ... no response",
+                    proxy_url,
+                    start.elapsed().as_secs_f64(),
+                );
+                let _ = std::io::stderr().flush();
             }
         }
-        let sleep_dur = std::cmp::min(backoff, Duration::from_secs(2));
-        sleep(sleep_dur).await;
-        backoff = std::cmp::min(backoff * 2, Duration::from_secs(2));
+        sleep(Duration::from_secs(10)).await;
     }
 }
 
