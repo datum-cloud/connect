@@ -17,11 +17,14 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: datum-cloud/datumctl
-          path: ../datumctl
+          path: datumctl-dep
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: connect-plugin/go.mod
+      - name: Rewrite replace directive for CI
+        run: go mod edit -replace go.datum.net/datumctl=../datumctl-dep
+        working-directory: connect-plugin
       - name: Verify dependencies
         run: go mod verify
         working-directory: connect-plugin
