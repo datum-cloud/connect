@@ -215,7 +215,7 @@ func TestPS_WithFakePIDFiles(t *testing.T) {
 	// Create temp state dir with a fake PID file
 	stateDir := t.TempDir()
 
-	pidPath := filepath.Join(stateDir, "datumctl", "connect", "tunnels", "test-tun.pid")
+	pidPath := filepath.Join(stateDir, "tunnels", "test-tun.pid")
 	os.MkdirAll(filepath.Dir(pidPath), 0755)
 
 	startTime := time.Now().Add(-10 * time.Minute)
@@ -226,7 +226,7 @@ func TestPS_WithFakePIDFiles(t *testing.T) {
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "ps")
 	cmd.Env = []string{
-		"XDG_STATE_HOME=" + stateDir,
+		"DATUM_STATE_DIR=" + stateDir,
 		"DATUM_ACCESS_TOKEN=test-token",
 		"DATUM_CONNECT_DIR=" + t.TempDir(),
 		"HOME=" + os.Getenv("HOME"),
@@ -245,7 +245,7 @@ func TestPS_WithFakePIDFiles(t *testing.T) {
 func TestPS_JSONOutput(t *testing.T) {
 	stateDir := t.TempDir()
 
-	pidPath := filepath.Join(stateDir, "datumctl", "connect", "tunnels", "json-tun.pid")
+	pidPath := filepath.Join(stateDir, "tunnels", "json-tun.pid")
 	os.MkdirAll(filepath.Dir(pidPath), 0755)
 
 	_ = pidfile.Write(pidPath, 99999, 10000, time.Now(), "/usr/bin/fake")
@@ -253,7 +253,7 @@ func TestPS_JSONOutput(t *testing.T) {
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "ps", "--json")
 	cmd.Env = []string{
-		"XDG_STATE_HOME=" + stateDir,
+		"DATUM_STATE_DIR=" + stateDir,
 		"DATUM_ACCESS_TOKEN=test-token",
 		"DATUM_CONNECT_DIR=" + t.TempDir(),
 		"HOME=" + os.Getenv("HOME"),
@@ -370,6 +370,11 @@ func TestStatus_WithConfig(t *testing.T) {
 	// Verify status output includes installed info when config file exists
 	t.Setenv("DATUM_ACCESS_TOKEN", "test-token")
 
+	// Build before overriding HOME — go build would otherwise place the
+	// module cache inside configDir (via GOPATH=$HOME/go default), leaving
+	// read-only cache files that cause t.TempDir cleanup to fail.
+	pluginBin := buildPlugin(t)
+
 	// Create a config file for an installed-but-not-running tunnel
 	configDir := t.TempDir()
 	t.Setenv("HOME", configDir)
@@ -384,7 +389,6 @@ func TestStatus_WithConfig(t *testing.T) {
 	}
 
 	// Run status — should show Stopped and installed info
-	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "status", "--name", "installed-tun")
 	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, _ := cmd.CombinedOutput()

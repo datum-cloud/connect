@@ -16,7 +16,11 @@ import (
 )
 
 // Dir returns the plugin state base directory.
+// DATUM_STATE_DIR overrides the platform default; used in tests.
 func Dir() string {
+	if override := os.Getenv("DATUM_STATE_DIR"); override != "" {
+		return override
+	}
 	switch runtime.GOOS {
 	case "windows":
 		return filepath.Join(os.Getenv("LOCALAPPDATA"), "datumctl", "connect")

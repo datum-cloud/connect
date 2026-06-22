@@ -7,7 +7,8 @@
 //   child-crash: exits with code 1
 //
 // Subcommands: list, listen, update, delete
-// Flags: --json
+// Global flags: --json, --project <value> (and any other --flag <value> pairs)
+// Subcommand flags are accepted but ignored.
 package main
 
 import (
@@ -23,18 +24,24 @@ import (
 func main() {
 	args := os.Args[1:]
 
-	// Parse --json flag
+	// Scan args: collect --json, skip flags-with-values, find first positional as subcommand.
+	// Flags that consume the next arg as their value:
+	flagsWithValue := map[string]bool{
+		"--project": true, "--endpoint": true, "--id": true,
+		"--label": true, "--name": true, "--session": true, "--log-file": true,
+		"--output": true, "-o": true,
+	}
 	jsonOut := false
 	var subcmd string
-	for i, arg := range args {
-		if arg == "--json" {
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--json":
 			jsonOut = true
-			args = append(args[:i], args[i+1:]...)
-			break
+		case flagsWithValue[args[i]]:
+			i++ // skip value
+		case !strings.HasPrefix(args[i], "-") && subcmd == "":
+			subcmd = args[i]
 		}
-	}
-	if len(args) > 0 {
-		subcmd = args[0]
 	}
 
 	mode := os.Getenv("FAKE_DUMMY_MODE")
