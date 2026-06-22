@@ -93,18 +93,23 @@ func Run(ctx context.Context, binaryPath string, args []string, env []string, ou
 		return nil, fmt.Errorf("failed to start %s: %w", binaryPath, err)
 	}
 
+	// childExited is closed after cmd.Wait() so signals.Forward never races
+	// with the cmd.Wait() call to reap the process exit status.
+	childExited := make(chan struct{})
+
 	// Start signal forwarding in a goroutine
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := signals.Forward(cmd.Process, 30*time.Second); err != nil {
+		if err := signals.Forward(cmd.Process, childExited, 30*time.Second); err != nil {
 			// Signal forwarding failure is non-fatal; child may have already exited
 		}
 	}()
 
-	// Wait for completion
+	// Wait for completion, then signal Forward that the child has exited
 	cmd.Wait()
+	close(childExited)
 
 	// Wait for signal goroutine to finish
 	wg.Wait()

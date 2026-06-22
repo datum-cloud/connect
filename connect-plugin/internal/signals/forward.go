@@ -12,25 +12,22 @@ import (
 // On SIGINT/SIGTERM (unix) or Ctrl+C/Ctrl+Break (windows), forwards
 // the signal to child and waits up to gracePeriod for clean shutdown.
 //
+// childExited must be closed by the caller after cmd.Wait() returns — this
+// avoids a double-Wait race where both Forward and the caller try to reap the
+// same process, which can cause the caller's ProcessState to be nil.
+//
 // Platform behavior:
-//	- Unix: receives SIGINT/SIGTERM, forwards to child, waits gracePeriod,
-//	  then sends SIGKILL if child hasn't exited
-//	- Windows: Go's signal.Notify with SIGINT handles Ctrl+C automatically.
-//	  Ctrl+Break maps to SIGINT via the Go runtime. Force-kill uses
-//	  os.Process.Kill() (Windows equivalent of SIGKILL).
+//   - Unix: receives SIGINT/SIGTERM, forwards to child, waits gracePeriod,
+//     then sends SIGKILL if child hasn't exited
+//   - Windows: Go's signal.Notify with SIGINT handles Ctrl+C automatically.
+//     Force-kill uses os.Process.Kill().
 //
 // Returns nil on success. The child's exit code is available via
 // cmd.ProcessState.ExitCode() after Wait().
-func Forward(child *os.Process, gracePeriod time.Duration) error {
+func Forward(child *os.Process, childExited <-chan struct{}, gracePeriod time.Duration) error {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-
-	// Watch for child exit in a goroutine
-	childExited := make(chan struct{})
-	go func() {
-		child.Wait()
-		close(childExited)
-	}()
+	defer signal.Stop(ch)
 
 	select {
 	case sig := <-ch:
