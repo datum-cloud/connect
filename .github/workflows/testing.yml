@@ -13,6 +13,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+      - name: Checkout datumctl
+        uses: actions/checkout@v6
+        with:
+          repository: datum-cloud/datumctl
+          path: ../datumctl
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
