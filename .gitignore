@@ -1,4 +1,5 @@
 target/
 *.so
 connect-plugin/datumctl-connect
-.drewr-y4nd1b/
+connect-plugin/fake-datum-connect-test
+connect-plugin/internal/daemon/fake-datum-connect
