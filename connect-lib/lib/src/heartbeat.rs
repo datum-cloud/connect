@@ -309,25 +309,22 @@ fn classify_lease_error(err: &kube::Error) -> LeaseErrorAction {
     }
 }
 
-/// Force an OAuth token refresh after a 401. The proactive timer only refreshes
-/// when the token is near expiry, so a server-side rejection that arrives early
-/// (clock skew, revocation, etc.) would otherwise leave the heartbeat retrying
-/// with the same dead token until the timer eventually fires.
+/// Force a token refresh after a 401. The proactive refresh timer in
+/// [`ExternalTokenSource`] only fires when the access token is within 60s of
+/// JWT expiry, so a token rejected before that (clock skew, revocation,
+/// IdP-side rotation) would otherwise leave the heartbeat retrying with the
+/// same dead token until the timer eventually catches up — the classic
+/// "stale auth" tunnel failure.
+///
+/// This signals the in-process refresh loop to re-execute the
+/// `DATUM_CREDENTIALS_HELPER` subprocess immediately. The loop swaps the new
+/// token into the shared [`ExternalTokenSource`] and notifies watchers; the
+/// next `project_control_plane_client()` call picks up the fresh token.
 ///
 /// When auth is already in [`LoginState::Missing`] (e.g. after a previous
-/// permanent refresh failure), this returns immediately without contacting the
-/// IdP — the auth layer has already surfaced the loss to the operator and
-/// there is nothing to refresh until they log in again.
-///
-/// Plugin-mode adaptation (connect-lib fork): connect-lib does not own the
-/// OAuth flow — token refresh is driven by the parent process (datumctl)
-/// via the `DATUM_CREDENTIALS_HELPER` subprocess, which swaps the new token
-/// into `ExternalTokenSource` out-of-band. From inside the heartbeat loop
-/// all we can do is log the 401 trigger; the next pcp-client construction
-/// will pick up whatever token the helper has provided. The
-/// `LoginState::Missing` guard remains in place so that if a future
-/// LoginState-driven mechanism marks the session as dead, we stop
-/// hammering the kube path on every 401.
+/// permanent refresh failure), this returns immediately without contacting
+/// the helper — the auth layer has already surfaced the loss to the operator
+/// and there is nothing to refresh until they log in again.
 async fn force_refresh_auth(project_id: &str, datum: &DatumCloudClient) {
     if matches!(datum.login_state(), crate::datum_cloud::LoginState::Missing) {
         debug!(
@@ -336,10 +333,11 @@ async fn force_refresh_auth(project_id: &str, datum: &DatumCloudClient) {
         );
         return;
     }
-    debug!(
+    info!(
         %project_id,
-        "heartbeat: 401 observed; token refresh is external in plugin mode (datumctl credentials helper)"
+        "heartbeat: 401 observed; forcing token refresh via credentials helper"
     );
+    datum.force_token_refresh();
 }
 
 async fn run_project(

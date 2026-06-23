@@ -200,6 +200,22 @@ impl DatumCloudClient {
         self.token_source.token()
     }
 
+    /// Force an immediate token refresh by signalling the background refresh
+    /// loop in [`ExternalTokenSource`] to re-execute the credentials helper
+    /// now, ahead of its proactive schedule.
+    ///
+    /// Call this when a 401 response is observed from the API: the proactive
+    /// refresh timer only fires near JWT expiry, so a token rejected early
+    /// (clock skew, revocation, IdP-side rotation) would otherwise leave
+    /// callers retrying with the same dead token until the timer catches up.
+    /// The refresh loop swaps the new token into the shared [`ExternalTokenSource`]
+    /// and notifies watchers; the next [`Self::project_control_plane_client`]
+    /// call (and any `ProjectControlPlaneClient` rebuilt via its token watch)
+    /// picks up the fresh token.
+    pub fn force_token_refresh(&self) {
+        self.token_source.force_refresh();
+    }
+
     pub fn api_url(&self) -> Cow<'static, str> {
         self.env.api_url()
     }

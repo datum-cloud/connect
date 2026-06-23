@@ -48,7 +48,12 @@ type ReloadHandle = Handle<EnvFilter, Registry>;
 static RELOAD_HANDLE: OnceLock<ReloadHandle> = OnceLock::new();
 
 fn init_tracing() {
-    let default_directive = "datum_connect=info";
+    let debug = debug_enabled();
+    let default_directive = if debug {
+        "datum_connect=debug,connect_lib=debug"
+    } else {
+        "datum_connect=info"
+    };
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_directive));
     let (filter_layer, handle) = reload::Layer::new(filter);
@@ -59,7 +64,31 @@ fn init_tracing() {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .try_init();
     let _ = RELOAD_HANDLE.set(handle);
+    if debug {
+        eprintln!("[datum-connect] debug logging enabled (token refresh, heartbeat, etc.)");
+    }
 }
+
+/// Whether verbose debug logging is enabled. Toggled by the `--debug` CLI flag
+/// or the `DATUM_CONNECT_DEBUG=1` env var. When enabled, the tracing filter is
+/// bumped to `debug` for the `datum_connect` and `connect_lib` targets so that
+/// token-refresh events (proactive + forced) and heartbeat 401 handling print
+/// to the console (stderr).
+fn debug_enabled() -> bool {
+    if std::env::var("DATUM_CONNECT_DEBUG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    // Fall back to the global Args flag captured at parse time. Set by
+    // `Args::parse()` before the runtime-dependent code runs; the binary
+    // parses args after init_tracing(), so the env var is the primary path
+    // for the very first subscriber, and DEBUG_FLAG covers the flag case.
+    DEBUG_FLAG.get().copied().unwrap_or(false)
+}
+
+static DEBUG_FLAG: OnceLock<bool> = OnceLock::new();
 
 fn silence_tracing() {
     if let Some(handle) = RELOAD_HANDLE.get() {
@@ -86,6 +115,10 @@ struct Args {
     project: Option<String>,
     #[clap(long, global = true)]
     json: bool,
+    /// Enable verbose debug logging on stderr (token refresh events, heartbeat
+    /// 401 handling, etc.). Also enabled by `DATUM_CONNECT_DEBUG=1`.
+    #[clap(long, global = true)]
+    debug: bool,
     #[clap(subcommand)]
     command: Commands,
 }
@@ -173,6 +206,21 @@ async fn run() -> n0_error::Result<()> {
     let datum = DatumCloudClient::with_external_token_source(ApiEnv::default(), token_source);
 
     let args = Args::parse();
+
+    // Honour the `--debug` CLI flag by bumping the tracing filter to debug.
+    // init_tracing() runs before Args::parse(), so the env var path covered
+    // the initial subscriber; this reloads the filter for the flag case.
+    // `RUST_LOG` always takes precedence and is left untouched when set.
+    let rust_log_set = std::env::var("RUST_LOG").is_ok();
+    if args.debug && !rust_log_set {
+        let _ = DEBUG_FLAG.set(true);
+        if let Some(handle) = RELOAD_HANDLE.get() {
+            let _ = handle.modify(|f| {
+                *f = EnvFilter::new("datum_connect=debug,connect_lib=debug");
+            });
+            eprintln!("[datum-connect] debug logging enabled (token refresh, heartbeat, etc.)");
+        }
+    }
 
     let json = args.json;
 

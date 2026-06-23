@@ -5,7 +5,7 @@ use arc_swap::ArcSwap;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::watch;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Errors that can occur when constructing an [`ExternalTokenSource`] from environment.
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +127,10 @@ impl ExternalTokenSource {
     /// and calls [`swap_token()`](Self::swap_token) with the result.
     pub fn force_refresh(&self) {
         let current = *self.refresh_trigger.borrow();
+        info!(
+            trigger_count = current.wrapping_add(1),
+            "token refresh: forced refresh requested (401 or stale auth observed)"
+        );
         let _ = self.refresh_trigger.send(current.wrapping_add(1));
     }
 
@@ -169,6 +173,21 @@ impl ExternalTokenSource {
                 std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
             });
 
+        if let Some(exp) = initial_exp {
+            debug!(
+                exp = exp,
+                next_refresh_in_secs = next_refresh
+                    .duration_since(std::time::SystemTime::now())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                "token refresh loop started; proactive refresh scheduled 60s before JWT expiry"
+            );
+        } else {
+            debug!(
+                "token refresh loop started; no JWT expiry claim, defaulting to 1h refresh interval"
+            );
+        }
+
         let mut backoff = std::time::Duration::from_secs(5);
         const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -183,31 +202,43 @@ impl ExternalTokenSource {
             };
 
             // Wait either for the timer or a force_refresh signal
-            tokio::select! {
-                _ = tokio::time::sleep(wait) => {},
-                _ = refresh_rx.changed() => {
-                    debug!("ExternalTokenSource: forced refresh triggered");
+            let forced = tokio::select! {
+                _ = tokio::time::sleep(wait) => {
+                    debug!("token refresh: proactive timer fired");
+                    false
                 }
-            }
+                _ = refresh_rx.changed() => {
+                    info!("token refresh: forced refresh signalled (401 or stale auth)");
+                    true
+                }
+            };
 
             // Execute helper to get a fresh token
             match Self::exec_helper(&helper, &session) {
                 Ok(new_token) => {
+                    let prev_exp = parse_jwt_expiry(&self.token()).ok().flatten();
+                    let new_exp = parse_jwt_expiry(&new_token).ok().flatten();
                     self.swap_token(new_token.clone());
                     backoff = std::time::Duration::from_secs(5); // Reset backoff
 
+                    info!(
+                        forced,
+                        new_exp = ?new_exp,
+                        prev_exp = ?prev_exp,
+                        "token refresh: succeeded; token swapped and watchers notified"
+                    );
+
                     // Parse new expiry for next refresh
-                    next_refresh = match parse_jwt_expiry(&new_token) {
-                        Ok(Some(exp)) => std::time::UNIX_EPOCH
+                    next_refresh = match new_exp {
+                        Some(exp) => std::time::UNIX_EPOCH
                             + std::time::Duration::from_secs(exp.saturating_sub(60)),
-                        _ => {
-                            std::time::SystemTime::now()
-                                + std::time::Duration::from_secs(3600)
+                        None => {
+                            std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
                         }
                     };
                 }
                 Err(e) => {
-                    warn!("token refresh failed: {e}");
+                    warn!(forced, "token refresh failed: {e}; retrying in {:?}", backoff);
                     // Retry with backoff
                     next_refresh = std::time::SystemTime::now() + backoff;
                     backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
@@ -484,5 +515,99 @@ mod tests {
 
         source.force_refresh();
         assert_eq!(*rx.borrow(), 2);
+    }
+
+    /// Verifies the end-to-end refresh path: when `force_refresh()` is
+    /// signalled (e.g. after a 401), the background loop re-executes the
+    /// credentials helper and swaps in the new token, notifying watchers.
+    ///
+    /// This guards against the "stale auth" regression where the heartbeat
+    /// observed a 401 but never actually triggered a refresh — the token
+    /// stayed dead until the proactive timer eventually fired.
+    #[tokio::test]
+    async fn force_refresh_swaps_token_via_loop() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new();
+
+        // Helper that emits a distinct JWT on every invocation by reading
+        // and incrementing a counter file. This lets the test observe that
+        // the loop actually re-executed the helper (not just that the signal
+        // was sent).
+        let counter_path = dir.path().join("counter");
+        std::fs::write(&counter_path, "0").expect("should write counter");
+        let helper_path = dir.path().join("counter-helper.sh");
+        let counter_str = counter_path.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            "#!/bin/sh\n\
+             n=$(cat '{counter_str}')\n\
+             n=$((n + 1))\n\
+             echo \"$n\" > '{counter_str}'\n\
+             exp=$((1700000000 + n))\n\
+             header=$(printf '{{\"alg\":\"HS256\",\"typ\":\"JWT\"}}' | base64 | tr -d '=' | tr '/+' '_-')\n\
+             payload=$(printf '{{\"exp\":%d,\"sub\":\"rotating\"}}' \"$exp\" | base64 | tr -d '=' | tr '/+' '_-')\n\
+             printf '%s.%s.rotated\\n' \"$header\" \"$payload\"\n",
+        );
+        std::fs::write(&helper_path, script).expect("should write helper script");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &helper_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("should set executable permission");
+
+        unsafe {
+            std::env::set_var("DATUM_CREDENTIALS_HELPER", helper_path.to_string_lossy().as_ref());
+            std::env::set_var("DATUM_SESSION", "test-session");
+        }
+
+        // Use a token with a far-future expiry so the proactive timer does
+        // not fire during the test — only the forced refresh should swap.
+        let initial = make_jwt_with_exp(9999999999);
+        std::fs::write(&counter_path, "0").expect("should reset counter");
+        // Build the source by hand so from_env() doesn't consume the first
+        // helper invocation (we want the *loop* to be the one rotating).
+        let (token_tx, _) = watch::channel(initial.clone());
+        let (refresh_tx, _) = watch::channel(0u64);
+        let source = ExternalTokenSource {
+            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
+                initial.clone().into(),
+            ))),
+            token_tx: std::sync::Arc::new(token_tx),
+            refresh_trigger: std::sync::Arc::new(refresh_tx),
+        };
+
+        let mut rx = source.watch();
+        assert_eq!(*rx.borrow(), initial, "watch initial value");
+
+        source.start_refresh(
+            helper_path.to_string_lossy().to_string(),
+            "test-session".to_string(),
+        );
+
+        // Nothing should have rotated yet (proactive timer is far in the
+        // future). Give the loop a moment to prove a negative.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(source.token(), initial, "no proactive refresh expected yet");
+
+        // Force a refresh (as the heartbeat does on a 401) and wait for the
+        // loop to re-exec the helper and swap the token.
+        source.force_refresh();
+        for _ in 0..40 {
+            if source.token() != initial {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let new_token = source.token();
+        assert_ne!(
+            new_token, initial,
+            "force_refresh must have rotated the token"
+        );
+        assert!(
+            new_token.ends_with(".rotated"),
+            "rotated token should come from the counter helper: {new_token}"
+        );
+        assert_eq!(*rx.borrow(), new_token, "watchers notified of new token");
     }
 }
