@@ -267,12 +267,22 @@ where
     let client = reqwest::Client::builder()
         .timeout(per_attempt_timeout)
         .danger_accept_invalid_certs(false)
-        // Force IPv4 — some staging environments have IPv6 DNS records but
-        // broken IPv6 connectivity, causing reqwest to hang on IPv6 and
-        // never fall back to IPv4.
-        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         .build()
         .map_err(|e| n0_error::anyerr!("building reqwest client for verify_endpoints: {e}"))?;
+
+    // Resolve the hostname and try IPv4 and IPv6 in parallel. Some environments
+    // have broken IPv6 (records exist but connectivity is dead) or broken IPv4.
+    // Racing both avoids getting stuck on whichever is broken.
+    let v4_client = reqwest::Client::builder()
+        .timeout(per_attempt_timeout)
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        .build()
+        .ok();
+    let v6_client = reqwest::Client::builder()
+        .timeout(per_attempt_timeout)
+        .local_address(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
+        .build()
+        .ok();
 
     // Origin probe — best-effort with budget, non-fatal on failure.
     match probe_until_reachable(&client, &origin_url, budget / 2).await {
@@ -292,9 +302,9 @@ where
     // Proxy probe — fixed 10s interval, indefinite, until non-5xx.
     let start = Instant::now();
     loop {
-        match client.get(&proxy_url).send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
+        let result = race_probe(&client, &v4_client, &v6_client, &proxy_url).await;
+        match result {
+            Ok(status) => {
                 if status < 500 {
                     verify_cb("proxy responding", &proxy_url, start.elapsed(), Some(status));
                     return Ok(());
@@ -331,6 +341,37 @@ where
         // replicator capturing Ready:False; re-patching here re-triggers
         // the mirror so Envoy eventually picks up the iroh cluster config.
         refresh_cb();
+    }
+}
+
+/// Race IPv4 and IPv6 probe attempts in parallel, returning the first success
+/// (any HTTP response). If both fail, return the error from the general client
+/// (which tries whatever the system resolver returns).
+async fn race_probe(
+    client: &reqwest::Client,
+    v4_client: &Option<reqwest::Client>,
+    v6_client: &Option<reqwest::Client>,
+    url: &str,
+) -> std::result::Result<u16, reqwest::Error> {
+    let v4 = match v4_client {
+        Some(c) => Some(c.get(url).send()),
+        None => None,
+    };
+    let v6 = match v6_client {
+        Some(c) => Some(c.get(url).send()),
+        None => None,
+    };
+
+    match (v4, v6) {
+        (Some(v4), Some(v6)) => {
+            tokio::select! {
+                resp = v4 => resp.map(|r| r.status().as_u16()),
+                resp = v6 => resp.map(|r| r.status().as_u16()),
+            }
+        }
+        (Some(v4), None) => v4.await.map(|r| r.status().as_u16()),
+        (None, Some(v6)) => v6.await.map(|r| r.status().as_u16()),
+        (None, None) => client.get(url).send().await.map(|r| r.status().as_u16()),
     }
 }
 
