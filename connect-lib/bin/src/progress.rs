@@ -302,12 +302,13 @@ where
                 );
                 let _ = std::io::stderr().flush();
             }
-            Err(_e) => {
+            Err(e) => {
                 let _ = writeln!(
                     std::io::stderr(),
-                    "  \u{25CB} waiting for tunnel [{}] ({:.0}s) ... no response",
+                    "  \u{25CB} waiting for tunnel [{}] ({:.0}s) ... {}",
                     proxy_url,
                     start.elapsed().as_secs_f64(),
+                    e,
                 );
                 let _ = std::io::stderr().flush();
             }
