@@ -267,6 +267,10 @@ where
     let client = reqwest::Client::builder()
         .timeout(per_attempt_timeout)
         .danger_accept_invalid_certs(false)
+        // Force IPv4 — some staging environments have IPv6 DNS records but
+        // broken IPv6 connectivity, causing reqwest to hang on IPv6 and
+        // never fall back to IPv4.
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         .build()
         .map_err(|e| n0_error::anyerr!("building reqwest client for verify_endpoints: {e}"))?;
 
