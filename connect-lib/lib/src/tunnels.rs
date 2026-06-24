@@ -1220,7 +1220,14 @@ impl TunnelService {
             let mut remaining_for_connector = remaining
                 .items
                 .into_iter()
-                .filter(|proxy| proxy_uses_connector(proxy, &connector_name))
+                .filter(|proxy| {
+                    // Skip proxies already marked for deletion — the API
+                    // server returns them in list responses until
+                    // finalizers complete, but they won't keep using the
+                    // connector.
+                    proxy.metadata.deletion_timestamp.is_none()
+                        && proxy_uses_connector(proxy, &connector_name)
+                })
                 .peekable();
             if remaining_for_connector.peek().is_none() {
                 let ad_selector = format!("{ADVERTISEMENT_CONNECTOR_FIELD}={connector_name}");
