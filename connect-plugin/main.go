@@ -3,15 +3,18 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 
+	"github.com/spf13/cobra"
+	"go.datum.net/datumctl-plugins/connect/internal/binary"
 	"go.datum.net/datumctl-plugins/connect/internal/env"
 	"go.datum.net/datumctl-plugins/connect/tunnel"
 	"go.datum.net/datumctl/plugin"
 )
 
-// Overridden at release time via -ldflags "-X main.version=vX.Y.Z".
-// See .goreleaser.yaml.
-var version = "v0.1.0"
+// Overridden at build time via -ldflags "-X main.version=vX.Y.Z".
+// See Taskfile.yaml and .goreleaser.yaml.
+var version = "v0.1.0-dev"
 
 func main() {
 	// Serve manifest before cobra parses anything
@@ -34,7 +37,21 @@ func main() {
 
 	// Create root command with pre-wired flags
 	cmd := plugin.NewRootCmd("connect", "Manage Datum Connect tunnels")
+	cmd.Version = version
 	cmd.AddCommand(tunnel.NewCmd())
+	cmd.AddCommand(&cobra.Command{
+		Use:   "version",
+		Short: "Print the plugin and Rust binary versions",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("datumctl-connect %s\n", version)
+			if binPath, err := binary.Discover(); err == nil {
+				out, err := exec.Command(binPath, "--version").Output()
+				if err == nil {
+					fmt.Printf("datum-connect  %s", string(out))
+				}
+			}
+		},
+	})
 
 	if err := cmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

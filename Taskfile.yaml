@@ -11,6 +11,10 @@ vars:
 
   GO_BUILD_FLAGS: -trimpath
 
+  GIT_COMMIT:
+    sh: git rev-parse --short HEAD
+  GO_LDFLAGS: -X main.version=v0.1.0+{{.GIT_COMMIT}}
+
   CARGO_TARGET_DIR: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}/target'
   CARGO_BUILD_FLAGS: -p {{.RUST_BINARY}}
   RELEASE_FLAGS: --release
@@ -39,7 +43,7 @@ tasks:
   build:go:
     desc: "Build the Go plugin binary"
     cmds:
-      - go build {{.GO_BUILD_FLAGS}} -o {{.PLUGIN_BINARY}} .
+      - go build {{.GO_BUILD_FLAGS}} -ldflags '{{.GO_LDFLAGS}}' -o {{.PLUGIN_BINARY}} .
     dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
 
   build:rust:

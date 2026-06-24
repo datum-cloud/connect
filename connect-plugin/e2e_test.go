@@ -28,8 +28,8 @@ func TestPluginManifestEmitsValidJSON(t *testing.T) {
 	if manifest["name"] != "connect" {
 		t.Errorf("expected name='connect', got '%v'", manifest["name"])
 	}
-	if manifest["version"] != "v0.1.0" {
-		t.Errorf("expected version='v0.1.0', got '%v'", manifest["version"])
+	if manifest["version"] != "v0.1.0-dev" {
+		t.Errorf("expected version='v0.1.0-dev', got '%v'", manifest["version"])
 	}
 	if manifest["description"] != "Manage Datum Connect tunnels" {
 		t.Errorf("expected description='Manage Datum Connect tunnels', got '%v'", manifest["description"])

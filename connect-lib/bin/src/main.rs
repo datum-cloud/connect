@@ -107,7 +107,11 @@ fn current_filter_string() -> String {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "datum-connect", about = "Datum Connect tunnel agent (plugin mode)")]
+#[command(
+    name = "datum-connect",
+    about = "Datum Connect tunnel agent (plugin mode)",
+    version = concat!("0.1.0+", env!("GIT_COMMIT")),
+)]
 struct Args {
     #[clap(long, env = "DATUM_CONNECT_DIR")]
     repo: Option<std::path::PathBuf>,
@@ -187,6 +191,10 @@ async fn run() -> n0_error::Result<()> {
 
     init_tracing();
 
+    // Let clap handle --version/--help before the plugin-mode env check
+    // so `datum-connect --version` works without DATUM_SESSION set.
+    let args = Args::parse();
+
     let session: Option<String> = std::env::var("DATUM_SESSION").ok();
     if session.is_none() && std::env::var("DATUM_PLUGIN_MODE").map(|v| v != "1").unwrap_or(true) {
         return Err(n0_error::anyerr!(
@@ -204,8 +212,6 @@ async fn run() -> n0_error::Result<()> {
     }
 
     let datum = DatumCloudClient::with_external_token_source(ApiEnv::default(), token_source);
-
-    let args = Args::parse();
 
     // Honour the `--debug` CLI flag by bumping the tracing filter to debug.
     // init_tracing() runs before Args::parse(), so the env var path covered
