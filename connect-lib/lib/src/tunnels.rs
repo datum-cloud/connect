@@ -73,6 +73,8 @@ pub struct TunnelSummary {
     pub connector_ready: bool,
     /// The name of the Connector resource backing this tunnel.
     pub connector_name: Option<String>,
+    /// Device name from the Connector's `datum.net/device-name` annotation.
+    pub connector_device: Option<String>,
 }
 
 /// A Connector that exists in the project but is not referenced by any tunnel.
@@ -83,6 +85,8 @@ pub struct OrphanedConnector {
     pub name: String,
     /// True when the connector's `Ready` condition is `True`.
     pub ready: bool,
+    /// Device name from the Connector's `datum.net/device-name` annotation.
+    pub device: Option<String>,
 }
 
 impl TunnelSummary {
@@ -578,6 +582,22 @@ impl TunnelService {
             })
             .collect();
 
+        let connector_device_by_name: std::collections::HashMap<String, String> =
+            connector_list
+                .items
+                .iter()
+                .filter_map(|c| {
+                    let name = c.metadata.name.clone()?;
+                    let device = c
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|a| a.get(DEVICE_NAME_ANNOTATION))?
+                        .clone();
+                    Some((name, device))
+                })
+                .collect();
+
         let mut tunnels = Vec::new();
         let mut referenced_connector_names = std::collections::HashSet::new();
 
@@ -637,7 +657,10 @@ impl TunnelService {
                 programmed,
                 connector_metadata_programmed,
                 connector_ready,
-                connector_name,
+                connector_name: connector_name.clone(),
+                connector_device: connector_name
+                    .as_deref()
+                    .and_then(|cn| connector_device_by_name.get(cn).cloned()),
             });
         }
 
@@ -651,7 +674,13 @@ impl TunnelService {
                     return None;
                 }
                 let ready = *connector_ready_by_name.get(&name).unwrap_or(&false);
-                Some(OrphanedConnector { name, ready })
+                let device = c
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(DEVICE_NAME_ANNOTATION))
+                    .cloned();
+                Some(OrphanedConnector { name, ready, device })
             })
             .collect();
 
@@ -878,6 +907,7 @@ impl TunnelService {
             // agent will establish the lease shortly after.
             connector_ready: false,
             connector_name: Some(connector_name.clone()),
+            connector_device: Some(friendly_device_name()),
         })
     }
 
@@ -989,6 +1019,7 @@ impl TunnelService {
             ),
             connector_ready: false,
             connector_name,
+            connector_device: None,
         };
 
         if !self.publish_tickets
@@ -1128,6 +1159,7 @@ impl TunnelService {
             ),
             connector_ready: false,
             connector_name,
+            connector_device: None,
         };
 
         if !self.publish_tickets

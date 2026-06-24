@@ -285,7 +285,8 @@ async fn run() -> n0_error::Result<()> {
                         "enabled": t.enabled,
                         "hostnames": t.hostnames,
                         "connector": connector,
-                        "connector_name": t.connector_name
+                        "connector_name": t.connector_name,
+                        "connector_device": t.connector_device
                     })
                 })
                 .collect();
@@ -300,7 +301,8 @@ async fn run() -> n0_error::Result<()> {
                     "enabled": false,
                     "hostnames": [],
                     "connector": connector,
-                    "connector_name": o.name
+                    "connector_name": o.name,
+                    "connector_device": o.device
                 }));
             }
             if json {
@@ -360,6 +362,7 @@ async fn run() -> n0_error::Result<()> {
                         connector_metadata_programmed: false,
                         connector_ready: false,
                         connector_name: None,
+                        connector_device: None,
                     }));
                     ep
                 }

@@ -57,8 +57,8 @@ func RenderTable(data []byte, w *tabwriter.Writer) error {
 	}
 
 	// Header
-	fmt.Fprintln(w, "ID\tLABEL\tENDPOINT\tSTATUS\tENABLED\tCONNECTOR\tHOSTNAMES")
-	fmt.Fprintln(w, "--\t-----\t--------\t------\t-------\t---------\t---------")
+	fmt.Fprintln(w, "ID\tLABEL\tENDPOINT\tSTATUS\tENABLED\tCONNECTOR\tDEVICE\tHOSTNAMES")
+	fmt.Fprintln(w, "--\t-----\t--------\t------\t-------\t---------\t------\t---------")
 
 	for _, t := range tunnels {
 		id := fmt.Sprintf("%v", t["id"])
@@ -75,6 +75,10 @@ func RenderTable(data []byte, w *tabwriter.Writer) error {
 		}
 		connectorStatus := fmt.Sprintf("%v", t["connector"])
 		connector := fmt.Sprintf("%s (%s)", connectorName, connectorStatus)
+		device := fmt.Sprintf("%v", t["connector_device"])
+		if device == "" || device == "<nil>" {
+			device = "\u2014"
+		}
 		hostnames := "\u2014"
 		if hnArr, ok := t["hostnames"].([]interface{}); ok && len(hnArr) > 0 {
 			hnStrs := make([]string, len(hnArr))
@@ -83,18 +87,22 @@ func RenderTable(data []byte, w *tabwriter.Writer) error {
 			}
 			hostnames = strings.Join(hnStrs, ",")
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", id, label, endpoint, status, enabled, connector, hostnames)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", id, label, endpoint, status, enabled, connector, device, hostnames)
 	}
 
 	if len(orphans) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "ORPHANED CONNECTORS (no tunnel — safe to delete)")
-		fmt.Fprintln(w, "NAME\tSTATUS")
-		fmt.Fprintln(w, "----\t------")
+		fmt.Fprintln(w, "NAME\tSTATUS\tDEVICE")
+		fmt.Fprintln(w, "----\t------\t------")
 		for _, o := range orphans {
 			name := fmt.Sprintf("%v", o["id"])
 			connector := fmt.Sprintf("%v", o["connector"])
-			fmt.Fprintf(w, "%s\t%s\n", name, connector)
+			device := fmt.Sprintf("%v", o["connector_device"])
+			if device == "" || device == "<nil>" {
+				device = "\u2014"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\n", name, connector, device)
 		}
 	}
 
