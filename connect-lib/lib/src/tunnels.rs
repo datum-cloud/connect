@@ -509,6 +509,76 @@ impl TunnelService {
             .await
     }
 
+    /// Delete connectors in the active project that are not referenced by any
+    /// HTTPProxy. Returns the names of deleted connectors.
+    pub async fn cleanup_orphaned_connectors(&self) -> Result<Vec<String>> {
+        let Some(selected) = self.datum.selected_context() else {
+            return Ok(Vec::new());
+        };
+        self.cleanup_orphaned_connectors_project(&selected.project_id)
+            .await
+    }
+
+    async fn cleanup_orphaned_connectors_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<String>> {
+        let pcp = self.datum.project_control_plane_client(project_id).await?;
+        let client = pcp.client();
+        let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
+        let connectors: Api<Connector> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
+        let ads: Api<ConnectorAdvertisement> =
+            Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
+
+        let proxy_list = proxies
+            .list(&ListParams::default())
+            .await
+            .std_context("Failed to list HTTPProxy objects")?;
+
+        // Collect connector names referenced by non-deleting proxies.
+        let referenced: std::collections::HashSet<String> = proxy_list
+            .items
+            .iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_none())
+            .filter_map(|p| proxy_connector_name(p))
+            .collect();
+
+        let connector_list = connectors
+            .list(&ListParams::default())
+            .await
+            .std_context("Failed to list Connector objects")?;
+
+        let mut deleted = Vec::new();
+        for c in connector_list.items {
+            let Some(name) = c.metadata.name.clone() else { continue };
+            if referenced.contains(&name) {
+                continue;
+            }
+            // Delete leftover ConnectorAdvertisements for this connector.
+            let ad_selector = format!("{ADVERTISEMENT_CONNECTOR_FIELD}={name}");
+            if let Ok(ad_list) = ads
+                .list(&ListParams::default().fields(&ad_selector))
+                .await
+            {
+                for ad in ad_list.items {
+                    if let Some(ad_name) = ad.metadata.name.clone()
+                        && let Err(err) = ads.delete(&ad_name, &DeleteParams::default()).await
+                    {
+                        warn!(%ad_name, "Failed to delete orphaned connector advertisement: {err:#}");
+                    }
+                }
+            }
+            // Delete the connector.
+            if let Err(err) = connectors.delete(&name, &DeleteParams::default()).await {
+                warn!(%name, "Failed to delete orphaned connector: {err:#}");
+            } else {
+                debug!(%name, "Deleted orphaned connector");
+                deleted.push(name);
+            }
+        }
+        Ok(deleted)
+    }
+
     pub async fn set_enabled_active(
         &self,
         tunnel_id: &str,

@@ -203,19 +203,27 @@ impl Repo {
                 );
                 tokio::fs::rename(&legacy, &key_file_path).await?;
             } else {
-                n0_error::bail_any!(
-                    "No listen key for tunnel '{tunnel_name}' in project '{project_id}'. \
-                     This tunnel was created on a different machine. \
-                     Copy the listen_key file from that machine to {} \
-                     to resume with the same hostname.",
-                    key_file_path.display()
-                );
+                n0_error::bail_any!("KEY_NOT_FOUND");
             }
         }
 
         let key = tokio::fs::read(&key_file_path).await?;
         let key = key.as_slice().try_into().anyerr()?;
         Ok(SecretKey::from_bytes(key))
+    }
+
+    /// Persist a key for a tunnel (used when regenerating a key for resume).
+    pub async fn save_listen_key_for_tunnel(
+        &self,
+        project_id: &str,
+        tunnel_name: &str,
+        key: &SecretKey,
+    ) -> Result<()> {
+        let tunnel_dir = self.0.join(project_id).join(tunnel_name);
+        let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
+        tokio::fs::create_dir_all(&tunnel_dir).await?;
+        tokio::fs::write(&key_file_path, key.to_bytes()).await?;
+        Ok(())
     }
 
     async fn secret_key(&self, key_file_path: PathBuf) -> Result<SecretKey> {

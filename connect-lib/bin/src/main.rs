@@ -339,6 +339,10 @@ async fn run() -> n0_error::Result<()> {
             // Optional in-memory key: Some(key) for --endpoint (generated),
             // None for --id/picker (key read from disk).
             let mut in_memory_key: Option<SecretKey> = None;
+            // Set when --id resume generates a new key because the original
+            // was missing. Forces update_active to rewire the HTTPProxy to
+            // the new connector.
+            let mut force_rewire = false;
 
             let mut preresolved_ns: Option<(ListenNode, TunnelService, connect_lib::TunnelSummary)> =
                 None;
@@ -372,10 +376,27 @@ async fn run() -> n0_error::Result<()> {
                     let t = service.get_active(&tunnel_id).await?.ok_or_else(|| {
                         n0_error::anyerr!("Tunnel '{tunnel_id}' not found in project {project_id}")
                     })?;
-                    // Read the per-tunnel key using the server-assigned tunnel name.
-                    let key = repo
-                        .listen_key_for_tunnel(&project_id, &t.id)
-                        .await?;
+                    // Read the per-tunnel key. If missing (e.g. key file was
+                    // deleted or tunnel created on another machine), generate
+                    // a new key and force a rewire so the HTTPProxy points to
+                    // a new connector with the same hostname.
+                    let key = match repo.listen_key_for_tunnel(&project_id, &t.id).await {
+                        Ok(k) => k,
+                        Err(e) if e.to_string().contains("KEY_NOT_FOUND") => {
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "  \u{26A0} No listen key for tunnel {} — generating new key. \
+                                 The hostname will stay the same but the old connector will be replaced.",
+                                t.id
+                            );
+                            let _ = std::io::stderr().flush();
+                            let new_key = SecretKey::generate(&mut rand::rng());
+                            in_memory_key = Some(new_key.clone());
+                            force_rewire = true;
+                            new_key
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let node = ListenNode::new_with_key(repo.clone(), key).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
                     // Inherit endpoint from the existing tunnel.
@@ -395,10 +416,24 @@ async fn run() -> n0_error::Result<()> {
                             t.endpoint
                         ));
                     }
-                    // Read the per-tunnel key using the server-assigned tunnel name.
-                    let key = repo
-                        .listen_key_for_tunnel(&project_id, &t.id)
-                        .await?;
+                    // Read the per-tunnel key (same missing-key handling as above).
+                    let key = match repo.listen_key_for_tunnel(&project_id, &t.id).await {
+                        Ok(k) => k,
+                        Err(e) if e.to_string().contains("KEY_NOT_FOUND") => {
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "  \u{26A0} No listen key for tunnel {} — generating new key. \
+                                 The hostname will stay the same but the old connector will be replaced.",
+                                t.id
+                            );
+                            let _ = std::io::stderr().flush();
+                            let new_key = SecretKey::generate(&mut rand::rng());
+                            in_memory_key = Some(new_key.clone());
+                            force_rewire = true;
+                            new_key
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let node = ListenNode::new_with_key(repo.clone(), key).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
                     preresolved_ns = Some((node, service, t));
@@ -503,8 +538,19 @@ async fn run() -> n0_error::Result<()> {
             }
 
             let tunnel_id = if let Some(t) = existing {
-                if let Some(label) = label.filter(|l| l != &t.label) {
-                    let updated = service.update_active(&t.id, &label, &endpoint).await?;
+                if force_rewire || label.as_ref().is_some_and(|l| l != &t.label) {
+                    let label_val = label.clone().unwrap_or_else(|| t.label.clone());
+                    let updated = service.update_active(&t.id, &label_val, &endpoint).await?;
+                    // Persist the new key if one was generated.
+                    if let Some(ref secret_key) = in_memory_key {
+                        repo.save_listen_key_for_tunnel(&project_id, &t.id, secret_key)
+                            .await?;
+                    }
+                    // Clean up orphaned connectors left from the old key.
+                    let deleted = service.cleanup_orphaned_connectors().await?;
+                    for name in &deleted {
+                        tracing::info!(connector = %name, "Cleaned up orphaned connector");
+                    }
                     if json {
                         println!(
                             "{}",
