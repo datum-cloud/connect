@@ -88,9 +88,12 @@ tasks:
 
   install:release:
     desc: "Build (release) and install both binaries"
+    dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
     cmds:
       - task: build:release
       - mkdir -p $HOME/.datumctl/plugins
+      - cp {{.PLUGIN_BINARY}} $HOME/.datumctl/plugins/
+      - chmod +x $HOME/.datumctl/plugins/{{.PLUGIN_BINARY}}
       - cp {{.CARGO_TARGET_DIR}}/release/{{.RUST_BINARY}} $HOME/.datumctl/plugins/
       - chmod +x $HOME/.datumctl/plugins/{{.RUST_BINARY}}
 
