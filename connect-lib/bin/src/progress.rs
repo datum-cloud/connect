@@ -303,12 +303,19 @@ where
                 let _ = std::io::stderr().flush();
             }
             Err(e) => {
+                let mut chain = format!("{e}");
+                let mut source = std::error::Error::source(&e);
+                while let Some(s) = source {
+                    chain.push_str(": ");
+                    chain.push_str(&s.to_string());
+                    source = s.source();
+                }
                 let _ = writeln!(
                     std::io::stderr(),
                     "  \u{25CB} waiting for tunnel [{}] ({:.0}s) ... {}",
                     proxy_url,
                     start.elapsed().as_secs_f64(),
-                    e,
+                    chain,
                 );
                 let _ = std::io::stderr().flush();
             }
