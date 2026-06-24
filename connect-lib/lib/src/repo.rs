@@ -202,10 +202,20 @@ impl Repo {
                     key_file_path.display(),
                 );
                 tokio::fs::rename(&legacy, &key_file_path).await?;
+            } else {
+                n0_error::bail_any!(
+                    "No listen key for tunnel '{tunnel_name}' in project '{project_id}'. \
+                     This tunnel was created on a different machine. \
+                     Copy the listen_key file from that machine to {} \
+                     to resume with the same hostname.",
+                    key_file_path.display()
+                );
             }
         }
 
-        self.secret_key(key_file_path).await
+        let key = tokio::fs::read(&key_file_path).await?;
+        let key = key.as_slice().try_into().anyerr()?;
+        Ok(SecretKey::from_bytes(key))
     }
 
     async fn secret_key(&self, key_file_path: PathBuf) -> Result<SecretKey> {
@@ -317,12 +327,17 @@ mod tests {
     #[tokio::test]
     async fn listen_key_for_tunnel_fresh_project_generates_key_at_per_tunnel_path() {
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        // Pre-create the key so listen_key_for_tunnel can read it.
+        let tunnel_dir = repo.0.join("my-project").join("my-tunnel");
+        tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
+        let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
+        let seed_key = SecretKey::generate(&mut rand::rng());
+        tokio::fs::write(&key_path, seed_key.to_bytes()).await.unwrap();
+
         let key = repo
             .listen_key_for_tunnel("my-project", "my-tunnel")
             .await
             .unwrap();
-        let tunnel_dir = repo.0.join("my-project").join("my-tunnel");
-        let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
         assert!(key_path.exists(), "key must exist at per-tunnel path");
         assert_eq!(tokio::fs::read(&key_path).await.unwrap(), key.to_bytes());
     }
@@ -361,6 +376,13 @@ mod tests {
     #[tokio::test]
     async fn listen_key_for_tunnel_is_stable_across_calls() {
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        // Pre-create the key.
+        let tunnel_dir = repo.0.join("stable-proj").join("stable-tunnel");
+        tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
+        let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
+        let seed_key = SecretKey::generate(&mut rand::rng());
+        tokio::fs::write(&key_path, seed_key.to_bytes()).await.unwrap();
+
         let first = repo
             .listen_key_for_tunnel("stable-proj", "stable-tunnel")
             .await
@@ -379,6 +401,14 @@ mod tests {
     #[tokio::test]
     async fn listen_key_for_tunnel_two_tunnels_get_distinct_keys() {
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        // Pre-create distinct keys for two tunnels.
+        for name in ["tunnel-a", "tunnel-b"] {
+            let tunnel_dir = repo.0.join("multi-proj").join(name);
+            tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
+            let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
+            let seed_key = SecretKey::generate(&mut rand::rng());
+            tokio::fs::write(&key_path, seed_key.to_bytes()).await.unwrap();
+        }
         let key_a = repo
             .listen_key_for_tunnel("multi-proj", "tunnel-a")
             .await
@@ -391,6 +421,18 @@ mod tests {
             key_a.to_bytes(),
             key_b.to_bytes(),
             "two tunnels in the same project must get distinct keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn listen_key_for_tunnel_errors_when_key_missing() {
+        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        let result = repo
+            .listen_key_for_tunnel("missing-proj", "missing-tunnel")
+            .await;
+        assert!(
+            result.is_err(),
+            "should error when key does not exist (no legacy migration)"
         );
     }
 }
