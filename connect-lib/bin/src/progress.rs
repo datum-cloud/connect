@@ -250,14 +250,16 @@ where
 /// failure. The proxy URL is checked on a fixed 10-second interval until it
 /// returns a non-5xx response, printing a status line on each attempt so the
 /// user sees progress during settling time.
-pub async fn verify_endpoints<F>(
+pub async fn verify_endpoints<F, R>(
     origin_endpoint: &str,
     hostname: &str,
     budget: Duration,
     verify_cb: F,
+    mut refresh_cb: R,
 ) -> Result<()>
 where
     F: Fn(&str, &str, Duration, Option<u16>),
+    R: FnMut(),
 {
     let (origin_url, proxy_url) = build_probe_urls(origin_endpoint, hostname);
 
@@ -320,6 +322,11 @@ where
             }
         }
         sleep(Duration::from_secs(10)).await;
+        // Nudge the replicator → Envoy xDS propagation chain. The initial
+        // refresh_connection_details call may have raced with the
+        // replicator capturing Ready:False; re-patching here re-triggers
+        // the mirror so Envoy eventually picks up the iroh cluster config.
+        refresh_cb();
     }
 }
 

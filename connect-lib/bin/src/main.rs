@@ -598,12 +598,21 @@ async fn run() -> n0_error::Result<()> {
             // until it returns a successful (non-5xx) response. Only after
             // this do we declare the tunnel ready to the user / Go supervisor.
             let verify_mode = mode;
+            let service_for_refresh = service.clone();
             progress::verify_endpoints(
                 &endpoint,
                 &hostname,
                 std::time::Duration::from_secs(10),
                 move |label, url, elapsed, status| {
                     progress::render_verify(verify_mode, label, url, elapsed, status);
+                },
+                || {
+                    let svc = service_for_refresh.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = svc.refresh_connection_details().await {
+                            tracing::debug!("refresh during probe failed: {e:#}");
+                        }
+                    });
                 },
             )
             .await?;
