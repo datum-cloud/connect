@@ -69,7 +69,12 @@ func RenderTable(data []byte, w *tabwriter.Writer) error {
 		if enabledVal, ok := t["enabled"].(bool); ok && enabledVal {
 			enabled = "yes"
 		}
-		connector := fmt.Sprintf("%v", t["connector"])
+		connectorName := fmt.Sprintf("%v", t["connector_name"])
+		if connectorName == "" || connectorName == "<nil>" {
+			connectorName = "\u2014"
+		}
+		connectorStatus := fmt.Sprintf("%v", t["connector"])
+		connector := fmt.Sprintf("%s (%s)", connectorName, connectorStatus)
 		hostnames := "\u2014"
 		if hnArr, ok := t["hostnames"].([]interface{}); ok && len(hnArr) > 0 {
 			hnStrs := make([]string, len(hnArr))
