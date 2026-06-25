@@ -402,14 +402,23 @@ async fn probe_url_with_dns_fallback(
 }
 
 /// Returns true if the reqwest error is DNS-related (resolution failure),
-/// as opposed to a connection timeout, TLS error, etc.
+/// as opposed to a connection timeout, TLS error, etc. Walks the full
+/// error source chain because reqwest wraps the real cause.
 fn is_dns_error(e: &reqwest::Error) -> bool {
-    let cause = e.to_string().to_lowercase();
-    cause.contains("dns")
-        || cause.contains("name or service not known")
-        || cause.contains("nodomain")
-        || cause.contains("failed to lookup")
-        || cause.contains("no such host")
+    let mut current: Option<&(dyn std::error::Error)> = Some(e);
+    while let Some(err) = current {
+        let msg = err.to_string().to_lowercase();
+        if msg.contains("dns")
+            || msg.contains("name or service not known")
+            || msg.contains("nodomain")
+            || msg.contains("failed to lookup")
+            || msg.contains("no such host")
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 async fn probe_until_reachable(
