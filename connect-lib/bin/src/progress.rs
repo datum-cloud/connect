@@ -270,19 +270,15 @@ where
         .build()
         .map_err(|e| n0_error::anyerr!("building reqwest client for verify_endpoints: {e}"))?;
 
-    // Resolve the hostname and try IPv4 and IPv6 in parallel. Some environments
-    // have broken IPv6 (records exist but connectivity is dead) or broken IPv4.
-    // Racing both avoids getting stuck on whichever is broken.
-    let v4_client = reqwest::Client::builder()
-        .timeout(per_attempt_timeout)
-        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-        .build()
-        .ok();
-    let v6_client = reqwest::Client::builder()
-        .timeout(per_attempt_timeout)
-        .local_address(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
-        .build()
-        .ok();
+    // Fallback resolver for when the system resolver (e.g. systemd-resolved)
+    // returns NXDOMAIN for records that exist on authoritative servers.
+    // Uses Cloudflare (1.1.1.1) public resolver.
+    let fallback_resolver =
+        hickory_resolver::Resolver::builder_with_config(
+            hickory_resolver::config::ResolverConfig::cloudflare(),
+            hickory_resolver::name_server::TokioConnectionProvider::default(),
+        )
+        .build();
 
     // Origin probe — best-effort with budget, non-fatal on failure.
     match probe_until_reachable(&client, &origin_url, budget / 2).await {
@@ -302,7 +298,13 @@ where
     // Proxy probe — fixed 10s interval, indefinite, until non-5xx.
     let start = Instant::now();
     loop {
-        let result = race_probe(&client, &v4_client, &v6_client, &proxy_url).await;
+        let result = probe_url_with_dns_fallback(
+            &client,
+            &fallback_resolver,
+            &proxy_url,
+            per_attempt_timeout,
+        )
+        .await;
         match result {
             Ok(status) => {
                 if status < 500 {
@@ -344,35 +346,70 @@ where
     }
 }
 
-/// Race IPv4 and IPv6 probe attempts in parallel, returning the first success
-/// (any HTTP response). If both fail, return the error from the general client
-/// (which tries whatever the system resolver returns).
-async fn race_probe(
+/// Probe a URL, falling back to a public DNS resolver if the system resolver
+/// fails. When the system resolver returns NXDOMAIN (e.g. systemd-resolved
+/// caching a stale negative entry), we resolve the hostname via Cloudflare
+/// DNS and connect directly to the IP with the Host header preserved.
+async fn probe_url_with_dns_fallback(
     client: &reqwest::Client,
-    v4_client: &Option<reqwest::Client>,
-    v6_client: &Option<reqwest::Client>,
+    fallback_resolver: &hickory_resolver::TokioAsyncResolver,
     url: &str,
+    timeout: Duration,
 ) -> std::result::Result<u16, reqwest::Error> {
-    let v4 = match v4_client {
-        Some(c) => Some(c.get(url).send()),
-        None => None,
+    // First, try the normal client (uses the system resolver).
+    match client.get(url).send().await {
+        Ok(resp) => return Ok(resp.status().as_u16()),
+        Err(e) if !is_dns_error(&e) => return Err(e),
+        Err(_dns_err) => {
+            // System resolver failed with a DNS error. Try the fallback.
+        }
+    }
+
+    // Parse the URL to extract hostname.
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => {
+            return client.get(url).send().await.map(|r| r.status().as_u16());
+        }
     };
-    let v6 = match v6_client {
-        Some(c) => Some(c.get(url).send()),
-        None => None,
+    let Some(host) = parsed.host_str() else {
+        return client.get(url).send().await.map(|r| r.status().as_u16());
+    };
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let scheme = parsed.scheme().to_string();
+
+    // Resolve via the fallback resolver.
+    let lookup = fallback_resolver.lookup_ip(host).await;
+    let ips: Vec<std::net::IpAddr> = match lookup {
+        Ok(lookup) => lookup.iter().collect(),
+        Err(_) => {
+            return client.get(url).send().await.map(|r| r.status().as_u16());
+        }
     };
 
-    match (v4, v6) {
-        (Some(v4), Some(v6)) => {
-            tokio::select! {
-                resp = v4 => resp.map(|r| r.status().as_u16()),
-                resp = v6 => resp.map(|r| r.status().as_u16()),
-            }
+    // Try each resolved IP address with the Host header preserved.
+    for ip in ips {
+        let ip_url = format!("{scheme}://{ip}:{port}/");
+        let req = client.get(&ip_url).header("host", host);
+        match tokio::time::timeout(timeout, req.send()).await {
+            Ok(Ok(resp)) => return Ok(resp.status().as_u16()),
+            Ok(Err(_e)) => continue,
+            Err(_) => continue,
         }
-        (Some(v4), None) => v4.await.map(|r| r.status().as_u16()),
-        (None, Some(v6)) => v6.await.map(|r| r.status().as_u16()),
-        (None, None) => client.get(url).send().await.map(|r| r.status().as_u16()),
     }
+
+    client.get(url).send().await.map(|r| r.status().as_u16())
+}
+
+/// Returns true if the reqwest error is DNS-related (resolution failure),
+/// as opposed to a connection timeout, TLS error, etc.
+fn is_dns_error(e: &reqwest::Error) -> bool {
+    let cause = e.to_string().to_lowercase();
+    cause.contains("dns")
+        || cause.contains("name or service not known")
+        || cause.contains("nodomain")
+        || cause.contains("failed to lookup")
+        || cause.contains("no such host")
 }
 
 async fn probe_until_reachable(
