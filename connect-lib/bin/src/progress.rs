@@ -360,8 +360,14 @@ async fn probe_url_with_dns_fallback(
     match client.get(url).send().await {
         Ok(resp) => return Ok(resp.status().as_u16()),
         Err(e) if !is_dns_error(&e) => return Err(e),
-        Err(_dns_err) => {
+        Err(dns_err) => {
             // System resolver failed with a DNS error. Try the fallback.
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{26A0} system DNS failed ({}), trying fallback resolver...",
+                dns_err,
+            );
+            let _ = std::io::stderr().flush();
         }
     }
 
@@ -381,8 +387,23 @@ async fn probe_url_with_dns_fallback(
     // Resolve via the fallback resolver.
     let lookup = fallback_resolver.lookup_ip(host).await;
     let ips: Vec<std::net::IpAddr> = match lookup {
-        Ok(lookup) => lookup.iter().collect(),
-        Err(_) => {
+        Ok(lookup) => {
+            let ips: Vec<_> = lookup.iter().collect();
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{26A0} fallback resolver returned {} IPs for {}",
+                ips.len(),
+                host,
+            );
+            let _ = std::io::stderr().flush();
+            ips
+        }
+        Err(e) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{26A0} fallback resolver also failed: {e}",
+            );
+            let _ = std::io::stderr().flush();
             return client.get(url).send().await.map(|r| r.status().as_u16());
         }
     };
@@ -393,7 +414,14 @@ async fn probe_url_with_dns_fallback(
         let req = client.get(&ip_url).header("host", host);
         match tokio::time::timeout(timeout, req.send()).await {
             Ok(Ok(resp)) => return Ok(resp.status().as_u16()),
-            Ok(Err(_e)) => continue,
+            Ok(Err(e)) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "  \u{26A0} fallback connect to {ip} failed: {e}",
+                );
+                let _ = std::io::stderr().flush();
+                continue;
+            }
             Err(_) => continue,
         }
     }
