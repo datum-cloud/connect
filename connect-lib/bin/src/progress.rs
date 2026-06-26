@@ -372,18 +372,19 @@ fn system_resolver_config() -> hickory_resolver::config::ResolverConfig {
     config
 }
 
-/// Extract the registrable domain from a hostname.
-/// e.g. "foo-bar.datumproxy.net" -> "datumproxy.net"
-fn extract_domain(host: &str) -> &str {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() >= 2 {
-        let second_last = parts[parts.len() - 2];
-        let last = parts[parts.len() - 1];
-        let start = host.len() - last.len() - 1 - second_last.len();
-        &host[start..]
-    } else {
-        host
+/// Create a ResolverConfig pointing at the given authoritative NS IPs
+/// on port 53 UDP.
+fn auth_ns_config(ns_ips: &[std::net::IpAddr]) -> hickory_resolver::config::ResolverConfig {
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+    use hickory_resolver::proto::xfer::Protocol;
+    let mut config = ResolverConfig::new();
+    for ip in ns_ips {
+        config.add_name_server(NameServerConfig::new(
+            std::net::SocketAddr::new(*ip, 53),
+            Protocol::Udp,
+        ));
     }
+    config
 }
 
 /// Query the system resolver for NS records of `domain`, then resolve
@@ -414,19 +415,23 @@ async fn resolve_ns_ips(
     ns_ips
 }
 
-/// Create a ResolverConfig pointing at the given authoritative NS IPs
-/// on port 53 UDP.
-fn auth_ns_config(ns_ips: &[std::net::IpAddr]) -> hickory_resolver::config::ResolverConfig {
-    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
-    use hickory_resolver::proto::xfer::Protocol;
-    let mut config = ResolverConfig::new();
-    for ip in ns_ips {
-        config.add_name_server(NameServerConfig::new(
-            std::net::SocketAddr::new(*ip, 53),
-            Protocol::Udp,
-        ));
+/// Walk the hostname labels from right to left, querying NS records at each
+/// level until one is found. Returns the NS IPs and the domain where they
+/// were found.
+async fn discover_ns_authority(
+    system_resolver: &hickory_resolver::TokioResolver,
+    hostname: &str,
+) -> (Vec<std::net::IpAddr>, String) {
+    let labels: Vec<&str> = hostname.split('.').collect();
+    // Start from the full hostname and work inward.
+    for n in (1..labels.len()).rev() {
+        let domain: String = labels[n - 1..].join(".");
+        let ns_ips = resolve_ns_ips(system_resolver, &domain).await;
+        if !ns_ips.is_empty() {
+            return (ns_ips, domain);
+        }
     }
-    config
+    (Vec::new(), String::new())
 }
 
 /// Resolve the proxy hostname via authoritative DNS as a visible progress step.
@@ -437,53 +442,64 @@ pub async fn resolve_hostname_dns(
     hostname: &str,
 ) -> Result<Vec<std::net::IpAddr>> {
     let start = Instant::now();
-    let domain = extract_domain(hostname);
     let max_duration = Duration::from_secs(120);
     let retry_interval = Duration::from_secs(5);
 
-    // Discover authoritative NS IPs once (they don't change during retries).
     let sys_resolver = hickory_resolver::Resolver::builder_with_config(
         system_resolver_config(),
         hickory_resolver::name_server::TokioConnectionProvider::default(),
     )
     .build();
-    let ns_ips = resolve_ns_ips(&sys_resolver, domain).await;
-    let auth_config = if ns_ips.is_empty() {
-        None
-    } else {
-        Some(auth_ns_config(&ns_ips))
-    };
 
+    let (ns_ips, ns_domain) = discover_ns_authority(&sys_resolver, hostname).await;
+    if ns_ips.is_empty() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "  \u{2717} checking for NS ({:.1}s) [{}]: no authoritative server found",
+            start.elapsed().as_secs_f64(),
+            hostname,
+        );
+        let _ = std::io::stderr().flush();
+        return Err(n0_error::anyerr!(
+            "no authoritative NS found for {hostname}"
+        ));
+    }
+
+    let ns_ip_str: Vec<String> = ns_ips.iter().map(|ip| ip.to_string()).collect();
+    let _ = writeln!(
+        std::io::stderr(),
+        "  \u{2713} checking for NS ({:.1}s) [{}]: {}",
+        start.elapsed().as_secs_f64(),
+        ns_domain,
+        ns_ip_str.join(", "),
+    );
+    let _ = std::io::stderr().flush();
+
+    let auth_config = auth_ns_config(&ns_ips);
     let mut last_print = Instant::now();
     loop {
-        let ips = match &auth_config {
-            None => Vec::new(),
-            Some(config) => {
-                let auth_resolver = hickory_resolver::Resolver::builder_with_config(
-                    config.clone(),
-                    hickory_resolver::name_server::TokioConnectionProvider::default(),
-                )
-                .build();
-                let mut ips: Vec<std::net::IpAddr> = Vec::new();
-                if let Ok(lookup) = auth_resolver.ipv4_lookup(hostname).await {
-                    for record in lookup.as_lookup().records() {
-                        if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
-                            ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
-                        }
-                    }
+        let auth_resolver = hickory_resolver::Resolver::builder_with_config(
+            auth_config.clone(),
+            hickory_resolver::name_server::TokioConnectionProvider::default(),
+        )
+        .build();
+        let mut ips: Vec<std::net::IpAddr> = Vec::new();
+        if let Ok(lookup) = auth_resolver.ipv4_lookup(hostname).await {
+            for record in lookup.as_lookup().records() {
+                if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
+                    ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
                 }
-                if ips.is_empty() {
-                    if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
-                        for record in lookup.as_lookup().records() {
-                            if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
-                                ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
-                            }
-                        }
-                    }
-                }
-                ips
             }
-        };
+        }
+        if ips.is_empty() {
+            if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
+                for record in lookup.as_lookup().records() {
+                    if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
+                        ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
+                    }
+                }
+            }
+        }
 
         if !ips.is_empty() {
             let ip_str: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
@@ -515,7 +531,7 @@ pub async fn resolve_hostname_dns(
         if last_print.elapsed() >= Duration::from_secs(5) {
             let _ = writeln!(
                 std::io::stderr(),
-                "  \u{25CB} waiting for DNS ({:.0}s) [{}]",
+                "  \u{25CB} waiting for A record ({:.0}s) [{}]",
                 start.elapsed().as_secs_f64(),
                 hostname,
             );
@@ -560,10 +576,6 @@ async fn probe_url_with_dns_fallback(
     };
     let port = parsed.port_or_known_default().unwrap_or(443);
     let scheme = parsed.scheme().to_string();
-    let domain = extract_domain(host);
-    if domain.is_empty() {
-        return client.get(url).send().await.map(|r| r.status().as_u16());
-    }
 
     let sys_resolver = hickory_resolver::Resolver::builder_with_config(
         system_resolver_config(),
@@ -571,12 +583,12 @@ async fn probe_url_with_dns_fallback(
     )
     .build();
 
-    let ns_ips = resolve_ns_ips(&sys_resolver, domain).await;
+    let (ns_ips, _ns_domain) = discover_ns_authority(&sys_resolver, host).await;
     if ns_ips.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
             "  \u{26A0} no NS records found for {}, falling back to system DNS",
-            domain,
+            host,
         );
         let _ = std::io::stderr().flush();
         return client.get(url).send().await.map(|r| r.status().as_u16());
