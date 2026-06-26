@@ -515,7 +515,7 @@ pub async fn resolve_hostname_dns(
         if last_print.elapsed() >= Duration::from_secs(5) {
             let _ = writeln!(
                 std::io::stderr(),
-                "  \u{25CB} waiting for DNS provisioned ({:.0}s) [{}]",
+                "  \u{25CB} waiting for DNS ({:.0}s) [{}]",
                 start.elapsed().as_secs_f64(),
                 hostname,
             );
