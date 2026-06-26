@@ -853,6 +853,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "connect-lib",
+ "hickory-resolver",
  "inquire",
  "iroh",
  "n0-error",
@@ -863,6 +864,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

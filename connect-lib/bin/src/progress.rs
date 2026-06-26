@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 /// Set to true once the first progress step has been rendered, so the
@@ -270,16 +270,6 @@ where
         .build()
         .map_err(|e| n0_error::anyerr!("building reqwest client for verify_endpoints: {e}"))?;
 
-    // Fallback resolver for when the system resolver (e.g. systemd-resolved)
-    // returns NXDOMAIN for records that exist on authoritative servers.
-    // Uses Cloudflare (1.1.1.1) public resolver.
-    let fallback_resolver =
-        hickory_resolver::Resolver::builder_with_config(
-            hickory_resolver::config::ResolverConfig::cloudflare(),
-            hickory_resolver::name_server::TokioConnectionProvider::default(),
-        )
-        .build();
-
     // Origin probe — best-effort with budget, non-fatal on failure.
     match probe_until_reachable(&client, &origin_url, budget / 2).await {
         Ok((elapsed, status)) => {
@@ -300,7 +290,6 @@ where
     loop {
         let result = probe_url_with_dns_fallback(
             &client,
-            &fallback_resolver,
             &proxy_url,
             per_attempt_timeout,
         )
@@ -346,49 +335,168 @@ where
     }
 }
 
-/// Probe a URL, falling back to a public DNS resolver if the system resolver
-/// fails. When the system resolver returns NXDOMAIN (e.g. systemd-resolved
-/// caching a stale negative entry), we resolve the hostname via Cloudflare
-/// DNS and connect directly to the IP with the Host header preserved.
+/// Read nameserver IPs from /etc/resolv.conf.
+fn system_nameservers() -> Vec<std::net::IpAddr> {
+    let content = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let mut ips = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("nameserver ") {
+            if let Ok(ip) = rest.trim().parse::<std::net::IpAddr>() {
+                ips.push(ip);
+            }
+        }
+    }
+    ips
+}
+
+/// Create a ResolverConfig using system DNS servers from /etc/resolv.conf,
+/// falling back to Google public DNS (UDP) as a last resort.
+fn system_resolver_config() -> hickory_resolver::config::ResolverConfig {
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+    use hickory_resolver::proto::xfer::Protocol;
+    let sys_ips = system_nameservers();
+    let mut config = ResolverConfig::new();
+    for ip in sys_ips {
+        config.add_name_server(NameServerConfig::new(
+            std::net::SocketAddr::new(ip, 53),
+            Protocol::Udp,
+        ));
+    }
+    if config.name_servers().is_empty() {
+        for ip in &[
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 4, 4)),
+        ] {
+            config.add_name_server(NameServerConfig::new(
+                std::net::SocketAddr::new(*ip, 53),
+                Protocol::Udp,
+            ));
+        }
+    }
+    config
+}
+
+/// Extract the registrable domain from a hostname.
+/// e.g. "foo-bar.datumproxy.net" -> "datumproxy.net"
+fn extract_domain(host: &str) -> &str {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() >= 2 {
+        let second_last = parts[parts.len() - 2];
+        let last = parts[parts.len() - 1];
+        let start = host.len() - last.len() - 1 - second_last.len();
+        &host[start..]
+    } else {
+        host
+    }
+}
+
+/// Query the system resolver for NS records of `domain`, then resolve
+/// each NS hostname to IP addresses.
+async fn resolve_ns_ips(
+    system_resolver: &hickory_resolver::TokioResolver,
+    domain: &str,
+) -> Vec<std::net::IpAddr> {
+    use hickory_resolver::proto::rr::RData;
+    let ns_lookup = match system_resolver.ns_lookup(domain).await {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+    let mut ns_names: Vec<String> = Vec::new();
+    for record in ns_lookup.as_lookup().records() {
+        if let RData::NS(name) = record.data() {
+            ns_names.push(name.to_string().trim_end_matches('.').to_string());
+        }
+    }
+    let mut ns_ips = Vec::new();
+    for name in &ns_names {
+        if let Ok(ip_lookup) = system_resolver.lookup_ip(name).await {
+            for ip in ip_lookup.iter() {
+                ns_ips.push(ip);
+            }
+        }
+    }
+    ns_ips
+}
+
+/// Create a ResolverConfig pointing at the given authoritative NS IPs
+/// on port 53 UDP.
+fn auth_ns_config(ns_ips: &[std::net::IpAddr]) -> hickory_resolver::config::ResolverConfig {
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+    use hickory_resolver::proto::xfer::Protocol;
+    let mut config = ResolverConfig::new();
+    for ip in ns_ips {
+        config.add_name_server(NameServerConfig::new(
+            std::net::SocketAddr::new(*ip, 53),
+            Protocol::Udp,
+        ));
+    }
+    config
+}
+
+/// Probe a URL, falling back to the authoritative NS if the system resolver
+/// returns a DNS error. When the system resolver returns NXDOMAIN (e.g.
+/// systemd-resolved caching a stale negative entry), we bypass it entirely:
+/// discover the authoritative name servers for the domain, query them directly
+/// for A/AAAA records, and connect to the resolved IPs with the Host header
+/// preserved.
 async fn probe_url_with_dns_fallback(
     client: &reqwest::Client,
-    fallback_resolver: &hickory_resolver::TokioAsyncResolver,
     url: &str,
     timeout: Duration,
 ) -> std::result::Result<u16, reqwest::Error> {
-    // First, try the normal client (uses the system resolver).
     match client.get(url).send().await {
         Ok(resp) => return Ok(resp.status().as_u16()),
         Err(e) if !is_dns_error(&e) => return Err(e),
         Err(dns_err) => {
-            // System resolver failed with a DNS error. Try the fallback.
             let _ = writeln!(
                 std::io::stderr(),
-                "  \u{26A0} system DNS failed ({}), trying fallback resolver...",
+                "  \u{26A0} system DNS failed ({}), querying authoritative NS...",
                 dns_err,
             );
             let _ = std::io::stderr().flush();
         }
     }
 
-    // Parse the URL to extract hostname.
     let parsed = match url::Url::parse(url) {
         Ok(u) => u,
-        Err(_) => {
-            return client.get(url).send().await.map(|r| r.status().as_u16());
-        }
+        Err(_) => return client.get(url).send().await.map(|r| r.status().as_u16()),
     };
     let Some(host) = parsed.host_str() else {
         return client.get(url).send().await.map(|r| r.status().as_u16());
     };
     let port = parsed.port_or_known_default().unwrap_or(443);
     let scheme = parsed.scheme().to_string();
+    let domain = extract_domain(host);
+    if domain.is_empty() {
+        return client.get(url).send().await.map(|r| r.status().as_u16());
+    }
 
-    // Resolve via the fallback resolver. Query A and AAAA separately —
-    // hickory's lookup_ip can fail on AAAA (empty response) without
-    // falling back to A records.
+    let sys_resolver = hickory_resolver::Resolver::builder_with_config(
+        system_resolver_config(),
+        hickory_resolver::name_server::TokioConnectionProvider::default(),
+    )
+    .build();
+
+    let ns_ips = resolve_ns_ips(&sys_resolver, domain).await;
+    if ns_ips.is_empty() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "  \u{26A0} no NS records found for {}, falling back to system DNS",
+            domain,
+        );
+        let _ = std::io::stderr().flush();
+        return client.get(url).send().await.map(|r| r.status().as_u16());
+    }
+
+    let auth_resolver = hickory_resolver::Resolver::builder_with_config(
+        auth_ns_config(&ns_ips),
+        hickory_resolver::name_server::TokioConnectionProvider::default(),
+    )
+    .build();
+
     let mut ips: Vec<std::net::IpAddr> = Vec::new();
-    let a_result = fallback_resolver.ipv4_lookup(host).await;
+    let a_result = auth_resolver.ipv4_lookup(host).await;
     match &a_result {
         Ok(lookup) => {
             for record in lookup.as_lookup().records() {
@@ -398,12 +506,12 @@ async fn probe_url_with_dns_fallback(
             }
         }
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback A lookup failed: {e}");
+            let _ = writeln!(std::io::stderr(), "  \u{26A0} auth NS A lookup failed: {e}");
             let _ = std::io::stderr().flush();
         }
     }
     if ips.is_empty() {
-        let aaaa_result = fallback_resolver.ipv6_lookup(host).await;
+        let aaaa_result = auth_resolver.ipv6_lookup(host).await;
         match &aaaa_result {
             Ok(lookup) => {
                 for record in lookup.as_lookup().records() {
@@ -413,25 +521,21 @@ async fn probe_url_with_dns_fallback(
                 }
             }
             Err(e) => {
-                let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback AAAA lookup failed: {e}");
+                let _ = writeln!(std::io::stderr(), "  \u{26A0} auth NS AAAA lookup failed: {e}");
                 let _ = std::io::stderr().flush();
             }
         }
     }
     if ips.is_empty() {
-        let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback resolver returned no IPs for {}", host);
+        let _ = writeln!(
+            std::io::stderr(),
+            "  \u{26A0} auth NS returned no IPs for {}",
+            host,
+        );
         let _ = std::io::stderr().flush();
         return client.get(url).send().await.map(|r| r.status().as_u16());
     }
-    let _ = writeln!(
-        std::io::stderr(),
-        "  \u{26A0} fallback resolver returned {} IPs for {}",
-        ips.len(),
-        host,
-    );
-    let _ = std::io::stderr().flush();
 
-    // Try each resolved IP address with the Host header preserved.
     for ip in ips {
         let ip_url = format!("{scheme}://{ip}:{port}/");
         let req = client.get(&ip_url).header("host", host);
@@ -440,7 +544,7 @@ async fn probe_url_with_dns_fallback(
             Ok(Err(e)) => {
                 let _ = writeln!(
                     std::io::stderr(),
-                    "  \u{26A0} fallback connect to {ip} failed: {e}",
+                    "  \u{26A0} auth NS connect to {ip} failed: {e}",
                 );
                 let _ = std::io::stderr().flush();
                 continue;
