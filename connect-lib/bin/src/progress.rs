@@ -434,6 +434,76 @@ fn auth_ns_config(ns_ips: &[std::net::IpAddr]) -> hickory_resolver::config::Reso
     config
 }
 
+/// Resolve the proxy hostname via authoritative DNS as a visible progress step.
+/// Used between controller-condition polling and HTTP verification so the user
+/// sees a clear "DNS resolved" step and we fail fast if resolution fails.
+pub async fn resolve_hostname_dns(
+    hostname: &str,
+    mode: Mode,
+) -> Result<Vec<std::net::IpAddr>> {
+    let start = Instant::now();
+    let domain = extract_domain(hostname);
+
+    let sys_resolver = hickory_resolver::Resolver::builder_with_config(
+        system_resolver_config(),
+        hickory_resolver::name_server::TokioConnectionProvider::default(),
+    )
+    .build();
+
+    let ns_ips = resolve_ns_ips(&sys_resolver, domain).await;
+    let ips = if ns_ips.is_empty() {
+        Vec::new()
+    } else {
+        let auth_resolver = hickory_resolver::Resolver::builder_with_config(
+            auth_ns_config(&ns_ips),
+            hickory_resolver::name_server::TokioConnectionProvider::default(),
+        )
+        .build();
+        let mut ips: Vec<std::net::IpAddr> = Vec::new();
+        if let Ok(lookup) = auth_resolver.ipv4_lookup(hostname).await {
+            for record in lookup.as_lookup().records() {
+                if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
+                    ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
+                }
+            }
+        }
+        if ips.is_empty() {
+            if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
+                for record in lookup.as_lookup().records() {
+                    if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
+                        ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
+                    }
+                }
+            }
+        }
+        ips
+    };
+
+    if ips.is_empty() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "  \u{2717} hostname DNS check ({:.1}s) [{}]: resolution failed",
+            start.elapsed().as_secs_f64(),
+            hostname,
+        );
+        let _ = std::io::stderr().flush();
+        return Err(n0_error::anyerr!(
+            "could not resolve {hostname} via authoritative DNS"
+        ));
+    }
+
+    let ip_str: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+    let _ = writeln!(
+        std::io::stderr(),
+        "  \u{2713} hostname DNS check ({:.1}s) [{}]: {}",
+        start.elapsed().as_secs_f64(),
+        hostname,
+        ip_str.join(", "),
+    );
+    let _ = std::io::stderr().flush();
+    Ok(ips)
+}
+
 /// Probe a URL, falling back to the authoritative NS if the system resolver
 /// returns a DNS error. When the system resolver returns NXDOMAIN (e.g.
 /// systemd-resolved caching a stale negative entry), we bypass it entirely:

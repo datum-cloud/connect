@@ -649,6 +649,11 @@ async fn run() -> n0_error::Result<()> {
                     n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
                 })?;
 
+            // Resolve the proxy hostname via authoritative DNS as a visible
+            // step. This fails fast if the hostname cannot be resolved, and
+            // prevents the HTTP probes below from getting stuck on DNS.
+            progress::resolve_hostname_dns(&hostname, mode).await?;
+
             // Verify origin is up and poll the tunnel URL every 10 seconds
             // until it returns a successful (non-5xx) response. Only after
             // this do we declare the tunnel ready to the user / Go supervisor.
