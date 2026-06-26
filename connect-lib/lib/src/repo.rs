@@ -137,9 +137,19 @@ impl Repo {
         self.secret_key(key_file_path).await
     }
 
+    /// Return a fresh listen key always written to a timestamp-suffixed file
+    /// (`listen_key.<YYYYMMDDHHmmss>`) so a stale key from a previous `listen`
+    /// is never accidentally reused. The plain `listen_key` name is only used
+    /// inside per-tunnel subdirectories where the key is intentionally stable.
     pub async fn listen_key(&self) -> Result<SecretKey> {
-        let key_file_path = self.0.join(Self::LISTEN_KEY_FILE);
-        self.secret_key(key_file_path).await
+        let key = SecretKey::generate(&mut rand::rng());
+        let now = chrono::Local::now().format("%Y%m%d%H%M%S");
+        let key_file_path = self.0.join(format!("{}.{}", Self::LISTEN_KEY_FILE, now));
+        if let Some(parent) = key_file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&key_file_path, key.to_bytes()).await?;
+        Ok(key)
     }
 
     /// Project-scoped listen key. Each project gets its own iroh identity so
