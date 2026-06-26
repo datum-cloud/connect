@@ -436,7 +436,7 @@ fn auth_ns_config(ns_ips: &[std::net::IpAddr]) -> hickory_resolver::config::Reso
 
 /// Resolve the proxy hostname via authoritative DNS as a visible progress step.
 /// Used between controller-condition polling and HTTP verification so the user
-/// sees a clear "DNS resolved" step and we fail fast if resolution fails.
+/// sees a clear "DNS provisioned" step and we fail fast if resolution fails.
 pub async fn resolve_hostname_dns(
     hostname: &str,
     mode: Mode,
@@ -482,7 +482,7 @@ pub async fn resolve_hostname_dns(
     if ips.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
-            "  \u{2717} hostname DNS check ({:.1}s) [{}]: resolution failed",
+            "  \u{2717} DNS provisioned ({:.1}s) [{}]: resolution failed",
             start.elapsed().as_secs_f64(),
             hostname,
         );
@@ -495,7 +495,7 @@ pub async fn resolve_hostname_dns(
     let ip_str: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
     let _ = writeln!(
         std::io::stderr(),
-        "  \u{2713} hostname DNS check ({:.1}s) [{}]: {}",
+        "  \u{2713} DNS provisioned ({:.1}s) [{}]: {}",
         start.elapsed().as_secs_f64(),
         hostname,
         ip_str.join(", "),
