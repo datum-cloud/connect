@@ -432,70 +432,99 @@ fn auth_ns_config(ns_ips: &[std::net::IpAddr]) -> hickory_resolver::config::Reso
 /// Resolve the proxy hostname via authoritative DNS as a visible progress step.
 /// Used between controller-condition polling and HTTP verification so the user
 /// sees a clear "DNS provisioned" step and we fail fast if resolution fails.
+/// Retries every 5 seconds until success or timeout.
 pub async fn resolve_hostname_dns(
     hostname: &str,
 ) -> Result<Vec<std::net::IpAddr>> {
     let start = Instant::now();
     let domain = extract_domain(hostname);
+    let max_duration = Duration::from_secs(120);
+    let retry_interval = Duration::from_secs(5);
 
+    // Discover authoritative NS IPs once (they don't change during retries).
     let sys_resolver = hickory_resolver::Resolver::builder_with_config(
         system_resolver_config(),
         hickory_resolver::name_server::TokioConnectionProvider::default(),
     )
     .build();
-
     let ns_ips = resolve_ns_ips(&sys_resolver, domain).await;
-    let ips = if ns_ips.is_empty() {
-        Vec::new()
+    let auth_config = if ns_ips.is_empty() {
+        None
     } else {
-        let auth_resolver = hickory_resolver::Resolver::builder_with_config(
-            auth_ns_config(&ns_ips),
-            hickory_resolver::name_server::TokioConnectionProvider::default(),
-        )
-        .build();
-        let mut ips: Vec<std::net::IpAddr> = Vec::new();
-        if let Ok(lookup) = auth_resolver.ipv4_lookup(hostname).await {
-            for record in lookup.as_lookup().records() {
-                if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
-                    ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
-                }
-            }
-        }
-        if ips.is_empty() {
-            if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
-                for record in lookup.as_lookup().records() {
-                    if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
-                        ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
-                    }
-                }
-            }
-        }
-        ips
+        Some(auth_ns_config(&ns_ips))
     };
 
-    if ips.is_empty() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "  \u{2717} DNS provisioned ({:.1}s) [{}]: resolution failed",
-            start.elapsed().as_secs_f64(),
-            hostname,
-        );
-        let _ = std::io::stderr().flush();
-        return Err(n0_error::anyerr!(
-            "could not resolve {hostname} via authoritative DNS"
-        ));
-    }
+    let mut last_print = Instant::now();
+    loop {
+        let ips = match &auth_config {
+            None => Vec::new(),
+            Some(config) => {
+                let auth_resolver = hickory_resolver::Resolver::builder_with_config(
+                    config.clone(),
+                    hickory_resolver::name_server::TokioConnectionProvider::default(),
+                )
+                .build();
+                let mut ips: Vec<std::net::IpAddr> = Vec::new();
+                if let Ok(lookup) = auth_resolver.ipv4_lookup(hostname).await {
+                    for record in lookup.as_lookup().records() {
+                        if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
+                            ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
+                        }
+                    }
+                }
+                if ips.is_empty() {
+                    if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
+                        for record in lookup.as_lookup().records() {
+                            if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
+                                ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
+                            }
+                        }
+                    }
+                }
+                ips
+            }
+        };
 
-    let ip_str: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
-    let _ = writeln!(
-        std::io::stderr(),
-        "  \u{2713} DNS provisioned ({:.1}s) [{}]: {}",
-        start.elapsed().as_secs_f64(),
-        hostname,
-        ip_str.join(", "),
-    );
-    let _ = std::io::stderr().flush();
-    Ok(ips)
+        if !ips.is_empty() {
+            let ip_str: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{2713} DNS provisioned ({:.1}s) [{}]: {}",
+                start.elapsed().as_secs_f64(),
+                hostname,
+                ip_str.join(", "),
+            );
+            let _ = std::io::stderr().flush();
+            return Ok(ips);
+        }
+
+        if start.elapsed() >= max_duration {
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{2717} DNS provisioned ({:.1}s) [{}]: resolution failed",
+                start.elapsed().as_secs_f64(),
+                hostname,
+            );
+            let _ = std::io::stderr().flush();
+            return Err(n0_error::anyerr!(
+                "could not resolve {hostname} via authoritative DNS after {}s",
+                max_duration.as_secs(),
+            ));
+        }
+
+        if last_print.elapsed() >= Duration::from_secs(5) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{25CB} waiting for DNS provisioned ({:.0}s) [{}]",
+                start.elapsed().as_secs_f64(),
+                hostname,
+            );
+            let _ = std::io::stderr().flush();
+            last_print = Instant::now();
+        }
+
+        tokio::time::sleep(retry_interval).await;
+    }
 }
 
 /// Probe a URL, falling back to the authoritative NS if the system resolver
