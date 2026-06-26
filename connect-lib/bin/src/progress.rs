@@ -388,31 +388,38 @@ async fn probe_url_with_dns_fallback(
     // hickory's lookup_ip can fail on AAAA (empty response) without
     // falling back to A records.
     let mut ips: Vec<std::net::IpAddr> = Vec::new();
-    let mut fallback_failed = false;
-    if let Ok(lookup) = fallback_resolver.ipv4_lookup(host).await {
-        for record in lookup.as_lookup().records() {
-            if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
-                ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
-            }
-        }
-    } else {
-        fallback_failed = true;
-    }
-    if ips.is_empty() {
-        if let Ok(lookup) = fallback_resolver.ipv6_lookup(host).await {
+    let a_result = fallback_resolver.ipv4_lookup(host).await;
+    match &a_result {
+        Ok(lookup) => {
             for record in lookup.as_lookup().records() {
-                if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
-                    ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
+                if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
+                    ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
                 }
             }
-        } else if fallback_failed {
-            let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback resolver failed for both A and AAAA");
+        }
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback A lookup failed: {e}");
             let _ = std::io::stderr().flush();
-            return client.get(url).send().await.map(|r| r.status().as_u16());
         }
     }
     if ips.is_empty() {
-        let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback resolver returned no IPs");
+        let aaaa_result = fallback_resolver.ipv6_lookup(host).await;
+        match &aaaa_result {
+            Ok(lookup) => {
+                for record in lookup.as_lookup().records() {
+                    if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
+                        ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback AAAA lookup failed: {e}");
+                let _ = std::io::stderr().flush();
+            }
+        }
+    }
+    if ips.is_empty() {
+        let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback resolver returned no IPs for {}", host);
         let _ = std::io::stderr().flush();
         return client.get(url).send().await.map(|r| r.status().as_u16());
     }
