@@ -384,29 +384,45 @@ async fn probe_url_with_dns_fallback(
     let port = parsed.port_or_known_default().unwrap_or(443);
     let scheme = parsed.scheme().to_string();
 
-    // Resolve via the fallback resolver.
-    let lookup = fallback_resolver.lookup_ip(host).await;
-    let ips: Vec<std::net::IpAddr> = match lookup {
-        Ok(lookup) => {
-            let ips: Vec<_> = lookup.iter().collect();
-            let _ = writeln!(
-                std::io::stderr(),
-                "  \u{26A0} fallback resolver returned {} IPs for {}",
-                ips.len(),
-                host,
-            );
-            let _ = std::io::stderr().flush();
-            ips
+    // Resolve via the fallback resolver. Query A and AAAA separately —
+    // hickory's lookup_ip can fail on AAAA (empty response) without
+    // falling back to A records.
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
+    let mut fallback_failed = false;
+    if let Ok(lookup) = fallback_resolver.ipv4_lookup(host).await {
+        for record in lookup.as_lookup().records() {
+            if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
+                ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
+            }
         }
-        Err(e) => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "  \u{26A0} fallback resolver also failed: {e}",
-            );
+    } else {
+        fallback_failed = true;
+    }
+    if ips.is_empty() {
+        if let Ok(lookup) = fallback_resolver.ipv6_lookup(host).await {
+            for record in lookup.as_lookup().records() {
+                if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
+                    ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
+                }
+            }
+        } else if fallback_failed {
+            let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback resolver failed for both A and AAAA");
             let _ = std::io::stderr().flush();
             return client.get(url).send().await.map(|r| r.status().as_u16());
         }
-    };
+    }
+    if ips.is_empty() {
+        let _ = writeln!(std::io::stderr(), "  \u{26A0} fallback resolver returned no IPs");
+        let _ = std::io::stderr().flush();
+        return client.get(url).send().await.map(|r| r.status().as_u16());
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "  \u{26A0} fallback resolver returned {} IPs for {}",
+        ips.len(),
+        host,
+    );
+    let _ = std::io::stderr().flush();
 
     // Try each resolved IP address with the Host header preserved.
     for ip in ips {
