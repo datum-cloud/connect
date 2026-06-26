@@ -138,13 +138,17 @@ impl Repo {
     }
 
     /// Return a fresh listen key always written to a timestamp-suffixed file
-    /// (`listen_key.<YYYYMMDDHHmmss>`) so a stale key from a previous `listen`
-    /// is never accidentally reused. The plain `listen_key` name is only used
-    /// inside per-tunnel subdirectories where the key is intentionally stable.
-    pub async fn listen_key(&self) -> Result<SecretKey> {
+    /// (`listen_key[.<project_id>].<YYYYMMDDHHmmss>`) so a stale key from a previous
+    /// `listen` is never accidentally reused. The plain `listen_key` name is only
+    /// used inside per-tunnel subdirectories where the key is intentionally stable.
+    pub async fn listen_key(&self, project_id: Option<&str>) -> Result<SecretKey> {
         let key = SecretKey::generate(&mut rand::rng());
         let now = chrono::Local::now().format("%Y%m%d%H%M%S");
-        let key_file_path = self.0.join(format!("{}.{}", Self::LISTEN_KEY_FILE, now));
+        let suffix = match project_id {
+            Some(pid) => format!("{}.{}", pid, now),
+            None => now.to_string(),
+        };
+        let key_file_path = self.0.join(format!("{}.{}", Self::LISTEN_KEY_FILE, suffix));
         if let Some(parent) = key_file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }

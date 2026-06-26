@@ -87,7 +87,7 @@ impl ListenNode {
         let config = repo.config().await?;
         let secret_key = match project_id {
             Some(pid) => repo.listen_key_for_project(pid).await?,
-            None => repo.listen_key().await?,
+            None => repo.listen_key(project_id).await?,
         };
         let endpoint = build_endpoint(secret_key, &config).await?;
         let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
