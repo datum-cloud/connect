@@ -31,12 +31,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-
-/// Set to true once the first progress step has been rendered, so the
-/// test harness can detect that setup-phase output was emitted.
-pub static PROGRESS_SEEN: AtomicBool = AtomicBool::new(false);
 
 use connect_lib::{ProgressStep, ProgressStepKind, StepStatus, TunnelProgress, TunnelService};
 use n0_error::Result;
@@ -439,7 +434,6 @@ fn auth_ns_config(ns_ips: &[std::net::IpAddr]) -> hickory_resolver::config::Reso
 /// sees a clear "DNS provisioned" step and we fail fast if resolution fails.
 pub async fn resolve_hostname_dns(
     hostname: &str,
-    mode: Mode,
 ) -> Result<Vec<std::net::IpAddr>> {
     let start = Instant::now();
     let domain = extract_domain(hostname);
@@ -630,7 +624,7 @@ async fn probe_url_with_dns_fallback(
 /// as opposed to a connection timeout, TLS error, etc. Walks the full
 /// error source chain because reqwest wraps the real cause.
 fn is_dns_error(e: &reqwest::Error) -> bool {
-    let mut current: Option<&(dyn std::error::Error)> = Some(e);
+    let mut current: Option<&dyn std::error::Error> = Some(e);
     while let Some(err) = current {
         let msg = err.to_string().to_lowercase();
         if msg.contains("dns")

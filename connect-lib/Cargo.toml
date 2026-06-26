@@ -2,6 +2,9 @@
 members = ["lib", "bin"]
 resolver = "2"
 
+[workspace.lints.rust]
+warnings = "deny"
+
 [workspace.dependencies]
 arc-swap = "1.8.0"
 base64 = "0.22"

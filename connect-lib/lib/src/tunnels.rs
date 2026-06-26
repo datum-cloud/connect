@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use iroh_proxy_utils::Authority;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -1373,6 +1372,7 @@ impl TunnelService {
         })
     }
 
+    #[allow(dead_code)]
     async fn find_connector_readonly(&self, project_id: &str) -> Result<Option<Connector>> {
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();

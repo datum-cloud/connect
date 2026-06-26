@@ -135,6 +135,7 @@ pub(crate) mod auth {
     /// classify any future in-process refresh attempts (Phase 12 work) and so
     /// the surface matches upstream for downstream merge compatibility.
     #[derive(Debug)]
+    #[allow(dead_code)]
     pub enum RefreshError {
         /// The IdP definitively rejected the refresh (typically `invalid_grant`,
         /// `invalid_client`, etc.). Auth state has been cleared; the operator
@@ -158,6 +159,7 @@ pub(crate) mod auth {
     impl std::error::Error for RefreshError {}
 }
 
+#[allow(unused_imports)]
 pub(crate) use self::auth::RefreshError;
 
 pub use self::auth::{AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};

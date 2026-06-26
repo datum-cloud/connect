@@ -344,30 +344,16 @@ async fn run() -> n0_error::Result<()> {
             // the new connector.
             let mut force_rewire = false;
 
-            let mut preresolved_ns: Option<(ListenNode, TunnelService, connect_lib::TunnelSummary)> =
-                None;
+            let preresolved_ns: Option<(ListenNode, TunnelService, connect_lib::TunnelSummary)>;
             let endpoint: String = match (endpoint, id) {
                 (Some(ep), None) => {
                     // --endpoint only: generate key in memory, use new_with_key()
                     let secret_key = SecretKey::generate(&mut rand::rng());
                     in_memory_key = Some(secret_key.clone());
-                    let node = ListenNode::new_with_key(repo.clone(), secret_key).await?;
-                    let service = TunnelService::new(datum.clone(), node.clone());
+                    ListenNode::new_with_key(repo.clone(), secret_key).await?;
                     // No existing tunnel — preresolved_ns stays None so
                     // the downstream block falls through to create.
-                    preresolved_ns = Some((node, service, connect_lib::TunnelSummary {
-                        id: String::new(),
-                        label: String::new(),
-                        endpoint: ep.clone(),
-                        hostnames: vec![],
-                        enabled: false,
-                        accepted: false,
-                        programmed: false,
-                        connector_metadata_programmed: false,
-                        connector_ready: false,
-                        connector_name: None,
-                        connector_device: None,
-                    }));
+                    preresolved_ns = None;
                     ep
                 }
                 (None, Some(tunnel_id)) => {
@@ -652,7 +638,7 @@ async fn run() -> n0_error::Result<()> {
             // Resolve the proxy hostname via authoritative DNS as a visible
             // step. This fails fast if the hostname cannot be resolved, and
             // prevents the HTTP probes below from getting stuck on DNS.
-            progress::resolve_hostname_dns(&hostname, mode).await?;
+            progress::resolve_hostname_dns(&hostname).await?;
 
             // Verify origin is up and poll the tunnel URL every 10 seconds
             // until it returns a successful (non-5xx) response. Only after
