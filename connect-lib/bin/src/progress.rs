@@ -29,7 +29,7 @@
 //! types via explicit case arms but currently no-ops them — only
 //! `tunnel_ready` (emitted from main.rs) drives `gotReady`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::time::Duration;
 
@@ -404,15 +404,15 @@ async fn resolve_ns_ips(
             ns_names.push(name.to_string().trim_end_matches('.').to_string());
         }
     }
-    let mut ns_ips = Vec::new();
+    let mut ns_ips = BTreeSet::new();
     for name in &ns_names {
         if let Ok(ip_lookup) = system_resolver.lookup_ip(name).await {
             for ip in ip_lookup.iter() {
-                ns_ips.push(ip);
+                ns_ips.insert(ip);
             }
         }
     }
-    ns_ips
+    ns_ips.into_iter().collect()
 }
 
 /// Walk the hostname labels from right to left, querying NS records at each
