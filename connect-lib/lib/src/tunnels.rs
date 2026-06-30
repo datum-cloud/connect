@@ -1799,7 +1799,7 @@ fn default_match() -> HTTPRouteMatch {
     }
 }
 
-fn friendly_device_name() -> String {
+pub fn friendly_device_name() -> String {
     #[cfg(target_os = "macos")]
     {
         if let Ok(output) = std::process::Command::new("scutil")

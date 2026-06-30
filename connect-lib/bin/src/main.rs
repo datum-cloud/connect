@@ -489,6 +489,29 @@ async fn run() -> n0_error::Result<()> {
                     let n = ListenNode::new(repo.clone()).await?;
                     let s = TunnelService::new(datum.clone(), n.clone());
                     let existing = s.get_active_by_endpoint(&endpoint).await?;
+                    // `--endpoint` carries a local, non-unique address (e.g.
+                    // `localhost:8888`), so matching by endpoint alone would
+                    // adopt a tunnel created on a different machine and rewire
+                    // its HTTPProxy to this process's fresh connector —
+                    // orphaning the original machine's connector and stealing
+                    // the hostname. Only adopt when the existing tunnel's
+                    // connector belongs to this device; otherwise fall through
+                    // to create a new tunnel.
+                    let existing = existing.and_then(|t| {
+                        let here = connect_lib::friendly_device_name();
+                        if t.connector_device.as_deref() == Some(here.as_str()) {
+                            Some(t)
+                        } else {
+                            tracing::info!(
+                                endpoint = %endpoint,
+                                tunnel = %t.id,
+                                device = ?t.connector_device,
+                                here = %here,
+                                "existing tunnel belongs to a different device; creating a new tunnel"
+                            );
+                            None
+                        }
+                    });
                     (n, s, existing)
                 }
             };
