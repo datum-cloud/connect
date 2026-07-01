@@ -35,7 +35,7 @@ type ProjectRunner = Arc<
         + Sync,
 >;
 
-const DEFAULT_PCP_NAMESPACE: &str = "default";
+use crate::DEFAULT_PCP_NAMESPACE;
 const DEFAULT_LEASE_DURATION_SECS: i32 = 30;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);

@@ -33,7 +33,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::time::Duration;
 
-use connect_lib::{ProgressStep, ProgressStepKind, StepStatus, TunnelProgress, TunnelService};
+use connect_lib::{
+    normalize_endpoint, ProgressStep, ProgressStepKind, StepStatus, TunnelProgress, TunnelService,
+};
 use n0_error::Result;
 use tokio::time::{sleep, Instant};
 
@@ -150,11 +152,7 @@ pub fn render_verify(mode: Mode, label: &str, url: &str, elapsed: Duration, stat
 // --- URL builder for verify_endpoints ---
 
 pub fn build_probe_urls(endpoint: &str, hostname: &str) -> (String, String) {
-    let origin = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{}", endpoint)
-    };
+    let origin = normalize_endpoint(endpoint);
     let proxy = format!("https://{}", hostname);
     (origin, proxy)
 }

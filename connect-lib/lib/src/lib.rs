@@ -19,13 +19,16 @@ pub use project_control_plane::ProjectControlPlaneClient;
 pub use repo::{MissingConnectDir, Repo};
 pub use state::{Advertisment, SelectedContext, State, StateWrapper, TcpProxyData};
 pub use tunnels::{
-    friendly_device_name, OrphanedConnector, ProgressStep, ProgressStepKind, StepStatus,
-    TunnelDeleteOutcome, TunnelProgress, TunnelService, TunnelSummary,
+    friendly_device_name, normalize_endpoint, OrphanedConnector, ProgressStep, ProgressStepKind,
+    StepStatus, TunnelDeleteOutcome, TunnelProgress, TunnelService, TunnelSummary,
 };
 
 /// The root domain for datum connect URLs to subdomain from. A proxy URL will
 /// be a three-word-codename subdomain off this URL. eg: "https://vast-gold-mine.iroh.datum.net"
 pub const DATUM_CONNECT_GATEWAY_DOMAIN_NAME: &str = "iroh.datum.net";
+
+/// Kubernetes namespace used for Connector, HTTPProxy, and related CRDs.
+pub const DEFAULT_PCP_NAMESPACE: &str = "default";
 
 /// Serializes env-dependent tests (std::env::set_var is not thread-safe).
 #[cfg(test)]

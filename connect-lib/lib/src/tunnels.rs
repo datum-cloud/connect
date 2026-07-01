@@ -32,29 +32,11 @@ use crate::datum_apis::traffic_protection_policy::{
     TrafficProtectionPolicyRuleSetType, TrafficProtectionPolicySpec,
 };
 use crate::datum_cloud::DatumCloudClient;
-use crate::{Advertisment, ListenNode, TcpProxyData, state::ProxyState};
-
-const DEFAULT_PCP_NAMESPACE: &str = "default";
+use crate::{DEFAULT_PCP_NAMESPACE, Advertisment, ListenNode, TcpProxyData, state::ProxyState};
 const DEFAULT_CONNECTOR_CLASS_NAME: &str = "datum-connect";
 const CONNECTOR_SELECTOR_FIELD: &str = "status.connectionDetails.publicKey.id";
 const ADVERTISEMENT_CONNECTOR_FIELD: &str = "spec.connectorRef.name";
 const DISPLAY_NAME_ANNOTATION: &str = "app.kubernetes.io/name";
-
-/// Returns true if any rule in the HTTPProxy has a backend that references the given connector by name.
-fn proxy_uses_connector(proxy: &HTTPProxy, connector_name: &str) -> bool {
-    proxy
-        .spec
-        .rules
-        .iter()
-        .flat_map(|rule| rule.backends.as_ref().and_then(|b| b.first()))
-        .any(|backend| {
-            backend
-                .connector
-                .as_ref()
-                .map(|c| c.name == connector_name)
-                .unwrap_or(false)
-        })
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TunnelSummary {
@@ -1327,7 +1309,7 @@ impl TunnelService {
                     // finalizers complete, but they won't keep using the
                     // connector.
                     proxy.metadata.deletion_timestamp.is_none()
-                        && proxy_uses_connector(proxy, &connector_name)
+                        && proxy_connector_name(proxy).as_deref() == Some(connector_name.as_str())
                 })
                 .peekable();
             if remaining_for_connector.peek().is_none() {
@@ -1580,7 +1562,9 @@ fn build_connection_details(listen: &ListenNode) -> Option<ConnectorConnectionDe
     })
 }
 
-fn normalize_endpoint(endpoint: &str) -> String {
+/// Normalizes an endpoint string by ensuring it has an `http://` scheme prefix.
+/// Returns the input unchanged if it already contains `://`.
+pub fn normalize_endpoint(endpoint: &str) -> String {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
         return endpoint.to_string();
