@@ -6,6 +6,13 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Gate integration-style tests that require rustls CryptoProvider
+# (ring or aws-lc-rs feature) and external token helpers.
+# Run with: cargo test --lib --features integration-tests
+integration-tests = []
+
 [dependencies]
 arc-swap = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }

@@ -10,6 +10,9 @@ pub mod repo;
 pub mod state;
 pub mod tunnels;
 
+#[cfg(test)]
+pub mod test_util;
+
 pub use config::{Config, DiscoveryMode};
 pub use datum_cloud::external_token_source::{ExternalTokenError, ExternalTokenSource};
 pub use datum_cloud::{ApiEnv, AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};

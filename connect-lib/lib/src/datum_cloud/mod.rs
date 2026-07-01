@@ -401,68 +401,7 @@ pub struct Project {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
-
-    fn make_jwt_with_exp(exp: u64) -> String {
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"alg":"HS256","typ":"JWT"}).to_string().as_bytes(),
-        );
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"exp": exp, "sub":"test-user"}).to_string().as_bytes(),
-        );
-        format!("{header}.{payload}.fake_sig")
-    }
-
-    struct TempDir {
-        path: std::path::PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("connect-dc-test-{ts}"));
-            std::fs::create_dir_all(&path).expect("should create temp dir");
-            TempDir { path }
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn setup_plugin_env() -> (TempDir, ExternalTokenSource) {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
-        let dir = TempDir::new();
-        let helper_path = dir.path().join("fake-helper.sh");
-        let jwt = make_jwt_with_exp(9999999999);
-        std::fs::write(&helper_path, format!("#!/bin/sh\necho '{}'\n", jwt))
-            .expect("should write helper script");
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &helper_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .expect("should set executable permission");
-        let helper_str = helper_path.to_string_lossy().to_string();
-
-        unsafe {
-            std::env::set_var("DATUM_CREDENTIALS_HELPER", &helper_str);
-            std::env::set_var("DATUM_SESSION", "test-session");
-        }
-
-        let source =
-            ExternalTokenSource::from_env(Some("test-session".to_string())).expect("should create token source");
-        (dir, source)
-    }
+    use crate::test_util::setup_plugin_env;
 
     #[test]
     fn with_external_token_source_creates_plugin_mode_client() {

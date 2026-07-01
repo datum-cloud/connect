@@ -296,77 +296,7 @@ enum JwtParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Helper: create a JWT-like string with a given exp claim.
-    fn make_jwt_with_exp(exp: u64) -> String {
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"alg":"HS256","typ":"JWT"})
-                .to_string()
-                .as_bytes(),
-        );
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"exp": exp, "sub":"test-user"})
-                .to_string()
-                .as_bytes(),
-        );
-        format!("{header}.{payload}.fake_signature_here")
-    }
-
-    /// A temporary directory that cleans up on drop.
-    struct TempDir {
-        path: std::path::PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("connect-ets-test-{ts}"));
-            std::fs::create_dir_all(&path).expect("should create temp dir");
-            TempDir { path }
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    /// Create a temporary helper script that outputs a fake JWT, set env vars,
-    /// and return a configured [`ExternalTokenSource`].
-    ///
-    /// The returned `TempDir` keeps the script alive for the test scope.
-    fn setup_plugin_env() -> (TempDir, ExternalTokenSource) {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
-        let dir = TempDir::new();
-        let helper_path = dir.path().join("fake-helper.sh");
-        let jwt = make_jwt_with_exp(9999999999);
-        std::fs::write(&helper_path, format!("#!/bin/sh\necho '{}'\n", jwt))
-            .expect("should write helper script");
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &helper_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .expect("should set executable permission");
-        let helper_str = helper_path.to_string_lossy().to_string();
-
-        unsafe {
-            std::env::set_var("DATUM_CREDENTIALS_HELPER", &helper_str);
-            std::env::set_var("DATUM_SESSION", "test-session");
-        }
-
-        let source =
-            ExternalTokenSource::from_env(Some("test-session".to_string())).expect("should create token source");
-        (dir, source)
-    }
+    use crate::test_util::{make_jwt_with_exp, setup_plugin_env, TempDir};
 
     #[test]
     fn parse_jwt_expiry_extracts_exp() {
@@ -527,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn force_refresh_swaps_token_via_loop() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
-        let dir = TempDir::new();
+        let dir = TempDir::new("ets-loop");
 
         // Helper that emits a distinct JWT on every invocation by reading
         // and incrementing a counter file. This lets the test observe that

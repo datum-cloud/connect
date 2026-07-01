@@ -182,78 +182,18 @@ impl ProjectControlPlaneClient {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
-    use crate::ExternalTokenSource;
-    use base64::Engine;
+    #[allow(unused_imports)]
+    use crate::test_util::setup_plugin_env;
 
-    fn make_jwt_with_exp(exp: u64) -> String {
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"alg":"HS256","typ":"JWT"}).to_string().as_bytes(),
-        );
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"exp": exp, "sub":"test-user"}).to_string().as_bytes(),
-        );
-        format!("{header}.{payload}.fake_sig")
-    }
-
-    struct TempDir {
-        path: std::path::PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("connect-pcp-test-{ts}"));
-            std::fs::create_dir_all(&path).expect("should create temp dir");
-            TempDir { path }
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn setup_plugin_env() -> (TempDir, ExternalTokenSource) {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
-        let dir = TempDir::new();
-        let helper_path = dir.path().join("fake-helper.sh");
-        let jwt = make_jwt_with_exp(9999999999);
-        std::fs::write(&helper_path, format!("#!/bin/sh\necho '{}'\n", jwt))
-            .expect("should write helper script");
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &helper_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .expect("should set executable permission");
-        let helper_str = helper_path.to_string_lossy().to_string();
-
-        unsafe {
-            std::env::set_var("DATUM_CREDENTIALS_HELPER", &helper_str);
-            std::env::set_var("DATUM_SESSION", "test-session");
-        }
-
-        let source =
-            ExternalTokenSource::from_env(Some("test-session".to_string())).expect("should create token source");
-        (dir, source)
-    }
-
-    // These tests are integration-style — they require rustls CryptoProvider
-    // to be installed (requires 'ring' or 'aws-lc-rs' feature). Marked
-    // ignore so they don't fail in CI when those features are disabled.
-    // Run manually with: cargo test --lib -- --ignored
+    // These tests require rustls CryptoProvider (requires 'ring' or 'aws-lc-rs'
+    // feature). Gate behind a feature flag so they don't fail in CI when
+    // those features are disabled. Run manually with:
+    //   cargo test --lib --features integration-tests
 
     #[test]
-    #[ignore]
+    #[cfg(feature = "integration-tests")]
     fn new_with_token_source_accepts_external_token_source() {
         let (_dir, token_source) = setup_plugin_env();
         let result = ProjectControlPlaneClient::new_with_token_source(
@@ -265,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[cfg(feature = "integration-tests")]
     fn new_with_token_source_sets_project_id() {
         let (_dir, token_source) = setup_plugin_env();
         let pcp = ProjectControlPlaneClient::new_with_token_source(
@@ -279,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[cfg(feature = "integration-tests")]
     fn access_token_returns_token_from_source() {
         let (_dir, token_source) = setup_plugin_env();
         let expected_token = token_source.token();
@@ -294,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[cfg(feature = "integration-tests")]
     fn server_url_is_stored() {
         let (_dir, token_source) = setup_plugin_env();
         let server_url = "https://custom.api.net/apis/resourcemanager.miloapis.com/v1alpha1/projects/test/control-plane".to_string();
@@ -309,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[cfg(feature = "integration-tests")]
     fn datum_is_plugin_mode_after_new_with_token_source() {
         let (_dir, token_source) = setup_plugin_env();
         let pcp = ProjectControlPlaneClient::new_with_token_source(

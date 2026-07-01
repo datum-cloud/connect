@@ -1,4 +1,4 @@
-/// Shared kube error classification helpers.
+//! Shared kube error classification helpers.
 
 /// Returns true if `err` is an HTTP 401 (unauthorized).
 pub fn is_unauthorized(err: &kube::Error) -> bool {

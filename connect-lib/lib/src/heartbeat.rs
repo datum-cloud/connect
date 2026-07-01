@@ -689,10 +689,8 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datum_cloud::{
-        ApiEnv, DatumCloudClient, RefreshError, external_token_source::ExternalTokenSource,
-    };
-    use base64::Engine;
+    use crate::datum_cloud::{ApiEnv, DatumCloudClient, RefreshError};
+    use crate::test_util::{api_error, setup_plugin_env};
 
     struct TestProvider {
         endpoint_id: String,
@@ -709,65 +707,6 @@ mod tests {
         ) -> Option<ConnectorConnectionDetails> {
             None
         }
-    }
-
-    fn make_jwt_with_exp(exp: u64) -> String {
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::json!({"alg":"HS256","typ":"JWT"}).to_string().as_bytes());
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::json!({"exp": exp, "sub":"test"}).to_string().as_bytes());
-        format!("{header}.{payload}.fake_sig")
-    }
-
-    struct TempDir {
-        path: std::path::PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("connect-hb-test-{ts}"));
-            std::fs::create_dir_all(&path).expect("should create temp dir");
-            TempDir { path }
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn setup_plugin_env() -> (TempDir, ExternalTokenSource) {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
-        let dir = TempDir::new();
-        let helper_path = dir.path().join("fake-helper.sh");
-        let jwt = make_jwt_with_exp(9999999999);
-        std::fs::write(&helper_path, format!("#!/bin/sh\necho '{}'\n", jwt))
-            .expect("should write helper script");
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &helper_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .expect("should set executable permission");
-        let helper_str = helper_path.to_string_lossy().to_string();
-
-        unsafe {
-            std::env::set_var("DATUM_CREDENTIALS_HELPER", &helper_str);
-            std::env::set_var("DATUM_SESSION", "test-session");
-        }
-
-        let source =
-            ExternalTokenSource::from_env(Some("test-session".to_string())).expect("should create token source");
-        (dir, source)
     }
 
     fn test_datum_client() -> DatumCloudClient {
@@ -856,15 +795,6 @@ mod tests {
             format!("{}", RefreshError::Permanent(n0_error::anyerr!("x")))
                 .contains("permanently")
         );
-    }
-
-    fn api_error(code: u16, reason: &str) -> kube::Error {
-        kube::Error::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "test".to_string(),
-            reason: reason.to_string(),
-            code,
-        })
     }
 
     #[test]
