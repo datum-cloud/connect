@@ -292,9 +292,13 @@ mod tests {
         // it into the first project that requests it, so the second project
         // gets a fresh identity instead of joining the cross-project DNS race.
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
-        let legacy = repo.listen_key().await.unwrap();
+        // Create a legacy key at the plain LISTEN_KEY_FILE path (no timestamp).
+        let legacy = SecretKey::generate(&mut rand::rng());
         let legacy_bytes = legacy.to_bytes();
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
+        tokio::fs::write(&legacy_path, &legacy_bytes)
+            .await
+            .expect("should write legacy key");
         assert!(legacy_path.exists(), "precondition: legacy key exists");
 
         let p1 = repo.listen_key_for_project("project-a").await.unwrap();
@@ -367,10 +371,13 @@ mod tests {
     #[tokio::test]
     async fn listen_key_for_tunnel_migrates_legacy_key_to_default_tunnel() {
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
-        // Create a legacy key at the project root.
-        let legacy_key = repo.listen_key().await.unwrap();
+        // Create a legacy key at the project root (plain name, no timestamp).
+        let legacy_key = SecretKey::generate(&mut rand::rng());
         let legacy_bytes = legacy_key.to_bytes();
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
+        tokio::fs::write(&legacy_path, &legacy_bytes)
+            .await
+            .expect("should write legacy key");
         assert!(legacy_path.exists(), "precondition: legacy key exists");
 
         // Access per-tunnel for "default" tunnel — should migrate.

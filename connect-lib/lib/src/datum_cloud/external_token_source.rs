@@ -506,7 +506,7 @@ mod tests {
             refresh_trigger: std::sync::Arc::new(refresh_tx),
         };
 
-        let mut rx = source.watch();
+        let rx = source.watch();
         assert_eq!(*rx.borrow(), initial, "watch initial value");
 
         source.start_refresh(
