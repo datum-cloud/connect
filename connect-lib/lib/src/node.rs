@@ -676,29 +676,30 @@ pub(crate) async fn build_n0des_client_opt(
             info!("Disabling metrics collection: N0DES_API_SECRET is not set");
             None
         }
-        Some(n0des_api_secret) => match build_n0des_client(endpoint, n0des_api_secret).await {
-            Ok(client) => Some(client),
-            Err(err) => {
-                warn!("Disabling metrics collection: Failed to connect to n0des: {err:#}");
-                None
+        Some(n0des_api_secret) => {
+            let remote_id = n0des_api_secret.remote.id;
+            debug!(remote = %remote_id.fmt_short(), "connecting to n0des endpoint");
+            let builder = match iroh_n0des::Client::builder(endpoint)
+                .api_secret(n0des_api_secret)
+            {
+                Ok(b) => b,
+                Err(err) => {
+                    warn!("Disabling metrics collection: Failed to build n0des client: {err:#}");
+                    return None;
+                }
+            };
+            match builder.build().await.std_context("Failed to connect to n0des endpoint") {
+                Ok(client) => {
+                    info!(remote = %remote_id.fmt_short(), "Connected to n0des endpoint for metrics collection");
+                    Some(Arc::new(client))
+                }
+                Err(err) => {
+                    warn!("Disabling metrics collection: Failed to connect to n0des: {err:#}");
+                    None
+                }
             }
         },
     }
-}
-
-pub(crate) async fn build_n0des_client(
-    endpoint: &Endpoint,
-    api_secret: ApiSecret,
-) -> Result<Arc<iroh_n0des::Client>> {
-    let remote_id = api_secret.remote.id;
-    debug!(remote=%remote_id.fmt_short(), "connecting to n0des endpoint");
-    let client = iroh_n0des::Client::builder(endpoint)
-        .api_secret(api_secret)?
-        .build()
-        .await
-        .std_context("Failed to connect to n0des endpoint")?;
-    info!(remote=%remote_id.fmt_short(), "Connected to n0des endpoint for metrics collection");
-    Ok(Arc::new(client))
 }
 
 #[cfg(test)]

@@ -4,11 +4,10 @@ use std::time::Duration as StdDuration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use n0_error::{Result, StdResultExt};
+use n0_error::Result;
 use tokio::sync::watch;
-use tracing::warn;
 
-use crate::http_user_agent::datum_http_user_agent;
+
 use crate::{ProjectControlPlaneClient, Repo, SelectedContext};
 
 pub mod env;
@@ -168,7 +167,6 @@ pub use self::auth::{AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
 pub struct DatumCloudClient {
     env: ApiEnv,
     token_source: Arc<ExternalTokenSource>,
-    http: reqwest::Client,
     session: SessionStateWrapper,
     login_state_tx: watch::Sender<LoginState>,
 }
@@ -176,15 +174,10 @@ pub struct DatumCloudClient {
 impl DatumCloudClient {
     /// Constructs a `DatumCloudClient` using an `ExternalTokenSource` (plugin mode).
     pub fn with_external_token_source(env: ApiEnv, token_source: ExternalTokenSource) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent(datum_http_user_agent())
-            .build()
-            .expect("reqwest client should build");
         let (login_state_tx, _) = watch::channel(LoginState::Valid);
         Self {
             env,
             token_source: Arc::new(token_source),
-            http,
             session: SessionStateWrapper::empty(),
             login_state_tx,
         }
@@ -317,40 +310,6 @@ impl DatumCloudClient {
         self.session.orgs_projects_watch()
     }
 
-    #[allow(dead_code)]
-    async fn fetch_direct(&self, url: &str) -> Result<serde_json::Value> {
-        tracing::debug!("GET {url}");
-
-        let token = self.token_source.token();
-
-        let res = self
-            .http
-            .get(url)
-            .header(
-                "Authorization",
-                format!("Bearer {token}"),
-            )
-            .send()
-            .await
-            .inspect_err(|e| warn!(%url, "Failed to fetch: {e:#}"))
-            .with_std_context(|_| format!("Failed to fetch {url}"))?;
-        let status = res.status();
-        if !status.is_success() {
-            let text = match res.text().await {
-                Ok(text) => text,
-                Err(err) => err.to_string(),
-            };
-            warn!(%url, "Request failed: {status} {text}");
-            n0_error::bail_any!("Request failed with status {status}");
-        }
-
-        let json: serde_json::Value = res
-            .json()
-            .await
-            .std_context("Failed to parse response text as JSON")?;
-        Ok(json)
-    }
-
     fn project_control_plane_client_with_token(
         &self,
         project_id: &str,
@@ -388,24 +347,6 @@ impl SessionStateWrapper {
         }
     }
 
-    #[allow(dead_code)]
-    async fn from_repo(repo: Option<Repo>) -> Result<Self> {
-        let selected = if let Some(repo) = repo.as_ref() {
-            repo.read_selected_context().await?
-        } else {
-            None
-        };
-        let (selected_context_tx, _) = watch::channel(selected.clone());
-        let (orgs_projects_tx, _) = watch::channel(Vec::new());
-        Ok(Self {
-            selected_context: Arc::new(ArcSwap::from_pointee(selected)),
-            selected_context_tx,
-            orgs_projects: Arc::new(ArcSwap::from_pointee(Vec::new())),
-            orgs_projects_tx,
-            repo,
-        })
-    }
-
     fn selected_context(&self) -> Option<SelectedContext> {
         self.selected_context.load_full().as_ref().clone()
     }
@@ -436,16 +377,6 @@ impl SessionStateWrapper {
         self.orgs_projects_tx.subscribe()
     }
 
-    #[allow(dead_code)]
-    fn set_orgs_projects(&self, orgs_projects: Vec<OrganizationWithProjects>) -> bool {
-        let current = self.orgs_projects.load_full();
-        if current.as_ref().as_slice() == orgs_projects.as_slice() {
-            return false;
-        }
-        self.orgs_projects.store(Arc::new(orgs_projects.clone()));
-        let _ = self.orgs_projects_tx.send(orgs_projects);
-        true
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

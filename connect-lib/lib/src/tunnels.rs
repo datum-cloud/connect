@@ -1372,49 +1372,6 @@ impl TunnelService {
         })
     }
 
-    #[allow(dead_code)]
-    async fn find_connector_readonly(&self, project_id: &str) -> Result<Option<Connector>> {
-        let pcp = self.datum.project_control_plane_client(project_id).await?;
-        let client = pcp.client();
-        let connectors: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
-        let endpoint_id = self.listen.endpoint_id().to_string();
-        let selector = format!("{CONNECTOR_SELECTOR_FIELD}={endpoint_id}");
-        let list = match connectors
-            .list(&ListParams::default().fields(&selector))
-            .await
-        {
-            Ok(list) => list,
-            Err(kube::Error::Api(e)) if e.code == 403 => {
-                n0_error::bail_any!(
-                    "Permission denied listing connectors in project {project_id}. \
-                     Switch your datumctl context to this project first: \
-                     'datumctl ctx switch {project_id}'"
-                );
-            }
-            Err(kube::Error::Api(e)) if e.code == 401 => {
-                n0_error::bail_any!(
-                    "Authentication failed for project {project_id}. \
-                     Switch your datumctl context to this project first: \
-                     'datumctl ctx switch {project_id}'"
-                );
-            }
-            Err(err) => {
-                return Err(err).std_context("Failed to list connectors");
-            }
-        };
-        if list.items.is_empty() {
-            return Ok(None);
-        }
-        if list.items.len() > 1 {
-            debug!(
-                %selector,
-                count = list.items.len(),
-                "Multiple connectors found for endpoint, using first"
-            );
-        }
-        Ok(Some(list.items.into_iter().next().unwrap()))
-    }
-
     async fn find_connector(&self, project_id: &str) -> Result<Option<Connector>> {
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();
