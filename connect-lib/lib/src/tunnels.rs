@@ -32,6 +32,7 @@ use crate::datum_apis::traffic_protection_policy::{
     TrafficProtectionPolicyRuleSetType, TrafficProtectionPolicySpec,
 };
 use crate::datum_cloud::DatumCloudClient;
+use crate::kube_error::is_quota_check_timeout;
 use crate::{DEFAULT_PCP_NAMESPACE, Advertisment, ListenNode, TcpProxyData, state::ProxyState};
 const DEFAULT_CONNECTOR_CLASS_NAME: &str = "datum-connect";
 const CONNECTOR_SELECTOR_FIELD: &str = "status.connectionDetails.publicKey.id";
@@ -106,41 +107,22 @@ fn proxy_state_from_summary(
     Ok(ProxyState { info, enabled })
 }
 
-fn condition_is_true(
+/// Returns whether the named condition is present with status "True".
+/// If `require_true` is false, returns true when the condition is absent
+/// (used for ConnectorMetadataProgrammed, which is intentionally unset in
+/// extension-server mode — absence means the extension server manages
+/// xDS injection directly).
+fn condition_status(
     conditions: Option<&[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]>,
     kind: &str,
+    require_true: bool,
 ) -> bool {
     conditions
         .unwrap_or_default()
         .iter()
-        .find(|condition| condition.type_ == kind)
-        .map(|condition| condition.status == "True")
-        .unwrap_or(false)
-}
-
-/// Returns true when the condition is True *or absent*. Used for
-/// ConnectorMetadataProgrammed which is deliberately not set by the operator
-/// in extension-server mode (EPP emission disabled). Absent means the
-/// extension server is managing xDS injection directly — the tunnel is ready.
-fn condition_is_true_or_absent(
-    conditions: Option<&[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]>,
-    kind: &str,
-) -> bool {
-    match conditions
-        .unwrap_or_default()
-        .iter()
-        .find(|condition| condition.type_ == kind)
-    {
-        Some(c) => c.status == "True",
-        None => true,
-    }
-}
-
-fn find_condition<'a>(
-    conditions: Option<&'a [k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]>,
-    kind: &str,
-) -> Option<&'a k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
-    conditions.unwrap_or_default().iter().find(|c| c.type_ == kind)
+        .find(|c| c.type_ == kind)
+        .map(|c| c.status == "True")
+        .unwrap_or(!require_true)
 }
 
 /// One checkpoint in the tunnel setup pipeline. Maps 1:1 to a controller
@@ -297,7 +279,7 @@ impl TunnelProgress {
                          current_gen: i64,
                          resource: Option<String>|
          -> ProgressStep {
-            let cond = find_condition(conds, type_);
+            let cond = conds.unwrap_or_default().iter().find(|c| c.type_ == type_);
             let observed = cond.and_then(|c| c.observed_generation).unwrap_or(0);
             let fresh = observed >= current_gen;
             let status = match cond {
@@ -623,11 +605,12 @@ impl TunnelService {
             .iter()
             .filter_map(|c| {
                 let name = c.metadata.name.clone()?;
-                let ready = condition_is_true(
+                let ready = condition_status(
                     c.status
                         .as_ref()
                         .and_then(|s| s.conditions.as_deref()),
                     CONNECTOR_CONDITION_READY,
+                    true,
                 );
                 Some((name, ready))
             })
@@ -668,26 +651,29 @@ impl TunnelService {
                 .unwrap_or_else(|| name.clone());
             let endpoint = normalize_endpoint(&proxy_backend_endpoint(&proxy).unwrap_or_default());
             let hostnames = proxy_hostnames(&proxy);
-            let accepted = condition_is_true(
+            let accepted = condition_status(
                 proxy
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_ACCEPTED,
+                true,
             );
-            let programmed = condition_is_true(
+            let programmed = condition_status(
                 proxy
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_PROGRAMMED,
+                true,
             );
-            let connector_metadata_programmed = condition_is_true_or_absent(
+            let connector_metadata_programmed = condition_status(
                 proxy
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
+                false,
             );
             let enabled = enabled_by_name.contains_key(&name);
             let connector_name = proxy_connector_name(&proxy);
@@ -933,26 +919,29 @@ impl TunnelService {
             endpoint,
             hostnames: proxy_hostnames(&proxy),
             enabled: true,
-            accepted: condition_is_true(
+            accepted: condition_status(
                 proxy
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_ACCEPTED,
+                true,
             ),
-            programmed: condition_is_true(
+            programmed: condition_status(
                 proxy
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_PROGRAMMED,
+                true,
             ),
-            connector_metadata_programmed: condition_is_true_or_absent(
+            connector_metadata_programmed: condition_status(
                 proxy
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
+                false,
             ),
             // connector_ready is not checked at creation time; the heartbeat
             // agent will establish the lease shortly after.
@@ -1047,26 +1036,29 @@ impl TunnelService {
             endpoint,
             hostnames: proxy_hostnames(&existing),
             enabled,
-            accepted: condition_is_true(
+            accepted: condition_status(
                 existing
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_ACCEPTED,
+                true,
             ),
-            programmed: condition_is_true(
+            programmed: condition_status(
                 existing
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_PROGRAMMED,
+                true,
             ),
-            connector_metadata_programmed: condition_is_true_or_absent(
+            connector_metadata_programmed: condition_status(
                 existing
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
+                false,
             ),
             connector_ready: false,
             connector_name,
@@ -1187,26 +1179,29 @@ impl TunnelService {
             endpoint,
             hostnames: proxy_hostnames(&proxy),
             enabled,
-            accepted: condition_is_true(
+            accepted: condition_status(
                 proxy
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_ACCEPTED,
+                true,
             ),
-            programmed: condition_is_true(
+            programmed: condition_status(
                 proxy
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_PROGRAMMED,
+                true,
             ),
-            connector_metadata_programmed: condition_is_true_or_absent(
+            connector_metadata_programmed: condition_status(
                 proxy
                     .status
                     .as_ref()
                     .and_then(|status| status.conditions.as_deref()),
                 HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
+                false,
             ),
             connector_ready: false,
             connector_name,
@@ -1829,18 +1824,7 @@ fn format_quota_error(err: &dyn std::error::Error, resource_type: &str) -> Optio
     None
 }
 
-/// True if `err` is the operator's transient quota-check timeout (a 403
-/// whose message says "Please try again in a moment"). Distinct from
-/// real quota exhaustion, which produces a different message and
-/// shouldn't be retried.
-fn is_quota_check_timeout(err: &kube::Error) -> bool {
-    matches!(
-        err,
-        kube::Error::Api(e)
-            if e.code == 403
-                && e.message.contains("took too long to be checked against your quota")
-    )
-}
+
 
 /// Retry a kube API call up to ~15 seconds while it keeps tripping the
 /// operator's quota-check timeout. Other errors return immediately so

@@ -23,6 +23,7 @@ use crate::datum_apis::connector::{
 };
 use crate::datum_apis::lease::Lease;
 use crate::datum_cloud::DatumCloudClient;
+use crate::kube_error::{is_not_found, is_unauthorized};
 
 type ProjectRunner = Arc<
     dyn Fn(
@@ -275,18 +276,6 @@ struct ConnectorCache {
 }
 
 /// Returns true if `err` is a kube API error with HTTP status 401.
-/// Used to decide whether a heartbeat retry should force an OAuth token refresh
-/// (the proactive refresh timer in `AuthClient` only fires when the access token
-/// is within `REFRESH_AUTH_WHEN` of expiry, so a token rejected before that
-/// would otherwise spin until the timer catches up).
-fn is_unauthorized(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(e) if e.code == 401)
-}
-
-fn is_not_found(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(e) if e.code == 404)
-}
-
 /// What the heartbeat loop should do with its cache after a lease op fails.
 #[derive(Debug, PartialEq, Eq)]
 enum LeaseErrorAction {

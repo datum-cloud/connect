@@ -3,6 +3,7 @@ pub mod datum_apis;
 pub mod datum_cloud;
 pub mod heartbeat;
 pub mod http_user_agent;
+pub mod kube_error;
 pub mod node;
 pub mod project_control_plane;
 pub mod repo;
