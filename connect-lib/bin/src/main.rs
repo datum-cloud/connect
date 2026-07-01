@@ -46,6 +46,9 @@ mod progress;
 
 type ReloadHandle = Handle<EnvFilter, Registry>;
 static RELOAD_HANDLE: OnceLock<ReloadHandle> = OnceLock::new();
+/// The filter string that `init_tracing()` actually installed.
+/// Used by `current_filter_string()` to restore the original filter later.
+static INSTALLED_FILTER: OnceLock<String> = OnceLock::new();
 
 fn init_tracing() {
     let debug = debug_enabled();
@@ -56,6 +59,7 @@ fn init_tracing() {
     };
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_directive));
+    let filter_string = filter.to_string();
     let (filter_layer, handle) = reload::Layer::new(filter);
     // Best-effort: if a subscriber is already installed (e.g. duplicate call in tests),
     // skip without panicking.
@@ -64,28 +68,21 @@ fn init_tracing() {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .try_init();
     let _ = RELOAD_HANDLE.set(handle);
+    let _ = INSTALLED_FILTER.set(filter_string);
     if debug {
         eprintln!("[datum-connect] debug logging enabled (token refresh, heartbeat, etc.)");
     }
 }
 
-/// Whether verbose debug logging is enabled. Toggled by the `--debug` CLI flag
-/// or the `DATUM_CONNECT_DEBUG=1` env var. When enabled, the tracing filter is
+/// Whether verbose debug logging is enabled. Toggled by the
+/// `DATUM_CONNECT_DEBUG=1` env var. When enabled, the tracing filter is
 /// bumped to `debug` for the `datum_connect` and `connect_lib` targets so that
 /// token-refresh events (proactive + forced) and heartbeat 401 handling print
 /// to the console (stderr).
 fn debug_enabled() -> bool {
-    if std::env::var("DATUM_CONNECT_DEBUG")
+    std::env::var("DATUM_CONNECT_DEBUG")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-    {
-        return true;
-    }
-    // Fall back to the global Args flag captured at parse time. Set by
-    // `Args::parse()` before the runtime-dependent code runs; the binary
-    // parses args after init_tracing(), so the env var is the primary path
-    // for the very first subscriber, and DEBUG_FLAG covers the flag case.
-    DEBUG_FLAG.get().copied().unwrap_or(false)
 }
 
 static DEBUG_FLAG: OnceLock<bool> = OnceLock::new();
@@ -103,7 +100,34 @@ fn restore_tracing(prev: &str) {
 }
 
 fn current_filter_string() -> String {
-    std::env::var("RUST_LOG").unwrap_or_else(|_| "datum_connect=info".to_string())
+    INSTALLED_FILTER
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "datum_connect=info".to_string())
+}
+
+/// Resolve the listen key for a tunnel, generating a new one if missing.
+/// Returns `(key, force_rewire)` where `force_rewire` is true when a new
+/// key was generated.
+async fn resolve_listen_key(
+    repo: &Repo,
+    project_id: &str,
+    tunnel_id: &str,
+) -> n0_error::Result<(SecretKey, bool)> {
+    match repo.listen_key_for_tunnel(project_id, tunnel_id).await {
+        Ok(k) => Ok((k, false)),
+        Err(e) if e.to_string().contains("KEY_NOT_FOUND") => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{26A0} No listen key for tunnel {tunnel_id} — generating new key. \
+                 The hostname will stay the same but the old connector will be replaced."
+            );
+            let _ = std::io::stderr().flush();
+            let new_key = SecretKey::generate(&mut rand::rng());
+            Ok((new_key, true))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -366,23 +390,12 @@ async fn run() -> n0_error::Result<()> {
                     // deleted or tunnel created on another machine), generate
                     // a new key and force a rewire so the HTTPProxy points to
                     // a new connector with the same hostname.
-                    let key = match repo.listen_key_for_tunnel(&project_id, &t.id).await {
-                        Ok(k) => k,
-                        Err(e) if e.to_string().contains("KEY_NOT_FOUND") => {
-                            let _ = writeln!(
-                                std::io::stderr(),
-                                "  \u{26A0} No listen key for tunnel {} — generating new key. \
-                                 The hostname will stay the same but the old connector will be replaced.",
-                                t.id
-                            );
-                            let _ = std::io::stderr().flush();
-                            let new_key = SecretKey::generate(&mut rand::rng());
-                            in_memory_key = Some(new_key.clone());
-                            force_rewire = true;
-                            new_key
-                        }
-                        Err(e) => return Err(e),
-                    };
+                    let (key, should_rewire) =
+                        resolve_listen_key(&repo, &project_id, &t.id).await?;
+                    if should_rewire {
+                        in_memory_key = Some(key.clone());
+                        force_rewire = true;
+                    }
                     let node = ListenNode::new_with_key(repo.clone(), key).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
                     // Inherit endpoint from the existing tunnel.
@@ -403,23 +416,12 @@ async fn run() -> n0_error::Result<()> {
                         ));
                     }
                     // Read the per-tunnel key (same missing-key handling as above).
-                    let key = match repo.listen_key_for_tunnel(&project_id, &t.id).await {
-                        Ok(k) => k,
-                        Err(e) if e.to_string().contains("KEY_NOT_FOUND") => {
-                            let _ = writeln!(
-                                std::io::stderr(),
-                                "  \u{26A0} No listen key for tunnel {} — generating new key. \
-                                 The hostname will stay the same but the old connector will be replaced.",
-                                t.id
-                            );
-                            let _ = std::io::stderr().flush();
-                            let new_key = SecretKey::generate(&mut rand::rng());
-                            in_memory_key = Some(new_key.clone());
-                            force_rewire = true;
-                            new_key
-                        }
-                        Err(e) => return Err(e),
-                    };
+                    let (key, should_rewire) =
+                        resolve_listen_key(&repo, &project_id, &t.id).await?;
+                    if should_rewire {
+                        in_memory_key = Some(key.clone());
+                        force_rewire = true;
+                    }
                     let node = ListenNode::new_with_key(repo.clone(), key).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
                     preresolved_ns = Some((node, service, t));
@@ -497,6 +499,8 @@ async fn run() -> n0_error::Result<()> {
                     // the hostname. Only adopt when the existing tunnel's
                     // connector belongs to this device; otherwise fall through
                     // to create a new tunnel.
+                    // (If connector_device is None the match fails and we
+                    // also fall through to create a new tunnel.)
                     let existing = existing.and_then(|t| {
                         let here = connect_lib::friendly_device_name();
                         if t.connector_device.as_deref() == Some(here.as_str()) {
