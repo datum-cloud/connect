@@ -1,8 +1,7 @@
 package svcunit
 
 import (
-	"os"
-	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -17,6 +16,13 @@ func TestServiceName(t *testing.T) {
 	}
 }
 
+// TestServiceArgs asserts the Phase 13 CLI contract for service units.
+//
+// Resolution table Item #7: `tunnel run` accepts only --name. All runtime
+// config (label, endpoint, project, session, credentials_helper_path) is
+// resolved by `run` from the persisted YAML config (svcconfig.Load) and the
+// server, not from CLI flags. If a future phase re-introduces CLI-passed
+// runtime config, update ServiceArgs AND this test together.
 func TestServiceArgs(t *testing.T) {
 	cfg := svcconfig.TunnelConfig{
 		Name:     "test-tun",
@@ -25,82 +31,69 @@ func TestServiceArgs(t *testing.T) {
 		Session:  "my-session",
 	}
 	args := ServiceArgs(cfg)
+	want := []string{"tunnel", "run", "--name", "test-tun"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("ServiceArgs() = %v, want %v", args, want)
+	}
+
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--name test-tun") {
 		t.Errorf("args should contain --name, got: %s", joined)
 	}
-	if !strings.Contains(joined, "--endpoint localhost:8080") {
-		t.Errorf("args should contain --endpoint, got: %s", joined)
-	}
-	if !strings.Contains(joined, "--session my-session") {
-		t.Errorf("args should contain --session, got: %s", joined)
-	}
-	if !strings.Contains(joined, "--yes") {
-		t.Errorf("args should contain --yes, got: %s", joined)
+	// Runtime config is YAML/server-driven; these CLI flags must not appear.
+	for _, flag := range []string{"--endpoint", "--session", "--label", "--yes"} {
+		if strings.Contains(joined, flag) {
+			t.Errorf("args should not contain %s (runtime config is YAML/server-driven), got: %s", flag, joined)
+		}
 	}
 }
 
-func TestServiceArgs_NoLabel(t *testing.T) {
-	cfg := svcconfig.TunnelConfig{
-		Name:     "minimal",
-		Endpoint: "localhost:8080",
-		Session:  "sess",
-	}
-	args := ServiceArgs(cfg)
-	joined := strings.Join(args, " ")
-	if strings.Contains(joined, "--label") {
-		t.Errorf("args should not contain --label for empty label, got: %s", joined)
-	}
-}
-
-func TestBuildConfig_PopulatesConnectDirEnvVar(t *testing.T) {
-	cfg := svcconfig.TunnelConfig{
-		Name:     "my-tunnel",
-		Endpoint: "localhost:8080",
-	}
-	sc, err := buildConfig(cfg, "/usr/local/bin/datumctl-connect")
+// TestBuildConfig_EnvVarsEmptyWithoutHelper asserts the Phase 13 pass-through
+// env contract: buildConfig sets NO per-service DATUM_* env vars. Runtime
+// config (DATUM_CONNECT_DIR, DATUM_SESSION) arrives via the plugin's
+// os.Environ() pass-through (Phase 11.5) or the persisted YAML; per-service
+// isolation was removed in Phase 13 (D-01).
+func TestBuildConfig_EnvVarsEmptyWithoutHelper(t *testing.T) {
+	sc, err := buildConfig(svcconfig.TunnelConfig{Name: "my-tunnel"}, "/usr/local/bin/datumctl-connect")
 	if err != nil {
 		t.Fatalf("buildConfig() error = %v", err)
 	}
 	if sc.EnvVars == nil {
-		t.Fatal("buildConfig() EnvVars is nil; want non-nil map")
+		t.Fatal("buildConfig() EnvVars is nil; want an initialized (possibly empty) map")
 	}
-	got, ok := sc.EnvVars["DATUM_CONNECT_DIR"]
-	if !ok {
-		t.Fatalf("EnvVars missing DATUM_CONNECT_DIR; got %v", sc.EnvVars)
+	if len(sc.EnvVars) != 0 {
+		t.Errorf("buildConfig() EnvVars should be empty without CredentialsHelperPath; got %v", sc.EnvVars)
 	}
-	home, _ := os.UserHomeDir()
-	want := filepath.Join(home, ".datumctl", "connect", "services", "my-tunnel")
-	if got != want {
-		t.Errorf("EnvVars[DATUM_CONNECT_DIR] = %q, want %q", got, want)
+	if _, ok := sc.EnvVars["DATUM_CONNECT_DIR"]; ok {
+		t.Errorf("EnvVars must not set DATUM_CONNECT_DIR (pass-through design), got %v", sc.EnvVars)
 	}
 }
 
-func TestBuildConfig_PerServiceIsolation(t *testing.T) {
-	// Two services must get DIFFERENT state subdirs (the whole point of D-12).
-	sc1, err := buildConfig(svcconfig.TunnelConfig{Name: "alpha"}, "bin")
-	if err != nil {
-		t.Fatalf("buildConfig(alpha) error = %v", err)
-	}
-	sc2, err := buildConfig(svcconfig.TunnelConfig{Name: "beta"}, "bin")
-	if err != nil {
-		t.Fatalf("buildConfig(beta) error = %v", err)
-	}
-	if sc1.EnvVars["DATUM_CONNECT_DIR"] == sc2.EnvVars["DATUM_CONNECT_DIR"] {
-		t.Errorf("two services share the same DATUM_CONNECT_DIR: %q",
-			sc1.EnvVars["DATUM_CONNECT_DIR"])
-	}
-}
-
-func TestBuildConfig_OnlyDatumConnectDirInEnvVars(t *testing.T) {
-	// D-14: 11.5 adds ONLY DATUM_CONNECT_DIR. Other DATUM_* vars are
-	// out of scope. If a future plan adds them, update this test.
-	sc, err := buildConfig(svcconfig.TunnelConfig{Name: "x"}, "bin")
+// TestBuildConfig_CredentialsHelperEnvVar asserts the one env var buildConfig
+// DOES set: DATUM_CREDENTIALS_HELPER, only when a path is configured.
+func TestBuildConfig_CredentialsHelperEnvVar(t *testing.T) {
+	sc, err := buildConfig(
+		svcconfig.TunnelConfig{Name: "my-tunnel", CredentialsHelperPath: "/usr/bin/datum-cred-helper"},
+		"/usr/local/bin/datumctl-connect",
+	)
 	if err != nil {
 		t.Fatalf("buildConfig() error = %v", err)
 	}
-	if len(sc.EnvVars) != 1 {
-		t.Errorf("EnvVars should have exactly 1 entry in 11.5; got %d: %v",
-			len(sc.EnvVars), sc.EnvVars)
+	want := map[string]string{"DATUM_CREDENTIALS_HELPER": "/usr/bin/datum-cred-helper"}
+	if !reflect.DeepEqual(sc.EnvVars, want) {
+		t.Errorf("EnvVars = %v, want %v", sc.EnvVars, want)
+	}
+}
+
+// TestServiceArgs_NoLabel documents that ServiceArgs never emits --label: the
+// label is resolved at run time from the server/YAML. Keeping the name asserts
+// the runtime-args contract even as TunnelConfig gains more persisted fields.
+func TestServiceArgs_NoLabel(t *testing.T) {
+	cfg := svcconfig.TunnelConfig{Name: "minimal"}
+	args := ServiceArgs(cfg)
+	// The only flag is --name; a new persisted field must not leak into args.
+	want := []string{"tunnel", "run", "--name", "minimal"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("ServiceArgs() = %v, want %v", args, want)
 	}
 }
