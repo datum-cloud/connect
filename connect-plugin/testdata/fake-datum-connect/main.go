@@ -5,6 +5,7 @@
 //   expired-token: prints ready JSON with "status": "expired"
 //   401-then-recover: first call returns 401 JSON, second returns ready JSON
 //   child-crash: exits with code 1
+//   error-before-ready: listen emits a typed error then exits without ready
 //
 // Subcommands: list, listen, update, delete
 // Flags: --json
@@ -23,18 +24,25 @@ import (
 func main() {
 	args := os.Args[1:]
 
-	// Parse --json flag
+	// Parse --json flag and locate the subcommand. The supervisor invokes the
+	// binary as: --json --project <proj> <subcommand> [flags], so the
+	// subcommand may not be the first argument.
 	jsonOut := false
-	var subcmd string
-	for i, arg := range args {
-		if arg == "--json" {
+	for i := range args {
+		if args[i] == "--json" {
 			jsonOut = true
 			args = append(args[:i], args[i+1:]...)
 			break
 		}
 	}
-	if len(args) > 0 {
-		subcmd = args[0]
+	var subcmd string
+	for _, arg := range args {
+		switch arg {
+		case "list", "listen", "update", "delete":
+			if subcmd == "" {
+				subcmd = arg
+			}
+		}
 	}
 
 	mode := os.Getenv("FAKE_DUMMY_MODE")
@@ -125,6 +133,13 @@ func handleListen(jsonOut bool) {
 		} else {
 			fmt.Fprintln(os.Stderr, "error: token expired")
 		}
+		os.Exit(1)
+	}
+
+	// Setup failure: emit a typed error on stdout (as the Rust binary would for
+	// e.g. an RBAC denial during Connector creation) and exit without ready.
+	if os.Getenv("FAKE_DUMMY_MODE") == "error-before-ready" {
+		fmt.Println(`{"type":"error","message":"Failed to create Connector: Forbidden"}`)
 		os.Exit(1)
 	}
 

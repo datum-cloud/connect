@@ -527,3 +527,33 @@ func TestListenMissingEndpointAndId(t *testing.T) {
 		t.Error("listen without --endpoint or --id should show 'required' error message")
 	}
 }
+
+func TestListenSurfacesChildErrorBeforeReady(t *testing.T) {
+	// SUP-01: when the child fails during setup — emitting a typed error and
+	// exiting before tunnel_ready — the supervisor must surface the child's
+	// actual error message and exit non-zero, rather than masking the true
+	// cause behind a generic "child exited before sending ready message" line.
+	fakeBin := buildFakeDatumConnect(t)
+	fakeHelper := buildFakeHelper(t, "testdata/fake-credentials-helper")
+	pluginBin := buildPlugin(t)
+
+	connectDir, _ := os.Getwd()
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080")
+	cmd.Env = append(os.Environ(),
+		"FAKE_DATUM_CONNECT="+fakeBin,
+		"FAKE_DUMMY_MODE=error-before-ready",
+		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
+		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR="+connectDir,
+		"PATH="+connectDir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("listen should exit non-zero when the child fails before sending ready")
+	}
+	if !bytes.Contains(out, []byte("Failed to create Connector")) {
+		t.Errorf("output should surface the child's real error message:\n%s", out)
+	}
+	if bytes.Contains(out, []byte("child exited before sending ready message")) {
+		t.Errorf("output should not contain the generic error masking the real cause:\n%s", out)
+	}
+}

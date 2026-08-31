@@ -156,6 +156,10 @@ func runListen(cmd *cobra.Command, args []string) error {
 	scanner := bufio.NewScanner(stdoutReader)
 	var ready TunnelReady
 	var gotReady bool
+	// childErr holds a typed error emitted by the child before tunnel_ready.
+	// It is surfaced as the command error when the child exits during setup,
+	// instead of masking the real cause behind a generic "child exited" message.
+	var childErr string
 
 	// Read lines — signals ready via readyCh
 	readDone := make(chan struct{})
@@ -196,7 +200,15 @@ func runListen(cmd *cobra.Command, args []string) error {
 				close(readyCh)
 			case "error":
 				if msg.Message != "" {
-					fmt.Fprintf(os.Stderr, "error: %s\n", msg.Message)
+					if gotReady {
+						// Mid-session error after ready — surface to stderr
+						// and keep the tunnel running.
+						fmt.Fprintf(os.Stderr, "error: %s\n", msg.Message)
+					} else {
+						// Setup error before ready — capture it so it becomes
+						// the command error below, surfacing the real cause.
+						childErr = msg.Message
+					}
 				}
 			case "heartbeat", "status":
 				// Internal messages — no output
@@ -243,7 +255,12 @@ func runListen(cmd *cobra.Command, args []string) error {
 		rustCmd.Wait()
 		return fmt.Errorf("timed out waiting for tunnel ready after %v", startupTimeout)
 	case <-readDone:
-		// Scanner ended — child exited without sending ready message
+		// Scanner ended — child exited without sending ready message. Surface
+		// the child's typed error when it provided one; fall back to a generic
+		// message only if the child gave no reason.
+		if childErr != "" {
+			return fmt.Errorf("%s", childErr)
+		}
 		return fmt.Errorf("child exited before sending ready message")
 	}
 
