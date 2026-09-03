@@ -410,16 +410,24 @@ async fn resolve_ns_ips(
     ns_ips.into_iter().collect()
 }
 
-/// Walk the hostname labels from right to left, querying NS records at each
-/// level until one is found. Returns the NS IPs and the domain where they
-/// were found.
+/// Walk the hostname labels from the deepest level to the root, querying NS
+/// records at each level, and return the first (deepest) domain that has NS
+/// records — the true zone cut authoritative for the hostname.
+///
+/// For `a.b.c.d.e` this checks `a.b.c.d.e`, then `b.c.d.e`, then `c.d.e`,
+/// etc., returning the deepest one that actually has a delegation. This is
+/// required because an outer zone (e.g. `datum.net`) can have a delegation
+/// while a deeper zone (e.g. `prism.staging.env.datum.net`) is delegated to
+/// *different* nameservers that are the real authority for the name.
 async fn discover_ns_authority(
     system_resolver: &hickory_resolver::TokioResolver,
     hostname: &str,
 ) -> (Vec<std::net::IpAddr>, String) {
     let labels: Vec<&str> = hostname.split('.').collect();
-    // Start from the full hostname and work inward.
-    for n in (1..labels.len()).rev() {
+    // Ascending n visits the deepest candidate first: labels[n-1..] has the
+    // most labels (deepest) when n is smallest. Return the first level that
+    // has NS records — that is the innermost authority.
+    for n in 1..labels.len() {
         let domain: String = labels[n - 1..].join(".");
         let ns_ips = resolve_ns_ips(system_resolver, &domain).await;
         if !ns_ips.is_empty() {
