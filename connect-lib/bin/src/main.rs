@@ -209,7 +209,7 @@ async fn main() {
 }
 
 async fn run() -> n0_error::Result<()> {
-    let _ = rustls::crypto::ring::default_provider()
+    rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| n0_error::anyerr!("failed to install ring crypto provider for rustls"))?;
 
@@ -233,10 +233,10 @@ async fn run() -> n0_error::Result<()> {
     let token_source = ExternalTokenSource::from_env(session.clone())
         .map_err(|e| n0_error::anyerr!("failed to create token source: {e}"))?;
 
-    if let Some(ref s) = session {
-        if let Ok(helper) = std::env::var("DATUM_CREDENTIALS_HELPER") {
-            token_source.start_refresh(helper, s.clone());
-        }
+    if let Some(ref s) = session
+        && let Ok(helper) = std::env::var("DATUM_CREDENTIALS_HELPER")
+    {
+        token_source.start_refresh(helper, s.clone());
     }
 
     let datum = DatumCloudClient::with_external_token_source(ApiEnv::default(), token_source);
@@ -260,17 +260,14 @@ async fn run() -> n0_error::Result<()> {
 
     let project_id = match args.project {
         Some(ref pid) => pid.clone(),
-        None => {
-            let session = std::env::var("DATUM_SESSION")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    n0_error::anyerr!(
-                        "no project set — pass --project or run 'datumctl config set project <name>'"
-                    )
-                })?;
-            session
-        }
+        None => std::env::var("DATUM_SESSION")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                n0_error::anyerr!(
+                    "no project set — pass --project or run 'datumctl config set project <name>'"
+                )
+            })?,
     };
 
     let ctx = resolve_project(&project_id);
@@ -529,7 +526,7 @@ async fn run() -> n0_error::Result<()> {
             let _ = writeln!(
                 std::io::stderr(),
                 "  \u{25CB} Your endpoint ID: {}",
-                endpoint_id.to_string()
+                endpoint_id
             );
             let _ = writeln!(std::io::stderr(), "  \u{25CB} Setting up tunnel...");
             let _ = std::io::stderr().flush();
@@ -628,9 +625,7 @@ async fn run() -> n0_error::Result<()> {
                                     prev: connect_lib::StepStatus| {
                 let elapsed = {
                     let mut map = step_started_at_for_cb.lock().unwrap();
-                    let timer = map
-                        .entry(step.kind.clone())
-                        .or_insert_with(std::time::Instant::now);
+                    let timer = map.entry(step.kind).or_insert_with(std::time::Instant::now);
                     timer.elapsed()
                 };
                 progress::render_progress_step(mode_for_cb, step, prev, elapsed);
@@ -664,11 +659,11 @@ async fn run() -> n0_error::Result<()> {
             if final_progress.hostnames.is_empty() {
                 for _ in 0..20 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Ok(Some(p)) = service.get_active_progress(&tunnel_id).await {
-                        if !p.hostnames.is_empty() {
-                            final_progress = p;
-                            break;
-                        }
+                    if let Ok(Some(p)) = service.get_active_progress(&tunnel_id).await
+                        && !p.hostnames.is_empty()
+                    {
+                        final_progress = p;
+                        break;
                     }
                 }
             }

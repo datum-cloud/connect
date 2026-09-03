@@ -68,7 +68,7 @@ connect/
 │       └── src/
 │           ├── datum_cloud/  # API client, auth, env
 │           ├── heartbeat.rs  # HeartbeatAgent
-│           ├── tunnel.rs     # TunnelService
+│           ├── tunnels.rs    # TunnelService
 │           └── …
 ├── flake.nix                # Nix dev shell
 ├── Taskfile.yaml            # Build/test/install tasks
