@@ -247,7 +247,7 @@ impl HeartbeatAgent {
                 continue;
             }
             match probe_connector(
-                &project_id,
+                project_id,
                 self.inner.datum.clone(),
                 self.inner.provider.clone(),
             )

@@ -110,10 +110,7 @@ impl ExternalTokenSource {
     pub fn start_refresh(&self, helper: String, session: String) {
         let this = self.clone();
         let mut refresh_rx = self.refresh_trigger.subscribe();
-        let initial_exp = match parse_jwt_expiry(&self.token()) {
-            Ok(exp) => exp,
-            Err(_) => None,
-        };
+        let initial_exp = parse_jwt_expiry(&self.token()).unwrap_or_default();
         tokio::spawn(async move {
             this.run_refresh_loop(helper, session, &mut refresh_rx, initial_exp)
                 .await;
@@ -327,7 +324,7 @@ mod tests {
 
     #[test]
     fn parse_jwt_expiry_rejects_invalid_base64() {
-        let token = format!("header.!!!.sig");
+        let token = "header.!!!.sig".to_string();
         let result = parse_jwt_expiry(&token);
         assert!(result.is_err());
     }
@@ -458,7 +455,6 @@ mod tests {
     /// stayed dead until the proactive timer eventually fired.
     #[tokio::test]
     async fn force_refresh_swaps_token_via_loop() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
         let dir = TempDir::new("ets-loop");
 
         // Helper that emits a distinct JWT on every invocation by reading
@@ -486,14 +482,6 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .expect("should set executable permission");
-
-        unsafe {
-            std::env::set_var(
-                "DATUM_CREDENTIALS_HELPER",
-                helper_path.to_string_lossy().as_ref(),
-            );
-            std::env::set_var("DATUM_SESSION", "test-session");
-        }
 
         // Use a token with a far-future expiry so the proactive timer does
         // not fire during the test — only the forced refresh should swap.

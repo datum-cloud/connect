@@ -501,7 +501,7 @@ impl TunnelService {
             .items
             .iter()
             .filter(|p| p.metadata.deletion_timestamp.is_none())
-            .filter_map(|p| proxy_connector_name(p))
+            .filter_map(proxy_connector_name)
             .collect();
 
         let connector_list = connectors
@@ -1755,12 +1755,11 @@ pub fn friendly_device_name() -> String {
             .arg("--get")
             .arg("ComputerName")
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !name.is_empty() {
-                    return name;
-                }
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !name.is_empty() {
+                return name;
             }
         }
     }
