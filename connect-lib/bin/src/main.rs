@@ -199,6 +199,38 @@ fn resolve_project(project_id: &str) -> SelectedContext {
     }
 }
 
+/// Rewrite a project control-plane lookup failure into an actionable message.
+///
+/// The raw error ("Failed to list HTTPProxy objects: ApiError:
+/// projects.resourcemanager.miloapis.com \"control-plane\" not found ...") is
+/// cryptic for a CLI user. When the control plane reports NotFound, the tunnel
+/// agent cannot reach the project's control plane — the project either doesn't
+/// exist on this environment or isn't provisioned for control-plane access.
+/// Surface that with concrete next steps instead of the raw API error.
+fn project_lookup_error(
+    project_id: &str,
+    endpoint: &str,
+    err: n0_error::AnyError,
+) -> n0_error::AnyError {
+    let msg = format!("{err:#}");
+    let not_found = msg.contains("not found")
+        || msg.contains("NotFound")
+        || msg.contains("NotFoundReason")
+        || msg.contains("404");
+    if not_found {
+        n0_error::anyerr!(
+            "could not list tunnels for project '{project_id}' (endpoint '{endpoint}'): the \
+             project's control plane is unreachable or does not exist on this environment. \
+             Verify the project is correct and provisioned, then reinstall the tunnel against the \
+             right project (e.g. `datumctl connect tunnel install --name <tunnel> \
+             --project <project> --endpoint <addr> --session <session>`) or confirm you are \
+             connected to the right environment. Underlying error: {msg}"
+        )
+    } else {
+        err
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let result = run().await;
@@ -496,7 +528,10 @@ async fn run() -> n0_error::Result<()> {
                 None => {
                     let n = ListenNode::new(repo.clone()).await?;
                     let s = TunnelService::new(datum.clone(), n.clone());
-                    let existing = s.get_active_by_endpoint(&endpoint).await?;
+                    let existing = s
+                        .get_active_by_endpoint(&endpoint)
+                        .await
+                        .map_err(|err| project_lookup_error(&project_id, endpoint.as_str(), err))?;
                     // `--endpoint` carries a local, non-unique address (e.g.
                     // `localhost:8888`), so matching by endpoint alone would
                     // adopt a tunnel created on a different machine and rewire
