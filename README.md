@@ -166,5 +166,5 @@ The plugin is versioned independently of both `datumctl` and the `datum-connect`
 | Two-binary architecture | Rust binary ships independently; Go supervisor handles dispatch, daemonisation, signal management. |
 | `--json` mode always on | Go supervisor parses line-delimited JSON events from stdout; human text goes to stderr. |
 | No `DATUM_ACCESS_TOKEN` in child env | Rust binary uses `DATUM_CREDENTIALS_HELPER` + `DATUM_SESSION` to exec helper for token. |
-| Proxy verification retries indefinitely | Datum Cloud can take time to settle; user sees periodic `○ waiting for proxy …` messages every 10s. |
+| Proxy verification has a five-minute budget | Datum Cloud can take time to settle; the user sees periodic `○ waiting for proxy …` messages, while setup still fails before the Go supervisor's startup deadline. |
 | State isolation | Plugin uses `~/.local/share/datumctl/connect/` — no OAuth files, no selected_context. |

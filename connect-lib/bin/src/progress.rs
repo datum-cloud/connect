@@ -30,6 +30,7 @@
 //! `tunnel_ready` (emitted from main.rs) drives `gotReady`.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::io::Write;
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ use connect_lib::{
 };
 use n0_error::Result;
 use tokio::time::{Instant, sleep};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -167,6 +169,7 @@ pub async fn await_tunnel_progress<F>(
     service: &TunnelService,
     tunnel_id: &str,
     progress_cb: F,
+    cancel: &CancellationToken,
 ) -> Result<TunnelProgress>
 where
     F: Fn(&ProgressStep, StepStatus),
@@ -176,10 +179,15 @@ where
     let mut last_status_print: HashMap<ProgressStepKind, u64> = HashMap::new();
 
     loop {
-        let progress_opt = service
-            .get_active_progress(tunnel_id)
-            .await
-            .map_err(|e| n0_error::anyerr!("polling tunnel {tunnel_id} progress: {e}"))?;
+        let progress_opt = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(n0_error::anyerr!("tunnel {tunnel_id} setup cancelled"));
+            }
+            result = service.get_active_progress(tunnel_id) => {
+                result.map_err(|e| n0_error::anyerr!("polling tunnel {tunnel_id} progress: {e}"))?
+            }
+        };
         let Some(progress) = progress_opt else {
             return Err(n0_error::anyerr!(
                 "Tunnel {tunnel_id} disappeared during setup"
@@ -229,18 +237,63 @@ where
             return Ok(progress);
         }
 
-        sleep(Duration::from_millis(250)).await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(n0_error::anyerr!("tunnel {tunnel_id} setup cancelled"));
+            }
+            _ = sleep(Duration::from_millis(250)) => {}
+        }
     }
 }
 
 // --- verify_endpoints ---
 
 /// Probe the origin endpoint (HTTP, best-effort) and then the tunnel proxy URL
-/// (HTTPS, indefinite). Origin is bounded by `budget` and is non-fatal on
-/// failure. The proxy URL is checked on a fixed 10-second interval until it
-/// returns a non-5xx response, printing a status line on each attempt so the
-/// user sees progress during settling time.
-pub async fn verify_endpoints<F, R>(
+/// (HTTPS) within one total operation `budget`. Origin probing is non-fatal
+/// and capped at five seconds. The proxy URL is checked on a fixed 10-second
+/// interval until it returns a non-5xx response, cancellation is requested,
+/// or the total operation budget expires.
+pub async fn verify_endpoints<F, R, RFut>(
+    origin_endpoint: &str,
+    hostname: &str,
+    budget: Duration,
+    verify_cb: F,
+    refresh_cb: R,
+    cancel: &CancellationToken,
+) -> Result<()>
+where
+    F: Fn(&str, &str, Duration, Option<u16>),
+    R: FnMut() -> RFut,
+    RFut: Future<Output = Result<()>>,
+{
+    if budget.is_zero() {
+        return Err(n0_error::anyerr!(
+            "endpoint verification budget must be greater than zero"
+        ));
+    }
+
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            Err(n0_error::anyerr!("endpoint verification cancelled"))
+        }
+        result = verify_endpoints_within_budget(
+            origin_endpoint,
+            hostname,
+            budget,
+            verify_cb,
+            refresh_cb,
+        ) => result,
+        _ = sleep(budget) => {
+            Err(n0_error::anyerr!(
+                "proxy https://{hostname} did not become reachable within the {budget:?} endpoint verification budget"
+            ))
+        }
+    }
+}
+
+async fn verify_endpoints_within_budget<F, R, RFut>(
     origin_endpoint: &str,
     hostname: &str,
     budget: Duration,
@@ -249,7 +302,8 @@ pub async fn verify_endpoints<F, R>(
 ) -> Result<()>
 where
     F: Fn(&str, &str, Duration, Option<u16>),
-    R: FnMut(),
+    R: FnMut() -> RFut,
+    RFut: Future<Output = Result<()>>,
 {
     let (origin_url, proxy_url) = build_probe_urls(origin_endpoint, hostname);
 
@@ -260,8 +314,10 @@ where
         .build()
         .map_err(|e| n0_error::anyerr!("building reqwest client for verify_endpoints: {e}"))?;
 
-    // Origin probe — best-effort with budget, non-fatal on failure.
-    match probe_until_reachable(&client, &origin_url, budget / 2).await {
+    // Origin probe — best-effort and non-fatal. Keep most of the total budget
+    // available for the proxy propagation that gates readiness.
+    let origin_budget = std::cmp::min(budget / 2, Duration::from_secs(5));
+    match probe_until_reachable(&client, &origin_url, origin_budget).await {
         Ok((elapsed, status)) => {
             verify_cb("origin reachable", &origin_url, elapsed, Some(status));
         }
@@ -275,7 +331,7 @@ where
         }
     }
 
-    // Proxy probe — fixed 10s interval, indefinite, until non-5xx.
+    // Proxy probe — the outer select enforces the total operation budget.
     let start = Instant::now();
     loop {
         let result = probe_url_with_dns_fallback(&client, &proxy_url, per_attempt_timeout).await;
@@ -321,7 +377,12 @@ where
         // refresh_connection_details call may have raced with the
         // replicator capturing Ready:False; re-patching here re-triggers
         // the mirror so Envoy eventually picks up the iroh cluster config.
-        refresh_cb();
+        if let Err(error) = refresh_cb().await {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "refreshing connection details during endpoint verification failed"
+            );
+        }
     }
 }
 
@@ -433,7 +494,20 @@ async fn discover_ns_authority(
 /// Used between controller-condition polling and HTTP verification so the user
 /// sees a clear "DNS provisioned" step and we fail fast if resolution fails.
 /// Retries every 5 seconds until success or timeout.
-pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr>> {
+pub async fn resolve_hostname_dns(
+    hostname: &str,
+    cancel: &CancellationToken,
+) -> Result<Vec<std::net::IpAddr>> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            Err(n0_error::anyerr!("DNS resolution for {hostname} cancelled"))
+        }
+        result = resolve_hostname_dns_uncancelled(hostname) => result,
+    }
+}
+
+async fn resolve_hostname_dns_uncancelled(hostname: &str) -> Result<Vec<std::net::IpAddr>> {
     let start = Instant::now();
     let max_duration = Duration::from_secs(120);
     let retry_interval = Duration::from_secs(5);
@@ -756,6 +830,46 @@ mod tests {
     fn build_probe_urls_keeps_scheme_when_present() {
         let (origin, _) = build_probe_urls("https://api.example.com", "x.example.com");
         assert_eq!(origin, "https://api.example.com");
+    }
+
+    #[tokio::test]
+    async fn endpoint_verification_honors_preexisting_cancellation() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = verify_endpoints(
+            "127.0.0.1:9",
+            "127.0.0.1:9",
+            Duration::from_secs(30),
+            |_, _, _, _| {},
+            || async { Ok(()) },
+            &cancel,
+        )
+        .await
+        .expect_err("cancelled verification must fail promptly");
+
+        assert!(error.to_string().contains("verification cancelled"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_verification_enforces_total_budget() {
+        let cancel = CancellationToken::new();
+        let budget = Duration::from_millis(25);
+        let started = Instant::now();
+
+        let error = verify_endpoints(
+            "127.0.0.1:9",
+            "127.0.0.1:9",
+            budget,
+            |_, _, _, _| {},
+            || async { Ok(()) },
+            &cancel,
+        )
+        .await
+        .expect_err("unreachable proxy must exhaust its operation budget");
+
+        assert!(error.to_string().contains("endpoint verification budget"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

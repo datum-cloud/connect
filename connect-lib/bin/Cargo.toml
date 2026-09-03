@@ -12,6 +12,7 @@ connect-lib = { path = "../lib" }
 clap = { version = "4", features = ["derive", "env"] }
 n0-error = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 serde_json = { workspace = true }

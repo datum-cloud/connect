@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::Arc,
     time::Duration,
 };
@@ -53,7 +54,6 @@ struct HeartbeatInner {
     provider: Arc<dyn HeartbeatDetailsProvider>,
     runner: ProjectRunner,
     projects: Mutex<HashMap<String, ProjectHeartbeat>>,
-    known_projects: Mutex<HashSet<String>>,
     login_task: Mutex<Option<AbortOnDropHandle<()>>>,
 }
 
@@ -82,7 +82,6 @@ impl HeartbeatAgent {
                 provider,
                 runner,
                 projects: Mutex::new(HashMap::new()),
-                known_projects: Mutex::new(HashSet::new()),
                 login_task: Mutex::new(None),
             }),
         }
@@ -129,7 +128,6 @@ impl HeartbeatAgent {
                         match login_state {
                             crate::datum_cloud::LoginState::Missing => {
                                 this.clear_projects().await;
-                                this.clear_known_projects().await;
                             }
                             _ => {
                                 if let Err(err) = this.refresh_projects().await {
@@ -207,11 +205,11 @@ impl HeartbeatAgent {
         }
     }
 
-    async fn clear_known_projects(&self) {
-        let mut known = self.inner.known_projects.lock().await;
-        known.clear();
-    }
-
+    /// Reconcile the current project snapshot once.
+    ///
+    /// Each invocation retries every project without a running heartbeat. The
+    /// caller's login/project watch events bound retry frequency; this method
+    /// deliberately does not start another polling or backoff loop.
     pub async fn refresh_projects(&self) -> Result<()> {
         let orgs = self.inner.datum.orgs_projects_cache();
         let mut next_projects: HashSet<String> = HashSet::new();
@@ -221,14 +219,17 @@ impl HeartbeatAgent {
             }
         }
 
-        {
-            let mut known = self.inner.known_projects.lock().await;
-            if *known == next_projects {
-                return Ok(());
-            }
-            *known = next_projects.clone();
-        }
+        self.reconcile_projects(next_projects, |project_id, datum, provider| async move {
+            probe_connector(&project_id, datum, provider).await
+        })
+        .await
+    }
 
+    async fn reconcile_projects<P, F>(&self, next_projects: HashSet<String>, probe: P) -> Result<()>
+    where
+        P: Fn(String, DatumCloudClient, Arc<dyn HeartbeatDetailsProvider>) -> F,
+        F: Future<Output = Result<bool>>,
+    {
         let running: Vec<String> = {
             let projects = self.inner.projects.lock().await;
             projects.keys().cloned().collect()
@@ -247,8 +248,8 @@ impl HeartbeatAgent {
             if !should_probe {
                 continue;
             }
-            match probe_connector(
-                project_id,
+            match probe(
+                project_id.clone(),
                 self.inner.datum.clone(),
                 self.inner.provider.clone(),
             )
@@ -688,6 +689,8 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::datum_cloud::{ApiEnv, DatumCloudClient, RefreshError};
     use crate::test_util::{api_error, setup_plugin_env};
 
@@ -758,6 +761,63 @@ mod tests {
         // second call is a no-op rather than tearing down and replacing.
         agent.start_manual().await;
         assert_eq!(agent.inner.projects.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_retries_non_running_projects_after_unsuccessful_probes() {
+        let datum = test_datum_client();
+        let provider = Arc::new(TestProvider {
+            endpoint_id: "test-endpoint".to_string(),
+        });
+        let runner: ProjectRunner = Arc::new(|_project_id, _datum, _provider, cancel| {
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+            })
+        });
+        let agent = HeartbeatAgent::new_with_runner(datum, provider, runner);
+        let next_projects = HashSet::from(["retry-project".to_string()]);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let attempts = attempts.clone();
+            move |_project_id, _datum, _provider| {
+                let attempts = attempts.clone();
+                async move {
+                    match attempts.fetch_add(1, Ordering::SeqCst) {
+                        0 => Err(n0_error::anyerr!("transient probe failure")),
+                        1 => Ok(false),
+                        _ => Ok(true),
+                    }
+                }
+            }
+        };
+
+        agent
+            .reconcile_projects(next_projects.clone(), &probe)
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(agent.inner.projects.lock().await.is_empty());
+
+        agent
+            .reconcile_projects(next_projects.clone(), &probe)
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(agent.inner.projects.lock().await.is_empty());
+
+        agent
+            .reconcile_projects(next_projects, &probe)
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(
+            agent
+                .inner
+                .projects
+                .lock()
+                .await
+                .contains_key("retry-project")
+        );
     }
 
     #[test]
