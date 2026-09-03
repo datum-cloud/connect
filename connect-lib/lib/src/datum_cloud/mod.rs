@@ -97,8 +97,18 @@ pub(crate) mod auth {
             self.0.load_full()
         }
 
-        pub fn get(&self) -> Arc<AuthState> {
-            self.0.load_full()
+        // Preserve the legacy public signature while internal callers migrate to load().
+        #[allow(clippy::result_unit_err, clippy::unnecessary_wraps)]
+        pub fn get(&self) -> Result<Arc<AuthState>, ()> {
+            Ok(self.0.load_full())
+        }
+    }
+
+    impl AuthState {
+        // Preserve the legacy public signature for downstream callers.
+        #[allow(clippy::result_unit_err, clippy::unnecessary_wraps)]
+        pub fn get(&self) -> Result<&AuthState, ()> {
+            Ok(self)
         }
     }
 
@@ -415,7 +425,8 @@ mod tests {
         let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         let auth_state = client.auth_state();
-        let auth = auth_state.get();
+        let auth = auth_state.get().unwrap();
+        let auth = auth.get().unwrap();
         assert_eq!(auth.profile.user_id, "external");
         assert_eq!(auth.profile.email, "external@plugin");
     }
