@@ -42,10 +42,10 @@ const (
 //	{"type":"status","state":"..."}
 //
 // Go-side parse policy:
-//	- Valid JSON with "type" → dispatch on type
-//	- Valid JSON without "type" → fatal error (Rust contract requires "type" on every message)
-//	- Invalid JSON → fatal error (should never occur from Rust)
-//	- Empty line → skip silently
+//   - Valid JSON with "type" → dispatch on type
+//   - Valid JSON without "type" → fatal error (Rust contract requires "type" on every message)
+//   - Invalid JSON → fatal error (should never occur from Rust)
+//   - Empty line → skip silently
 type TypedMessage struct {
 	Type    string                 `json:"type"`
 	Message string                 `json:"message,omitempty"`
@@ -75,10 +75,10 @@ type RunResult struct {
 // This is the ONLY path data goes to stderr — no progress/status messages.
 //
 // Exit code mapping:
-//	- Child exits normally: RunResult.ExitCode = child's exit code, returned nil error
-//	- Child exits via signal: RunResult.ExitCode = 128 + signal number, returned nil error
-//	- Child not found: returned error (not a RunResult)
-//	- Go-side setup failure: returned error
+//   - Child exits normally: RunResult.ExitCode = child's exit code, returned nil error
+//   - Child exits via signal: RunResult.ExitCode = 128 + signal number, returned nil error
+//   - Child not found: returned error (not a RunResult)
+//   - Go-side setup failure: returned error
 //
 // IMPORTANT: This function is for fire-and-forget commands only (list, update, delete).
 // The listen command manages process lifecycle directly to handle streaming output.
@@ -92,19 +92,21 @@ func Run(ctx context.Context, binaryPath string, args []string, env []string, ou
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start %s: %w", binaryPath, err)
 	}
+	childExited := make(chan struct{})
 
 	// Start signal forwarding in a goroutine
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := signals.Forward(cmd.Process, 30*time.Second); err != nil {
+		if err := signals.Forward(cmd.Process, childExited, 30*time.Second); err != nil {
 			// Signal forwarding failure is non-fatal; child may have already exited
 		}
 	}()
 
 	// Wait for completion
 	cmd.Wait()
+	close(childExited)
 
 	// Wait for signal goroutine to finish
 	wg.Wait()
@@ -135,9 +137,9 @@ func Run(ctx context.Context, binaryPath string, args []string, env []string, ou
 // cmd.OutOrStdout() and exits with the child's exit code on failure.
 //
 // Exit code policy:
-//	- Child exits non-zero: os.Exit(child_exit_code) — EXIT-01: propagate verbatim
-//	- Go-side error: returns error (caller decides exit code)
-//	- Child not found: os.Exit(1)
+//   - Child exits non-zero: os.Exit(child_exit_code) — EXIT-01: propagate verbatim
+//   - Go-side error: returns error (caller decides exit code)
+//   - Child not found: os.Exit(1)
 func RunWithOutput(ctx context.Context, cmd *cobra.Command, binaryPath string, args []string, env []string, outputMode OutputMode) error {
 	result, err := Run(ctx, binaryPath, args, env, outputMode)
 	if err != nil {
@@ -163,10 +165,10 @@ func RunWithOutput(ctx context.Context, cmd *cobra.Command, binaryPath string, a
 // Returns (TypedMessage{}, false) for invalid JSON, missing "type", or empty lines.
 //
 // Parse/error policy:
-//	- Valid JSON with "type" field → parse and return (dispatch on type)
-//	- Valid JSON without "type" field → fatal error (Rust contract requires "type" on every message)
-//	- Invalid JSON → fatal error (should never occur from Rust)
-//	- Empty line → skip silently (trailing newline, whitespace)
+//   - Valid JSON with "type" field → parse and return (dispatch on type)
+//   - Valid JSON without "type" field → fatal error (Rust contract requires "type" on every message)
+//   - Invalid JSON → fatal error (should never occur from Rust)
+//   - Empty line → skip silently (trailing newline, whitespace)
 //
 // This function is safe to call on every line from child stdout.
 func ParseTypedMessage(line []byte) (TypedMessage, bool) {

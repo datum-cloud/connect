@@ -13,10 +13,19 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+      - name: Checkout datumctl dependency
+        uses: actions/checkout@v6
+        with:
+          repository: datum-cloud/datumctl
+          ref: v0.15.0
+          path: datumctl-dep
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: connect-plugin/go.mod
+      - name: Rewrite datumctl replace for CI
+        run: go mod edit -replace go.datum.net/datumctl=../datumctl-dep
+        working-directory: connect-plugin
       - name: Verify dependencies
         run: go mod verify
         working-directory: connect-plugin
