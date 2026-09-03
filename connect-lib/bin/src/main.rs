@@ -28,6 +28,7 @@ use std::sync::OnceLock;
 
 use clap::{Parser, Subcommand};
 use n0_error::StdResultExt;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{
     Registry,
     filter::EnvFilter,
@@ -49,6 +50,11 @@ static RELOAD_HANDLE: OnceLock<ReloadHandle> = OnceLock::new();
 /// The filter string that `init_tracing()` actually installed.
 /// Used by `current_filter_string()` to restore the original filter later.
 static INSTALLED_FILTER: OnceLock<String> = OnceLock::new();
+
+/// Fits within the Go supervisor's ten-minute startup timeout while allowing
+/// the gateway and Envoy propagation chain time to settle.
+const ENDPOINT_VERIFICATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const TUNNEL_PROGRESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 
 fn init_tracing() {
     let debug = debug_enabled();
@@ -447,7 +453,11 @@ async fn run() -> n0_error::Result<()> {
                     let picked = if tunnels.len() == 1 {
                         // Auto-adopt the only candidate without popping a picker
                         // (informed by datum-cloud/app@cff37e7).
-                        tunnels.into_iter().next().unwrap()
+                        tunnels.into_iter().next().ok_or_else(|| {
+                            n0_error::anyerr!(
+                                "tunnel picker had no candidate after confirming one was available"
+                            )
+                        })?
                     } else {
                         // Multiple candidates: silence tracing, prompt with inquire,
                         // restore tracing. inquire is sync, so call from a
@@ -458,18 +468,24 @@ async fn run() -> n0_error::Result<()> {
                             .iter()
                             .map(|t| format!("{}  ({})  → {}", t.label, t.id, t.endpoint))
                             .collect();
-                        let chosen_idx_res = tokio::task::spawn_blocking(move || {
+                        let candidate_count = tunnels.len();
+                        let picker_task = tokio::task::spawn_blocking(move || {
                             inquire::Select::new("Select a tunnel:", choices)
                                 .with_starting_cursor(0)
                                 .raw_prompt()
                                 .map(|item| item.index)
                         })
-                        .await
-                        .map_err(|e| n0_error::anyerr!("picker task join failed: {e}"))?;
+                        .await;
                         restore_tracing(&prev_filter);
+                        let chosen_idx_res = picker_task
+                            .map_err(|e| n0_error::anyerr!("picker task join failed: {e}"))?;
                         let idx =
                             chosen_idx_res.map_err(|e| n0_error::anyerr!("picker error: {e}"))?;
-                        tunnels.into_iter().nth(idx).unwrap()
+                        tunnels.into_iter().nth(idx).ok_or_else(|| {
+                            n0_error::anyerr!(
+                                "picker returned candidate index {idx}, but only {candidate_count} tunnels were available"
+                            )
+                        })?
                     };
                     // Read the per-tunnel key using the picked tunnel's name.
                     let key = repo.listen_key_for_tunnel(&project_id, &picked.id).await?;
@@ -546,6 +562,16 @@ async fn run() -> n0_error::Result<()> {
             let heartbeat = HeartbeatAgent::new(datum.clone(), node.clone());
             heartbeat.start().await;
             heartbeat.register_project(&project_id).await;
+
+            let setup_cancel = CancellationToken::new();
+            let setup_cancel_for_signal = setup_cancel.clone();
+            let setup_signal_handle = tokio::spawn(async move {
+                let result = tokio::signal::ctrl_c().await;
+                setup_cancel_for_signal.cancel();
+                result
+            });
+
+            let setup_result: n0_error::Result<connect_lib::TunnelSummary> = async {
             // Wait up to 10s for the relay URL to appear (iroh connects fast
             // in practice, usually <1s). This is a best-effort poll; if the
             // relay never appears, ensure_connector will warn and proceed.
@@ -553,7 +579,13 @@ async fn run() -> n0_error::Result<()> {
                 if node.endpoint().addr().relay_urls().next().is_some() {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::select! {
+                    biased;
+                    _ = setup_cancel.cancelled() => {
+                        return Err(n0_error::anyerr!("tunnel setup cancelled"));
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                }
             }
 
             let tunnel_id = if let Some(t) = existing {
@@ -585,13 +617,8 @@ async fn run() -> n0_error::Result<()> {
                 let tunnel = service.create_active(&label, &endpoint).await?;
                 // Persist the in-memory key to the per-tunnel directory.
                 if let Some(ref secret_key) = in_memory_key {
-                    let key_path = repo
-                        .path()
-                        .join(&project_id)
-                        .join(&tunnel.id)
-                        .join(Repo::LISTEN_KEY_FILE);
-                    tokio::fs::create_dir_all(key_path.parent().unwrap()).await?;
-                    tokio::fs::write(&key_path, secret_key.to_bytes()).await?;
+                    repo.save_listen_key_for_tunnel(&project_id, &tunnel.id, secret_key)
+                        .await?;
                 }
                 if json {
                     println!(
@@ -602,7 +629,7 @@ async fn run() -> n0_error::Result<()> {
                 tunnel.id
             };
 
-            let _ = service.set_enabled_active(&tunnel_id, true).await;
+            service.set_enabled_active(&tunnel_id, true).await?;
 
             // Mode (Text/Json) routes callback output:
             //   Text → stderr (one transition line per change, prefixed by resource)
@@ -624,7 +651,15 @@ async fn run() -> n0_error::Result<()> {
             let progress_cb = move |step: &connect_lib::ProgressStep,
                                     prev: connect_lib::StepStatus| {
                 let elapsed = {
-                    let mut map = step_started_at_for_cb.lock().unwrap();
+                    let mut map = match step_started_at_for_cb.lock() {
+                        Ok(map) => map,
+                        Err(poisoned) => {
+                            tracing::warn!(
+                                "progress timing mutex was poisoned; recovering its last state"
+                            );
+                            poisoned.into_inner()
+                        }
+                    };
                     let timer = map.entry(step.kind).or_insert_with(std::time::Instant::now);
                     timer.elapsed()
                 };
@@ -633,16 +668,21 @@ async fn run() -> n0_error::Result<()> {
 
             let service_for_progress = service.clone();
             let tunnel_id_for_progress = tunnel_id.clone();
-            let progress_handle = tokio::spawn(async move {
+            let mut final_progress = tokio::time::timeout(
+                TUNNEL_PROGRESS_BUDGET,
                 progress::await_tunnel_progress(
                     &service_for_progress,
                     &tunnel_id_for_progress,
                     &progress_cb,
+                    &setup_cancel,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                n0_error::anyerr!(
+                    "tunnel {tunnel_id} did not become ready within the {TUNNEL_PROGRESS_BUDGET:?} progress budget"
                 )
-                .await
-            });
-
-            let mut final_progress = progress_handle.await.unwrap()?;
+            })??;
 
             // Re-patch connectionDetails now that the connector is Ready:True.
             // This triggers the replicator to re-mirror the upstream-status
@@ -652,13 +692,19 @@ async fn run() -> n0_error::Result<()> {
             // Without this, if the annotation was captured at Ready:False
             // (race between replicator and lease renewal), the extension
             // server serves 503 indefinitely.
-            let _ = service.refresh_connection_details().await;
+            service.refresh_connection_details().await?;
 
             // Hostnames are written by the gateway controller shortly after
             // Programmed=True. Poll until one appears (usually <1s).
             if final_progress.hostnames.is_empty() {
                 for _ in 0..20 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::select! {
+                        biased;
+                        _ = setup_cancel.cancelled() => {
+                            return Err(n0_error::anyerr!("tunnel setup cancelled"));
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                    }
                     if let Ok(Some(p)) = service.get_active_progress(&tunnel_id).await
                         && !p.hostnames.is_empty()
                     {
@@ -674,38 +720,53 @@ async fn run() -> n0_error::Result<()> {
             // Resolve the proxy hostname via authoritative DNS as a visible
             // step. This fails fast if the hostname cannot be resolved, and
             // prevents the HTTP probes below from getting stuck on DNS.
-            progress::resolve_hostname_dns(&hostname).await?;
+            progress::resolve_hostname_dns(&hostname, &setup_cancel).await?;
 
-            // Verify origin is up and poll the tunnel URL every 10 seconds
-            // until it returns a successful (non-5xx) response. Only after
-            // this do we declare the tunnel ready to the user / Go supervisor.
+            // Verify origin is up and poll the tunnel URL until it returns a
+            // successful (non-5xx) response or the setup budget expires. Only
+            // after this do we declare the tunnel ready to the user / Go supervisor.
             let verify_mode = mode;
             let service_for_refresh = service.clone();
             progress::verify_endpoints(
                 &endpoint,
                 &hostname,
-                std::time::Duration::from_secs(10),
+                ENDPOINT_VERIFICATION_BUDGET,
                 move |label, url, elapsed, status| {
                     progress::render_verify(verify_mode, label, url, elapsed, status);
                 },
                 || {
                     let svc = service_for_refresh.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = svc.refresh_connection_details().await {
-                            tracing::debug!("refresh during probe failed: {e:#}");
-                        }
-                    });
+                    async move { svc.refresh_connection_details().await }
                 },
+                &setup_cancel,
             )
             .await?;
 
             // Re-fetch the up-to-date TunnelSummary for the tunnel_ready
             // payload (existing contract — id, label, endpoint, hostnames,
             // endpoint_id, status, elapsed_secs).
-            let tunnel = service
+            service
                 .get_active(&tunnel_id)
                 .await?
-                .ok_or_else(|| n0_error::anyerr!("Tunnel {tunnel_id} not found after setup"))?;
+                .ok_or_else(|| n0_error::anyerr!("Tunnel {tunnel_id} not found after setup"))
+            }
+            .await;
+
+            if !setup_cancel.is_cancelled() {
+                setup_signal_handle.abort();
+            }
+            match setup_signal_handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(n0_error::anyerr!("Ctrl-C listener failed: {error}"));
+                }
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    return Err(n0_error::anyerr!("Ctrl-C listener task failed: {error}"));
+                }
+            }
+            let tunnel = setup_result?;
+            let tunnel_id = tunnel.id.clone();
 
             let elapsed = setup_start.elapsed().as_secs();
             if json {
