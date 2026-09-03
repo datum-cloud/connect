@@ -94,6 +94,7 @@ jobs:
         with:
           distribution: goreleaser
           version: "~> v2"
+          workdir: connect-plugin
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
