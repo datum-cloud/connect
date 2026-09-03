@@ -19,6 +19,7 @@ arc-swap = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
 chrono = { workspace = true }
 derive_more = { workspace = true }
+fs2 = { workspace = true }
 gethostname = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }

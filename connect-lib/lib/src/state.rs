@@ -7,7 +7,7 @@ use iroh_tickets::{ParseError, Ticket};
 use n0_error::{Result, StackResultExt, StdResultExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, futures::Notified};
+use tokio::sync::{Mutex, Notify, futures::Notified};
 
 use crate::{DATUM_CONNECT_GATEWAY_DOMAIN_NAME, Repo};
 
@@ -73,6 +73,9 @@ impl SelectedContext {
 pub struct StateWrapper {
     inner: Arc<ArcSwap<State>>,
     notify: Arc<Notify>,
+    // Coordinates clones of this wrapper within one process. Atomic file
+    // replacement prevents torn reads, but does not coordinate other processes.
+    update_lock: Arc<Mutex<()>>,
 }
 
 impl StateWrapper {
@@ -80,6 +83,7 @@ impl StateWrapper {
         Self {
             inner: Arc::new(ArcSwap::new(Arc::new(state))),
             notify: Default::default(),
+            update_lock: Default::default(),
         }
     }
 
@@ -95,16 +99,28 @@ impl StateWrapper {
         self.notify.notified()
     }
 
+    /// Apply one state transaction against the latest contents on disk.
+    ///
+    /// The repository lock is advisory, so direct writers that ignore it are
+    /// outside this transaction boundary. Notifications are process-local and
+    /// are emitted only after this wrapper persists and publishes its update.
+    /// If this future is cancelled, dropping it releases an acquired lock. A
+    /// cancellation during the atomic write can leave an unused temporary file;
+    /// the destination remains either the old or new complete state. If the
+    /// rename completed before cancellation, disk can be newer than this
+    /// wrapper, and the next update reconciles by reloading disk under the lock.
     pub async fn update<R>(
         &self,
         repo: &Repo,
         f: impl FnOnce(&mut State) -> R,
     ) -> n0_error::Result<R> {
-        let mut inner = (*self.inner.load_full()).clone();
+        let _update_guard = self.update_lock.lock().await;
+        let state_lock = repo.lock_state().await?;
+        let mut inner = repo.read_or_initialize_state(&state_lock).await?;
         let res = f(&mut inner);
         let inner = Arc::new(inner);
-        self.inner.store(inner.clone());
-        repo.write_state(&inner).await?;
+        repo.write_state_locked(&inner, &state_lock).await?;
+        self.inner.store(inner);
         self.notify.notify_waiters();
         Ok(res)
     }
@@ -230,7 +246,7 @@ impl State {
 
     pub(crate) async fn write_to_file(&self, path: PathBuf) -> Result<()> {
         let data = serde_yml::to_string(&self).anyerr()?;
-        tokio::fs::write(&path, &data).await?;
+        crate::repo::atomic_write_private(&path, data.as_bytes()).await?;
         Ok(())
     }
 }
@@ -290,6 +306,21 @@ impl Ticket for AdvertismentTicket {
 mod tests {
     use super::*;
 
+    fn temp_repo_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("datum-state-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn proxy_with_id(id: impl Into<String>) -> ProxyState {
+        ProxyState::new(Advertisment::with_id(
+            id.into(),
+            TcpProxyData {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            None,
+        ))
+    }
+
     #[test]
     fn parse_tcp_proxy_data_from_host_port() {
         let data = TcpProxyData::from_host_port_str("example.test:443").unwrap();
@@ -307,5 +338,106 @@ mod tests {
     fn parse_tcp_proxy_data_rejects_invalid_port() {
         let err = TcpProxyData::from_host_port_str("example.test:abc").unwrap_err();
         assert!(err.to_string().contains("invalid port"));
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_does_not_publish_state_or_notify_waiters() {
+        let directory = temp_repo_dir();
+        let repo = Repo::open_or_create(&directory).await.unwrap();
+        let wrapper = repo.load_state().await.unwrap();
+        let notified = wrapper.updated();
+        let state_path = directory.join("state.yml");
+
+        let result = wrapper
+            .update(&repo, |state| {
+                std::fs::remove_file(&state_path).unwrap();
+                std::fs::create_dir(&state_path).unwrap();
+                state.set_proxy(proxy_with_id("proxy-failed"));
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(wrapper.get().proxies.is_empty());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), notified)
+                .await
+                .is_err(),
+            "failed writes must not announce an update"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_updates_are_serialized_without_lost_changes() {
+        const UPDATE_COUNT: usize = 24;
+
+        let directory = temp_repo_dir();
+        let repo = Repo::open_or_create(&directory).await.unwrap();
+        let wrapper = StateWrapper::new(State::default());
+        let mut updates = tokio::task::JoinSet::new();
+
+        for index in 0..UPDATE_COUNT {
+            let repo = repo.clone();
+            let wrapper = wrapper.clone();
+            updates.spawn(async move {
+                wrapper
+                    .update(&repo, |state| {
+                        state.set_proxy(proxy_with_id(format!("proxy-{index}")));
+                    })
+                    .await
+            });
+        }
+
+        while let Some(result) = updates.join_next().await {
+            result.unwrap().unwrap();
+        }
+
+        assert_eq!(wrapper.get().proxies.len(), UPDATE_COUNT);
+        let persisted = State::from_file(directory.join("state.yml")).await.unwrap();
+        assert_eq!(persisted.proxies.len(), UPDATE_COUNT);
+        for index in 0..UPDATE_COUNT {
+            let id = format!("proxy-{index}");
+            assert!(persisted.proxies.iter().any(|proxy| proxy.id() == id));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn separately_opened_repositories_preserve_concurrent_updates() {
+        const UPDATE_COUNT: usize = 24;
+
+        let directory = temp_repo_dir();
+        let first_repo = Repo::open_or_create(&directory).await.unwrap();
+        let second_repo = Repo::open_or_create(&directory).await.unwrap();
+        let first_wrapper = first_repo.load_state().await.unwrap();
+        let second_wrapper = second_repo.load_state().await.unwrap();
+        let start = Arc::new(tokio::sync::Barrier::new(UPDATE_COUNT));
+        let mut updates = tokio::task::JoinSet::new();
+
+        for index in 0..UPDATE_COUNT {
+            let (repo, wrapper) = if index % 2 == 0 {
+                (first_repo.clone(), first_wrapper.clone())
+            } else {
+                (second_repo.clone(), second_wrapper.clone())
+            };
+            let start = start.clone();
+            updates.spawn(async move {
+                start.wait().await;
+                wrapper
+                    .update(&repo, |state| {
+                        state.set_proxy(proxy_with_id(format!("proxy-{index}")));
+                    })
+                    .await
+            });
+        }
+
+        while let Some(result) = updates.join_next().await {
+            result.unwrap().unwrap();
+        }
+
+        let persisted = State::from_file(directory.join("state.yml")).await.unwrap();
+        assert_eq!(persisted.proxies.len(), UPDATE_COUNT);
+        for index in 0..UPDATE_COUNT {
+            let id = format!("proxy-{index}");
+            assert!(persisted.proxies.iter().any(|proxy| proxy.id() == id));
+        }
     }
 }

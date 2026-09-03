@@ -1,5 +1,4 @@
 use std::{
-    fs,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
     path::PathBuf,
 };
@@ -68,7 +67,9 @@ impl Config {
 
     pub async fn write(&self, path: PathBuf) -> Result<()> {
         let data = serde_yml::to_string(self).anyerr()?;
-        fs::write(path, data)?;
+        crate::repo::atomic_write_private(&path, data.as_bytes())
+            .await
+            .context("writing config file")?;
         Ok(())
     }
 }

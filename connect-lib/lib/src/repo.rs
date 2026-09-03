@@ -1,10 +1,133 @@
-use std::path::PathBuf;
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use iroh::SecretKey;
 use n0_error::{Result, StackResultExt, StdResultExt};
+use tokio::io::AsyncWriteExt;
 use tracing::{info, instrument, warn};
 
 use crate::{config::Config, state::State};
+
+const PRIVATE_DIR_MODE: u32 = 0o700;
+const PRIVATE_FILE_MODE: u32 = 0o600;
+const TEMP_FILE_ATTEMPTS: usize = 16;
+
+#[derive(Debug)]
+pub(crate) struct StateLockGuard {
+    file: std::fs::File,
+}
+
+impl Drop for StateLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+/// Persist `data` by replacing `path` with a fully-written temporary file from
+/// the same directory. This keeps the final rename on one filesystem, so
+/// readers observe either the previous contents or all of `data`.
+pub(crate) async fn atomic_write_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_private_dir(parent).await?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+
+    let (temporary_path, temporary_file) = {
+        let mut opened = None;
+        for _ in 0..TEMP_FILE_ATTEMPTS {
+            let temporary_name = format!(
+                ".{}.{}.tmp",
+                file_name.to_string_lossy(),
+                rand::random::<u64>()
+            );
+            let candidate = parent.join(temporary_name);
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                options.mode(PRIVATE_FILE_MODE);
+            }
+
+            match options.open(&candidate).await {
+                Ok(file) => {
+                    opened = Some((candidate, file));
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        opened.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate an atomic-write temporary file",
+            )
+        })?
+    };
+
+    let write_result = write_temporary_file(temporary_file, &temporary_path, path, data).await;
+    if write_result.is_err() {
+        // Preserve the primary write error. Cleanup is best-effort and async.
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+    }
+    write_result
+}
+
+async fn write_temporary_file(
+    mut file: tokio::fs::File,
+    temporary_path: &Path,
+    destination: &Path,
+    data: &[u8],
+) -> io::Result<()> {
+    file.write_all(data).await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(temporary_path, destination).await?;
+    sync_parent_directory(destination).await;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn sync_parent_directory(destination: &Path) {
+    let Some(parent) = destination.parent() else {
+        return;
+    };
+    let result = async {
+        let directory = tokio::fs::File::open(parent).await?;
+        directory.sync_all().await
+    }
+    .await;
+    if let Err(error) = result {
+        // The atomic rename already succeeded, so surfacing this error would
+        // report a failed write even though the destination has changed.
+        warn!(
+            directory = %parent.display(),
+            %error,
+            "could not sync atomic-write parent directory"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_destination: &Path) {}
+
+async fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    tokio::fs::create_dir_all(path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE)).await?;
+    }
+    Ok(())
+}
 
 /// Error returned by [`Repo::default_location`] when the
 /// `DATUM_CONNECT_DIR` environment variable is not set.
@@ -53,6 +176,7 @@ impl Repo {
     const CONNECT_KEY_FILE: &str = "connect_key";
     pub const LISTEN_KEY_FILE: &str = "listen_key";
     const STATE_FILE: &str = "state.yml";
+    const STATE_LOCK_FILE: &str = ".state.lock";
     pub fn default_location() -> Result<PathBuf, MissingConnectDir> {
         match std::env::var("DATUM_CONNECT_DIR") {
             Ok(path) if !path.is_empty() => Ok(PathBuf::from(path)),
@@ -63,7 +187,7 @@ impl Repo {
     /// Opens or creates a repo at the given base directory.
     pub async fn open_or_create(base_dir: impl Into<PathBuf>) -> Result<Self> {
         let base_dir = base_dir.into();
-        tokio::fs::create_dir_all(&base_dir).await?;
+        ensure_private_dir(&base_dir).await?;
         info!("opening repo at {}", base_dir.display());
 
         let this = Self(base_dir);
@@ -73,7 +197,7 @@ impl Repo {
 
     pub async fn config(&self) -> Result<Config> {
         let config_file_path = self.0.join(Self::CONFIG_FILE);
-        if !config_file_path.exists() {
+        if !tokio::fs::try_exists(&config_file_path).await? {
             warn!("config does not exist. creating new config");
             let cfg = Config::default();
             cfg.write(config_file_path).await?;
@@ -84,18 +208,70 @@ impl Repo {
     }
 
     pub async fn load_state(&self) -> Result<crate::StateWrapper> {
-        let state_file_path = self.0.join(Self::STATE_FILE);
-        let state = if !state_file_path.exists() {
-            let state = State::default();
-            state.write_to_file(state_file_path).await?;
-            state
-        } else {
-            State::from_file(state_file_path).await?
-        };
+        let state_lock = self.lock_state().await?;
+        let state = self.read_or_initialize_state(&state_lock).await?;
         Ok(crate::StateWrapper::new(state))
     }
 
     pub async fn write_state(&self, state: &State) -> Result<()> {
+        let state_lock = self.lock_state().await?;
+        self.write_state_locked(state, &state_lock).await
+    }
+
+    /// Acquire the repository-local advisory state lock without blocking an
+    /// async runtime worker.
+    ///
+    /// Advisory locks require every writer to cooperate. They coordinate
+    /// separate `Repo` instances and processes on platforms supported by
+    /// `fs2`, but cannot prevent an unrelated process from modifying
+    /// `state.yml` directly. Cancelling while acquisition is queued cannot
+    /// stop the already-running blocking task; if it later acquires the lock,
+    /// its undelivered guard is immediately dropped and the lock is released.
+    pub(crate) async fn lock_state(&self) -> Result<StateLockGuard> {
+        ensure_private_dir(&self.0).await?;
+        let lock_path = self.0.join(Self::STATE_LOCK_FILE);
+        let file = tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(PRIVATE_FILE_MODE);
+            }
+
+            let file = options.open(lock_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+            }
+            fs2::FileExt::lock_exclusive(&file)?;
+            Ok(file)
+        })
+        .await
+        .std_context("joining state-lock acquisition task")??;
+        Ok(StateLockGuard { file })
+    }
+
+    pub(crate) async fn read_or_initialize_state(
+        &self,
+        _state_lock: &StateLockGuard,
+    ) -> Result<State> {
+        let state_file_path = self.0.join(Self::STATE_FILE);
+        if tokio::fs::try_exists(&state_file_path).await? {
+            State::from_file(state_file_path).await
+        } else {
+            let state = State::default();
+            state.write_to_file(state_file_path).await?;
+            Ok(state)
+        }
+    }
+
+    pub(crate) async fn write_state_locked(
+        &self,
+        state: &State,
+        _state_lock: &StateLockGuard,
+    ) -> Result<()> {
         state.write_to_file(self.0.join(Self::STATE_FILE)).await
     }
 
@@ -104,7 +280,7 @@ impl Repo {
         selected: Option<&crate::SelectedContext>,
     ) -> Result<()> {
         let path = self.0.join(Self::CONFIG_FILE);
-        let mut config = if path.exists() {
+        let mut config = if tokio::fs::try_exists(&path).await? {
             let data = tokio::fs::read_to_string(&path)
                 .await
                 .context("reading config file")?;
@@ -118,7 +294,7 @@ impl Repo {
 
     pub async fn read_selected_context(&self) -> Result<Option<crate::SelectedContext>> {
         let path = self.0.join(Self::CONFIG_FILE);
-        if path.exists() {
+        if tokio::fs::try_exists(&path).await? {
             let data = tokio::fs::read_to_string(path)
                 .await
                 .context("reading config file")?;
@@ -166,9 +342,9 @@ impl Repo {
     pub async fn listen_key_for_project(&self, project_id: &str) -> Result<SecretKey> {
         let project_dir = self.0.join(project_id);
         let key_file_path = project_dir.join(Self::LISTEN_KEY_FILE);
-        if !key_file_path.exists() {
+        if !tokio::fs::try_exists(&key_file_path).await? {
             let legacy = self.0.join(Self::LISTEN_KEY_FILE);
-            if legacy.exists() {
+            if tokio::fs::try_exists(&legacy).await? {
                 tokio::fs::create_dir_all(&project_dir).await?;
                 info!(
                     "migrating legacy listen_key {} -> {} for project {project_id}",
@@ -202,10 +378,10 @@ impl Repo {
         let tunnel_dir = self.0.join(project_id).join(tunnel_name);
         let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
 
-        if !key_file_path.exists() {
+        if !tokio::fs::try_exists(&key_file_path).await? {
             // Check for legacy key at repo root (the old flat layout).
             let legacy = self.0.join(Self::LEGACY_LISTEN_KEY);
-            if legacy.exists() {
+            if tokio::fs::try_exists(&legacy).await? {
                 tokio::fs::create_dir_all(&tunnel_dir).await?;
                 info!(
                     "migrating legacy listen_key {} -> {} for project {project_id} tunnel {tunnel_name}",
@@ -238,7 +414,7 @@ impl Repo {
     }
 
     async fn secret_key(&self, key_file_path: PathBuf) -> Result<SecretKey> {
-        if !key_file_path.exists() {
+        if !tokio::fs::try_exists(&key_file_path).await? {
             warn!("secret key does not exist. creating new key");
             if let Some(parent) = key_file_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -265,7 +441,7 @@ impl Repo {
     /// Delete the local state directory for a tunnel
     pub async fn delete_tunnel_dir(&self, project_id: &str, tunnel_name: &str) -> Result<()> {
         let tunnel_dir = self.0.join(project_id).join(tunnel_name);
-        if tunnel_dir.exists() {
+        if tokio::fs::try_exists(&tunnel_dir).await? {
             tokio::fs::remove_dir_all(&tunnel_dir).await?;
         }
         Ok(())
@@ -280,6 +456,97 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("datum-repo-test-{}", uuid::Uuid::new_v4()));
         path
+    }
+
+    #[tokio::test]
+    async fn atomic_write_replaces_complete_contents_without_leaving_temporary_files() {
+        let directory = temp_repo_dir();
+        ensure_private_dir(&directory).await.unwrap();
+        let path = directory.join("state.yml");
+        atomic_write_private(&path, b"old: value\n").await.unwrap();
+
+        atomic_write_private(&path, b"new: complete value\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            b"new: complete value\n"
+        );
+        let mut entries = tokio::fs::read_dir(&directory).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name());
+        }
+        assert_eq!(names, [std::ffi::OsString::from("state.yml")]);
+    }
+
+    #[tokio::test]
+    async fn failed_atomic_replace_removes_the_temporary_file() {
+        let directory = temp_repo_dir();
+        ensure_private_dir(&directory).await.unwrap();
+        let destination = directory.join("state.yml");
+        tokio::fs::create_dir(&destination).await.unwrap();
+
+        let error = atomic_write_private(&destination, b"proxies: []\n")
+            .await
+            .unwrap_err();
+
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        let mut entries = tokio::fs::read_dir(&directory).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                !entry.file_name().to_string_lossy().ends_with(".tmp"),
+                "temporary file was not cleaned up: {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_state_and_config_use_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temp_repo_dir();
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777))
+            .await
+            .unwrap();
+
+        let repo = Repo::open_or_create(&directory).await.unwrap();
+        repo.config().await.unwrap();
+        repo.load_state().await.unwrap();
+
+        let mode = |metadata: std::fs::Metadata| metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode(tokio::fs::metadata(&directory).await.unwrap()),
+            PRIVATE_DIR_MODE
+        );
+        assert_eq!(
+            mode(
+                tokio::fs::metadata(directory.join(Repo::CONFIG_FILE))
+                    .await
+                    .unwrap()
+            ),
+            PRIVATE_FILE_MODE
+        );
+        assert_eq!(
+            mode(
+                tokio::fs::metadata(directory.join(Repo::STATE_FILE))
+                    .await
+                    .unwrap()
+            ),
+            PRIVATE_FILE_MODE
+        );
+        assert_eq!(
+            mode(
+                tokio::fs::metadata(directory.join(Repo::STATE_LOCK_FILE))
+                    .await
+                    .unwrap()
+            ),
+            PRIVATE_FILE_MODE
+        );
     }
 
     #[tokio::test]
