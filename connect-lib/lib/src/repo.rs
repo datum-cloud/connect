@@ -25,6 +25,17 @@ impl Drop for StateLockGuard {
     }
 }
 
+#[derive(Debug)]
+struct KeyLockGuard {
+    file: std::fs::File,
+}
+
+impl Drop for KeyLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 /// Persist `data` by replacing `path` with a fully-written temporary file from
 /// the same directory. This keeps the final rename on one filesystem, so
 /// readers observe either the previous contents or all of `data`.
@@ -129,6 +140,53 @@ async fn ensure_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+async fn set_private_file_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn write_new_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_private_dir(parent).await?;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(PRIVATE_FILE_MODE);
+    }
+
+    let mut file = options.open(path).await?;
+    if let Err(error) = set_private_file_permissions(path).await {
+        drop(file);
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(error);
+    }
+    let result = async {
+        file.write_all(data).await?;
+        file.flush().await?;
+        file.sync_all().await
+    }
+    .await;
+    drop(file);
+
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(error);
+    }
+
+    sync_parent_directory(path).await;
+    Ok(())
+}
+
 /// Error returned by [`Repo::default_location`] when the
 /// `DATUM_CONNECT_DIR` environment variable is not set.
 ///
@@ -177,6 +235,7 @@ impl Repo {
     pub const LISTEN_KEY_FILE: &str = "listen_key";
     const STATE_FILE: &str = "state.yml";
     const STATE_LOCK_FILE: &str = ".state.lock";
+    const KEY_LOCK_FILE: &str = ".keys.lock";
     pub fn default_location() -> Result<PathBuf, MissingConnectDir> {
         match std::env::var("DATUM_CONNECT_DIR") {
             Ok(path) if !path.is_empty() => Ok(PathBuf::from(path)),
@@ -253,6 +312,34 @@ impl Repo {
         Ok(StateLockGuard { file })
     }
 
+    /// Serialize key creation and legacy-key migration across repository
+    /// instances and cooperating processes.
+    async fn lock_keys(&self) -> Result<KeyLockGuard> {
+        ensure_private_dir(&self.0).await?;
+        let lock_path = self.0.join(Self::KEY_LOCK_FILE);
+        let file = tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(PRIVATE_FILE_MODE);
+            }
+
+            let file = options.open(lock_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+            }
+            fs2::FileExt::lock_exclusive(&file)?;
+            Ok(file)
+        })
+        .await
+        .std_context("joining key-lock acquisition task")??;
+        Ok(KeyLockGuard { file })
+    }
+
     pub(crate) async fn read_or_initialize_state(
         &self,
         _state_lock: &StateLockGuard,
@@ -307,7 +394,8 @@ impl Repo {
 
     pub async fn connect_key(&self) -> Result<SecretKey> {
         let key_file_path = self.0.join(Self::CONNECT_KEY_FILE);
-        self.secret_key(key_file_path).await
+        let key_lock = self.lock_keys().await?;
+        self.secret_key_locked(key_file_path, &key_lock).await
     }
 
     /// Return a fresh listen key always written to a timestamp-suffixed file
@@ -315,6 +403,7 @@ impl Repo {
     /// `listen` is never accidentally reused. The plain `listen_key` name is only
     /// used inside per-tunnel subdirectories where the key is intentionally stable.
     pub async fn listen_key(&self, project_id: Option<&str>) -> Result<SecretKey> {
+        let key_lock = self.lock_keys().await?;
         let key = SecretKey::generate(&mut rand::rng());
         let now = chrono::Local::now().format("%Y%m%d%H%M%S");
         let suffix = match project_id {
@@ -325,12 +414,26 @@ impl Repo {
             }
             None => now.to_string(),
         };
-        let key_file_path = self.0.join(format!("{}.{}", Self::LISTEN_KEY_FILE, suffix));
-        if let Some(parent) = key_file_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        let base_name = format!("{}.{}", Self::LISTEN_KEY_FILE, suffix);
+        for attempt in 0..TEMP_FILE_ATTEMPTS {
+            let file_name = if attempt == 0 {
+                base_name.clone()
+            } else {
+                format!("{base_name}.{attempt}")
+            };
+            let key_file_path = self.0.join(file_name);
+            match write_new_private(&key_file_path, &key.to_bytes()).await {
+                Ok(()) => return Ok(key),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
-        tokio::fs::write(&key_file_path, key.to_bytes()).await?;
-        Ok(key)
+        drop(key_lock);
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique timestamped listen-key file",
+        )
+        .into())
     }
 
     /// Project-scoped listen key. Each project gets its own iroh identity so
@@ -348,10 +451,11 @@ impl Repo {
             ProjectId::try_from(project_id).map_err(|error| n0_error::anyerr!(error))?;
         let project_dir = self.0.join(project_id.as_str());
         let key_file_path = project_dir.join(Self::LISTEN_KEY_FILE);
+        let key_lock = self.lock_keys().await?;
         if !tokio::fs::try_exists(&key_file_path).await? {
             let legacy = self.0.join(Self::LISTEN_KEY_FILE);
             if tokio::fs::try_exists(&legacy).await? {
-                tokio::fs::create_dir_all(&project_dir).await?;
+                ensure_private_dir(&project_dir).await?;
                 info!(
                     "migrating legacy listen_key {} -> {} for project {project_id}",
                     legacy.display(),
@@ -360,7 +464,7 @@ impl Repo {
                 tokio::fs::rename(&legacy, &key_file_path).await?;
             }
         }
-        self.secret_key(key_file_path).await
+        self.secret_key_locked(key_file_path, &key_lock).await
     }
 
     /// Per-tunnel listen key. Each named tunnel gets its own iroh identity so
@@ -387,12 +491,14 @@ impl Repo {
             TunnelId::try_from(tunnel_name).map_err(|error| n0_error::anyerr!(error))?;
         let tunnel_dir = self.0.join(project_id.as_str()).join(tunnel_name.as_str());
         let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
+        let key_lock = self.lock_keys().await?;
 
         if !tokio::fs::try_exists(&key_file_path).await? {
             // Check for legacy key at repo root (the old flat layout).
             let legacy = self.0.join(Self::LEGACY_LISTEN_KEY);
             if tokio::fs::try_exists(&legacy).await? {
-                tokio::fs::create_dir_all(&tunnel_dir).await?;
+                ensure_private_dir(&self.0.join(project_id.as_str())).await?;
+                ensure_private_dir(&tunnel_dir).await?;
                 info!(
                     "migrating legacy listen_key {} -> {} for project {project_id} tunnel {tunnel_name}",
                     legacy.display(),
@@ -404,9 +510,33 @@ impl Repo {
             }
         }
 
-        let key = tokio::fs::read(&key_file_path).await?;
-        let key = key.as_slice().try_into().anyerr()?;
-        Ok(SecretKey::from_bytes(key))
+        self.read_key_locked(&key_file_path, &key_lock).await
+    }
+
+    /// Return a tunnel key only when this repository already owns its local
+    /// identity. This deliberately does not move the legacy root key: endpoint
+    /// matching must not turn a compatibility artifact into adoption proof.
+    pub async fn existing_listen_key_for_tunnel(
+        &self,
+        project_id: &str,
+        tunnel_name: &str,
+    ) -> Result<Option<SecretKey>> {
+        let project_id =
+            ProjectId::try_from(project_id).map_err(|error| n0_error::anyerr!(error))?;
+        let tunnel_name =
+            TunnelId::try_from(tunnel_name).map_err(|error| n0_error::anyerr!(error))?;
+        let key_file_path = self
+            .0
+            .join(project_id.as_str())
+            .join(tunnel_name.as_str())
+            .join(Self::LISTEN_KEY_FILE);
+        let key_lock = self.lock_keys().await?;
+        if !tokio::fs::try_exists(&key_file_path).await? {
+            return Ok(None);
+        }
+        self.read_key_locked(&key_file_path, &key_lock)
+            .await
+            .map(Some)
     }
 
     /// Persist a key for a tunnel (used when regenerating a key for resume).
@@ -422,29 +552,112 @@ impl Repo {
             TunnelId::try_from(tunnel_name).map_err(|error| n0_error::anyerr!(error))?;
         let tunnel_dir = self.0.join(project_id.as_str()).join(tunnel_name.as_str());
         let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
-        tokio::fs::create_dir_all(&tunnel_dir).await?;
-        tokio::fs::write(&key_file_path, key.to_bytes()).await?;
-        Ok(())
+        let key_lock = self.lock_keys().await?;
+        ensure_private_dir(&self.0.join(project_id.as_str())).await?;
+        ensure_private_dir(&tunnel_dir).await?;
+        self.save_key_locked(&key_file_path, key, &key_lock).await
     }
 
-    async fn secret_key(&self, key_file_path: PathBuf) -> Result<SecretKey> {
+    /// Return the tunnel's persisted key, creating and reserving one when it is
+    /// missing. The repository key lock makes concurrent callers converge on
+    /// the same identity before either caller mutates upstream resources.
+    pub async fn reserve_listen_key_for_tunnel(
+        &self,
+        project_id: &str,
+        tunnel_name: &str,
+    ) -> Result<SecretKey> {
+        let project_id =
+            ProjectId::try_from(project_id).map_err(|error| n0_error::anyerr!(error))?;
+        let tunnel_name =
+            TunnelId::try_from(tunnel_name).map_err(|error| n0_error::anyerr!(error))?;
+        let project_dir = self.0.join(project_id.as_str());
+        let tunnel_dir = project_dir.join(tunnel_name.as_str());
+        let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
+        let key_lock = self.lock_keys().await?;
+        ensure_private_dir(&project_dir).await?;
+        ensure_private_dir(&tunnel_dir).await?;
+        self.secret_key_locked(key_file_path, &key_lock).await
+    }
+
+    async fn secret_key_locked(
+        &self,
+        key_file_path: PathBuf,
+        key_lock: &KeyLockGuard,
+    ) -> Result<SecretKey> {
         if !tokio::fs::try_exists(&key_file_path).await? {
             warn!("secret key does not exist. creating new key");
             if let Some(parent) = key_file_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+                ensure_private_dir(parent).await?;
             }
-            return self.create_key(&key_file_path).await;
+            return self.create_key_locked(&key_file_path, key_lock).await;
         };
 
+        self.read_key_locked(&key_file_path, key_lock).await
+    }
+
+    async fn read_key_locked(
+        &self,
+        key_file_path: &Path,
+        _key_lock: &KeyLockGuard,
+    ) -> Result<SecretKey> {
+        set_private_file_permissions(key_file_path).await?;
         let key = tokio::fs::read(key_file_path).await?;
         let key = key.as_slice().try_into().anyerr()?;
         Ok(SecretKey::from_bytes(key))
     }
 
-    async fn create_key(&self, key_file_path: &PathBuf) -> Result<SecretKey> {
+    async fn create_key_locked(
+        &self,
+        key_file_path: &Path,
+        key_lock: &KeyLockGuard,
+    ) -> Result<SecretKey> {
         let key = SecretKey::generate(&mut rand::rng());
-        tokio::fs::write(key_file_path, key.to_bytes()).await?;
-        Ok(key)
+        match write_new_private(key_file_path, &key.to_bytes()).await {
+            Ok(()) => Ok(key),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                self.read_key_locked(key_file_path, key_lock).await
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn save_key_locked(
+        &self,
+        key_file_path: &Path,
+        key: &SecretKey,
+        key_lock: &KeyLockGuard,
+    ) -> Result<()> {
+        let requested = key.to_bytes();
+        match tokio::fs::read(key_file_path).await {
+            Ok(existing) => {
+                set_private_file_permissions(key_file_path).await?;
+                if existing == requested {
+                    return Ok(());
+                }
+                n0_error::bail_any!(
+                    "refusing to overwrite a different listen key at {}",
+                    key_file_path.display()
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        match write_new_private(key_file_path, &requested).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = self.read_key_locked(key_file_path, key_lock).await?;
+                if existing.to_bytes() == requested {
+                    Ok(())
+                } else {
+                    n0_error::bail_any!(
+                        "refusing to overwrite a different listen key at {}",
+                        key_file_path.display()
+                    );
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Get the base directory path of this repo
@@ -630,6 +843,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn concurrent_connect_key_creation_returns_one_persisted_key() {
+        let directory = temp_repo_dir();
+        Repo::open_or_create(&directory).await.unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let repo = Repo::from_path(directory.clone());
+            tasks.push(tokio::spawn(async move {
+                repo.connect_key().await.unwrap().to_bytes()
+            }));
+        }
+
+        let mut keys = Vec::new();
+        for task in tasks {
+            keys.push(task.await.unwrap());
+        }
+
+        assert!(keys.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            tokio::fs::read(directory.join(Repo::CONNECT_KEY_FILE))
+                .await
+                .unwrap(),
+            keys[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_project_key_migration_preserves_the_legacy_key() {
+        let directory = temp_repo_dir();
+        Repo::open_or_create(&directory).await.unwrap();
+        let legacy = SecretKey::generate(&mut rand::rng());
+        tokio::fs::write(directory.join(Repo::LISTEN_KEY_FILE), legacy.to_bytes())
+            .await
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let repo = Repo::from_path(directory.clone());
+            tasks.push(tokio::spawn(async move {
+                repo.listen_key_for_project("project-race")
+                    .await
+                    .unwrap()
+                    .to_bytes()
+            }));
+        }
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), legacy.to_bytes());
+        }
+        assert!(!directory.join(Repo::LISTEN_KEY_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_timestamped_listen_keys_do_not_overwrite_each_other() {
+        let directory = temp_repo_dir();
+        Repo::open_or_create(&directory).await.unwrap();
+        let first_repo = Repo::from_path(directory.clone());
+        let second_repo = Repo::from_path(directory.clone());
+
+        let (first, second) = tokio::join!(
+            first_repo.listen_key(Some("project-race")),
+            second_repo.listen_key(Some("project-race"))
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_ne!(first.to_bytes(), second.to_bytes());
+        let mut entries = tokio::fs::read_dir(&directory).await.unwrap();
+        let mut persisted = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("listen_key.project-race.")
+            {
+                persisted.push(tokio::fs::read(entry.path()).await.unwrap());
+            }
+        }
+        assert_eq!(persisted.len(), 2);
+        assert!(persisted.contains(&first.to_bytes().to_vec()));
+        assert!(persisted.contains(&second.to_bytes().to_vec()));
+    }
+
     // ── Per-tunnel key tests ──────────────────────────────────────────
 
     #[tokio::test]
@@ -754,6 +1050,147 @@ mod tests {
             result.is_err(),
             "should error when key does not exist (no legacy migration)"
         );
+    }
+
+    #[tokio::test]
+    async fn save_listen_key_for_tunnel_is_idempotent_for_the_same_key() {
+        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        let key = SecretKey::generate(&mut rand::rng());
+
+        repo.save_listen_key_for_tunnel("project", "tunnel", &key)
+            .await
+            .unwrap();
+        repo.save_listen_key_for_tunnel("project", "tunnel", &key)
+            .await
+            .unwrap();
+
+        let persisted = repo
+            .listen_key_for_tunnel("project", "tunnel")
+            .await
+            .unwrap();
+        assert_eq!(persisted.to_bytes(), key.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn save_listen_key_for_tunnel_rejects_a_different_existing_key() {
+        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        let original = SecretKey::generate(&mut rand::rng());
+        let replacement = SecretKey::generate(&mut rand::rng());
+        repo.save_listen_key_for_tunnel("project", "tunnel", &original)
+            .await
+            .unwrap();
+
+        let error = repo
+            .save_listen_key_for_tunnel("project", "tunnel", &replacement)
+            .await
+            .expect_err("a different key must not overwrite the persisted identity");
+
+        assert!(error.to_string().contains("refusing to overwrite"));
+        let persisted = repo
+            .listen_key_for_tunnel("project", "tunnel")
+            .await
+            .unwrap();
+        assert_eq!(persisted.to_bytes(), original.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn concurrent_different_tunnel_key_saves_have_one_winner() {
+        let directory = temp_repo_dir();
+        Repo::open_or_create(&directory).await.unwrap();
+        let first_key = SecretKey::generate(&mut rand::rng());
+        let second_key = SecretKey::generate(&mut rand::rng());
+        let first_bytes = first_key.to_bytes();
+        let second_bytes = second_key.to_bytes();
+        let first_repo = Repo::from_path(directory.clone());
+        let second_repo = Repo::from_path(directory.clone());
+
+        let (first_result, second_result) = tokio::join!(
+            first_repo.save_listen_key_for_tunnel("project", "tunnel", &first_key),
+            second_repo.save_listen_key_for_tunnel("project", "tunnel", &second_key)
+        );
+
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let persisted = tokio::fs::read(
+            directory
+                .join("project")
+                .join("tunnel")
+                .join(Repo::LISTEN_KEY_FILE),
+        )
+        .await
+        .unwrap();
+        let expected = if first_result.is_ok() {
+            first_bytes
+        } else {
+            second_bytes
+        };
+        assert_eq!(persisted, expected);
+    }
+
+    #[tokio::test]
+    async fn concurrent_tunnel_key_reservations_converge_on_one_identity() {
+        let directory = temp_repo_dir();
+        Repo::open_or_create(&directory).await.unwrap();
+        let first_repo = Repo::from_path(directory.clone());
+        let second_repo = Repo::from_path(directory.clone());
+
+        let (first, second) = tokio::join!(
+            first_repo.reserve_listen_key_for_tunnel("project", "tunnel"),
+            second_repo.reserve_listen_key_for_tunnel("project", "tunnel")
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.to_bytes(), second.to_bytes());
+        assert_eq!(
+            tokio::fs::read(
+                directory
+                    .join("project")
+                    .join("tunnel")
+                    .join(Repo::LISTEN_KEY_FILE),
+            )
+            .await
+            .unwrap(),
+            first.to_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_key_directories_and_files_use_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temp_repo_dir();
+        let repo = Repo::open_or_create(&directory).await.unwrap();
+        repo.connect_key().await.unwrap();
+        let tunnel_key = SecretKey::generate(&mut rand::rng());
+        repo.save_listen_key_for_tunnel("project", "tunnel", &tunnel_key)
+            .await
+            .unwrap();
+
+        let mode = |metadata: std::fs::Metadata| metadata.permissions().mode() & 0o777;
+        for path in [
+            directory.clone(),
+            directory.join("project"),
+            directory.join("project").join("tunnel"),
+        ] {
+            assert_eq!(
+                mode(tokio::fs::metadata(path).await.unwrap()),
+                PRIVATE_DIR_MODE
+            );
+        }
+        for path in [
+            directory.join(Repo::KEY_LOCK_FILE),
+            directory.join(Repo::CONNECT_KEY_FILE),
+            directory
+                .join("project")
+                .join("tunnel")
+                .join(Repo::LISTEN_KEY_FILE),
+        ] {
+            assert_eq!(
+                mode(tokio::fs::metadata(path).await.unwrap()),
+                PRIVATE_FILE_MODE
+            );
+        }
     }
 
     #[tokio::test]

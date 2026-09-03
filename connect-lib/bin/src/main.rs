@@ -40,7 +40,9 @@ use tracing_subscriber::{
 use connect_lib::datum_cloud::DatumCloudClient;
 use connect_lib::datum_cloud::env::ApiEnv;
 use connect_lib::datum_cloud::external_token_source::ExternalTokenSource;
-use connect_lib::{HeartbeatAgent, ListenNode, Repo, SelectedContext, TunnelService};
+use connect_lib::{
+    HeartbeatAgent, ListenNode, Repo, SelectedContext, TunnelService, TunnelSummary,
+};
 use iroh::SecretKey;
 
 mod progress;
@@ -129,10 +131,47 @@ async fn resolve_listen_key(
                  The hostname will stay the same but the old connector will be replaced."
             );
             let _ = std::io::stderr().flush();
-            let new_key = SecretKey::generate(&mut rand::rng());
-            Ok((new_key, true))
+            let reserved_key = repo
+                .reserve_listen_key_for_tunnel(project_id, tunnel_id)
+                .await?;
+            Ok((reserved_key, true))
         }
         Err(e) => Err(e),
+    }
+}
+
+async fn resolve_endpoint_candidates(
+    repo: &Repo,
+    project_id: &str,
+    endpoint: &str,
+    candidates: Vec<TunnelSummary>,
+    fresh_key: SecretKey,
+) -> n0_error::Result<(SecretKey, Option<TunnelSummary>)> {
+    let endpoint = connect_lib::normalize_endpoint(endpoint);
+    let mut owned = Vec::new();
+    for tunnel in candidates {
+        if connect_lib::normalize_endpoint(&tunnel.endpoint) != endpoint {
+            continue;
+        }
+        if let Some(key) = repo
+            .existing_listen_key_for_tunnel(project_id, &tunnel.id)
+            .await?
+        {
+            owned.push((key, tunnel));
+        }
+    }
+
+    match owned.len() {
+        0 => Ok((fresh_key, None)),
+        1 => {
+            let (key, tunnel) = owned.pop().ok_or_else(|| {
+                n0_error::anyerr!("owned tunnel disappeared after confirming one match")
+            })?;
+            Ok((key, Some(tunnel)))
+        }
+        count => Err(n0_error::anyerr!(
+            "endpoint '{endpoint}' matches {count} tunnels owned by this repository; pass --id to choose one"
+        )),
     }
 }
 
@@ -355,43 +394,38 @@ async fn run() -> n0_error::Result<()> {
             endpoint,
             id,
         } => {
-            // Plan 12-02 resolution rules (replaces plan 12-01 stubs):
-            //   --endpoint only        → generate key in memory, create tunnel
-            //   --id only              → real resolution via TunnelService::get_active;
-            //                            read per-tunnel key, inherit endpoint
-            //   --id + --endpoint      → validate endpoint agreement, read per-tunnel key
-            //   neither flag           → picker with auto-adopt on len==1, error on len==0
-            //
-            // Per-tunnel key layout (Phase 17):
-            //   --endpoint generates a key in memory → new_with_key() → persist after creation
-            //   --id / picker read per-tunnel key → new_with_key() → no persistence needed
-            //
-            // Informed by datum-cloud/app@ca4470f (tunnel listen --id pins existing
-            // tunnel and preserves its hostname) and @a68d8ae (--id alone resumes
-            // an existing tunnel; --id+--endpoint must agree).
-            //
-            // The id branches pre-build (node, service) so we can call
-            // get_active(&id). They stash the result in `preresolved_ns` so the
-            // downstream block reuses them instead of re-creating.
-
-            // Optional in-memory key: Some(key) for --endpoint (generated),
-            // None for --id/picker (key read from disk).
+            // Resolve the tunnel identity before update/create: existing
+            // tunnels must use their durable key, while a new tunnel keeps its
+            // generated key in memory until its remote ID is known.
             let mut in_memory_key: Option<SecretKey> = None;
-            // Set when --id resume generates a new key because the original
-            // was missing. Forces update_active to rewire the HTTPProxy to
-            // the new connector.
             let mut force_rewire = false;
 
-            let preresolved_ns: Option<(ListenNode, TunnelService, connect_lib::TunnelSummary)>;
+            let resolved: (ListenNode, TunnelService, Option<TunnelSummary>);
             let endpoint: String = match (endpoint, id) {
                 (Some(ep), None) => {
-                    // --endpoint only: generate key in memory, use new_with_key()
-                    let secret_key = SecretKey::generate(&mut rand::rng());
-                    in_memory_key = Some(secret_key.clone());
-                    ListenNode::new_with_key(repo.clone(), secret_key).await?;
-                    // No existing tunnel — preresolved_ns stays None so
-                    // the downstream block falls through to create.
-                    preresolved_ns = None;
+                    let fresh_key = SecretKey::generate(&mut rand::rng());
+                    let probe_node =
+                        ListenNode::new_with_key(repo.clone(), fresh_key.clone()).await?;
+                    let probe_service = TunnelService::new(datum.clone(), probe_node.clone());
+                    let candidates = probe_service.list_active().await?;
+                    let (key, existing) = resolve_endpoint_candidates(
+                        &repo,
+                        &project_id,
+                        &ep,
+                        candidates,
+                        fresh_key.clone(),
+                    )
+                    .await?;
+                    if existing.is_none() {
+                        in_memory_key = Some(key.clone());
+                    }
+                    let node = if key.to_bytes() == fresh_key.to_bytes() {
+                        probe_node
+                    } else {
+                        ListenNode::new_with_key(repo.clone(), key).await?
+                    };
+                    let service = TunnelService::new(datum.clone(), node.clone());
+                    resolved = (node, service, existing);
                     ep
                 }
                 (None, Some(tunnel_id)) => {
@@ -407,14 +441,13 @@ async fn run() -> n0_error::Result<()> {
                     let (key, should_rewire) =
                         resolve_listen_key(&repo, &project_id, &t.id).await?;
                     if should_rewire {
-                        in_memory_key = Some(key.clone());
                         force_rewire = true;
                     }
                     let node = ListenNode::new_with_key(repo.clone(), key).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
                     // Inherit endpoint from the existing tunnel.
                     let ep = t.endpoint.clone();
-                    preresolved_ns = Some((node, service, t));
+                    resolved = (node, service, Some(t));
                     ep
                 }
                 (Some(endpoint_val), Some(id_val)) => {
@@ -433,12 +466,11 @@ async fn run() -> n0_error::Result<()> {
                     let (key, should_rewire) =
                         resolve_listen_key(&repo, &project_id, &t.id).await?;
                     if should_rewire {
-                        in_memory_key = Some(key.clone());
                         force_rewire = true;
                     }
                     let node = ListenNode::new_with_key(repo.clone(), key).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
-                    preresolved_ns = Some((node, service, t));
+                    resolved = (node, service, Some(t));
                     endpoint_val
                 }
                 (None, None) => {
@@ -495,52 +527,12 @@ async fn run() -> n0_error::Result<()> {
                     let node = ListenNode::new_with_key(repo.clone(), key).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
                     let ep = picked.endpoint.clone();
-                    preresolved_ns = Some((node, service, picked));
+                    resolved = (node, service, Some(picked));
                     ep
                 }
             };
 
-            // Reuse the (node, service, existing-tunnel) tuple if one of the
-            // resolution branches above already built it; otherwise build now
-            // and look up the existing tunnel by endpoint.
-            let (node, service, existing) = match preresolved_ns {
-                Some((n, s, t)) => {
-                    // For --endpoint, t.id is empty — treat as "no existing tunnel".
-                    let existing = if t.id.is_empty() { None } else { Some(t) };
-                    (n, s, existing)
-                }
-                None => {
-                    let n = ListenNode::new(repo.clone()).await?;
-                    let s = TunnelService::new(datum.clone(), n.clone());
-                    let existing = s.get_active_by_endpoint(&endpoint).await?;
-                    // `--endpoint` carries a local, non-unique address (e.g.
-                    // `localhost:8888`), so matching by endpoint alone would
-                    // adopt a tunnel created on a different machine and rewire
-                    // its HTTPProxy to this process's fresh connector —
-                    // orphaning the original machine's connector and stealing
-                    // the hostname. Only adopt when the existing tunnel's
-                    // connector belongs to this device; otherwise fall through
-                    // to create a new tunnel.
-                    // (If connector_device is None the match fails and we
-                    // also fall through to create a new tunnel.)
-                    let existing = existing.and_then(|t| {
-                        let here = connect_lib::friendly_device_name();
-                        if t.connector_device.as_deref() == Some(here.as_str()) {
-                            Some(t)
-                        } else {
-                            tracing::info!(
-                                endpoint = %endpoint,
-                                tunnel = %t.id,
-                                device = ?t.connector_device,
-                                here = %here,
-                                "existing tunnel belongs to a different device; creating a new tunnel"
-                            );
-                            None
-                        }
-                    });
-                    (n, s, existing)
-                }
-            };
+            let (node, service, existing) = resolved;
             let endpoint_id = node.endpoint_id();
             let _ = writeln!(
                 std::io::stderr(),
@@ -592,29 +584,19 @@ async fn run() -> n0_error::Result<()> {
             }
 
             let tunnel_id = if let Some(t) = existing {
-                if force_rewire || label.as_ref().is_some_and(|l| l != &t.label) {
-                    let label_val = label.clone().unwrap_or_else(|| t.label.clone());
-                    let updated = service.update_active(&t.id, &label_val, &endpoint).await?;
-                    // Persist the new key if one was generated.
-                    if let Some(ref secret_key) = in_memory_key {
-                        repo.save_listen_key_for_tunnel(&project_id, &t.id, secret_key)
-                            .await?;
-                    }
-                    // Clean up orphaned connectors left from the old key.
-                    let deleted = service.cleanup_orphaned_connectors().await?;
-                    for name in &deleted {
-                        tracing::info!(connector = %name, "Cleaned up orphaned connector");
-                    }
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({"type": "tunnel_updated", "id": updated.id})
-                        );
-                    }
-                    updated.id
-                } else {
-                    t.id
+                let changed = force_rewire || label.as_ref().is_some_and(|l| l != &t.label);
+                let label_val = label.clone().unwrap_or_else(|| t.label.clone());
+                // A resume always applies the idempotent desired state. This
+                // closes the recovery window where a key was durably reserved
+                // but a previous upstream rewire failed.
+                let updated = service.update_active(&t.id, &label_val, &endpoint).await?;
+                if changed && json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type": "tunnel_updated", "id": updated.id})
+                    );
                 }
+                updated.id
             } else {
                 let label = label.unwrap_or_else(|| endpoint.clone());
                 let tunnel = service.create_active(&label, &endpoint).await?;
@@ -1036,4 +1018,123 @@ async fn run() -> n0_error::Result<()> {
         .await
         .map_err(|e| n0_error::anyerr!("failed to shut down token refresh: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tunnel(id: &str, device: Option<String>) -> TunnelSummary {
+        TunnelSummary {
+            id: id.to_string(),
+            label: "test tunnel".to_string(),
+            endpoint: "127.0.0.1:8080".to_string(),
+            hostnames: Vec::new(),
+            enabled: true,
+            accepted: true,
+            programmed: true,
+            connector_metadata_programmed: true,
+            connector_ready: true,
+            connector_name: Some("connector".to_string()),
+            connector_device: device,
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_missing_key_resolution_uses_one_reserved_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_create(directory.path()).await.unwrap();
+
+        let (first, second) = tokio::join!(
+            resolve_listen_key(&repo, "project", "tunnel"),
+            resolve_listen_key(&repo, "project", "tunnel")
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.0.to_bytes(), second.0.to_bytes());
+        assert!(first.1 || second.1);
+        assert_eq!(
+            repo.listen_key_for_tunnel("project", "tunnel")
+                .await
+                .unwrap()
+                .to_bytes(),
+            first.0.to_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_adoption_requires_the_existing_local_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_create(directory.path()).await.unwrap();
+        let persisted = SecretKey::generate(&mut rand::rng());
+        repo.save_listen_key_for_tunnel("project", "tunnel", &persisted)
+            .await
+            .unwrap();
+        let fresh = SecretKey::generate(&mut rand::rng());
+        assert_ne!(fresh.to_bytes(), persisted.to_bytes());
+
+        let (resolved, adopted) = resolve_endpoint_candidates(
+            &repo,
+            "project",
+            "127.0.0.1:8080",
+            vec![tunnel("tunnel", Some(connect_lib::friendly_device_name()))],
+            fresh,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.to_bytes(), persisted.to_bytes());
+        assert_eq!(adopted.unwrap().id, "tunnel");
+    }
+
+    #[tokio::test]
+    async fn endpoint_match_without_a_local_key_keeps_the_fresh_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_create(directory.path()).await.unwrap();
+        let fresh = SecretKey::generate(&mut rand::rng());
+
+        let (resolved, adopted) = resolve_endpoint_candidates(
+            &repo,
+            "project",
+            "127.0.0.1:8080",
+            vec![tunnel("unowned", Some(connect_lib::friendly_device_name()))],
+            fresh.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.to_bytes(), fresh.to_bytes());
+        assert!(adopted.is_none());
+        assert!(
+            repo.listen_key_for_tunnel("project", "unowned")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_adoption_rejects_multiple_locally_owned_matches() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_create(directory.path()).await.unwrap();
+        for tunnel_id in ["first", "second"] {
+            let key = SecretKey::generate(&mut rand::rng());
+            repo.save_listen_key_for_tunnel("project", tunnel_id, &key)
+                .await
+                .unwrap();
+        }
+
+        let error = resolve_endpoint_candidates(
+            &repo,
+            "project",
+            "127.0.0.1:8080",
+            vec![tunnel("first", None), tunnel("second", None)],
+            SecretKey::generate(&mut rand::rng()),
+        )
+        .await
+        .expect_err("ambiguous local ownership must fail closed");
+
+        assert!(error.to_string().contains("matches 2 tunnels"));
+        assert!(error.to_string().contains("pass --id"));
+    }
 }
