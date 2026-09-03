@@ -251,7 +251,7 @@ impl AuthHandler for StateWrapper {
                 }
             }
             HttpProxyRequestKind::Absolute { target, .. } => {
-                if let Ok(authority) = Authority::from_absolute_uri(&target) {
+                if let Ok(authority) = Authority::from_absolute_uri(target) {
                     if self.tcp_proxy_exists(&authority.host, authority.port) {
                         Ok(())
                     } else {

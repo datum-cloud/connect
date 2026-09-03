@@ -331,10 +331,10 @@ fn system_nameservers() -> Vec<std::net::IpAddr> {
     let mut ips = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("nameserver ") {
-            if let Ok(ip) = rest.trim().parse::<std::net::IpAddr>() {
-                ips.push(ip);
-            }
+        if let Some(rest) = line.strip_prefix("nameserver ")
+            && let Ok(ip) = rest.trim().parse::<std::net::IpAddr>()
+        {
+            ips.push(ip);
         }
     }
     ips
@@ -484,12 +484,12 @@ pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr
                 }
             }
         }
-        if ips.is_empty() {
-            if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
-                for record in lookup.as_lookup().records() {
-                    if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
-                        ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
-                    }
+        if ips.is_empty()
+            && let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await
+        {
+            for record in lookup.as_lookup().records() {
+                if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
+                    ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
                 }
             }
         }
