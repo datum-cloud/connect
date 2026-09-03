@@ -86,8 +86,7 @@ pub fn setup_plugin_env() -> (TempDir, ExternalTokenSource) {
         std::env::set_var("DATUM_SESSION", "test-session");
     }
 
-    let source = ExternalTokenSource::from_env(Some("test-session".to_string()))
-        .expect("should create token source");
+    let source = ExternalTokenSource::from_token_for_test(jwt);
     (dir, source)
 }
 
