@@ -22,7 +22,7 @@ pub struct HTTPRouteRulesMatchesHeaders {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HTTPRouteRulesMatchesHeadersType {
     Exact,
-   RegularExpression,
+    RegularExpression,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

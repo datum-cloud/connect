@@ -788,12 +788,10 @@ mod tests {
         // log line can be grepped (Transient → keep retrying;
         // Permanent → surface to operator).
         assert!(
-            format!("{}", RefreshError::Transient(n0_error::anyerr!("x")))
-                .contains("transient")
+            format!("{}", RefreshError::Transient(n0_error::anyerr!("x"))).contains("transient")
         );
         assert!(
-            format!("{}", RefreshError::Permanent(n0_error::anyerr!("x")))
-                .contains("permanently")
+            format!("{}", RefreshError::Permanent(n0_error::anyerr!("x"))).contains("permanently")
         );
     }
 

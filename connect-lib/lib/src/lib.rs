@@ -18,13 +18,13 @@ pub use datum_cloud::external_token_source::{ExternalTokenError, ExternalTokenSo
 pub use datum_cloud::{ApiEnv, AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
 pub use heartbeat::HeartbeatAgent;
 pub use http_user_agent::datum_http_user_agent;
-pub use node::{build_endpoint, ConnectNode, ListenNode};
+pub use node::{ConnectNode, ListenNode, build_endpoint};
 pub use project_control_plane::ProjectControlPlaneClient;
 pub use repo::{MissingConnectDir, Repo};
 pub use state::{Advertisment, SelectedContext, State, StateWrapper, TcpProxyData};
 pub use tunnels::{
-    friendly_device_name, normalize_endpoint, OrphanedConnector, ProgressStep, ProgressStepKind,
-    StepStatus, TunnelDeleteOutcome, TunnelProgress, TunnelService, TunnelSummary,
+    OrphanedConnector, ProgressStep, ProgressStepKind, StepStatus, TunnelDeleteOutcome,
+    TunnelProgress, TunnelService, TunnelSummary, friendly_device_name, normalize_endpoint,
 };
 
 /// The root domain for datum connect URLs to subdomain from. A proxy URL will

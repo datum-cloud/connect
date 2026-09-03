@@ -14,7 +14,9 @@ pub enum ApiEnv {
     Staging,
     Production,
     /// Custom API host (plugin mode override).
-    Custom { api_url: String },
+    Custom {
+        api_url: String,
+    },
 }
 
 impl ApiEnv {
@@ -63,11 +65,9 @@ impl ApiEnv {
         match self {
             ApiEnv::Staging => Cow::Borrowed(STAGING_WEB_URL),
             ApiEnv::Production => Cow::Borrowed(PROD_WEB_URL),
-            ApiEnv::Custom { api_url } => Cow::Owned(
-                api_url
-                    .replace("api.", "app.")
-                    .replace("//api.", "//app."),
-            ),
+            ApiEnv::Custom { api_url } => {
+                Cow::Owned(api_url.replace("api.", "app.").replace("//api.", "//app."))
+            }
         }
     }
 }
@@ -94,7 +94,9 @@ mod tests {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         cleanup_env();
         assert!(matches!(ApiEnv::default(), ApiEnv::Production));
-        unsafe { std::env::set_var("DATUM_API_ENV", "staging"); }
+        unsafe {
+            std::env::set_var("DATUM_API_ENV", "staging");
+        }
         assert!(matches!(ApiEnv::default(), ApiEnv::Staging));
     }
 
@@ -102,14 +104,20 @@ mod tests {
     fn from_env_with_host_override_uses_datum_api_host() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         cleanup_env();
-        unsafe { std::env::set_var("DATUM_API_HOST", "https://custom.example.com"); }
+        unsafe {
+            std::env::set_var("DATUM_API_HOST", "https://custom.example.com");
+        }
         let env = ApiEnv::from_env_with_host_override();
-        assert!(matches!(&env, ApiEnv::Custom { api_url } if api_url == "https://custom.example.com"));
+        assert!(
+            matches!(&env, ApiEnv::Custom { api_url } if api_url == "https://custom.example.com")
+        );
     }
 
     #[test]
     fn api_url_custom_returns_host() {
-        let env = ApiEnv::Custom { api_url: "https://my.api.com".to_string() };
+        let env = ApiEnv::Custom {
+            api_url: "https://my.api.com".to_string(),
+        };
         assert_eq!(env.api_url(), "https://my.api.com");
     }
 
@@ -117,7 +125,9 @@ mod tests {
     fn from_env_with_host_override_adds_https_scheme_when_missing() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         cleanup_env();
-        unsafe { std::env::set_var("DATUM_API_HOST", "api.datum.net"); }
+        unsafe {
+            std::env::set_var("DATUM_API_HOST", "api.datum.net");
+        }
         let env = ApiEnv::from_env_with_host_override();
         assert!(matches!(&env, ApiEnv::Custom { api_url } if api_url == "https://api.datum.net"));
     }
@@ -126,16 +136,22 @@ mod tests {
     fn from_env_with_host_override_preserves_existing_scheme() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         cleanup_env();
-        unsafe { std::env::set_var("DATUM_API_HOST", "http://internal.api.datum.net"); }
+        unsafe {
+            std::env::set_var("DATUM_API_HOST", "http://internal.api.datum.net");
+        }
         let env = ApiEnv::from_env_with_host_override();
-        assert!(matches!(&env, ApiEnv::Custom { api_url } if api_url == "http://internal.api.datum.net"));
+        assert!(
+            matches!(&env, ApiEnv::Custom { api_url } if api_url == "http://internal.api.datum.net")
+        );
     }
 
     #[test]
     fn from_env_with_host_override_empty_falls_back_to_production() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         cleanup_env();
-        unsafe { std::env::set_var("DATUM_API_HOST", ""); }
+        unsafe {
+            std::env::set_var("DATUM_API_HOST", "");
+        }
         let env = ApiEnv::from_env_with_host_override();
         assert!(matches!(env, ApiEnv::Production));
     }

@@ -4,7 +4,7 @@ use iroh_proxy_utils::Authority;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, ResourceExt};
-use n0_error::{Result, StdResultExt, StackResultExt};
+use n0_error::{Result, StackResultExt, StdResultExt};
 use serde_json::json;
 use tracing::{debug, warn};
 
@@ -14,17 +14,17 @@ use crate::datum_apis::connector::{
     ConnectorConnectionDetailsPublicKey, ConnectorConnectionType, ConnectorSpec,
     PublicKeyConnectorAddress, PublicKeyDiscoveryMode,
 };
-use crate::datum_apis::connector_class::ConnectorClass;
 use crate::datum_apis::connector_advertisement::{
     ConnectorAdvertisement, ConnectorAdvertisementLayer4, ConnectorAdvertisementLayer4Service,
     ConnectorAdvertisementSpec, Layer4ServiceAddress, Layer4ServicePort, Protocol,
 };
+use crate::datum_apis::connector_class::ConnectorClass;
 use crate::datum_apis::http_proxy::{
     ConnectorReference, HTTP_PROXY_CONDITION_ACCEPTED, HTTP_PROXY_CONDITION_CERTIFICATES_READY,
     HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED, HTTP_PROXY_CONDITION_PROGRAMMED, HTTPProxy,
-    HTTPProxyRule, HTTPProxyRuleBackend, HTTPProxySpec, HTTPRouteMatch,
-    HTTPRouteRulesFiltersType, HTTPRouteRulesMatchesHeaders, HTTPRouteRulesMatchesHeadersType,
-    HTTPRouteRulesMatchesPath, HTTPRouteRulesMatchesPathType,
+    HTTPProxyRule, HTTPProxyRuleBackend, HTTPProxySpec, HTTPRouteMatch, HTTPRouteRulesFiltersType,
+    HTTPRouteRulesMatchesHeaders, HTTPRouteRulesMatchesHeadersType, HTTPRouteRulesMatchesPath,
+    HTTPRouteRulesMatchesPathType,
 };
 use crate::datum_apis::traffic_protection_policy::{
     LocalPolicyTargetReferenceWithSectionName, OWASPCRS, ParanoiaLevels, TrafficProtectionPolicy,
@@ -33,7 +33,7 @@ use crate::datum_apis::traffic_protection_policy::{
 };
 use crate::datum_cloud::DatumCloudClient;
 use crate::kube_error::is_quota_check_timeout;
-use crate::{DEFAULT_PCP_NAMESPACE, Advertisment, ListenNode, TcpProxyData, state::ProxyState};
+use crate::{Advertisment, DEFAULT_PCP_NAMESPACE, ListenNode, TcpProxyData, state::ProxyState};
 const DEFAULT_CONNECTOR_CLASS_NAME: &str = "datum-connect";
 const CONNECTOR_SELECTOR_FIELD: &str = "status.connectionDetails.publicKey.id";
 const ADVERTISEMENT_CONNECTOR_FIELD: &str = "spec.connectorRef.name";
@@ -273,28 +273,29 @@ impl TunnelProgress {
         // show observedGeneration=1 until it re-reconciles. Treating those
         // as Ready makes the CLI claim "Tunnel ready" while the data plane
         // is still serving 503s from stale Envoy config.
-        let make_step = |kind: ProgressStepKind,
-                         conds: Option<&[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]>,
-                         type_: &str,
-                         current_gen: i64,
-                         resource: Option<String>|
-         -> ProgressStep {
-            let cond = conds.unwrap_or_default().iter().find(|c| c.type_ == type_);
-            let observed = cond.and_then(|c| c.observed_generation).unwrap_or(0);
-            let fresh = observed >= current_gen;
-            let status = match cond {
-                Some(c) if c.status == "True" && fresh => StepStatus::Ready,
-                Some(_) => StepStatus::Pending,
-                None => StepStatus::Unknown,
+        let make_step =
+            |kind: ProgressStepKind,
+             conds: Option<&[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]>,
+             type_: &str,
+             current_gen: i64,
+             resource: Option<String>|
+             -> ProgressStep {
+                let cond = conds.unwrap_or_default().iter().find(|c| c.type_ == type_);
+                let observed = cond.and_then(|c| c.observed_generation).unwrap_or(0);
+                let fresh = observed >= current_gen;
+                let status = match cond {
+                    Some(c) if c.status == "True" && fresh => StepStatus::Ready,
+                    Some(_) => StepStatus::Pending,
+                    None => StepStatus::Unknown,
+                };
+                ProgressStep {
+                    kind,
+                    status,
+                    reason: cond.map(|c| c.reason.clone()),
+                    message: cond.map(|c| c.message.clone()),
+                    resource,
+                }
             };
-            ProgressStep {
-                kind,
-                status,
-                reason: cond.map(|c| c.reason.clone()),
-                message: cond.map(|c| c.message.clone()),
-                resource,
-            }
-        };
 
         let steps = vec![
             make_step(
@@ -373,16 +374,15 @@ impl TunnelService {
     pub async fn get_active_by_endpoint(&self, endpoint: &str) -> Result<Option<TunnelSummary>> {
         let tunnels = self.list_active().await?;
         let normalized = normalize_endpoint(endpoint);
-        Ok(tunnels.into_iter().find(|tunnel| tunnel.endpoint == normalized))
+        Ok(tunnels
+            .into_iter()
+            .find(|tunnel| tunnel.endpoint == normalized))
     }
 
     /// Fetch the rich progress view for a tunnel: every checkpoint condition
     /// from both the HTTPProxy and its referenced Connector. Returns `None`
     /// if the proxy doesn't exist (matches `get_active`).
-    pub async fn get_active_progress(
-        &self,
-        tunnel_id: &str,
-    ) -> Result<Option<TunnelProgress>> {
+    pub async fn get_active_progress(&self, tunnel_id: &str) -> Result<Option<TunnelProgress>> {
         let Some(selected) = self.datum.selected_context() else {
             return Ok(None);
         };
@@ -410,7 +410,10 @@ impl TunnelService {
             None
         };
 
-        Ok(Some(TunnelProgress::from_resources(&proxy, connector.as_ref())))
+        Ok(Some(TunnelProgress::from_resources(
+            &proxy,
+            connector.as_ref(),
+        )))
     }
 
     /// Re-patch the connector's connectionDetails after it becomes Ready.
@@ -432,8 +435,7 @@ impl TunnelService {
             return Ok(());
         };
         let pcp = self.datum.project_control_plane_client(project_id).await?;
-        let connectors: Api<Connector> =
-            Api::namespaced(pcp.client(), DEFAULT_PCP_NAMESPACE);
+        let connectors: Api<Connector> = Api::namespaced(pcp.client(), DEFAULT_PCP_NAMESPACE);
         let name = connector.name_any();
         if let Some(details) = build_connection_details(&self.listen) {
             let details_value = serde_json::to_value(details)
@@ -482,16 +484,12 @@ impl TunnelService {
             .await
     }
 
-    async fn cleanup_orphaned_connectors_project(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<String>> {
+    async fn cleanup_orphaned_connectors_project(&self, project_id: &str) -> Result<Vec<String>> {
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();
         let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         let connectors: Api<Connector> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
-        let ads: Api<ConnectorAdvertisement> =
-            Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
+        let ads: Api<ConnectorAdvertisement> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
 
         let proxy_list = proxies
             .list(&ListParams::default())
@@ -513,16 +511,15 @@ impl TunnelService {
 
         let mut deleted = Vec::new();
         for c in connector_list.items {
-            let Some(name) = c.metadata.name.clone() else { continue };
+            let Some(name) = c.metadata.name.clone() else {
+                continue;
+            };
             if referenced.contains(&name) {
                 continue;
             }
             // Delete leftover ConnectorAdvertisements for this connector.
             let ad_selector = format!("{ADVERTISEMENT_CONNECTOR_FIELD}={name}");
-            if let Ok(ad_list) = ads
-                .list(&ListParams::default().fields(&ad_selector))
-                .await
-            {
+            if let Ok(ad_list) = ads.list(&ListParams::default().fields(&ad_selector)).await {
                 for ad in ad_list.items {
                     if let Some(ad_name) = ad.metadata.name.clone()
                         && let Err(err) = ads.delete(&ad_name, &DeleteParams::default()).await
@@ -577,7 +574,8 @@ impl TunnelService {
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();
         let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
-        let ads: Api<ConnectorAdvertisement> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
+        let ads: Api<ConnectorAdvertisement> =
+            Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         let connectors_api: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
 
         let proxy_list = proxies
@@ -606,9 +604,7 @@ impl TunnelService {
             .filter_map(|c| {
                 let name = c.metadata.name.clone()?;
                 let ready = condition_status(
-                    c.status
-                        .as_ref()
-                        .and_then(|s| s.conditions.as_deref()),
+                    c.status.as_ref().and_then(|s| s.conditions.as_deref()),
                     CONNECTOR_CONDITION_READY,
                     true,
                 );
@@ -616,21 +612,20 @@ impl TunnelService {
             })
             .collect();
 
-        let connector_device_by_name: std::collections::HashMap<String, String> =
-            connector_list
-                .items
-                .iter()
-                .filter_map(|c| {
-                    let name = c.metadata.name.clone()?;
-                    let device = c
-                        .metadata
-                        .annotations
-                        .as_ref()
-                        .and_then(|a| a.get(DEVICE_NAME_ANNOTATION))?
-                        .clone();
-                    Some((name, device))
-                })
-                .collect();
+        let connector_device_by_name: std::collections::HashMap<String, String> = connector_list
+            .items
+            .iter()
+            .filter_map(|c| {
+                let name = c.metadata.name.clone()?;
+                let device = c
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(DEVICE_NAME_ANNOTATION))?
+                    .clone();
+                Some((name, device))
+            })
+            .collect();
 
         let mut tunnels = Vec::new();
         let mut referenced_connector_names = std::collections::HashSet::new();
@@ -717,7 +712,11 @@ impl TunnelService {
                     .as_ref()
                     .and_then(|a| a.get(DEVICE_NAME_ANNOTATION))
                     .cloned();
-                Some(OrphanedConnector { name, ready, device })
+                Some(OrphanedConnector {
+                    name,
+                    ready,
+                    device,
+                })
             })
             .collect();
 
@@ -777,21 +776,19 @@ impl TunnelService {
             status: None,
         };
         let post_params = PostParams::default();
-        proxy = with_quota_check_retry("HTTPProxy create", || {
-            proxies.create(&post_params, &proxy)
-        })
-        .await
-        .map_err(|err| {
-            warn!(
-                %project_id,
-                connector = %connector_name,
-                endpoint = %endpoint,
-                "HTTPProxy create failed: {err:#}"
-            );
-            format_quota_error(&err, "HTTPProxy")
-                .unwrap_or_else(|| format!("Failed to create HTTPProxy: {err}"))
-        })
-        .map_err(|err| n0_error::anyerr!(err))?;
+        proxy = with_quota_check_retry("HTTPProxy create", || proxies.create(&post_params, &proxy))
+            .await
+            .map_err(|err| {
+                warn!(
+                    %project_id,
+                    connector = %connector_name,
+                    endpoint = %endpoint,
+                    "HTTPProxy create failed: {err:#}"
+                );
+                format_quota_error(&err, "HTTPProxy")
+                    .unwrap_or_else(|| format!("Failed to create HTTPProxy: {err}"))
+            })
+            .map_err(|err| n0_error::anyerr!(err))?;
         let proxy_name = proxy.name_any();
         debug!(
             %project_id,
@@ -878,18 +875,17 @@ impl TunnelService {
             with_quota_check_retry("TrafficProtectionPolicy create", || {
                 tpps.create(&tpp_post, &tpp)
             })
-                .await
-                .map_err(|err| {
-                    warn!(
-                        %project_id,
-                        proxy = %proxy_name,
-                        "TrafficProtectionPolicy create failed: {err:#}"
-                    );
-                    format_quota_error(&err, "TrafficProtectionPolicy").unwrap_or_else(|| {
-                        format!("Failed to create TrafficProtectionPolicy: {err}")
-                    })
-                })
-                .map_err(|err| n0_error::anyerr!(err))?;
+            .await
+            .map_err(|err| {
+                warn!(
+                    %project_id,
+                    proxy = %proxy_name,
+                    "TrafficProtectionPolicy create failed: {err:#}"
+                );
+                format_quota_error(&err, "TrafficProtectionPolicy")
+                    .unwrap_or_else(|| format!("Failed to create TrafficProtectionPolicy: {err}"))
+            })
+            .map_err(|err| n0_error::anyerr!(err))?;
             debug!(
                 %project_id,
                 proxy = %proxy_name,
@@ -973,7 +969,10 @@ impl TunnelService {
             .await
             .std_context("Failed to fetch HTTPProxy")?;
         let hostnames = existing.spec.hostnames.clone().unwrap_or_default();
-        let desired_rules = vec![https_redirect_rule(), proxy_rule(&endpoint, &connector_name)];
+        let desired_rules = vec![
+            https_redirect_rule(),
+            proxy_rule(&endpoint, &connector_name),
+        ];
 
         // Skip the PATCH when the existing spec already matches what we'd
         // write. A no-op patch still bumps metadata.generation on some API
@@ -1114,7 +1113,10 @@ impl TunnelService {
         // never become True.
         {
             let target = parse_target(&endpoint)?;
-            let desired_rules = vec![https_redirect_rule(), proxy_rule(&endpoint, &connector_name)];
+            let desired_rules = vec![
+                https_redirect_rule(),
+                proxy_rule(&endpoint, &connector_name),
+            ];
             if !http_proxy_spec_matches(&proxy, &label, &desired_rules) {
                 let hostnames = proxy.spec.hostnames.clone().unwrap_or_default();
                 let patch = json!({
@@ -1336,7 +1338,12 @@ impl TunnelService {
             }
         }
 
-        if let Err(err) = self.listen.repo().delete_tunnel_dir(project_id, tunnel_id).await {
+        if let Err(err) = self
+            .listen
+            .repo()
+            .delete_tunnel_dir(project_id, tunnel_id)
+            .await
+        {
             warn!(%tunnel_id, "Failed to delete tunnel local state: {err:#}");
         }
 
@@ -1414,11 +1421,15 @@ impl TunnelService {
                 Ok(fallback)
             }
             Ok(_) => {
-                warn!("No ConnectorClass found in cluster; using default '{DEFAULT_CONNECTOR_CLASS_NAME}'");
+                warn!(
+                    "No ConnectorClass found in cluster; using default '{DEFAULT_CONNECTOR_CLASS_NAME}'"
+                );
                 Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string())
             }
             Err(e) => {
-                warn!("Failed to list ConnectorClasses (using default '{DEFAULT_CONNECTOR_CLASS_NAME}'): {e:#}");
+                warn!(
+                    "Failed to list ConnectorClasses (using default '{DEFAULT_CONNECTOR_CLASS_NAME}'): {e:#}"
+                );
                 Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string())
             }
         }
@@ -1663,13 +1674,15 @@ fn https_redirect_rule() -> HTTPProxyRule {
             ..Default::default()
         }],
         filters: Some(vec![crate::datum_apis::http_proxy::HTTPRouteRulesFilters {
-            request_redirect: Some(crate::datum_apis::http_proxy::HTTPRouteRulesFiltersRequestRedirect {
-                scheme: Some("https".to_string()),
-                status_code: Some(301),
-                hostname: None,
-                path: None,
-                port: None,
-            }),
+            request_redirect: Some(
+                crate::datum_apis::http_proxy::HTTPRouteRulesFiltersRequestRedirect {
+                    scheme: Some("https".to_string()),
+                    status_code: Some(301),
+                    hostname: None,
+                    path: None,
+                    port: None,
+                },
+            ),
             r#type: HTTPRouteRulesFiltersType::RequestRedirect,
             extension_ref: None,
             request_header_modifier: None,
@@ -1824,8 +1837,6 @@ fn format_quota_error(err: &dyn std::error::Error, resource_type: &str) -> Optio
     None
 }
 
-
-
 /// Retry a kube API call up to ~15 seconds while it keeps tripping the
 /// operator's quota-check timeout. Other errors return immediately so
 /// real failures still surface fast. Prints a one-line stderr notice on
@@ -1846,9 +1857,7 @@ where
             Ok(v) => return Ok(v),
             Err(err) if is_quota_check_timeout(&err) => {
                 if i == 0 {
-                    eprintln!(
-                        "  … quota check timed out for {op_name}; retrying for up to 15s"
-                    );
+                    eprintln!("  … quota check timed out for {op_name}; retrying for up to 15s");
                 }
                 warn!(
                     op = op_name,
@@ -1943,7 +1952,10 @@ mod tests {
         let progress = TunnelProgress::from_resources(&p, None);
         assert_eq!(progress.steps.len(), 6);
         assert!(
-            progress.steps.iter().all(|s| s.status == StepStatus::Unknown),
+            progress
+                .steps
+                .iter()
+                .all(|s| s.status == StepStatus::Unknown),
             "no conditions yet → every step Unknown"
         );
         assert!(!progress.all_ready());
@@ -1954,7 +1966,12 @@ mod tests {
     fn progress_all_ready_when_every_condition_true() {
         let p = proxy(vec![
             cond(HTTP_PROXY_CONDITION_ACCEPTED, "True", "Accepted", ""),
-            cond(HTTP_PROXY_CONDITION_CERTIFICATES_READY, "True", "AllCertificatesReady", ""),
+            cond(
+                HTTP_PROXY_CONDITION_CERTIFICATES_READY,
+                "True",
+                "AllCertificatesReady",
+                "",
+            ),
             cond(HTTP_PROXY_CONDITION_PROGRAMMED, "True", "Programmed", ""),
             cond(
                 HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
@@ -1977,7 +1994,12 @@ mod tests {
         // This is the silent-tunnel failure: the iroh DNS record is owned by
         // a different project's Connector. Waiting longer won't help — the
         // CLI must bail and surface the owner so the user can act.
-        let p = proxy(vec![cond(HTTP_PROXY_CONDITION_ACCEPTED, "True", "Accepted", "")]);
+        let p = proxy(vec![cond(
+            HTTP_PROXY_CONDITION_ACCEPTED,
+            "True",
+            "Accepted",
+            "",
+        )]);
         let owner_msg =
             "iroh DNS record is owned by Connector /other-project/default/datum-connect-xyz";
         let c = connector(vec![
@@ -1990,7 +2012,9 @@ mod tests {
             ),
         ]);
         let progress = TunnelProgress::from_resources(&p, Some(&c));
-        let fail = progress.terminal_failure().expect("terminal failure detected");
+        let fail = progress
+            .terminal_failure()
+            .expect("terminal failure detected");
         assert_eq!(fail.kind, ProgressStepKind::IrohDnsPublished);
         assert_eq!(fail.message.as_deref(), Some(owner_msg));
         assert!(!progress.all_ready());
@@ -2056,7 +2080,11 @@ mod tests {
         kube::Error::Api(kube::core::ErrorResponse {
             status: "Failure".into(),
             message: message.into(),
-            reason: if code == 403 { "Forbidden".into() } else { "Unknown".into() },
+            reason: if code == 403 {
+                "Forbidden".into()
+            } else {
+                "Unknown".into()
+            },
             code,
         })
     }
@@ -2225,7 +2253,11 @@ mod tests {
         }
     }
 
-    fn advertisement_with_target(connector_name: &str, host: &str, port: u16) -> ConnectorAdvertisement {
+    fn advertisement_with_target(
+        connector_name: &str,
+        host: &str,
+        port: u16,
+    ) -> ConnectorAdvertisement {
         ConnectorAdvertisement {
             metadata: ObjectMeta {
                 name: Some("tunnel-test".into()),
@@ -2246,12 +2278,10 @@ mod tests {
     #[test]
     fn advertisement_spec_matches_detects_drift() {
         let existing = advertisement_with_target("datum-connect-mhxj5", "127.0.0.1", 11434);
-        let desired_new_port =
-            advertisement_spec("datum-connect-mhxj5", target("127.0.0.1", 9999));
+        let desired_new_port = advertisement_spec("datum-connect-mhxj5", target("127.0.0.1", 9999));
         assert!(!advertisement_spec_matches(&existing, &desired_new_port));
 
-        let desired_new_conn =
-            advertisement_spec("datum-connect-NEW", target("127.0.0.1", 11434));
+        let desired_new_conn = advertisement_spec("datum-connect-NEW", target("127.0.0.1", 11434));
         assert!(!advertisement_spec_matches(&existing, &desired_new_conn));
     }
 }

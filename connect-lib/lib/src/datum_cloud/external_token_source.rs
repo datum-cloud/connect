@@ -169,9 +169,7 @@ impl ExternalTokenSource {
                 std::time::UNIX_EPOCH
                     .checked_add(std::time::Duration::from_secs(exp.saturating_sub(60)))
             })
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
-            });
+            .unwrap_or_else(|| std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
 
         if let Some(exp) = initial_exp {
             debug!(
@@ -230,15 +228,18 @@ impl ExternalTokenSource {
 
                     // Parse new expiry for next refresh
                     next_refresh = match new_exp {
-                        Some(exp) => std::time::UNIX_EPOCH
-                            + std::time::Duration::from_secs(exp.saturating_sub(60)),
-                        None => {
-                            std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
+                        Some(exp) => {
+                            std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(exp.saturating_sub(60))
                         }
+                        None => std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
                     };
                 }
                 Err(e) => {
-                    warn!(forced, "token refresh failed: {e}; retrying in {:?}", backoff);
+                    warn!(
+                        forced,
+                        "token refresh failed: {e}; retrying in {:?}", backoff
+                    );
                     // Retry with backoff
                     next_refresh = std::time::SystemTime::now() + backoff;
                     backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
@@ -296,7 +297,7 @@ enum JwtParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{make_jwt_with_exp, setup_plugin_env, TempDir};
+    use crate::test_util::{TempDir, make_jwt_with_exp, setup_plugin_env};
 
     #[test]
     fn parse_jwt_expiry_extracts_exp() {
@@ -309,7 +310,9 @@ mod tests {
     fn parse_jwt_expiry_returns_none_when_missing() {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"sub":"test-user"}).to_string().as_bytes(),
+            serde_json::json!({"sub":"test-user"})
+                .to_string()
+                .as_bytes(),
         );
         let token = format!("{header}.{payload}.sig");
         let exp = parse_jwt_expiry(&token).unwrap();
@@ -341,9 +344,8 @@ mod tests {
     #[test]
     fn parse_jwt_expiry_handles_url_safe_chars() {
         let payload_json = serde_json::json!({"exp": 9999999999u64, "sub": "test"});
-        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            payload_json.to_string().as_bytes(),
-        );
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(payload_json.to_string().as_bytes());
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
         let token = format!("{header}.{payload_b64}.sig");
         let exp = parse_jwt_expiry(&token).unwrap().unwrap();
@@ -486,7 +488,10 @@ mod tests {
         .expect("should set executable permission");
 
         unsafe {
-            std::env::set_var("DATUM_CREDENTIALS_HELPER", helper_path.to_string_lossy().as_ref());
+            std::env::set_var(
+                "DATUM_CREDENTIALS_HELPER",
+                helper_path.to_string_lossy().as_ref(),
+            );
             std::env::set_var("DATUM_SESSION", "test-session");
         }
 

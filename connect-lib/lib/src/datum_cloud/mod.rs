@@ -7,15 +7,12 @@ use chrono::Utc;
 use n0_error::Result;
 use tokio::sync::watch;
 
-
 use crate::{ProjectControlPlaneClient, Repo, SelectedContext};
 
 pub mod env;
 pub mod external_token_source;
 
-pub use self::{
-    env::ApiEnv,
-};
+pub use self::env::ApiEnv;
 
 use self::external_token_source::ExternalTokenSource;
 
@@ -376,7 +373,6 @@ impl SessionStateWrapper {
     fn orgs_projects_watch(&self) -> watch::Receiver<Vec<OrganizationWithProjects>> {
         self.orgs_projects_tx.subscribe()
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
