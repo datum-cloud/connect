@@ -30,7 +30,7 @@ pub enum ExternalTokenError {
 #[derive(Clone)]
 pub struct ExternalTokenSource {
     token: std::sync::Arc<ArcSwap<SecretString>>,
-    token_tx: std::sync::Arc<watch::Sender<String>>,
+    revision_tx: std::sync::Arc<watch::Sender<u64>>,
     refresh_trigger: std::sync::Arc<watch::Sender<u64>>,
 }
 
@@ -68,26 +68,37 @@ impl ExternalTokenSource {
             "ExternalTokenSource::from_env — token loaded from helper"
         );
 
-        let (token_tx, _) = watch::channel(token.clone());
+        let (revision_tx, _) = watch::channel(0u64);
         let (refresh_tx, _) = watch::channel(0u64);
 
         Ok(Self {
             token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
-                token.clone().into(),
+                token.into_boxed_str(),
             ))),
-            token_tx: std::sync::Arc::new(token_tx),
+            revision_tx: std::sync::Arc::new(revision_tx),
             refresh_trigger: std::sync::Arc::new(refresh_tx),
         })
     }
 
     /// Returns the current token as a plain `String`.
     pub fn token(&self) -> String {
-        self.token.load_full().expose_secret().to_string()
+        self.with_token(str::to_owned)
     }
 
-    /// Returns a watch channel subscriber for token updates.
-    pub fn watch(&self) -> watch::Receiver<String> {
-        self.token_tx.subscribe()
+    /// Calls `use_token` with the current token without copying it into an
+    /// intermediate plaintext value.
+    pub(crate) fn with_token<T>(&self, use_token: impl FnOnce(&str) -> T) -> T {
+        let token = self.token.load();
+        use_token(token.expose_secret())
+    }
+
+    /// Returns a subscriber that is notified when the token changes.
+    ///
+    /// Only a monotonically increasing revision is published. Subscribers
+    /// must fetch the current token through [`Self::with_token`] after an
+    /// update, so bearer credentials never travel through the watch channel.
+    pub fn watch(&self) -> watch::Receiver<u64> {
+        self.revision_tx.subscribe()
     }
 
     /// Atomically swaps the token and notifies watch subscribers.
@@ -96,10 +107,10 @@ impl ExternalTokenSource {
             new_token_len = new_token.len(),
             "ExternalTokenSource::swap_token"
         );
-        self.token.store(std::sync::Arc::new(SecretString::new(
-            new_token.clone().into(),
-        )));
-        let _ = self.token_tx.send(new_token);
+        self.token
+            .store(std::sync::Arc::new(SecretString::new(new_token.into())));
+        self.revision_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
     }
 
     /// Start the background refresh loop. Must be called from within a tokio runtime.
@@ -389,25 +400,29 @@ mod tests {
     }
 
     #[test]
-    fn swap_token_updates_and_notifies_watch() {
+    fn swap_token_updates_and_notifies_revision_watch() {
         let (_dir, source) = setup_plugin_env();
 
-        let rx = source.watch();
+        let mut rx = source.watch();
         let new_token = make_jwt_with_exp(8888888888);
         source.swap_token(new_token.clone());
 
         assert_eq!(source.token(), new_token);
-        assert_eq!(*rx.borrow(), new_token);
+        assert!(rx.has_changed().expect("revision sender should stay open"));
+        assert_eq!(*rx.borrow_and_update(), 1);
     }
 
     #[test]
     fn swap_token_multiple_times() {
         let (_dir, source) = setup_plugin_env();
+        let mut rx = source.watch();
 
         for i in 1..=5 {
             let new_token = make_jwt_with_exp(7777777000 + i);
             source.swap_token(new_token.clone());
             assert_eq!(source.token(), new_token);
+            assert!(rx.has_changed().expect("revision sender should stay open"));
+            assert_eq!(*rx.borrow_and_update(), i);
         }
     }
 
@@ -415,7 +430,7 @@ mod tests {
     fn watch_receiver_initial_value() {
         let (_dir, source) = setup_plugin_env();
         let rx = source.watch();
-        assert_eq!(*rx.borrow(), source.token());
+        assert_eq!(*rx.borrow(), 0);
     }
 
     #[test]
@@ -470,7 +485,7 @@ mod tests {
              n=$(cat '{counter_str}')\n\
              n=$((n + 1))\n\
              echo \"$n\" > '{counter_str}'\n\
-             exp=$((1700000000 + n))\n\
+             exp=$((4000000000 + n))\n\
              header=$(printf '{{\"alg\":\"HS256\",\"typ\":\"JWT\"}}' | base64 | tr -d '=' | tr '/+' '_-')\n\
              payload=$(printf '{{\"exp\":%d,\"sub\":\"rotating\"}}' \"$exp\" | base64 | tr -d '=' | tr '/+' '_-')\n\
              printf '%s.%s.rotated\\n' \"$header\" \"$payload\"\n",
@@ -489,18 +504,18 @@ mod tests {
         std::fs::write(&counter_path, "0").expect("should reset counter");
         // Build the source by hand so from_env() doesn't consume the first
         // helper invocation (we want the *loop* to be the one rotating).
-        let (token_tx, _) = watch::channel(initial.clone());
+        let (revision_tx, _) = watch::channel(0u64);
         let (refresh_tx, _) = watch::channel(0u64);
         let source = ExternalTokenSource {
             token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
                 initial.clone().into(),
             ))),
-            token_tx: std::sync::Arc::new(token_tx),
+            revision_tx: std::sync::Arc::new(revision_tx),
             refresh_trigger: std::sync::Arc::new(refresh_tx),
         };
 
         let rx = source.watch();
-        assert_eq!(*rx.borrow(), initial, "watch initial value");
+        assert_eq!(*rx.borrow(), 0, "watch initial revision");
 
         source.start_refresh(
             helper_path.to_string_lossy().to_string(),
@@ -531,6 +546,6 @@ mod tests {
             new_token.ends_with(".rotated"),
             "rotated token should come from the counter helper: {new_token}"
         );
-        assert_eq!(*rx.borrow(), new_token, "watchers notified of new token");
+        assert_eq!(*rx.borrow(), 1, "watchers notified of token revision");
     }
 }

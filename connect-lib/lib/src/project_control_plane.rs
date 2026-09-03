@@ -6,24 +6,23 @@ use http::header::USER_AGENT;
 use kube::{Client, Config};
 use n0_error::{Result, StdResultExt};
 use n0_future::task::AbortOnDropHandle;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::watch;
 use tracing::warn;
 
 use crate::datum_cloud::DatumCloudClient;
-use crate::datum_cloud::LoginState;
 use crate::http_user_agent::datum_http_user_agent;
 
 #[derive(derive_more::Debug, Clone)]
 pub struct ProjectControlPlaneClient {
     project_id: String,
     server_url: String,
-    access_token: Arc<ArcSwap<String>>,
+    access_token: Arc<ArcSwap<SecretString>>,
     #[debug("kube::Client")]
     client: Arc<ArcSwap<Client>>,
     datum: DatumCloudClient,
     _auth_task: Option<Arc<AbortOnDropHandle<()>>>,
-    token_rx: Option<watch::Receiver<String>>,
+    auth_revision_rx: Option<watch::Receiver<u64>>,
 }
 
 impl ProjectControlPlaneClient {
@@ -33,18 +32,31 @@ impl ProjectControlPlaneClient {
         access_token: String,
         datum: DatumCloudClient,
     ) -> Result<Self> {
-        let client = Self::build_kube_client(&server_url, &access_token)?;
-        let mut this = Self {
+        let auth_revision_rx = datum.auth_update_watch();
+        Self::new_with_initial_token(
             project_id,
             server_url,
-            access_token: Arc::new(ArcSwap::from_pointee(access_token)),
-            client: Arc::new(ArcSwap::from_pointee(client)),
+            &access_token,
             datum,
-            _auth_task: None,
-            token_rx: None,
-        };
-        this.start_auth_watch();
-        Ok(this)
+            auth_revision_rx,
+        )
+    }
+
+    pub(crate) fn new_subscribed(
+        project_id: String,
+        server_url: String,
+        datum: DatumCloudClient,
+        auth_revision_rx: watch::Receiver<u64>,
+    ) -> Result<Self> {
+        datum.with_token(|access_token| {
+            Self::new_with_initial_token(
+                project_id,
+                server_url,
+                access_token,
+                datum.clone(),
+                auth_revision_rx,
+            )
+        })
     }
 
     pub fn new_with_token_source(
@@ -52,20 +64,32 @@ impl ProjectControlPlaneClient {
         server_url: String,
         token_source: crate::datum_cloud::external_token_source::ExternalTokenSource,
     ) -> Result<Self> {
-        let initial_token = token_source.token();
-        let client = Self::build_kube_client(&server_url, &initial_token)?;
         let datum = DatumCloudClient::with_external_token_source(
             crate::ApiEnv::from_env_with_host_override(),
-            token_source.clone(),
+            token_source,
         );
+        let auth_revision_rx = datum.auth_update_watch();
+        Self::new_subscribed(project_id, server_url, datum, auth_revision_rx)
+    }
+
+    fn new_with_initial_token(
+        project_id: String,
+        server_url: String,
+        access_token: &str,
+        datum: DatumCloudClient,
+        auth_revision_rx: watch::Receiver<u64>,
+    ) -> Result<Self> {
+        let client = Self::build_kube_client(&server_url, access_token)?;
         let mut this = Self {
             project_id,
             server_url,
-            access_token: Arc::new(ArcSwap::from_pointee(initial_token)),
+            access_token: Arc::new(ArcSwap::from_pointee(SecretString::new(
+                access_token.to_owned().into_boxed_str(),
+            ))),
             client: Arc::new(ArcSwap::from_pointee(client)),
             datum,
             _auth_task: None,
-            token_rx: Some(token_source.watch()),
+            auth_revision_rx: Some(auth_revision_rx),
         };
         this.start_auth_watch();
         Ok(this)
@@ -80,7 +104,7 @@ impl ProjectControlPlaneClient {
     }
 
     pub fn access_token(&self) -> String {
-        self.access_token.load_full().as_ref().clone()
+        self.access_token.load().expose_secret().to_owned()
     }
 
     pub fn client(&self) -> Client {
@@ -88,8 +112,8 @@ impl ProjectControlPlaneClient {
     }
 
     pub async fn client_refreshed(&self) -> Result<Client> {
-        let access_token = self.datum.token();
-        self.rebuild_if_changed(&access_token)?;
+        self.datum
+            .with_token(|access_token| self.rebuild_if_changed(access_token))?;
         Ok(self.client())
     }
 
@@ -106,73 +130,46 @@ impl ProjectControlPlaneClient {
     }
 
     fn rebuild_if_changed(&self, access_token: &str) -> Result<()> {
-        let current = self.access_token.load_full();
-        if current.as_ref().as_str() == access_token {
+        let current = self.access_token.load();
+        if current.expose_secret() == access_token {
             return Ok(());
         }
 
         let client = Self::build_kube_client(&self.server_url, access_token)?;
         self.client.store(Arc::new(client));
-        self.access_token.store(Arc::new(access_token.to_string()));
+        self.access_token.store(Arc::new(SecretString::new(
+            access_token.to_owned().into_boxed_str(),
+        )));
         Ok(())
     }
 
-    async fn refresh_client_from_update(&self) -> Result<()> {
-        if self.datum.is_plugin_mode() {
-            let token = self.datum.token();
-            return self.rebuild_if_changed(&token);
-        }
-        let auth_state = self.datum.auth_state();
-        let auth = auth_state.load();
-        self.rebuild_if_changed(auth.tokens.access_token.secret())
+    fn refresh_client_from_update(&self) -> Result<()> {
+        self.datum
+            .with_token(|access_token| self.rebuild_if_changed(access_token))
     }
 
     fn start_auth_watch(&mut self) {
         if self._auth_task.is_some() {
             return;
         }
-        let mut client = self.clone();
+        let Some(mut auth_revision_rx) = self.auth_revision_rx.take() else {
+            return;
+        };
+        let client = self.clone();
         let task = tokio::spawn(async move {
-            if let Some(token_rx) = client.token_rx.take() {
-                if let Err(err) = client.refresh_client_from_update().await {
+            // Re-read once after construction. This closes the legacy public
+            // constructor's read-before-subscribe window and is a no-op for
+            // callers that subscribed before their initial token read.
+            if let Err(err) = client.refresh_client_from_update() {
+                warn!("failed to refresh project control plane client: {err:#}");
+            }
+
+            loop {
+                if auth_revision_rx.changed().await.is_err() {
+                    return;
+                }
+                if let Err(err) = client.refresh_client_from_update() {
                     warn!("failed to refresh project control plane client: {err:#}");
-                }
-                let mut token_rx = token_rx;
-                loop {
-                    if token_rx.changed().await.is_err() {
-                        return;
-                    }
-                    let new_token = (*token_rx.borrow()).clone();
-                    if let Err(err) = client.rebuild_if_changed(&new_token) {
-                        warn!("failed to refresh project control plane client: {err:#}");
-                    }
-                }
-            } else {
-                let mut login_rx = client.datum.login_state_watch();
-                let mut auth_update_rx = client.datum.auth_update_watch();
-                if *login_rx.borrow() != LoginState::Missing
-                    && let Err(err) = client.refresh_client_from_update().await
-                {
-                    warn!("failed to refresh project control plane client: {err:#}");
-                }
-                loop {
-                    tokio::select! {
-                        res = login_rx.changed() => {
-                            if res.is_err() {
-                                return;
-                            }
-                        }
-                        res = auth_update_rx.changed() => {
-                            if res.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    if *login_rx.borrow() != LoginState::Missing
-                        && let Err(err) = client.refresh_client_from_update().await
-                    {
-                        warn!("failed to refresh project control plane client: {err:#}");
-                    }
                 }
             }
         });
@@ -185,12 +182,40 @@ mod tests {
     #[allow(unused_imports)]
     use super::*;
     #[allow(unused_imports)]
-    use crate::test_util::setup_plugin_env;
+    use crate::test_util::{make_jwt_with_exp, setup_plugin_env};
+
+    #[tokio::test]
+    #[cfg(feature = "integration-tests")]
+    async fn datum_factory_rebuilds_long_lived_client_after_token_rotation() {
+        let (_dir, token_source) = setup_plugin_env();
+        let datum = DatumCloudClient::with_external_token_source(
+            crate::ApiEnv::Production,
+            token_source.clone(),
+        );
+        let client = datum
+            .project_control_plane_client("test-project")
+            .await
+            .expect("project control plane client should be constructed");
+        let initial_token = client.access_token();
+        let rotated_token = make_jwt_with_exp(8888888888);
+
+        token_source.swap_token(rotated_token.clone());
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while client.access_token() != rotated_token {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("project control plane client should observe the token revision");
+
+        assert_ne!(client.access_token(), initial_token);
+    }
 
     // These tests require rustls CryptoProvider (requires 'ring' or 'aws-lc-rs'
     // feature). Gate behind a feature flag so they don't fail in CI when
     // those features are disabled. Run manually with:
-    //   cargo test --lib --features integration-tests
+    //   cargo test --lib --features integration-tests,kube/aws-lc-rs
 
     #[test]
     #[cfg(feature = "integration-tests")]

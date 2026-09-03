@@ -181,6 +181,10 @@ impl DatumCloudClient {
         self.token_source.token()
     }
 
+    pub(crate) fn with_token<T>(&self, use_token: impl FnOnce(&str) -> T) -> T {
+        self.token_source.with_token(use_token)
+    }
+
     /// Force an immediate token refresh by signalling the background refresh
     /// loop in [`ExternalTokenSource`] to re-execute the credentials helper
     /// now, ahead of its proactive schedule.
@@ -191,7 +195,7 @@ impl DatumCloudClient {
     /// callers retrying with the same dead token until the timer catches up.
     /// The refresh loop swaps the new token into the shared [`ExternalTokenSource`]
     /// and notifies watchers; the next [`Self::project_control_plane_client`]
-    /// call (and any `ProjectControlPlaneClient` rebuilt via its token watch)
+    /// call (and any `ProjectControlPlaneClient` rebuilt via its revision watch)
     /// picks up the fresh token.
     pub fn force_token_refresh(&self) {
         self.token_source.force_refresh();
@@ -206,8 +210,7 @@ impl DatumCloudClient {
     }
 
     pub fn auth_update_watch(&self) -> watch::Receiver<u64> {
-        let (_, rx) = watch::channel(0u64);
-        rx
+        self.token_source.watch()
     }
 
     /// Returns a watch receiver for login state changes.
@@ -272,8 +275,17 @@ impl DatumCloudClient {
         &self,
         project_id: &str,
     ) -> Result<ProjectControlPlaneClient> {
-        let token = self.token_source.token();
-        self.project_control_plane_client_with_token(project_id, &token)
+        // Subscribe before reading the token. If a rotation lands between
+        // these operations, the receiver remains dirty and the long-lived
+        // client performs a second read after construction.
+        let auth_revision_rx = self.auth_update_watch();
+        let server_url = self.project_control_plane_url(project_id);
+        ProjectControlPlaneClient::new_subscribed(
+            project_id.to_string(),
+            server_url,
+            self.clone(),
+            auth_revision_rx,
+        )
     }
 
     pub async fn project_control_plane_client_active(
@@ -294,20 +306,6 @@ impl DatumCloudClient {
 
     pub fn orgs_projects_watch(&self) -> watch::Receiver<Vec<OrganizationWithProjects>> {
         self.session.orgs_projects_watch()
-    }
-
-    fn project_control_plane_client_with_token(
-        &self,
-        project_id: &str,
-        access_token: &str,
-    ) -> Result<ProjectControlPlaneClient> {
-        let server_url = self.project_control_plane_url(project_id);
-        ProjectControlPlaneClient::new(
-            project_id.to_string(),
-            server_url,
-            access_token.to_string(),
-            self.clone(),
-        )
     }
 }
 
@@ -444,12 +442,17 @@ mod tests {
     }
 
     #[test]
-    fn auth_update_watch_returns_receiver_in_plugin_mode() {
+    fn auth_update_watch_reports_token_revisions() {
         let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
-        let rx = client.auth_update_watch();
-        // Initial value should be 0
+        let client =
+            DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source.clone());
+        let mut rx = client.auth_update_watch();
+
         assert_eq!(*rx.borrow(), 0);
+
+        token_source.swap_token("rotated-token".to_string());
+        assert!(rx.has_changed().expect("auth watch should stay open"));
+        assert_eq!(*rx.borrow_and_update(), 1);
     }
 
     #[test]
