@@ -237,15 +237,10 @@ async fn run() -> n0_error::Result<()> {
     }
 
     let token_source = ExternalTokenSource::from_env(session.clone())
+        .await
         .map_err(|e| n0_error::anyerr!("failed to create token source: {e}"))?;
-
-    if let Some(ref s) = session
-        && let Ok(helper) = std::env::var("DATUM_CREDENTIALS_HELPER")
-    {
-        token_source.start_refresh(helper, s.clone());
-    }
-
-    let datum = DatumCloudClient::with_external_token_source(ApiEnv::default(), token_source);
+    let datum =
+        DatumCloudClient::with_external_token_source(ApiEnv::default(), token_source.clone());
 
     // Honour the `--debug` CLI flag by bumping the tracing filter to debug.
     // init_tracing() runs before Args::parse(), so the env var path covered
@@ -290,6 +285,14 @@ async fn run() -> n0_error::Result<()> {
         },
     };
     let repo = Repo::open_or_create(repo_path).await?;
+
+    if let Some(ref s) = session {
+        let helper = std::env::var("DATUM_CREDENTIALS_HELPER")
+            .map_err(|_| n0_error::anyerr!("DATUM_CREDENTIALS_HELPER is no longer set"))?;
+        token_source
+            .start_refresh(helper, s.clone())
+            .map_err(|e| n0_error::anyerr!("failed to start token refresh: {e}"))?;
+    }
 
     match args.command {
         Commands::List => {
@@ -941,13 +944,13 @@ async fn run() -> n0_error::Result<()> {
             }
 
             // Non-zero exit for terminal failures.
-            return match exit_reason {
+            match exit_reason {
                 ExitReason::CtrlC => Ok(()),
                 ExitReason::TerminalFailure => {
                     Err(n0_error::anyerr!("tunnel exited with terminal failure"))
                 }
                 ExitReason::DeletedUpstream => Err(n0_error::anyerr!("tunnel deleted upstream")),
-            };
+            }?;
         }
         Commands::Update {
             id,
@@ -1028,5 +1031,9 @@ async fn run() -> n0_error::Result<()> {
             }
         }
     }
+    token_source
+        .shutdown_refresh()
+        .await
+        .map_err(|e| n0_error::anyerr!("failed to shut down token refresh: {e}"))?;
     Ok(())
 }

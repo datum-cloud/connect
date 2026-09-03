@@ -1,11 +1,21 @@
 use std::env;
-use std::process::Command;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+const HELPER_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_HELPER_STDOUT_BYTES: usize = 64 * 1024;
+const MAX_HELPER_STDERR_BYTES: usize = 4 * 1024;
 
 /// Errors that can occur when constructing an [`ExternalTokenSource`] from environment.
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +26,24 @@ pub enum ExternalTokenError {
     MissingSession,
     #[error("credentials helper exec failed: {0}")]
     HelperExecError(String),
+    #[error("credentials helper timed out after {0:?}")]
+    HelperTimedOut(Duration),
+    #[error("credentials helper execution was cancelled")]
+    HelperCancelled,
+    #[error("credentials helper returned more than {MAX_HELPER_STDOUT_BYTES} bytes")]
+    HelperOutputTooLarge,
+    #[error("token refresh task is already started")]
+    RefreshAlreadyStarted,
+    #[error("token refresh task is already shutting down")]
+    RefreshShutdownInProgress,
+    #[error("token refresh requires a Tokio runtime: {0}")]
+    RefreshRuntimeUnavailable(String),
+    #[error("token refresh task state lock is poisoned")]
+    RefreshStatePoisoned,
+    #[error("token refresh task handle is unavailable")]
+    RefreshTaskHandleUnavailable,
+    #[error("token refresh task failed: {0}")]
+    RefreshTaskFailed(#[source] tokio::task::JoinError),
     #[error("invalid JWT token: {0}")]
     InvalidToken(String),
     #[error("failed to parse JWT payload: {0}")]
@@ -29,9 +57,39 @@ pub enum ExternalTokenError {
 /// and refreshed periodically before JWT expiry or on demand via [`force_refresh()`](Self::force_refresh).
 #[derive(Clone)]
 pub struct ExternalTokenSource {
-    token: std::sync::Arc<ArcSwap<SecretString>>,
-    revision_tx: std::sync::Arc<watch::Sender<u64>>,
-    refresh_trigger: std::sync::Arc<watch::Sender<u64>>,
+    token: Arc<ArcSwap<SecretString>>,
+    revision_tx: Arc<watch::Sender<u64>>,
+    refresh_trigger: Arc<watch::Sender<u64>>,
+    refresh_task: Arc<Mutex<RefreshTaskState>>,
+}
+
+struct RefreshTask {
+    cancel: CancellationToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for RefreshTask {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+enum RefreshTaskState {
+    Stopped,
+    Running(RefreshTask),
+    Stopping,
+}
+
+/// Current state of the supervised credentials-refresh task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshTaskHealth {
+    Stopped,
+    Running,
+    Stopping,
+    Finished,
 }
 
 impl std::fmt::Debug for ExternalTokenSource {
@@ -47,37 +105,58 @@ impl ExternalTokenSource {
     ///
     /// `session` is the session name to pass to `auth get-token --session <session>`.
     /// If `None`, falls back to `DATUM_SESSION` env var.
-    pub fn from_env(session: Option<String>) -> Result<Self, ExternalTokenError> {
-        let helper =
-            env::var("DATUM_CREDENTIALS_HELPER").map_err(|_| ExternalTokenError::MissingHelper)?;
+    pub fn from_env(
+        session: Option<String>,
+    ) -> impl Future<Output = Result<Self, ExternalTokenError>> {
+        let config = (|| {
+            let helper = env::var("DATUM_CREDENTIALS_HELPER")
+                .map_err(|_| ExternalTokenError::MissingHelper)?;
+            let session = match session {
+                Some(s) => s,
+                None => {
+                    env::var("DATUM_SESSION").map_err(|_| ExternalTokenError::MissingSession)?
+                }
+            };
+            Ok((helper, session))
+        })();
 
-        let session = match session {
-            Some(s) => s,
-            None => env::var("DATUM_SESSION").map_err(|_| ExternalTokenError::MissingSession)?,
-        };
+        async move {
+            let (helper, session) = config?;
+            let token =
+                Self::exec_helper(&helper, &session, &CancellationToken::new(), HELPER_TIMEOUT)
+                    .await?;
 
-        let token = Self::exec_helper(&helper, &session)?;
+            let exp = parse_jwt_expiry(&token).map_err(|e| {
+                ExternalTokenError::InvalidToken(format!("failed to extract expiry: {e}"))
+            })?;
 
-        let exp = parse_jwt_expiry(&token).map_err(|e| {
-            ExternalTokenError::InvalidToken(format!("failed to extract expiry: {e}"))
-        })?;
+            debug!(
+                token_len = token.len(),
+                exp = ?exp,
+                "ExternalTokenSource::from_env — token loaded from helper"
+            );
 
-        debug!(
-            token_len = token.len(),
-            exp = ?exp,
-            "ExternalTokenSource::from_env — token loaded from helper"
-        );
+            Ok(Self::from_token(token))
+        }
+    }
 
+    fn from_token(token: String) -> Self {
         let (revision_tx, _) = watch::channel(0u64);
         let (refresh_tx, _) = watch::channel(0u64);
 
-        Ok(Self {
-            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
+        Self {
+            token: Arc::new(ArcSwap::from_pointee(SecretString::new(
                 token.into_boxed_str(),
             ))),
-            revision_tx: std::sync::Arc::new(revision_tx),
-            refresh_trigger: std::sync::Arc::new(refresh_tx),
-        })
+            revision_tx: Arc::new(revision_tx),
+            refresh_trigger: Arc::new(refresh_tx),
+            refresh_task: Arc::new(Mutex::new(RefreshTaskState::Stopped)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_token_for_test(token: String) -> Self {
+        Self::from_token(token)
     }
 
     /// Returns the current token as a plain `String`.
@@ -118,14 +197,93 @@ impl ExternalTokenSource {
     /// The loop periodically re-executes the credentials helper before the current
     /// token expires, calls [`swap_token()`](Self::swap_token) with the result,
     /// and responds to [`force_refresh()`](Self::force_refresh) signals.
-    pub fn start_refresh(&self, helper: String, session: String) {
-        let this = self.clone();
+    pub fn start_refresh(&self, helper: String, session: String) -> Result<(), ExternalTokenError> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|error| ExternalTokenError::RefreshRuntimeUnavailable(error.to_string()))?;
+        let mut task = self
+            .refresh_task
+            .lock()
+            .map_err(|_| ExternalTokenError::RefreshStatePoisoned)?;
+        if !matches!(*task, RefreshTaskState::Stopped) {
+            return Err(ExternalTokenError::RefreshAlreadyStarted);
+        }
+
+        let token = self.token.clone();
+        let revision_tx = self.revision_tx.clone();
         let mut refresh_rx = self.refresh_trigger.subscribe();
         let initial_exp = parse_jwt_expiry(&self.token()).unwrap_or_default();
-        tokio::spawn(async move {
-            this.run_refresh_loop(helper, session, &mut refresh_rx, initial_exp)
-                .await;
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let handle = runtime.spawn(async move {
+            Self::run_refresh_loop(
+                token,
+                revision_tx,
+                helper,
+                session,
+                &mut refresh_rx,
+                initial_exp,
+                task_cancel,
+            )
+            .await;
         });
+        *task = RefreshTaskState::Running(RefreshTask {
+            cancel,
+            handle: Some(handle),
+        });
+        Ok(())
+    }
+
+    /// Returns whether the refresh task is stopped, running, or has finished unexpectedly.
+    pub fn refresh_task_health(&self) -> Result<RefreshTaskHealth, ExternalTokenError> {
+        let task = self
+            .refresh_task
+            .lock()
+            .map_err(|_| ExternalTokenError::RefreshStatePoisoned)?;
+        Ok(match &*task {
+            RefreshTaskState::Stopped => RefreshTaskHealth::Stopped,
+            RefreshTaskState::Running(task)
+                if task.handle.as_ref().is_some_and(JoinHandle::is_finished) =>
+            {
+                RefreshTaskHealth::Finished
+            }
+            RefreshTaskState::Running(_) => RefreshTaskHealth::Running,
+            RefreshTaskState::Stopping => RefreshTaskHealth::Stopping,
+        })
+    }
+
+    /// Cancels and joins the refresh task. Calling this while stopped is a no-op.
+    pub async fn shutdown_refresh(&self) -> Result<(), ExternalTokenError> {
+        let task = {
+            let mut state = self
+                .refresh_task
+                .lock()
+                .map_err(|_| ExternalTokenError::RefreshStatePoisoned)?;
+            match std::mem::replace(&mut *state, RefreshTaskState::Stopping) {
+                RefreshTaskState::Stopped => {
+                    *state = RefreshTaskState::Stopped;
+                    None
+                }
+                RefreshTaskState::Running(task) => Some(task),
+                RefreshTaskState::Stopping => {
+                    *state = RefreshTaskState::Stopping;
+                    return Err(ExternalTokenError::RefreshShutdownInProgress);
+                }
+            }
+        };
+        let Some(mut task) = task else {
+            return Ok(());
+        };
+
+        task.cancel.cancel();
+        let join_result = match task.handle.take() {
+            Some(handle) => handle.await.map_err(ExternalTokenError::RefreshTaskFailed),
+            None => Err(ExternalTokenError::RefreshTaskHandleUnavailable),
+        };
+        *self
+            .refresh_task
+            .lock()
+            .map_err(|_| ExternalTokenError::RefreshStatePoisoned)? = RefreshTaskState::Stopped;
+        join_result
     }
 
     /// Triggers an immediate token refresh.
@@ -142,20 +300,80 @@ impl ExternalTokenSource {
         let _ = self.refresh_trigger.send(current.wrapping_add(1));
     }
 
-    fn exec_helper(helper: &str, session: &str) -> Result<String, ExternalTokenError> {
-        let output = Command::new(helper)
+    async fn exec_helper(
+        helper: &str,
+        session: &str,
+        cancel: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<String, ExternalTokenError> {
+        let mut command = Command::new(helper);
+        command
             .args(["auth", "get-token", "--session", session])
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
             .map_err(|e| ExternalTokenError::HelperExecError(format!("exec failed: {e}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ExternalTokenError::HelperExecError("failed to capture stdout".into())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ExternalTokenError::HelperExecError("failed to capture stderr".into())
+        })?;
+
+        enum HelperOutcome {
+            Completed(std::io::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)>),
+            Cancelled,
+            TimedOut,
+        }
+
+        let outcome = {
+            let execution = async {
+                let (status, stdout, stderr) = tokio::try_join!(
+                    child.wait(),
+                    read_bounded(stdout, MAX_HELPER_STDOUT_BYTES),
+                    read_bounded(stderr, MAX_HELPER_STDERR_BYTES),
+                )?;
+                Ok((status, stdout, stderr))
+            };
+            tokio::pin!(execution);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => HelperOutcome::Cancelled,
+                _ = tokio::time::sleep(timeout) => HelperOutcome::TimedOut,
+                result = &mut execution => HelperOutcome::Completed(result),
+            }
+        };
+
+        let (status, mut stdout, stderr) = match outcome {
+            HelperOutcome::Completed(result) => result.map_err(|e| {
+                ExternalTokenError::HelperExecError(format!("process I/O failed: {e}"))
+            })?,
+            HelperOutcome::Cancelled => {
+                terminate_child(&mut child).await;
+                return Err(ExternalTokenError::HelperCancelled);
+            }
+            HelperOutcome::TimedOut => {
+                terminate_child(&mut child).await;
+                return Err(ExternalTokenError::HelperTimedOut(timeout));
+            }
+        };
+
+        if !status.success() {
+            let stderr = sanitize_stderr(&stderr);
             return Err(ExternalTokenError::HelperExecError(format!(
                 "exit code {}: {}",
-                output.status,
-                stderr.trim()
+                status, stderr
             )));
         }
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.len() > MAX_HELPER_STDOUT_BYTES {
+            stdout.fill(0);
+            return Err(ExternalTokenError::HelperOutputTooLarge);
+        }
+        let token = String::from_utf8_lossy(&stdout).trim().to_string();
+        stdout.fill(0);
         if token.is_empty() {
             return Err(ExternalTokenError::HelperExecError(
                 "empty token returned".into(),
@@ -165,25 +383,26 @@ impl ExternalTokenSource {
     }
 
     async fn run_refresh_loop(
-        self,
+        token: Arc<ArcSwap<SecretString>>,
+        revision_tx: Arc<watch::Sender<u64>>,
         helper: String,
         session: String,
         refresh_rx: &mut watch::Receiver<u64>,
         initial_exp: Option<u64>,
+        cancel: CancellationToken,
     ) {
         // Compute the next refresh time: 60s before JWT expiry, or 1h from now if no expiry.
-        let mut next_refresh: std::time::SystemTime = initial_exp
+        let mut next_refresh: SystemTime = initial_exp
             .and_then(|exp| {
-                std::time::UNIX_EPOCH
-                    .checked_add(std::time::Duration::from_secs(exp.saturating_sub(60)))
+                std::time::UNIX_EPOCH.checked_add(Duration::from_secs(exp.saturating_sub(60)))
             })
-            .unwrap_or_else(|| std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
+            .unwrap_or_else(|| SystemTime::now() + Duration::from_secs(3600));
 
         if let Some(exp) = initial_exp {
             debug!(
                 exp = exp,
                 next_refresh_in_secs = next_refresh
-                    .duration_since(std::time::SystemTime::now())
+                    .duration_since(SystemTime::now())
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
                 "token refresh loop started; proactive refresh scheduled 60s before JWT expiry"
@@ -194,38 +413,45 @@ impl ExternalTokenSource {
             );
         }
 
-        let mut backoff = std::time::Duration::from_secs(5);
-        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+        let mut backoff = Duration::from_secs(5);
+        const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
         loop {
-            let now = std::time::SystemTime::now();
+            let now = SystemTime::now();
             let wait = if next_refresh > now {
-                next_refresh
-                    .duration_since(now)
-                    .unwrap_or(std::time::Duration::ZERO)
+                next_refresh.duration_since(now).unwrap_or(Duration::ZERO)
             } else {
-                std::time::Duration::ZERO
+                Duration::ZERO
             };
 
             // Wait either for the timer or a force_refresh signal
             let forced = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(wait) => {
                     debug!("token refresh: proactive timer fired");
                     false
                 }
-                _ = refresh_rx.changed() => {
+                result = refresh_rx.changed() => {
+                    if result.is_err() {
+                        break;
+                    }
                     info!("token refresh: forced refresh signalled (401 or stale auth)");
                     true
                 }
             };
 
             // Execute helper to get a fresh token
-            match Self::exec_helper(&helper, &session) {
+            match Self::exec_helper(&helper, &session, &cancel, HELPER_TIMEOUT).await {
                 Ok(new_token) => {
-                    let prev_exp = parse_jwt_expiry(&self.token()).ok().flatten();
+                    let prev_exp = {
+                        let current = token.load();
+                        parse_jwt_expiry(current.expose_secret()).ok().flatten()
+                    };
                     let new_exp = parse_jwt_expiry(&new_token).ok().flatten();
-                    self.swap_token(new_token.clone());
-                    backoff = std::time::Duration::from_secs(5); // Reset backoff
+                    token.store(Arc::new(SecretString::new(new_token.into())));
+                    revision_tx.send_modify(|revision| *revision = revision.saturating_add(1));
+                    backoff = Duration::from_secs(5);
 
                     info!(
                         forced,
@@ -237,24 +463,76 @@ impl ExternalTokenSource {
                     // Parse new expiry for next refresh
                     next_refresh = match new_exp {
                         Some(exp) => {
-                            std::time::UNIX_EPOCH
-                                + std::time::Duration::from_secs(exp.saturating_sub(60))
+                            std::time::UNIX_EPOCH + Duration::from_secs(exp.saturating_sub(60))
                         }
-                        None => std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                        None => SystemTime::now() + Duration::from_secs(3600),
                     };
                 }
+                Err(ExternalTokenError::HelperCancelled) if cancel.is_cancelled() => break,
                 Err(e) => {
                     warn!(
                         forced,
                         "token refresh failed: {e}; retrying in {:?}", backoff
                     );
                     // Retry with backoff
-                    next_refresh = std::time::SystemTime::now() + backoff;
+                    next_refresh = SystemTime::now() + backoff;
                     backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
                 }
             }
         }
     }
+}
+
+async fn read_bounded(reader: impl AsyncRead + Unpin, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
+}
+
+async fn terminate_child(child: &mut Child) {
+    if let Err(error) = child.kill().await
+        && error.kind() != std::io::ErrorKind::InvalidInput
+    {
+        warn!(%error, "failed to terminate credentials helper");
+    }
+    if let Err(error) = child.wait().await
+        && error.kind() != std::io::ErrorKind::InvalidInput
+    {
+        warn!(%error, "failed to reap credentials helper");
+    }
+}
+
+fn sanitize_stderr(stderr: &[u8]) -> String {
+    let truncated = stderr.len() > MAX_HELPER_STDERR_BYTES;
+    let bounded = &stderr[..stderr.len().min(MAX_HELPER_STDERR_BYTES)];
+    let mut sanitized = String::with_capacity(bounded.len());
+    let mut previous_was_space = true;
+
+    for character in String::from_utf8_lossy(bounded).chars() {
+        if character.is_control() || character.is_whitespace() {
+            if !previous_was_space {
+                sanitized.push(' ');
+                previous_was_space = true;
+            }
+        } else {
+            sanitized.push(character);
+            previous_was_space = false;
+        }
+    }
+
+    if previous_was_space {
+        sanitized.pop();
+    }
+    if truncated {
+        sanitized.push_str(" [truncated]");
+    }
+    if sanitized.is_empty() {
+        sanitized.push_str("no stderr output");
+    }
+    sanitized
 }
 
 /// Parse the `exp` (expiry) claim from the middle segment of a JWT.
@@ -360,42 +638,67 @@ mod tests {
         assert_eq!(exp, 9999999999);
     }
 
-    #[test]
-    fn from_env_requires_helper() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_env_requires_helper() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("DATUM_CREDENTIALS_HELPER");
             std::env::set_var("DATUM_SESSION", "test-session");
         }
         let result = ExternalTokenSource::from_env(Some("test-session".to_string()));
+        drop(_lock);
+        let result = result.await;
         assert!(matches!(result, Err(ExternalTokenError::MissingHelper)));
     }
 
-    #[test]
-    fn from_env_requires_session() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_env_requires_session() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/echo");
             std::env::remove_var("DATUM_SESSION");
         }
         let result = ExternalTokenSource::from_env(None);
+        drop(_lock);
+        let result = result.await;
         assert!(matches!(result, Err(ExternalTokenError::MissingSession)));
     }
 
-    #[test]
-    fn from_env_succeeds_with_fake_helper() {
-        let (_dir, source) = setup_plugin_env();
+    #[tokio::test]
+    async fn from_env_succeeds_with_fake_helper() {
+        let dir = TempDir::new("ets-from-env");
+        let helper_path = dir.path().join("fake-helper.sh");
+        let jwt = make_jwt_with_exp(9_999_999_999);
+        std::fs::write(&helper_path, format!("#!/bin/sh\nprintf '%s\\n' '{jwt}'\n"))
+            .expect("should write helper script");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &helper_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("should set executable permission");
+
+        let env_lock = crate::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("DATUM_CREDENTIALS_HELPER", &helper_path);
+            std::env::set_var("DATUM_SESSION", "test-session");
+        }
+        let source = ExternalTokenSource::from_env(Some("test-session".to_string()));
+        drop(env_lock);
+        let source = source.await.expect("fake helper should produce a token");
         assert!(source.token().starts_with("eyJ"));
     }
 
-    #[test]
-    fn from_env_requires_datum_credentials_helper() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_env_requires_datum_credentials_helper() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("DATUM_CREDENTIALS_HELPER");
             std::env::set_var("DATUM_SESSION", "test-session");
         }
         let result = ExternalTokenSource::from_env(None);
+        drop(_lock);
+        let result = result.await;
         assert!(matches!(result, Err(ExternalTokenError::MissingHelper)));
     }
 
@@ -502,25 +805,19 @@ mod tests {
         // not fire during the test — only the forced refresh should swap.
         let initial = make_jwt_with_exp(9999999999);
         std::fs::write(&counter_path, "0").expect("should reset counter");
-        // Build the source by hand so from_env() doesn't consume the first
+        // Build the source directly so from_env() doesn't consume the first
         // helper invocation (we want the *loop* to be the one rotating).
-        let (revision_tx, _) = watch::channel(0u64);
-        let (refresh_tx, _) = watch::channel(0u64);
-        let source = ExternalTokenSource {
-            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
-                initial.clone().into(),
-            ))),
-            revision_tx: std::sync::Arc::new(revision_tx),
-            refresh_trigger: std::sync::Arc::new(refresh_tx),
-        };
+        let source = ExternalTokenSource::from_token(initial.clone());
 
         let rx = source.watch();
         assert_eq!(*rx.borrow(), 0, "watch initial revision");
 
-        source.start_refresh(
-            helper_path.to_string_lossy().to_string(),
-            "test-session".to_string(),
-        );
+        source
+            .start_refresh(
+                helper_path.to_string_lossy().to_string(),
+                "test-session".to_string(),
+            )
+            .expect("refresh task should start");
 
         // Nothing should have rotated yet (proactive timer is far in the
         // future). Give the loop a moment to prove a negative.
@@ -547,5 +844,114 @@ mod tests {
             "rotated token should come from the counter helper: {new_token}"
         );
         assert_eq!(*rx.borrow(), 1, "watchers notified of token revision");
+        source
+            .shutdown_refresh()
+            .await
+            .expect("refresh task should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn helper_execution_times_out() {
+        let dir = TempDir::new("ets-timeout");
+        let helper_path = dir.path().join("slow-helper.sh");
+        std::fs::write(&helper_path, "#!/bin/sh\nexec sleep 10\n")
+            .expect("should write helper script");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &helper_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("should set executable permission");
+
+        let result = ExternalTokenSource::exec_helper(
+            &helper_path.to_string_lossy(),
+            "test-session",
+            &CancellationToken::new(),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ExternalTokenError::HelperTimedOut(duration))
+                if duration == Duration::from_millis(100)
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_refresh_start_is_rejected() {
+        let source = ExternalTokenSource::from_token(make_jwt_with_exp(9_999_999_999));
+        source
+            .start_refresh("/bin/false".into(), "test-session".into())
+            .expect("first refresh task should start");
+
+        assert_eq!(
+            source
+                .refresh_task_health()
+                .expect("refresh health should be readable"),
+            RefreshTaskHealth::Running
+        );
+        assert!(matches!(
+            source.start_refresh("/bin/false".into(), "test-session".into()),
+            Err(ExternalTokenError::RefreshAlreadyStarted)
+        ));
+
+        source
+            .shutdown_refresh()
+            .await
+            .expect("refresh task should stop cleanly");
+        assert_eq!(
+            source
+                .refresh_task_health()
+                .expect("refresh health should be readable"),
+            RefreshTaskHealth::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_in_flight_helper_and_joins_refresh_task() {
+        let dir = TempDir::new("ets-cancel");
+        let marker_path = dir.path().join("started");
+        let helper_path = dir.path().join("blocking-helper.sh");
+        let marker = marker_path.to_string_lossy().replace('\'', "'\\''");
+        std::fs::write(
+            &helper_path,
+            format!("#!/bin/sh\ntouch '{marker}'\nexec sleep 10\n"),
+        )
+        .expect("should write helper script");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &helper_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("should set executable permission");
+
+        let source = ExternalTokenSource::from_token(make_jwt_with_exp(9_999_999_999));
+        source
+            .start_refresh(
+                helper_path.to_string_lossy().to_string(),
+                "test-session".into(),
+            )
+            .expect("refresh task should start");
+        source.force_refresh();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("helper should start");
+
+        tokio::time::timeout(Duration::from_secs(2), source.shutdown_refresh())
+            .await
+            .expect("shutdown should not wait for helper timeout")
+            .expect("refresh task should join cleanly");
+        assert_eq!(
+            source
+                .refresh_task_health()
+                .expect("refresh health should be readable"),
+            RefreshTaskHealth::Stopped
+        );
     }
 }
