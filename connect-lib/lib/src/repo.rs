@@ -1,13 +1,10 @@
 use std::path::PathBuf;
 
 use iroh::SecretKey;
-use tracing::{info, instrument, warn};
 use n0_error::{Result, StackResultExt, StdResultExt};
+use tracing::{info, instrument, warn};
 
-use crate::{
-    config::Config,
-    state::State,
-};
+use crate::{config::Config, state::State};
 
 /// Error returned by [`Repo::default_location`] when the
 /// `DATUM_CONNECT_DIR` environment variable is not set.
@@ -307,11 +304,11 @@ mod tests {
             legacy_bytes,
             "first project must adopt the legacy key"
         );
-        assert!(!legacy_path.exists(), "legacy file must be gone after migration");
-        let p1_path = repo
-            .0
-            .join("project-a")
-            .join(Repo::LISTEN_KEY_FILE);
+        assert!(
+            !legacy_path.exists(),
+            "legacy file must be gone after migration"
+        );
+        let p1_path = repo.0.join("project-a").join(Repo::LISTEN_KEY_FILE);
         assert!(p1_path.exists(), "key must now live under the project dir");
 
         let p2 = repo.listen_key_for_project("project-b").await.unwrap();
@@ -340,12 +337,12 @@ mod tests {
         let key = repo.listen_key_for_project("only-project").await.unwrap();
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
         assert!(!legacy_path.exists(), "no legacy must be created");
-        let project_path = repo
-            .0
-            .join("only-project")
-            .join(Repo::LISTEN_KEY_FILE);
+        let project_path = repo.0.join("only-project").join(Repo::LISTEN_KEY_FILE);
         assert!(project_path.exists());
-        assert_eq!(tokio::fs::read(&project_path).await.unwrap(), key.to_bytes());
+        assert_eq!(
+            tokio::fs::read(&project_path).await.unwrap(),
+            key.to_bytes()
+        );
     }
 
     // ── Per-tunnel key tests ──────────────────────────────────────────
@@ -358,7 +355,9 @@ mod tests {
         tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
         let seed_key = SecretKey::generate(&mut rand::rng());
-        tokio::fs::write(&key_path, seed_key.to_bytes()).await.unwrap();
+        tokio::fs::write(&key_path, seed_key.to_bytes())
+            .await
+            .unwrap();
 
         let key = repo
             .listen_key_for_tunnel("my-project", "my-tunnel")
@@ -399,7 +398,10 @@ mod tests {
             .join("proj-migrate")
             .join("default")
             .join(Repo::LISTEN_KEY_FILE);
-        assert!(expected_path.exists(), "key must now live at per-tunnel path");
+        assert!(
+            expected_path.exists(),
+            "key must now live at per-tunnel path"
+        );
     }
 
     #[tokio::test]
@@ -410,7 +412,9 @@ mod tests {
         tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
         let seed_key = SecretKey::generate(&mut rand::rng());
-        tokio::fs::write(&key_path, seed_key.to_bytes()).await.unwrap();
+        tokio::fs::write(&key_path, seed_key.to_bytes())
+            .await
+            .unwrap();
 
         let first = repo
             .listen_key_for_tunnel("stable-proj", "stable-tunnel")
@@ -436,7 +440,9 @@ mod tests {
             tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
             let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
             let seed_key = SecretKey::generate(&mut rand::rng());
-            tokio::fs::write(&key_path, seed_key.to_bytes()).await.unwrap();
+            tokio::fs::write(&key_path, seed_key.to_bytes())
+                .await
+                .unwrap();
         }
         let key_a = repo
             .listen_key_for_tunnel("multi-proj", "tunnel-a")
@@ -479,7 +485,9 @@ mod default_location_tests {
     fn returns_ok_when_var_set() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         let saved = std::env::var("DATUM_CONNECT_DIR").ok();
-        unsafe { std::env::set_var("DATUM_CONNECT_DIR", "/tmp/test-connect-dir"); }
+        unsafe {
+            std::env::set_var("DATUM_CONNECT_DIR", "/tmp/test-connect-dir");
+        }
 
         let got = Repo::default_location();
 
@@ -501,7 +509,9 @@ mod default_location_tests {
     fn returns_err_when_var_empty() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         let saved = std::env::var("DATUM_CONNECT_DIR").ok();
-        unsafe { std::env::set_var("DATUM_CONNECT_DIR", ""); }
+        unsafe {
+            std::env::set_var("DATUM_CONNECT_DIR", "");
+        }
 
         let got = Repo::default_location();
 
@@ -519,7 +529,9 @@ mod default_location_tests {
     fn returns_err_when_var_unset() {
         let _lock = crate::ENV_LOCK.lock().unwrap();
         let saved = std::env::var("DATUM_CONNECT_DIR").ok();
-        unsafe { std::env::remove_var("DATUM_CONNECT_DIR"); }
+        unsafe {
+            std::env::remove_var("DATUM_CONNECT_DIR");
+        }
 
         let got = Repo::default_location();
 
@@ -538,7 +550,10 @@ mod default_location_tests {
         let msg = format!("{}", MissingConnectDir);
         assert!(msg.contains("DATUM_CONNECT_DIR is not set"), "msg = {msg}");
         assert!(msg.contains("datumctl connect tunnel"), "msg = {msg}");
-        assert!(msg.contains("export DATUM_CONNECT_DIR=\"$HOME/.datumctl/connect\""), "msg = {msg}");
+        assert!(
+            msg.contains("export DATUM_CONNECT_DIR=\"$HOME/.datumctl/connect\""),
+            "msg = {msg}"
+        );
         assert!(msg.contains("(exit 64)"), "msg = {msg}");
     }
 }

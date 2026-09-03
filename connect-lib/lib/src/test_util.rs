@@ -45,10 +45,14 @@ impl Drop for TempDir {
 /// The `sub` claim is set to `"test-user"` and the signature is `"fake_sig"`.
 pub fn make_jwt_with_exp(exp: u64) -> String {
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        serde_json::json!({"alg":"HS256","typ":"JWT"}).to_string().as_bytes(),
+        serde_json::json!({"alg":"HS256","typ":"JWT"})
+            .to_string()
+            .as_bytes(),
     );
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        serde_json::json!({"exp": exp, "sub":"test-user"}).to_string().as_bytes(),
+        serde_json::json!({"exp": exp, "sub":"test-user"})
+            .to_string()
+            .as_bytes(),
     );
     format!("{header}.{payload}.fake_sig")
 }
@@ -82,8 +86,8 @@ pub fn setup_plugin_env() -> (TempDir, ExternalTokenSource) {
         std::env::set_var("DATUM_SESSION", "test-session");
     }
 
-    let source =
-        ExternalTokenSource::from_env(Some("test-session".to_string())).expect("should create token source");
+    let source = ExternalTokenSource::from_env(Some("test-session".to_string()))
+        .expect("should create token source");
     (dir, source)
 }
 

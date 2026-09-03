@@ -34,10 +34,10 @@ use std::io::Write;
 use std::time::Duration;
 
 use connect_lib::{
-    normalize_endpoint, ProgressStep, ProgressStepKind, StepStatus, TunnelProgress, TunnelService,
+    ProgressStep, ProgressStepKind, StepStatus, TunnelProgress, TunnelService, normalize_endpoint,
 };
 use n0_error::Result;
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -142,10 +142,7 @@ pub fn render_verify(mode: Mode, label: &str, url: &str, elapsed: Duration, stat
             Some(_) => "tunnel_verified",
             None => "tunnel_verifying",
         };
-        println!(
-            "{}",
-            serde_json::json!({ "type": json_type, "url": url })
-        );
+        println!("{}", serde_json::json!({ "type": json_type, "url": url }));
     }
 }
 
@@ -281,16 +278,16 @@ where
     // Proxy probe — fixed 10s interval, indefinite, until non-5xx.
     let start = Instant::now();
     loop {
-        let result = probe_url_with_dns_fallback(
-            &client,
-            &proxy_url,
-            per_attempt_timeout,
-        )
-        .await;
+        let result = probe_url_with_dns_fallback(&client, &proxy_url, per_attempt_timeout).await;
         match result {
             Ok(status) => {
                 if status < 500 {
-                    verify_cb("proxy responding", &proxy_url, start.elapsed(), Some(status));
+                    verify_cb(
+                        "proxy responding",
+                        &proxy_url,
+                        start.elapsed(),
+                        Some(status),
+                    );
                     return Ok(());
                 }
                 let _ = writeln!(
@@ -436,9 +433,7 @@ async fn discover_ns_authority(
 /// Used between controller-condition polling and HTTP verification so the user
 /// sees a clear "DNS provisioned" step and we fail fast if resolution fails.
 /// Retries every 5 seconds until success or timeout.
-pub async fn resolve_hostname_dns(
-    hostname: &str,
-) -> Result<Vec<std::net::IpAddr>> {
+pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr>> {
     let start = Instant::now();
     let max_duration = Duration::from_secs(120);
     let retry_interval = Duration::from_secs(5);
@@ -624,7 +619,10 @@ async fn probe_url_with_dns_fallback(
                 }
             }
             Err(e) => {
-                let _ = writeln!(std::io::stderr(), "  \u{26A0} auth NS AAAA lookup failed: {e}");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "  \u{26A0} auth NS AAAA lookup failed: {e}"
+                );
                 let _ = std::io::stderr().flush();
             }
         }

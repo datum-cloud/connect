@@ -679,16 +679,18 @@ pub(crate) async fn build_n0des_client_opt(
         Some(n0des_api_secret) => {
             let remote_id = n0des_api_secret.remote.id;
             debug!(remote = %remote_id.fmt_short(), "connecting to n0des endpoint");
-            let builder = match iroh_n0des::Client::builder(endpoint)
-                .api_secret(n0des_api_secret)
-            {
+            let builder = match iroh_n0des::Client::builder(endpoint).api_secret(n0des_api_secret) {
                 Ok(b) => b,
                 Err(err) => {
                     warn!("Disabling metrics collection: Failed to build n0des client: {err:#}");
                     return None;
                 }
             };
-            match builder.build().await.std_context("Failed to connect to n0des endpoint") {
+            match builder
+                .build()
+                .await
+                .std_context("Failed to connect to n0des endpoint")
+            {
                 Ok(client) => {
                     info!(remote = %remote_id.fmt_short(), "Connected to n0des endpoint for metrics collection");
                     Some(Arc::new(client))
@@ -698,7 +700,7 @@ pub(crate) async fn build_n0des_client_opt(
                     None
                 }
             }
-        },
+        }
     }
 }
 

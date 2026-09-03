@@ -29,16 +29,16 @@ use std::sync::OnceLock;
 use clap::{Parser, Subcommand};
 use n0_error::StdResultExt;
 use tracing_subscriber::{
+    Registry,
     filter::EnvFilter,
     layer::SubscriberExt,
     reload::{self, Handle},
     util::SubscriberInitExt,
-    Registry,
 };
 
+use connect_lib::datum_cloud::DatumCloudClient;
 use connect_lib::datum_cloud::env::ApiEnv;
 use connect_lib::datum_cloud::external_token_source::ExternalTokenSource;
-use connect_lib::datum_cloud::DatumCloudClient;
 use connect_lib::{HeartbeatAgent, ListenNode, Repo, SelectedContext, TunnelService};
 use iroh::SecretKey;
 
@@ -57,8 +57,8 @@ fn init_tracing() {
     } else {
         "datum_connect=info"
     };
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_directive));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directive));
     let filter_string = filter.to_string();
     let (filter_layer, handle) = reload::Layer::new(filter);
     // Best-effort: if a subscriber is already installed (e.g. duplicate call in tests),
@@ -220,7 +220,11 @@ async fn run() -> n0_error::Result<()> {
     let args = Args::parse();
 
     let session: Option<String> = std::env::var("DATUM_SESSION").ok();
-    if session.is_none() && std::env::var("DATUM_PLUGIN_MODE").map(|v| v != "1").unwrap_or(true) {
+    if session.is_none()
+        && std::env::var("DATUM_PLUGIN_MODE")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    {
         return Err(n0_error::anyerr!(
             "neither DATUM_SESSION nor DATUM_PLUGIN_MODE=1 set — this binary runs in plugin mode only"
         ));
@@ -340,7 +344,11 @@ async fn run() -> n0_error::Result<()> {
                 }
             }
         }
-        Commands::Listen { label, endpoint, id } => {
+        Commands::Listen {
+            label,
+            endpoint,
+            id,
+        } => {
             // Plan 12-02 resolution rules (replaces plan 12-01 stubs):
             //   --endpoint only        → generate key in memory, create tunnel
             //   --id only              → real resolution via TunnelService::get_active;
@@ -462,14 +470,12 @@ async fn run() -> n0_error::Result<()> {
                         .await
                         .map_err(|e| n0_error::anyerr!("picker task join failed: {e}"))?;
                         restore_tracing(&prev_filter);
-                        let idx = chosen_idx_res
-                            .map_err(|e| n0_error::anyerr!("picker error: {e}"))?;
+                        let idx =
+                            chosen_idx_res.map_err(|e| n0_error::anyerr!("picker error: {e}"))?;
                         tunnels.into_iter().nth(idx).unwrap()
                     };
                     // Read the per-tunnel key using the picked tunnel's name.
-                    let key = repo
-                        .listen_key_for_tunnel(&project_id, &picked.id)
-                        .await?;
+                    let key = repo.listen_key_for_tunnel(&project_id, &picked.id).await?;
                     let node = ListenNode::new_with_key(repo.clone(), key).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
                     let ep = picked.endpoint.clone();
@@ -520,17 +526,20 @@ async fn run() -> n0_error::Result<()> {
                 }
             };
             let endpoint_id = node.endpoint_id();
-            let _ = writeln!(std::io::stderr(), "  \u{25CB} Your endpoint ID: {}", endpoint_id.to_string());
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{25CB} Your endpoint ID: {}",
+                endpoint_id.to_string()
+            );
             let _ = writeln!(std::io::stderr(), "  \u{25CB} Setting up tunnel...");
             let _ = std::io::stderr().flush();
 
             let setup_start = std::time::Instant::now();
-            let step_started_at = std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::<
+            let step_started_at =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
                     connect_lib::ProgressStepKind,
                     std::time::Instant,
-                >::new(),
-            ));
+                >::new()));
 
             // Start heartbeat BEFORE create_active/ensure_connector so the
             // iroh endpoint connects to the relay and populates its address
@@ -605,7 +614,11 @@ async fn run() -> n0_error::Result<()> {
             // The Go supervisor's 'default: skip' case in connect/tunnel/listen/main.go
             // ignores the new event types; only the final tunnel_ready event
             // unblocks its gotReady handshake.
-            let mode = if json { progress::Mode::Json } else { progress::Mode::Text };
+            let mode = if json {
+                progress::Mode::Json
+            } else {
+                progress::Mode::Text
+            };
 
             // Now start progress monitoring — heartbeat is already connecting,
             // so the operator sees Pending before Ready.
@@ -626,7 +639,12 @@ async fn run() -> n0_error::Result<()> {
             let service_for_progress = service.clone();
             let tunnel_id_for_progress = tunnel_id.clone();
             let progress_handle = tokio::spawn(async move {
-                progress::await_tunnel_progress(&service_for_progress, &tunnel_id_for_progress, &progress_cb).await
+                progress::await_tunnel_progress(
+                    &service_for_progress,
+                    &tunnel_id_for_progress,
+                    &progress_cb,
+                )
+                .await
             });
 
             let mut final_progress = progress_handle.await.unwrap()?;
@@ -654,13 +672,9 @@ async fn run() -> n0_error::Result<()> {
                     }
                 }
             }
-            let hostname = final_progress
-                .hostnames
-                .first()
-                .cloned()
-                .ok_or_else(|| {
-                    n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
-                })?;
+            let hostname = final_progress.hostnames.first().cloned().ok_or_else(|| {
+                n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
+            })?;
 
             // Resolve the proxy hostname via authoritative DNS as a visible
             // step. This fails fast if the hostname cannot be resolved, and
@@ -732,8 +746,7 @@ async fn run() -> n0_error::Result<()> {
             // ALL exit paths via the post-loop block. Informed by upstream
             // datum-cloud/app@6264818 (runtime select-loop precedent).
             let mut login_rx = datum.login_state_watch();
-            let mut runtime_poll =
-                tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut runtime_poll = tokio::time::interval(std::time::Duration::from_secs(10));
             // First tick fires immediately; consume it so the first real poll
             // happens 10s after tunnel_ready (not concurrently with it).
             runtime_poll.tick().await;
@@ -825,7 +838,9 @@ async fn run() -> n0_error::Result<()> {
                             resources.push(serde_json::json!({"type": "HTTPProxy", "name": name}));
                         }
                         if let Some(ref name) = o.connector_ad {
-                            resources.push(serde_json::json!({"type": "ConnectorAdvertisement", "name": name}));
+                            resources.push(
+                                serde_json::json!({"type": "ConnectorAdvertisement", "name": name}),
+                            );
                         }
                         if let Some(ref name) = o.traffic_protection_policy {
                             resources.push(serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}));
@@ -875,12 +890,14 @@ async fn run() -> n0_error::Result<()> {
                 ExitReason::TerminalFailure => {
                     Err(n0_error::anyerr!("tunnel exited with terminal failure"))
                 }
-                ExitReason::DeletedUpstream => {
-                    Err(n0_error::anyerr!("tunnel deleted upstream"))
-                }
+                ExitReason::DeletedUpstream => Err(n0_error::anyerr!("tunnel deleted upstream")),
             };
         }
-        Commands::Update { id, label, endpoint } => {
+        Commands::Update {
+            id,
+            label,
+            endpoint,
+        } => {
             let node = ListenNode::new(repo.clone()).await?;
             let service = TunnelService::new(datum.clone(), node.clone());
             let current = service
@@ -889,7 +906,9 @@ async fn run() -> n0_error::Result<()> {
                 .ok_or_else(|| n0_error::anyerr!("Tunnel {} not found", id))?;
             let new_label = label.unwrap_or(current.label);
             let new_endpoint = endpoint.unwrap_or(current.endpoint);
-            let tunnel = service.update_active(&id, &new_label, &new_endpoint).await?;
+            let tunnel = service
+                .update_active(&id, &new_label, &new_endpoint)
+                .await?;
             if json {
                 println!(
                     "{}",
@@ -917,10 +936,12 @@ async fn run() -> n0_error::Result<()> {
                     resources.push(serde_json::json!({"type": "HTTPProxy", "name": name}));
                 }
                 if let Some(ref name) = outcome.connector_ad {
-                    resources.push(serde_json::json!({"type": "ConnectorAdvertisement", "name": name}));
+                    resources
+                        .push(serde_json::json!({"type": "ConnectorAdvertisement", "name": name}));
                 }
                 if let Some(ref name) = outcome.traffic_protection_policy {
-                    resources.push(serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}));
+                    resources
+                        .push(serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}));
                 }
                 if let Some(ref name) = outcome.connector {
                     resources.push(serde_json::json!({"type": "Connector", "name": name}));
