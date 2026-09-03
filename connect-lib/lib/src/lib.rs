@@ -3,6 +3,7 @@ pub mod datum_apis;
 pub mod datum_cloud;
 pub mod heartbeat;
 pub mod http_user_agent;
+pub mod identifiers;
 pub mod kube_error;
 pub mod node;
 pub mod project_control_plane;
@@ -18,6 +19,7 @@ pub use datum_cloud::external_token_source::{ExternalTokenError, ExternalTokenSo
 pub use datum_cloud::{ApiEnv, AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
 pub use heartbeat::HeartbeatAgent;
 pub use http_user_agent::datum_http_user_agent;
+pub use identifiers::{ProjectId, ProjectIdError, TunnelId, TunnelIdError};
 pub use node::{ConnectNode, ListenNode, build_endpoint};
 pub use project_control_plane::ProjectControlPlaneClient;
 pub use repo::{MissingConnectDir, Repo};

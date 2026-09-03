@@ -7,7 +7,7 @@ use chrono::Utc;
 use n0_error::Result;
 use tokio::sync::watch;
 
-use crate::{ProjectControlPlaneClient, Repo, SelectedContext};
+use crate::{ProjectControlPlaneClient, ProjectId, Repo, SelectedContext};
 
 pub mod env;
 pub mod external_token_source;
@@ -264,11 +264,23 @@ impl DatumCloudClient {
         self.session.set_selected_context(selected_context).await
     }
 
-    fn project_control_plane_url(&self, project_id: &str) -> String {
-        format!(
-            "{}/apis/resourcemanager.miloapis.com/v1alpha1/projects/{project_id}/control-plane",
-            self.api_url()
-        )
+    fn project_control_plane_url(&self, project_id: &str) -> Result<url::Url> {
+        let project_id =
+            ProjectId::try_from(project_id).map_err(|error| n0_error::anyerr!(error))?;
+        let mut url =
+            url::Url::parse(self.api_url().as_ref()).map_err(|error| n0_error::anyerr!(error))?;
+        url.path_segments_mut()
+            .map_err(|()| n0_error::anyerr!("Datum API URL cannot be used as a base URL"))?
+            .pop_if_empty()
+            .extend([
+                "apis",
+                "resourcemanager.miloapis.com",
+                "v1alpha1",
+                "projects",
+                project_id.as_str(),
+                "control-plane",
+            ]);
+        Ok(url)
     }
 
     pub async fn project_control_plane_client(
@@ -279,7 +291,7 @@ impl DatumCloudClient {
         // these operations, the receiver remains dirty and the long-lived
         // client performs a second read after construction.
         let auth_revision_rx = self.auth_update_watch();
-        let server_url = self.project_control_plane_url(project_id);
+        let server_url = String::from(self.project_control_plane_url(project_id)?);
         ProjectControlPlaneClient::new_subscribed(
             project_id.to_string(),
             server_url,
@@ -439,6 +451,51 @@ mod tests {
         let cloned = client.clone();
         assert!(cloned.is_plugin_mode());
         assert_eq!(cloned.token(), client.token());
+    }
+
+    #[test]
+    fn project_control_plane_url_uses_encoded_path_segments() {
+        let (_dir, token_source) = setup_plugin_env();
+        let client = DatumCloudClient::with_external_token_source(
+            ApiEnv::Custom {
+                api_url: "https://api.example.com/base/".to_owned(),
+            },
+            token_source,
+        );
+
+        let url = client
+            .project_control_plane_url("project name%23")
+            .expect("valid project control-plane URL");
+
+        assert_eq!(
+            url.as_str(),
+            "https://api.example.com/base/apis/resourcemanager.miloapis.com/v1alpha1/projects/project%20name%2523/control-plane"
+        );
+    }
+
+    #[test]
+    fn project_control_plane_url_rejects_invalid_project_ids() {
+        let (_dir, token_source) = setup_plugin_env();
+        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+
+        let error = client
+            .project_control_plane_url("../another-project")
+            .expect_err("path traversal must be rejected");
+
+        assert!(error.to_string().contains("must not contain '/'"));
+    }
+
+    #[tokio::test]
+    async fn project_control_plane_client_rejects_invalid_project_ids() {
+        let (_dir, token_source) = setup_plugin_env();
+        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+
+        let error = client
+            .project_control_plane_client("project\\other")
+            .await
+            .expect_err("path separators must be rejected");
+
+        assert!(error.to_string().contains("must not contain '/' or '\\'"));
     }
 
     #[test]
