@@ -40,6 +40,7 @@ pub enum HTTPRouteRulesMatchesPathType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct HTTPRouteMatch {
     pub path: Option<HTTPRouteRulesMatchesPath>,
     pub headers: Option<Vec<HTTPRouteRulesMatchesHeaders>>,
@@ -165,3 +166,80 @@ pub const HTTP_PROXY_REASON_PENDING: &str = "Pending";
 pub const HTTP_PROXY_REASON_HOSTNAMES_VERIFIED: &str = "HostnamesVerified";
 pub const HTTP_PROXY_REASON_UNVERIFIED_HOSTNAMES_PRESENT: &str = "UnverifiedHostnamesPresent";
 pub const HTTP_PROXY_REASON_HOSTNAME_IN_USE: &str = "HostnameInUse";
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn route_match_uses_gateway_api_field_names() {
+        let route_match = HTTPRouteMatch {
+            path: Some(HTTPRouteRulesMatchesPath {
+                r#type: Some(HTTPRouteRulesMatchesPathType::PathPrefix),
+                value: Some("/api".into()),
+            }),
+            headers: None,
+            method: Some("GET".into()),
+            query_params: Some(vec![HTTPRouteRulesMatchesQueryParams {
+                name: "version".into(),
+                r#type: Some(HTTPRouteRulesMatchesQueryParamsType::Exact),
+                value: "v1".into(),
+            }]),
+            time_of_day: Some(vec![HTTPRouteRulesMatchesTimeOfDay {
+                time: "09:00".into(),
+                modifier: Some("UTC".into()),
+            }]),
+        };
+
+        assert_eq!(
+            serde_json::to_value(route_match).expect("route match serializes"),
+            json!({
+                "path": {"type": "PathPrefix", "value": "/api"},
+                "headers": null,
+                "method": "GET",
+                "queryParams": [{"name": "version", "type": "Exact", "value": "v1"}],
+                "timeOfDay": [{"time": "09:00", "modifier": "UTC"}]
+            })
+        );
+    }
+
+    #[test]
+    fn request_redirect_uses_camel_case_field_names() {
+        let filter = HTTPRouteRulesFilters {
+            request_redirect: Some(HTTPRouteRulesFiltersRequestRedirect {
+                scheme: Some("https".into()),
+                status_code: Some(301),
+                hostname: None,
+                path: None,
+                port: None,
+            }),
+            r#type: HTTPRouteRulesFiltersType::RequestRedirect,
+            extension_ref: None,
+            request_header_modifier: None,
+            request_mirror: None,
+            response_header_modifier: None,
+            url_rewrite: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(filter).expect("filter serializes"),
+            json!({
+                "requestRedirect": {
+                    "scheme": "https",
+                    "statusCode": 301,
+                    "hostname": null,
+                    "path": null,
+                    "port": null
+                },
+                "type": "RequestRedirect",
+                "extensionRef": null,
+                "requestHeaderModifier": null,
+                "requestMirror": null,
+                "responseHeaderModifier": null,
+                "urlRewrite": null
+            })
+        );
+    }
+}

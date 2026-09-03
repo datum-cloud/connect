@@ -1385,54 +1385,20 @@ impl TunnelService {
                 return Err(err).std_context("Failed to list connectors");
             }
         };
-        if list.items.is_empty() {
+        let Some(mut connector) = select_unique_connector(list.items, &selector)? else {
             return Ok(None);
-        }
-        if list.items.len() > 1 {
-            debug!(
-                %selector,
-                count = list.items.len(),
-                "Multiple connectors found for endpoint, using first"
-            );
-        }
-        let mut connector = list.items.into_iter().next().unwrap();
+        };
         patch_device_annotations(&connectors, &mut connector).await;
         Ok(Some(connector))
     }
 
     async fn resolve_connector_class(client: kube::Client) -> Result<String> {
         let classes: Api<ConnectorClass> = Api::all(client);
-        match classes.list(&ListParams::default()).await {
-            Ok(class_list) if !class_list.items.is_empty() => {
-                for c in &class_list.items {
-                    if c.name_any() == DEFAULT_CONNECTOR_CLASS_NAME {
-                        return Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string());
-                    }
-                }
-                let fallback = class_list
-                    .items
-                    .first()
-                    .map(|c| c.name_any())
-                    .context("No ConnectorClass available")?;
-                warn!(
-                    %fallback,
-                    "ConnectorClass '{DEFAULT_CONNECTOR_CLASS_NAME}' not found, using '{fallback}'"
-                );
-                Ok(fallback)
-            }
-            Ok(_) => {
-                warn!(
-                    "No ConnectorClass found in cluster; using default '{DEFAULT_CONNECTOR_CLASS_NAME}'"
-                );
-                Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string())
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to list ConnectorClasses (using default '{DEFAULT_CONNECTOR_CLASS_NAME}'): {e:#}"
-                );
-                Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string())
-            }
-        }
+        let class_list = classes
+            .list(&ListParams::default())
+            .await
+            .std_context("Failed to list ConnectorClasses")?;
+        select_connector_class(&class_list.items)
     }
 
     async fn ensure_connector(&self, project_id: &str) -> Result<Connector> {
@@ -1543,6 +1509,49 @@ fn parse_target(target: &str) -> Result<ParsedTarget> {
         address: host.to_string(),
         port,
     })
+}
+
+pub(crate) fn select_unique_connector(
+    connectors: Vec<Connector>,
+    selector: &str,
+) -> Result<Option<Connector>> {
+    match connectors.len() {
+        0 => Ok(None),
+        1 => Ok(connectors.into_iter().next()),
+        count => {
+            let names = connectors
+                .iter()
+                .map(ResourceExt::name_any)
+                .collect::<Vec<_>>()
+                .join(", ");
+            n0_error::bail_any!(
+                "ambiguous connector selection for {selector}: found {count} matches ({names})"
+            )
+        }
+    }
+}
+
+fn select_connector_class(classes: &[ConnectorClass]) -> Result<String> {
+    if classes
+        .iter()
+        .any(|class| class.name_any() == DEFAULT_CONNECTOR_CLASS_NAME)
+    {
+        return Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string());
+    }
+
+    let available = classes
+        .iter()
+        .map(ResourceExt::name_any)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let available = if available.is_empty() {
+        "none".to_string()
+    } else {
+        available
+    };
+    n0_error::bail_any!(
+        "required ConnectorClass '{DEFAULT_CONNECTOR_CLASS_NAME}' is unavailable; found: {available}"
+    )
 }
 
 fn build_connection_details(listen: &ListenNode) -> Option<ConnectorConnectionDetails> {
@@ -2282,5 +2291,30 @@ mod tests {
 
         let desired_new_conn = advertisement_spec("datum-connect-NEW", target("127.0.0.1", 11434));
         assert!(!advertisement_spec_matches(&existing, &desired_new_conn));
+    }
+
+    #[test]
+    fn connector_selection_rejects_duplicates() {
+        let first = connector(vec![]);
+        let mut second = connector(vec![]);
+        second.metadata.name = Some("datum-connect-second".into());
+
+        let error = select_unique_connector(vec![first, second], "publicKey.id=test")
+            .expect_err("duplicate connector selection must fail");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous connector selection"));
+        assert!(message.contains("datum-connect-test"));
+        assert!(message.contains("datum-connect-second"));
+    }
+
+    #[test]
+    fn connector_class_selection_requires_the_supported_class() {
+        let other = ConnectorClass::new(
+            "custom",
+            crate::datum_apis::connector_class::ConnectorClassSpec {},
+        );
+        let error = select_connector_class(&[other])
+            .expect_err("an unrelated class must not be selected implicitly");
+        assert!(error.to_string().contains("required ConnectorClass"));
     }
 }
