@@ -1,5 +1,6 @@
 target/
 dist/
+connect-plugin/release-assets/
 *.so
 connect-plugin/datumctl-connect
 .drewr-y4nd1b/

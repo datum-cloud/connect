@@ -84,9 +84,9 @@ jobs:
           path: /tmp/rust-artifacts
       - name: Stage Rust binaries for goreleaser
         run: |
-          mkdir -p ../dist/rust
-          find /tmp/rust-artifacts -type f -exec cp {} ../dist/rust/ \;
-          ls -la ../dist/rust/
+          mkdir -p release-assets
+          find /tmp/rust-artifacts -type f -exec cp {} release-assets/ \;
+          ls -la release-assets/
       - name: Install Syft CLI
         run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
       - name: Run GoReleaser
