@@ -15,13 +15,13 @@
           inherit system overlays;
         };
 
-        # Pinned to match the rust-toolchain.toml in connect-lib/ (if any) or
-        # the latest stable on nixpkgs unstable. The plugin Rust binary only
-        # builds for native host targets — no WASM, no cross-compile from this
-        # shell (release builds happen via scripts/release.sh which sets its
-        # own targets).
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
+        # Pinned to match connect-lib/rust-toolchain.toml. The plugin Rust binary only
+        # builds for the native host target. The tag-triggered release workflow
+        # installs each explicit cross target for its build matrix.
+        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./connect-lib/rust-toolchain.toml;
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
         };
 
         # Native build inputs (tools needed at build time).
@@ -43,7 +43,7 @@
         # ── Packaged Rust binary ──────────────────────────────────────────
         # `nix build` produces the datum-connect Rust binary used by the
         # Go plugin as a subprocess in plugin mode.
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+        packages.default = rustPlatform.buildRustPackage {
           pname = "datum-connect";
           version = "0.1.0";
           src = ./connect-lib;
@@ -61,9 +61,8 @@
           inherit nativeBuildInputs buildInputs;
 
           cargoBuildFlags = [ "-p" "datum-connect" ];
-          # Workspace tests require network (iroh STUN/relay); run locally
-          # via `task test:rust` in the dev shell.
-          doCheck = false;
+          doCheck = true;
+          cargoTestFlags = [ "--workspace" "--locked" ];
 
           meta = with pkgs.lib; {
             description = "Datum Connect tunnel agent (plugin-mode Rust binary)";
