@@ -8,7 +8,7 @@ use n0_error::{Result, StackResultExt, StdResultExt};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, instrument, warn};
 
-use crate::{config::Config, state::State};
+use crate::{ProjectId, TunnelId, config::Config, state::State};
 
 const PRIVATE_DIR_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -318,7 +318,11 @@ impl Repo {
         let key = SecretKey::generate(&mut rand::rng());
         let now = chrono::Local::now().format("%Y%m%d%H%M%S");
         let suffix = match project_id {
-            Some(pid) => format!("{}.{}", pid, now),
+            Some(project_id) => {
+                let project_id =
+                    ProjectId::try_from(project_id).map_err(|error| n0_error::anyerr!(error))?;
+                format!("{project_id}.{now}")
+            }
             None => now.to_string(),
         };
         let key_file_path = self.0.join(format!("{}.{}", Self::LISTEN_KEY_FILE, suffix));
@@ -340,7 +344,9 @@ impl Repo {
     /// with whatever Connector that key was registered as. Subsequent projects
     /// (no legacy file left) get freshly generated keys.
     pub async fn listen_key_for_project(&self, project_id: &str) -> Result<SecretKey> {
-        let project_dir = self.0.join(project_id);
+        let project_id =
+            ProjectId::try_from(project_id).map_err(|error| n0_error::anyerr!(error))?;
+        let project_dir = self.0.join(project_id.as_str());
         let key_file_path = project_dir.join(Self::LISTEN_KEY_FILE);
         if !tokio::fs::try_exists(&key_file_path).await? {
             let legacy = self.0.join(Self::LISTEN_KEY_FILE);
@@ -375,7 +381,11 @@ impl Repo {
         project_id: &str,
         tunnel_name: &str,
     ) -> Result<SecretKey> {
-        let tunnel_dir = self.0.join(project_id).join(tunnel_name);
+        let project_id =
+            ProjectId::try_from(project_id).map_err(|error| n0_error::anyerr!(error))?;
+        let tunnel_name =
+            TunnelId::try_from(tunnel_name).map_err(|error| n0_error::anyerr!(error))?;
+        let tunnel_dir = self.0.join(project_id.as_str()).join(tunnel_name.as_str());
         let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
 
         if !tokio::fs::try_exists(&key_file_path).await? {
@@ -406,7 +416,11 @@ impl Repo {
         tunnel_name: &str,
         key: &SecretKey,
     ) -> Result<()> {
-        let tunnel_dir = self.0.join(project_id).join(tunnel_name);
+        let project_id =
+            ProjectId::try_from(project_id).map_err(|error| n0_error::anyerr!(error))?;
+        let tunnel_name =
+            TunnelId::try_from(tunnel_name).map_err(|error| n0_error::anyerr!(error))?;
+        let tunnel_dir = self.0.join(project_id.as_str()).join(tunnel_name.as_str());
         let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
         tokio::fs::create_dir_all(&tunnel_dir).await?;
         tokio::fs::write(&key_file_path, key.to_bytes()).await?;
@@ -440,7 +454,11 @@ impl Repo {
 
     /// Delete the local state directory for a tunnel
     pub async fn delete_tunnel_dir(&self, project_id: &str, tunnel_name: &str) -> Result<()> {
-        let tunnel_dir = self.0.join(project_id).join(tunnel_name);
+        let project_id =
+            ProjectId::try_from(project_id).map_err(|error| n0_error::anyerr!(error))?;
+        let tunnel_name =
+            TunnelId::try_from(tunnel_name).map_err(|error| n0_error::anyerr!(error))?;
+        let tunnel_dir = self.0.join(project_id.as_str()).join(tunnel_name.as_str());
         if tokio::fs::try_exists(&tunnel_dir).await? {
             tokio::fs::remove_dir_all(&tunnel_dir).await?;
         }
@@ -736,6 +754,27 @@ mod tests {
             result.is_err(),
             "should error when key does not exist (no legacy migration)"
         );
+    }
+
+    #[tokio::test]
+    async fn repository_rejects_unsafe_project_and_tunnel_paths() {
+        let directory = temp_repo_dir();
+        let repo = Repo::open_or_create(&directory).await.unwrap();
+        let key = SecretKey::generate(&mut rand::rng());
+
+        let project_error = repo
+            .save_listen_key_for_tunnel("../outside", "safe-tunnel", &key)
+            .await
+            .expect_err("project path traversal must be rejected");
+        assert!(project_error.to_string().contains("project ID"));
+
+        let tunnel_error = repo
+            .save_listen_key_for_tunnel("safe-project", "../outside", &key)
+            .await
+            .expect_err("tunnel path traversal must be rejected");
+        assert!(tunnel_error.to_string().contains("tunnel ID"));
+
+        assert!(!directory.join("safe-project").exists());
     }
 }
 
