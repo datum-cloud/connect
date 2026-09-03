@@ -24,6 +24,7 @@ use crate::datum_apis::connector::{
 use crate::datum_apis::lease::Lease;
 use crate::datum_cloud::DatumCloudClient;
 use crate::kube_error::{is_not_found, is_unauthorized};
+use crate::tunnels::select_unique_connector;
 
 type ProjectRunner = Arc<
     dyn Fn(
@@ -392,7 +393,7 @@ async fn run_project(
                 }
                 Err(err) => {
                     warn!(%project_id, "heartbeat: connector lookup failed: {err:#}");
-                    if is_unauthorized(&err) {
+                    if matches!(&err, ConnectorLookupError::Kube(error) if is_unauthorized(error)) {
                         force_refresh_auth(&project_id, &datum).await;
                     }
                     sleep_with_cancel(backoff.next(), &cancel).await;
@@ -576,22 +577,20 @@ async fn probe_connector(
 async fn find_connector(
     connectors: &Api<Connector>,
     endpoint_id: String,
-) -> kube::Result<Option<Connector>> {
+) -> std::result::Result<Option<Connector>, ConnectorLookupError> {
     let selector = format!("status.connectionDetails.publicKey.id={endpoint_id}");
     let list = connectors
         .list(&ListParams::default().fields(&selector))
         .await?;
-    if list.items.is_empty() {
-        return Ok(None);
-    }
-    if list.items.len() > 1 {
-        warn!(
-            %selector,
-            count = list.items.len(),
-            "heartbeat: multiple connectors found, using first"
-        );
-    }
-    Ok(list.items.into_iter().next())
+    select_unique_connector(list.items, &selector).map_err(ConnectorLookupError::Selection)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ConnectorLookupError {
+    #[error(transparent)]
+    Kube(#[from] kube::Error),
+    #[error(transparent)]
+    Selection(n0_error::AnyError),
 }
 
 trait HeartbeatDetailsProvider: Send + Sync {
