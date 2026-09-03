@@ -124,7 +124,7 @@ impl ProjectControlPlaneClient {
         }
         let auth_state = self.datum.auth_state();
         let auth = auth_state.load();
-        self.rebuild_if_changed(&auth.tokens.access_token.secret().to_string())
+        self.rebuild_if_changed(auth.tokens.access_token.secret())
     }
 
     fn start_auth_watch(&mut self) {

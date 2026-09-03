@@ -40,15 +40,15 @@ impl ApiEnv {
     /// An empty `DATUM_API_HOST` (set to `""`) is treated as unset — the
     /// function falls through to `from_env()`.
     pub fn from_env_with_host_override() -> Self {
-        if let Ok(host) = env::var("DATUM_API_HOST") {
-            if !host.is_empty() {
-                let api_url = if host.starts_with("http://") || host.starts_with("https://") {
-                    host
-                } else {
-                    format!("https://{}", host)
-                };
-                return ApiEnv::Custom { api_url };
-            }
+        if let Ok(host) = env::var("DATUM_API_HOST")
+            && !host.is_empty()
+        {
+            let api_url = if host.starts_with("http://") || host.starts_with("https://") {
+                host
+            } else {
+                format!("https://{}", host)
+            };
+            return ApiEnv::Custom { api_url };
         }
         Self::from_env()
     }
