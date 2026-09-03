@@ -17,12 +17,13 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: connect-plugin/go.mod
+          cache-dependency-path: connect-plugin/go.sum
       - name: Verify dependencies
         run: go mod verify
         working-directory: connect-plugin
       - name: Build
         run: go build ./...
         working-directory: connect-plugin
-      - name: Test (known-good packages only)
-        run: go test -timeout 5m ./internal/daemon ./internal/env ./internal/exec ./internal/pidfile ./internal/state ./internal/svcconfig
+      - name: Test
+        run: go test -timeout 5m ./...
         working-directory: connect-plugin

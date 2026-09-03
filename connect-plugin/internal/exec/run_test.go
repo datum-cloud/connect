@@ -1,30 +1,39 @@
 package exec
 
 import (
+	"bytes"
 	"context"
-	"os"
+	"encoding/json"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func buildFakeBinary(t *testing.T, src string) string {
 	t.Helper()
-	// Build from connect-plugin/ module root — use absolute path for reliability
-	bin := "fake-datum-connect-test"
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to locate test source")
+	}
+	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
+	binName := "fake-datum-connect-test"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	bin := filepath.Join(t.TempDir(), binName)
 	cmd := exec.Command("go", "build", "-o", bin, "./"+src)
-	cmd.Dir = "/home/drewr/src/datum-connect-plugin-build/connect/connect-plugin"
+	cmd.Dir = moduleRoot
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build %s: %v\n%s", src, err, out)
 	}
-	t.Cleanup(func() { os.Remove(bin) })
-	// Return absolute path so Run() can find it regardless of CWD
-	absBin := "/home/drewr/src/datum-connect-plugin-build/connect/connect-plugin/" + bin
-	return absBin
+	return bin
 }
 
 func TestRunWithValidBinary(t *testing.T) {
-	// Test 1: Run() with valid binary, args, env — returns result with stdout, stderr, exit code 0
 	fakeBin := buildFakeBinary(t, "testdata/fake-datum-connect")
 	env := []string{"DATUM_ACCESS_TOKEN=test-token"}
 
@@ -35,17 +44,18 @@ func TestRunWithValidBinary(t *testing.T) {
 	if result.ExitCode != 0 {
 		t.Errorf("expected exit code 0, got %d", result.ExitCode)
 	}
-	if len(result.Stdout) == 0 {
-		t.Error("expected stdout to be non-empty")
+	var tunnels []struct {
+		ID string `json:"id"`
 	}
-	// Verify it's valid JSON from the fake binary
-	if !strings.Contains(string(result.Stdout), "tun-123") {
-		t.Errorf("expected stdout to contain 'tun-123', got: %s", string(result.Stdout))
+	if err := json.Unmarshal(result.Stdout, &tunnels); err != nil {
+		t.Fatalf("stdout is not valid tunnel JSON: %v\n%s", err, result.Stdout)
+	}
+	if len(tunnels) != 2 || tunnels[0].ID != "tun-123" {
+		t.Fatalf("unexpected tunnels: %#v", tunnels)
 	}
 }
 
 func TestRunWithNonZeroExit(t *testing.T) {
-	// Test 2: Run() with binary that exits non-zero — returns captured output and exit code
 	fakeBin := buildFakeBinary(t, "testdata/fake-datum-connect")
 	env := []string{"FAKE_DUMMY_MODE=child-crash"}
 
@@ -53,13 +63,12 @@ func TestRunWithNonZeroExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() returned error (expected nil for non-zero exit): %v", err)
 	}
-	if result.ExitCode == 0 {
-		t.Error("expected non-zero exit code from child crash")
+	if result.ExitCode != 1 {
+		t.Errorf("expected child exit code 1, got %d", result.ExitCode)
 	}
 }
 
 func TestRunWithNotFoundBinary(t *testing.T) {
-	// Test 3: Run() with binary not found — returns error (not wrapped in result)
 	_, err := Run(context.Background(), "/nonexistent/binary", []string{"list"}, nil, OutputModeJSON)
 	if err == nil {
 		t.Fatal("expected error for non-existent binary, got nil")
@@ -70,7 +79,6 @@ func TestRunWithNotFoundBinary(t *testing.T) {
 }
 
 func TestRunWithOutputModeYAML(t *testing.T) {
-	// Test 4: Run() with OutputModeYAML — stdout is YAML-converted from JSON
 	fakeBin := buildFakeBinary(t, "testdata/fake-datum-connect")
 	env := []string{"DATUM_ACCESS_TOKEN=test-token"}
 
@@ -81,36 +89,18 @@ func TestRunWithOutputModeYAML(t *testing.T) {
 	if result.ExitCode != 0 {
 		t.Errorf("expected exit code 0, got %d", result.ExitCode)
 	}
-	// YAML output should not be raw JSON — it should contain YAML markers
-	yamlStr := string(result.Stdout)
-	if strings.Contains(yamlStr, "[{") {
-		t.Errorf("expected YAML output, got raw JSON: %s", yamlStr)
+	var tunnels []struct {
+		ID string `yaml:"id"`
 	}
-	if !strings.Contains(yamlStr, "tun-123") {
-		t.Errorf("expected YAML output to contain 'tun-123', got: %s", yamlStr)
+	if err := yaml.Unmarshal(result.Stdout, &tunnels); err != nil {
+		t.Fatalf("stdout is not valid tunnel YAML: %v\n%s", err, result.Stdout)
 	}
-}
-
-func TestRunWithOutputModeJSON(t *testing.T) {
-	// Test 5: Run() with OutputModeJSON — stdout is passed through as-is
-	fakeBin := buildFakeBinary(t, "testdata/fake-datum-connect")
-	env := []string{"DATUM_ACCESS_TOKEN=test-token"}
-
-	result, err := Run(context.Background(), fakeBin, []string{"--json", "list"}, env, OutputModeJSON)
-	if err != nil {
-		t.Fatalf("Run() returned error: %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Errorf("expected exit code 0, got %d", result.ExitCode)
-	}
-	// JSON output should be raw JSON
-	if !strings.Contains(string(result.Stdout), "tun-123") {
-		t.Errorf("expected JSON output to contain 'tun-123', got: %s", string(result.Stdout))
+	if len(tunnels) != 2 || tunnels[0].ID != "tun-123" {
+		t.Fatalf("unexpected tunnels: %#v", tunnels)
 	}
 }
 
-func TestRunWithOutputModeTable(t *testing.T) {
-	// Test 6: Run() with OutputModeTable — stdout is rendered as a table
+func TestRunWithOutputModeTableLeavesJSONForCaller(t *testing.T) {
 	fakeBin := buildFakeBinary(t, "testdata/fake-datum-connect")
 	env := []string{"DATUM_ACCESS_TOKEN=test-token"}
 
@@ -121,13 +111,12 @@ func TestRunWithOutputModeTable(t *testing.T) {
 	if result.ExitCode != 0 {
 		t.Errorf("expected exit code 0, got %d", result.ExitCode)
 	}
-	// Table output should contain tab-separated values
-	tableStr := string(result.Stdout)
-	if !strings.Contains(tableStr, "dev-server") {
-		t.Errorf("expected table output to contain 'dev-server', got: %s", tableStr)
+	jsonResult, err := Run(context.Background(), fakeBin, []string{"--json", "list"}, env, OutputModeJSON)
+	if err != nil {
+		t.Fatalf("Run() in JSON mode returned error: %v", err)
 	}
-	if !strings.Contains(tableStr, "localhost:8080") {
-		t.Errorf("expected table output to contain 'localhost:8080', got: %s", tableStr)
+	if !bytes.Equal(result.Stdout, jsonResult.Stdout) {
+		t.Fatalf("table mode changed caller-owned JSON:\n table: %s\n  json: %s", result.Stdout, jsonResult.Stdout)
 	}
 }
 

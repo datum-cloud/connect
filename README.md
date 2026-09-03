@@ -56,8 +56,7 @@ connect/
 │   ├── e2e_interaction_test.go  # E2E tests (install, service, PID)
 │   ├── go.mod / go.sum
 │   ├── scripts/             # Build/release helpers
-│   ├── testdata/            # Test fixtures
-│   └── fake-datum-connect-test  # Test helper binary
+│   └── testdata/            # Source fixtures built into per-test temp directories
 ├── connect-lib/             # Rust workspace
 │   ├── Cargo.toml
 │   ├── bin/                 # Binary crate (datum-connect)

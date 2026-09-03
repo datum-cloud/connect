@@ -1,9 +1,10 @@
 // Package state provides cross-platform plugin state directory resolution.
 //
 // State directory contains tunnel PID files, logs, and other runtime data.
+// DATUM_CONNECT_STATE_DIR overrides the platform default when explicitly set.
 // Paths follow platform conventions:
 //
-//	linux:   $XDG_STATE_HOME/datumctl/connect  (default ~/.local/share/datumctl/connect)
+//	linux:   $XDG_STATE_HOME/datumctl/connect (default ~/.local/state/datumctl/connect)
 //	darwin:  ~/Library/Application Support/datumctl/connect
 //	windows: %LOCALAPPDATA%/datumctl/connect
 package state
@@ -17,6 +18,10 @@ import (
 
 // Dir returns the plugin state base directory.
 func Dir() string {
+	if override := os.Getenv("DATUM_CONNECT_STATE_DIR"); override != "" {
+		return override
+	}
+
 	switch runtime.GOOS {
 	case "windows":
 		return filepath.Join(os.Getenv("LOCALAPPDATA"), "datumctl", "connect")

@@ -5,15 +5,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
+
+	"go.datum.net/datumctl-plugins/connect/internal/pidfile"
 )
 
-func TestRunSupervisor_StartsAndExits(t *testing.T) {
+func TestRunSupervisorStopsWhenContextExpires(t *testing.T) {
 	fakeBin := findFakeBinary(t)
 	setupFakeEnv(t, fakeBin)
 
-	// Create temp PID directory
 	pidDir := t.TempDir()
 	t.Setenv("DATUM_CONNECT_TUNNEL_DIR", pidDir)
 
@@ -22,16 +24,19 @@ func TestRunSupervisor_StartsAndExits(t *testing.T) {
 		Endpoint: "localhost:8080",
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
 	err := RunSupervisor(ctx, cfg)
-	// The fake binary blocks on listen (waiting for signal), so it will timeout.
-	// We just verify it exited without panic and cleaned up.
-	t.Logf("RunSupervisor returned: %v", err)
+	if err == nil {
+		t.Fatal("expected the context to terminate the child process")
+	}
+	if ctx.Err() != context.DeadlineExceeded {
+		t.Fatalf("expected deadline expiry, got %v", ctx.Err())
+	}
 }
 
-func TestRunSupervisor_WritesPIDFile(t *testing.T) {
+func TestRunSupervisorWritesAndRemovesPIDFile(t *testing.T) {
 	fakeBin := findFakeBinary(t)
 	setupFakeEnv(t, fakeBin)
 
@@ -43,33 +48,64 @@ func TestRunSupervisor_WritesPIDFile(t *testing.T) {
 		Endpoint: "localhost:8080",
 	}
 
-	// Run with timeout — supervisor will block on message loop
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	_ = RunSupervisor(ctx, cfg)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunSupervisor(ctx, cfg)
+	}()
 
-	// After timeout, PID file should be cleaned up (defer ran)
 	pidPath := filepath.Join(pidDir, "pidtest.pid")
-	if _, err := os.Stat(pidPath); err == nil {
-		t.Error("PID file should be removed after supervisor exits")
+	deadline := time.Now().Add(2 * time.Second)
+	var state *pidfile.PidFile
+	for time.Now().Before(deadline) {
+		var err error
+		state, err = pidfile.Read(pidPath)
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if state == nil {
+		t.Fatal("supervisor did not write a readable PID file")
+	}
+	if state.GoPID != os.Getpid() || state.RustPID <= 0 || state.BinaryPath != fakeBin {
+		t.Fatalf("unexpected PID file contents: %#v", state)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected cancellation to terminate the child process")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor did not return after cancellation")
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("PID file was not removed after supervisor exit: %v", err)
 	}
 }
 
-// findFakeBinary locates the pre-built fake-datum-connect binary.
 func findFakeBinary(t *testing.T) string {
 	t.Helper()
-	candidates := []string{
-		"../../testdata/fake-datum-connect/fake-datum-connect",
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to locate test source")
 	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			abs, _ := filepath.Abs(c)
-			return abs
-		}
+	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
+	binName := "fake-datum-connect"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
 	}
-	t.Skip("fake-datum-connect binary not found (run `go build` in testdata first)")
-	return ""
+	bin := filepath.Join(t.TempDir(), binName)
+	cmd := exec.Command("go", "build", "-o", bin, "./testdata/fake-datum-connect")
+	cmd.Dir = moduleRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build fake datum-connect: %v\n%s", err, out)
+	}
+	return bin
 }
 
 // setupFakeEnv sets up environment so binary.Discover() finds the fake binary
@@ -79,7 +115,7 @@ func setupFakeEnv(t *testing.T, fakeBin string) {
 	t.Setenv("FAKE_DATUM_CONNECT", fakeBin)
 	// Add fake binary dir to PATH
 	fakeDir := filepath.Dir(fakeBin)
-	t.Setenv("PATH", fakeDir+":"+os.Getenv("PATH"))
+	t.Setenv("PATH", fakeDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	// Build and use a fake credentials helper
 	helperBin := buildFakeHelper(t)
@@ -105,18 +141,14 @@ func main() { fmt.Println("test-token-from-helper") }
 	if err := os.WriteFile(srcPath, []byte(src), 0644); err != nil {
 		t.Fatalf("write helper source: %v", err)
 	}
-	binPath := filepath.Join(helperDir, "fake-helper")
+	binName := "fake-helper"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	binPath := filepath.Join(helperDir, binName)
 	cmd := exec.Command("go", "build", "-o", binPath, srcPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build helper: %v\n%s", err, out)
 	}
 	return binPath
-}
-
-func TestMain(m *testing.M) {
-	// Build the fake binary before running tests
-	cmd := exec.Command("go", "build", "-o", "fake-datum-connect", "../../testdata/fake-datum-connect")
-	cmd.Dir = "."
-	_ = cmd.Run()
-	os.Exit(m.Run())
 }

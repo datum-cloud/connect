@@ -1,14 +1,9 @@
 package pidfile
 
 import (
-	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -16,31 +11,14 @@ import (
 // Uses OS-level checks:
 //   - Unix: signals PID 0 (doesn't actually send a signal, just checks existence)
 //   - Windows: uses tasklist /FI
+//
 // Returns false for invalid PIDs, errors, and non-existent processes.
 func PIDAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
 
-	switch runtime.GOOS {
-	case "windows":
-		return pidAliveWindows(pid)
-	default:
-		return pidAliveUnix(pid)
-	}
-}
-
-func pidAliveUnix(pid int) bool {
-	// Signal 0 checks existence without sending a signal
-	return syscall.Kill(pid, 0) == nil
-}
-
-func pidAliveWindows(pid int) bool {
-	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH").Output()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(out), strconv.Itoa(pid))
+	return pidAlive(pid)
 }
 
 // RunningTunnel holds info about a discovered running tunnel process.

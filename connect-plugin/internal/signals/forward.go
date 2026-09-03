@@ -2,53 +2,59 @@
 package signals
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 )
 
-// Forward sets up signal forwarding from parent to child process.
-// On SIGINT/SIGTERM (unix) or Ctrl+C/Ctrl+Break (windows), forwards
-// the signal to child and waits up to gracePeriod for clean shutdown.
+// Forward relays SIGINT or SIGTERM to child and gives it gracePeriod to exit.
+// Signal delivery follows os.Process.Signal platform support; if the child
+// remains alive, Forward terminates it with os.Process.Kill.
 //
-// Platform behavior:
-//	- Unix: receives SIGINT/SIGTERM, forwards to child, waits gracePeriod,
-//	  then sends SIGKILL if child hasn't exited
-//	- Windows: Go's signal.Notify with SIGINT handles Ctrl+C automatically.
-//	  Ctrl+Break maps to SIGINT via the Go runtime. Force-kill uses
-//	  os.Process.Kill() (Windows equivalent of SIGKILL).
+// childExited must be closed by the caller after cmd.Wait() returns so this
+// function never races the caller to reap the same process.
 //
 // Returns nil on success. The child's exit code is available via
 // cmd.ProcessState.ExitCode() after Wait().
-func Forward(child *os.Process, gracePeriod time.Duration) error {
+func Forward(child *os.Process, childExited <-chan struct{}, gracePeriod time.Duration) error {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(ch)
+	return forward(child, childExited, gracePeriod, ch)
+}
 
-	// Watch for child exit in a goroutine
-	childExited := make(chan struct{})
-	go func() {
-		child.Wait()
-		close(childExited)
-	}()
+type childProcess interface {
+	Signal(os.Signal) error
+	Kill() error
+}
 
+func forward(child childProcess, childExited <-chan struct{}, gracePeriod time.Duration, signals <-chan os.Signal) error {
 	select {
-	case sig := <-ch:
-		// Received signal — forward to child
+	case sig := <-signals:
+		// Some platforms cannot relay every signal; the grace timeout still
+		// provides a portable forced-termination fallback.
 		_ = child.Signal(sig)
 
-		// Wait for child to exit within grace period
+		timer := time.NewTimer(gracePeriod)
+		defer timer.Stop()
 		select {
 		case <-childExited:
 			return nil
-		case <-time.After(gracePeriod):
-			// Grace period expired — force kill
-			_ = child.Signal(syscall.SIGKILL)
+		case <-timer.C:
+			if err := child.Kill(); err != nil {
+				if errors.Is(err, os.ErrProcessDone) {
+					<-childExited
+					return nil
+				}
+				return fmt.Errorf("kill child after grace period: %w", err)
+			}
 			<-childExited
 			return nil
 		}
 	case <-childExited:
-		// Child exited before receiving signal — nothing to forward
 		return nil
 	}
 }

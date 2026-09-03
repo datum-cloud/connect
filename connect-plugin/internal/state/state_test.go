@@ -23,6 +23,15 @@ func TestDir_IncludesConnect(t *testing.T) {
 	}
 }
 
+func TestDirHonorsExplicitOverride(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DATUM_CONNECT_STATE_DIR", root)
+
+	if got := Dir(); got != root {
+		t.Fatalf("Dir() = %q, want %q", got, root)
+	}
+}
+
 func TestTunnelDir(t *testing.T) {
 	td := TunnelDir()
 	if !strings.HasSuffix(td, "tunnels") && !strings.HasSuffix(td, "tunnels/") {
