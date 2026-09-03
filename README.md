@@ -3,6 +3,50 @@
 A `datumctl` plugin (`datumctl connect tunnel listen ...`) that wraps the Rust
 [`datum-connect`](connect-lib/) binary to manage Datum Connect tunnels.
 
+## Getting Started
+
+### Prerequisites
+
+- **`datumctl`** — the plugin is loaded by `datumctl`, so it must be installed and on your `PATH` first.
+- **Credentials** — a Datum Cloud session (`datumctl` login/logged-in state) to establish tunnels. No access token is passed to the child process; the Rust binary resolves credentials via `DATUM_CREDENTIALS_HELPER`.
+
+### Install the plugin
+
+Install the pre-built binaries from the [latest GitHub release](https://github.com/datum-cloud/connect/releases) with the plugin manager:
+
+```bash
+datumctl plugin install datum-cloud/connect
+```
+
+This downloads the archive for your platform (Linux, macOS, or Windows on amd64/arm64), extracts it, and places both binaries in `~/.datumctl/plugins/`:
+
+```
+~/.datumctl/plugins/
+├── datumctl-connect   # Go supervisor / plugin entrypoint
+└── datum-connect      # Rust tunnel agent
+```
+
+> **Manual install:** if you prefer to install from a release archive yourself, download the `*_<os>_<arch>.tar.gz` (or `.zip` on Windows) asset from the latest release, extract it, and copy both `datumctl-connect` and `datum-connect` into `~/.datumctl/plugins/`.
+>
+> **From source:** see [Developing](#developing) below to build both binaries with `task build`, then copy them into `~/.datumctl/plugins/`.
+
+### Verify the install
+
+`datumctl` should now discover the plugin's `connect` subcommand:
+
+```bash
+datumctl connect --help
+datumctl connect tunnel listen --help
+```
+
+### Establish a tunnel
+
+Once installed and authenticated, start a tunnel with the `connect tunnel` subcommand — see `datumctl connect tunnel listen --help` for the full set of flags (e.g. project, port, zone/service selection, foreground vs. daemon mode).
+
+```
+datumctl connect tunnel listen --endpoint localhost:8000
+```
+
 ## Architecture
 
 ```
@@ -74,14 +118,6 @@ connect/
 ├── Taskfile.yaml            # Build/test/install tasks
 └── README.md
 ```
-
-## Install
-
-```bash
-datumctl plugin install datum-cloud/connect
-```
-
-Downloads the pre-built archive from the [latest GitHub release](https://github.com/datum-cloud/connect/releases) and places both binaries in `~/.datumctl/plugins/`.
 
 ## Components
 
