@@ -711,9 +711,13 @@ async fn run() -> n0_error::Result<()> {
                 n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
             })?;
 
-            // Resolve the proxy hostname via authoritative DNS as a visible
-            // step. This fails fast if the hostname cannot be resolved, and
-            // prevents the HTTP probes below from getting stuck on DNS.
+            // Confirm the proxy hostname is resolvable via authoritative DNS
+            // before the HTTP probes below. Deliberately a SINGLE lookup: we
+            // only reach this point after await_tunnel_progress confirmed the
+            // record is programmed/published, and resolve_hostname_dns waits
+            // a short grace period for the record to land before querying, so
+            // it avoids repeatedly poisoning the authoritative server's
+            // negative cache (negquery-cache-ttl) with misses.
             progress::resolve_hostname_dns(&hostname).await?;
 
             // Verify origin is up and poll the tunnel URL every 10 seconds
