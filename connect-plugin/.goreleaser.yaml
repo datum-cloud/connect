@@ -1,6 +1,7 @@
 # GoReleaser config for the datumctl-connect plugin.
 #
-# Release a version by pushing a semver tag (vX.Y.Z). The workflow runs
+# Release a version by pushing a prerelease tag (vX.Y.Z-dev.N), following the
+# -dev.N pattern used by the other datumctl plugins. The workflow runs
 # goreleaser, which builds the plugin and publishes archives + checksums.txt
 # to a GitHub release. Installable via `datumctl plugin install datum-cloud/connect`.
 #
@@ -48,6 +49,12 @@ archives:
     files:
       - src: release-assets/datum-connect-{{ .Os }}-{{ .Arch }}{{ if eq .Os "windows" }}.exe{{ end }}
         dst: datum-connect{{ if eq .Os "windows" }}.exe{{ end }}
+
+release:
+  # Dev tags (v0.1.0-dev.2) are previews, not the release users should land
+  # on. "auto" keys off the tag's prerelease suffix, so a GA tag still
+  # publishes as the latest release.
+  prerelease: auto
 
 checksum:
   name_template: checksums.txt

@@ -1,5 +1,9 @@
 name: Release
 
+# Release a version by pushing a prerelease tag (vX.Y.Z-dev.N), matching the
+# -dev.N pattern used by the other datumctl plugins. The tag's prerelease
+# suffix (via goreleaser's `prerelease: auto`) keeps dev builds from becoming
+# the latest release.
 on:
   push:
     tags:
