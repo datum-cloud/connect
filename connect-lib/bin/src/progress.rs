@@ -45,12 +45,18 @@ pub enum Mode {
     Json,
 }
 
-/// How long to wait after the readiness conditions flip before issuing the
-/// first authoritative DNS lookup in `resolve_hostname_dns`. The `datumproxy.net`
-/// record can lag the HTTPProxy `Programmed` condition by a few seconds, so we
-/// give it a moment to land before querying, to minimise the chance of a
-/// negative-cache (negquery-cache-ttl) miss.
-const PROVISION_GRACE: Duration = Duration::from_secs(20);
+/// Default for how long to wait after the readiness conditions flip before
+/// issuing the first authoritative DNS lookup in `resolve_hostname_dns`. The
+/// goal is to *never* trigger PowerDNS's negative-response cache
+/// (`negquery-cache-ttl`, default 60s) at all — the first lookup should just
+/// succeed. In practice, actual record-creation latency varies a lot (see
+/// https://github.com/datum-cloud/connect/issues/5 — it's driven by
+/// per-region controller/data-plane warmup, not DNS propagation itself,
+/// which is fast), so no fixed value is right for every run. Overridable via
+/// `--dns-grace-period` for experimentation; the retry loop in
+/// `resolve_hostname_dns` stays as a fallback for whatever this grace period
+/// doesn't cover.
+pub const DEFAULT_PROVISION_GRACE: Duration = Duration::from_secs(30);
 
 // --- format_terminal_failure ---
 
@@ -108,13 +114,23 @@ pub(crate) fn status_to_str(s: StepStatus) -> &'static str {
 
 // --- callbacks ---
 
-pub fn render_progress_step(mode: Mode, step: &ProgressStep, _prev: StepStatus, elapsed: Duration) {
+/// `total_elapsed` is time since the whole `tunnel listen` setup began;
+/// `step_elapsed` is time since this particular step started. Printed as
+/// `(step/total)`.
+pub fn render_progress_step(
+    mode: Mode,
+    step: &ProgressStep,
+    _prev: StepStatus,
+    total_elapsed: Duration,
+    step_elapsed: Duration,
+) {
     if step.status == StepStatus::Ready {
         let _ = writeln!(
             std::io::stderr(),
-            "  \u{2713} {} ({:.1}s) [{}]",
+            "  \u{2713} {} ({:.1}/{:.1}s) [{}]",
             step.kind.label(),
-            elapsed.as_secs_f64(),
+            step_elapsed.as_secs_f64(),
+            total_elapsed.as_secs_f64(),
             step.resource.as_deref().unwrap_or(""),
         );
         let _ = std::io::stderr().flush();
@@ -130,16 +146,27 @@ pub fn render_progress_step(mode: Mode, step: &ProgressStep, _prev: StepStatus, 
     }
 }
 
-pub fn render_verify(mode: Mode, label: &str, url: &str, elapsed: Duration, status: Option<u16>) {
+/// `total_elapsed` is time since the whole `tunnel listen` setup began;
+/// `step_elapsed` is time since this particular probe started. Printed as
+/// `(step/total)`.
+pub fn render_verify(
+    mode: Mode,
+    label: &str,
+    url: &str,
+    total_elapsed: Duration,
+    step_elapsed: Duration,
+    status: Option<u16>,
+) {
     let status_str = match status {
         Some(s) => format!(": HTTP {}", s),
         None => String::new(),
     };
     let _ = writeln!(
         std::io::stderr(),
-        "  \u{2713} {} ({:.1}s) [{}]{}",
+        "  \u{2713} {} ({:.1}/{:.1}s) [{}]{}",
         label,
-        elapsed.as_secs_f64(),
+        step_elapsed.as_secs_f64(),
+        total_elapsed.as_secs_f64(),
         url,
         status_str,
     );
@@ -169,11 +196,14 @@ pub fn build_probe_urls(endpoint: &str, hostname: &str) -> (String, String) {
 /// an error formatted via `format_terminal_failure` when a terminal-failure
 /// step is observed, and returns an error if the tunnel disappears upstream
 /// during setup. Prints a status line to stderr every 10s for any step that
-/// has been Pending for at least 10s.
+/// has been Pending for at least 10s. `setup_start` is the whole `tunnel
+/// listen` setup's start time, used only for the total-elapsed half of that
+/// status line's `(step/total)` notation.
 pub async fn await_tunnel_progress<F>(
     service: &TunnelService,
     tunnel_id: &str,
     progress_cb: F,
+    setup_start: std::time::Instant,
 ) -> Result<TunnelProgress>
 where
     F: Fn(&ProgressStep, StepStatus),
@@ -212,9 +242,10 @@ where
                     if secs >= 10 && secs - last_print >= 10 {
                         let _ = writeln!(
                             std::io::stderr(),
-                            "  \u{25CB} waiting for {} ({:.0}s) [{}]",
+                            "  \u{25CB} waiting for {} ({:.0}/{:.0}s) [{}]",
                             step.kind.label(),
                             start.elapsed().as_secs_f64(),
+                            setup_start.elapsed().as_secs_f64(),
                             step.resource.as_deref().unwrap_or("")
                         );
                         let _ = std::io::stderr().flush();
@@ -247,15 +278,19 @@ where
 /// failure. The proxy URL is checked on a fixed 10-second interval until it
 /// returns a non-5xx response, printing a status line on each attempt so the
 /// user sees progress during settling time.
+/// `setup_start` is the whole `tunnel listen` setup's start time; every
+/// printed line here shows `(step/total)`, where `step` is time since the
+/// relevant probe (origin, or the proxy-wait loop) started.
 pub async fn verify_endpoints<F, R>(
     origin_endpoint: &str,
     hostname: &str,
     budget: Duration,
     verify_cb: F,
     mut refresh_cb: R,
+    setup_start: std::time::Instant,
 ) -> Result<()>
 where
-    F: Fn(&str, &str, Duration, Option<u16>),
+    F: Fn(&str, &str, Duration, Duration, Option<u16>),
     R: FnMut(),
 {
     let (origin_url, proxy_url) = build_probe_urls(origin_endpoint, hostname);
@@ -270,7 +305,13 @@ where
     // Origin probe — best-effort with budget, non-fatal on failure.
     match probe_until_reachable(&client, &origin_url, budget / 2).await {
         Ok((elapsed, status)) => {
-            verify_cb("origin reachable", &origin_url, elapsed, Some(status));
+            verify_cb(
+                "origin reachable",
+                &origin_url,
+                setup_start.elapsed(),
+                elapsed,
+                Some(status),
+            );
         }
         Err(_e) => {
             let _ = writeln!(
@@ -292,6 +333,7 @@ where
                     verify_cb(
                         "proxy responding",
                         &proxy_url,
+                        setup_start.elapsed(),
                         start.elapsed(),
                         Some(status),
                     );
@@ -299,9 +341,10 @@ where
                 }
                 let _ = writeln!(
                     std::io::stderr(),
-                    "  \u{25CB} waiting for tunnel [{}] ({:.0}s) ... HTTP {}",
+                    "  \u{25CB} waiting for tunnel [{}] ({:.0}/{:.0}s) ... HTTP {}",
                     proxy_url,
                     start.elapsed().as_secs_f64(),
+                    setup_start.elapsed().as_secs_f64(),
                     status,
                 );
                 let _ = std::io::stderr().flush();
@@ -315,9 +358,10 @@ where
                 }
                 let _ = writeln!(
                     std::io::stderr(),
-                    "  \u{25CB} waiting for tunnel [{}] ({:.0}s) ... {}",
+                    "  \u{25CB} waiting for tunnel [{}] ({:.0}/{:.0}s) ... {}",
                     proxy_url,
                     start.elapsed().as_secs_f64(),
+                    setup_start.elapsed().as_secs_f64(),
                     cause,
                 );
                 let _ = std::io::stderr().flush();
@@ -449,20 +493,30 @@ async fn discover_ns_authority(
 /// sees a clear "DNS provisioned" step and we fail fast if resolution fails.
 ///
 /// Second attempt at this fix (see `git log -p` on this function for the
-/// first): a single lookup after `PROVISION_GRACE` (tried in
-/// `5aa2528`) avoids hammering PowerDNS's negative-response cache
-/// (`negquery-cache-ttl`, default 60s), but it fails hard whenever record
-/// creation lags past the grace period — which in practice is routine, not
-/// rare. Retrying more often than `negquery-cache-ttl` doesn't help either:
-/// any retry inside that window just replays the same cached NXDOMAIN
-/// instead of re-checking the backend. So this goes back to a plain retry
-/// loop with `max_duration`/`retry_interval` from before `5aa2528` — most
-/// retries inside a cache window are wasted queries, but harmless ones, and
-/// the loop still gets a fresh check every time a cache window rolls over.
-/// We can't do better than this until
+/// first): a single lookup after a grace period (tried in `5aa2528`) avoids
+/// hammering PowerDNS's negative-response cache (`negquery-cache-ttl`,
+/// default 60s), but it fails hard whenever record creation lags past the
+/// grace period — which in practice is routine, not rare. Retrying more
+/// often than `negquery-cache-ttl` doesn't help either: any retry inside
+/// that window just replays the same cached NXDOMAIN instead of re-checking
+/// the backend. So this goes back to a plain retry loop with
+/// `max_duration`/`retry_interval` from before `5aa2528` — most retries
+/// inside a cache window are wasted queries, but harmless ones, and the loop
+/// still gets a fresh check every time a cache window rolls over. We can't
+/// do better than this until
 /// https://github.com/datum-cloud/dns-operator/issues/140 is fixed (see
-/// `PROVISION_GRACE`'s own doc comment).
-pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr>> {
+/// `DEFAULT_PROVISION_GRACE`'s own doc comment).
+///
+/// `setup_start` is the whole `tunnel listen` setup's start time; every
+/// printed line here shows `(step/total)`, where `step` is time since this
+/// function was entered (i.e. since route programming completed).
+/// `grace_period` is how long to wait before the first lookup — normally
+/// `DEFAULT_PROVISION_GRACE`, overridable via `--dns-grace-period`.
+pub async fn resolve_hostname_dns(
+    hostname: &str,
+    setup_start: std::time::Instant,
+    grace_period: Duration,
+) -> Result<Vec<std::net::IpAddr>> {
     let start = Instant::now();
     let max_duration = Duration::from_secs(120);
     let retry_interval = Duration::from_secs(5);
@@ -477,8 +531,9 @@ pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr
     if ns_ips.is_empty() {
         let _ = writeln!(
             std::io::stderr(),
-            "  \u{2717} checking for NS ({:.1}s) [{}]: no authoritative server found",
+            "  \u{2717} checking for NS ({:.1}/{:.1}s) [{}]: no authoritative server found",
             start.elapsed().as_secs_f64(),
+            setup_start.elapsed().as_secs_f64(),
             hostname,
         );
         let _ = std::io::stderr().flush();
@@ -490,8 +545,9 @@ pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr
     let ns_ip_str: Vec<String> = ns_ips.iter().map(|ip| ip.to_string()).collect();
     let _ = writeln!(
         std::io::stderr(),
-        "  \u{2713} checking for NS ({:.1}s) [{}]: {}",
+        "  \u{2713} checking for NS ({:.1}/{:.1}s) [{}]: {}",
         start.elapsed().as_secs_f64(),
+        setup_start.elapsed().as_secs_f64(),
         ns_domain,
         ns_ip_str.join(", "),
     );
@@ -499,13 +555,14 @@ pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr
 
     let _ = writeln!(
         std::io::stderr(),
-        "  \u{25CB} waiting {:.0}s for DNS record to propagate ({:.1}s) [{}]",
-        PROVISION_GRACE.as_secs_f64(),
+        "  \u{25CB} waiting {:.0}s for DNS record to propagate ({:.1}/{:.1}s) [{}]",
+        grace_period.as_secs_f64(),
         start.elapsed().as_secs_f64(),
+        setup_start.elapsed().as_secs_f64(),
         hostname,
     );
     let _ = std::io::stderr().flush();
-    sleep(PROVISION_GRACE).await;
+    sleep(grace_period).await;
 
     let auth_config = auth_ns_config(&ns_ips);
     let mut last_print = Instant::now();
@@ -537,8 +594,9 @@ pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr
             let ip_str: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
             let _ = writeln!(
                 std::io::stderr(),
-                "  \u{2713} DNS provisioned ({:.1}s) [{}]: {}",
+                "  \u{2713} DNS provisioned ({:.1}/{:.1}s) [{}]: {}",
                 start.elapsed().as_secs_f64(),
+                setup_start.elapsed().as_secs_f64(),
                 hostname,
                 ip_str.join(", "),
             );
@@ -549,8 +607,9 @@ pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr
         if start.elapsed() >= max_duration {
             let _ = writeln!(
                 std::io::stderr(),
-                "  \u{2717} DNS provisioned ({:.1}s) [{}]: resolution failed",
+                "  \u{2717} DNS provisioned ({:.1}/{:.1}s) [{}]: resolution failed",
                 start.elapsed().as_secs_f64(),
+                setup_start.elapsed().as_secs_f64(),
                 hostname,
             );
             let _ = std::io::stderr().flush();
@@ -563,8 +622,9 @@ pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr
         if last_print.elapsed() >= Duration::from_secs(5) {
             let _ = writeln!(
                 std::io::stderr(),
-                "  \u{25CB} waiting for A record ({:.0}s) [{}]",
+                "  \u{25CB} waiting for A record ({:.0}/{:.0}s) [{}]",
                 start.elapsed().as_secs_f64(),
+                setup_start.elapsed().as_secs_f64(),
                 hostname,
             );
             let _ = std::io::stderr().flush();

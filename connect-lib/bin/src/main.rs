@@ -163,6 +163,13 @@ enum Commands {
         endpoint: Option<String>,
         #[clap(long)]
         id: Option<String>,
+        /// Seconds to wait after route programming before the first
+        /// authoritative DNS lookup, overriding the default (see
+        /// progress::DEFAULT_PROVISION_GRACE). For experimenting with how
+        /// long DNS record creation actually takes to avoid ever hitting
+        /// PowerDNS's negative-response cache.
+        #[clap(long)]
+        dns_grace_period: Option<u64>,
     },
     /// Update an existing tunnel.
     Update {
@@ -445,6 +452,7 @@ async fn run() -> n0_error::Result<()> {
             label,
             endpoint,
             id,
+            dns_grace_period,
         } => {
             // Plan 12-02 resolution rules (replaces plan 12-01 stubs):
             //   --endpoint only        → generate key in memory, create tunnel
@@ -736,14 +744,20 @@ async fn run() -> n0_error::Result<()> {
                 let step_started_at_for_cb = step_started_at.clone();
                 let progress_cb = move |step: &connect_lib::ProgressStep,
                                         prev: connect_lib::StepStatus| {
-                    let elapsed = {
+                    let step_elapsed = {
                         let mut map = step_started_at_for_cb.lock().unwrap();
                         let timer = map
                             .entry(step.kind.clone())
                             .or_insert_with(std::time::Instant::now);
                         timer.elapsed()
                     };
-                    progress::render_progress_step(mode_for_cb, step, prev, elapsed);
+                    progress::render_progress_step(
+                        mode_for_cb,
+                        step,
+                        prev,
+                        setup_start.elapsed(),
+                        step_elapsed,
+                    );
                 };
 
                 let service_for_progress = service.clone();
@@ -753,6 +767,7 @@ async fn run() -> n0_error::Result<()> {
                         &service_for_progress,
                         &tunnel_id_for_progress,
                         &progress_cb,
+                        setup_start,
                     )
                     .await
                 });
@@ -787,13 +802,18 @@ async fn run() -> n0_error::Result<()> {
                 })?;
 
                 // Confirm the proxy hostname is resolvable via authoritative DNS
-                // before the HTTP probes below. Deliberately a SINGLE lookup: we
-                // only reach this point after await_tunnel_progress confirmed the
-                // record is programmed/published, and resolve_hostname_dns waits
-                // a short grace period for the record to land before querying, so
-                // it avoids repeatedly poisoning the authoritative server's
-                // negative cache (negquery-cache-ttl) with misses.
-                progress::resolve_hostname_dns(&hostname).await?;
+                // before the HTTP probes below. We only reach this point after
+                // await_tunnel_progress confirmed the record is
+                // programmed/published, and resolve_hostname_dns waits a grace
+                // period for the record to land before its first query, so the
+                // first lookup ideally lands after the record exists and never
+                // triggers the authoritative server's negative cache
+                // (negquery-cache-ttl) at all; a retry loop is the fallback for
+                // whatever that grace period doesn't cover.
+                let dns_grace_period = dns_grace_period
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(progress::DEFAULT_PROVISION_GRACE);
+                progress::resolve_hostname_dns(&hostname, setup_start, dns_grace_period).await?;
 
                 // Verify origin is up and poll the tunnel URL every 10 seconds
                 // until it returns a successful (non-5xx) response. Only after
@@ -804,8 +824,15 @@ async fn run() -> n0_error::Result<()> {
                     &endpoint,
                     &hostname,
                     std::time::Duration::from_secs(10),
-                    move |label, url, elapsed, status| {
-                        progress::render_verify(verify_mode, label, url, elapsed, status);
+                    move |label, url, total_elapsed, step_elapsed, status| {
+                        progress::render_verify(
+                            verify_mode,
+                            label,
+                            url,
+                            total_elapsed,
+                            step_elapsed,
+                            status,
+                        );
                     },
                     || {
                         let svc = service_for_refresh.clone();
@@ -815,6 +842,7 @@ async fn run() -> n0_error::Result<()> {
                             }
                         });
                     },
+                    setup_start,
                 )
                 .await?;
 
