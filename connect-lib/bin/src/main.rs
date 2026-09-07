@@ -189,6 +189,71 @@ enum ExitReason {
     DeletedUpstream,
 }
 
+/// Delete the tunnel and its backing resources (HTTPProxy,
+/// ConnectorAdvertisement, TrafficProtectionPolicy, Connector) and report the
+/// outcome. Used both by the post-`tunnel_ready` watch loop's exit cleanup
+/// and by a Ctrl+C during setup (before `tunnel_ready`) — `tunnel_id` already
+/// names a real, created tunnel at that point, so it must be torn down the
+/// same way or the tunnel and its Connector are left stranded server-side.
+async fn cleanup_tunnel(service: &TunnelService, tunnel_id: &str, json: bool) {
+    let outcome = service.delete_active(tunnel_id).await;
+    match &outcome {
+        Ok(o) => {
+            if json {
+                let mut resources = Vec::new();
+                if let Some(ref name) = o.http_proxy {
+                    resources.push(serde_json::json!({"type": "HTTPProxy", "name": name}));
+                }
+                if let Some(ref name) = o.connector_ad {
+                    resources.push(
+                        serde_json::json!({"type": "ConnectorAdvertisement", "name": name}),
+                    );
+                }
+                if let Some(ref name) = o.traffic_protection_policy {
+                    resources.push(
+                        serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}),
+                    );
+                }
+                if let Some(ref name) = o.connector {
+                    resources.push(serde_json::json!({"type": "Connector", "name": name}));
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "tunnel_deleted",
+                        "id": tunnel_id,
+                        "deleted": true,
+                        "resources": resources
+                    })
+                );
+            } else {
+                println!("Deleted tunnel {}", tunnel_id);
+                if let Some(ref name) = o.http_proxy {
+                    println!("  HTTPProxy {}", name);
+                }
+                if let Some(ref name) = o.connector_ad {
+                    println!("  ConnectorAdvertisement {}", name);
+                }
+                if let Some(ref name) = o.traffic_protection_policy {
+                    println!("  TrafficProtectionPolicy {}", name);
+                }
+                if let Some(ref name) = o.connector {
+                    println!("  Connector {}", name);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to delete tunnel on shutdown: {e}");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"type": "tunnel_deleted", "id": tunnel_id})
+                );
+            }
+        }
+    }
+}
+
 fn resolve_project(project_id: &str) -> SelectedContext {
     SelectedContext {
         project_id: project_id.to_string(),
@@ -657,99 +722,120 @@ async fn run() -> n0_error::Result<()> {
 
             // Now start progress monitoring — heartbeat is already connecting,
             // so the operator sees Pending before Ready.
-            let mode_for_cb = mode;
-            let step_started_at_for_cb = step_started_at.clone();
-            let progress_cb = move |step: &connect_lib::ProgressStep,
-                                    prev: connect_lib::StepStatus| {
-                let elapsed = {
-                    let mut map = step_started_at_for_cb.lock().unwrap();
-                    let timer = map
-                        .entry(step.kind.clone())
-                        .or_insert_with(std::time::Instant::now);
-                    timer.elapsed()
+            //
+            // This whole setup sequence (progress wait, DNS resolution,
+            // endpoint verification) can run from seconds up to
+            // `startupTimeout` — by far the likeliest window for a user to
+            // hit Ctrl+C. `tunnel_id` above already names a real, created
+            // tunnel, so an interrupt here must run the same delete_active
+            // cleanup as a post-ready Ctrl+C; otherwise the tunnel and its
+            // Connector are left stranded server-side with no local process
+            // left to clean them up.
+            let setup = async {
+                let mode_for_cb = mode;
+                let step_started_at_for_cb = step_started_at.clone();
+                let progress_cb = move |step: &connect_lib::ProgressStep,
+                                        prev: connect_lib::StepStatus| {
+                    let elapsed = {
+                        let mut map = step_started_at_for_cb.lock().unwrap();
+                        let timer = map
+                            .entry(step.kind.clone())
+                            .or_insert_with(std::time::Instant::now);
+                        timer.elapsed()
+                    };
+                    progress::render_progress_step(mode_for_cb, step, prev, elapsed);
                 };
-                progress::render_progress_step(mode_for_cb, step, prev, elapsed);
-            };
 
-            let service_for_progress = service.clone();
-            let tunnel_id_for_progress = tunnel_id.clone();
-            let progress_handle = tokio::spawn(async move {
-                progress::await_tunnel_progress(
-                    &service_for_progress,
-                    &tunnel_id_for_progress,
-                    &progress_cb,
-                )
-                .await
-            });
+                let service_for_progress = service.clone();
+                let tunnel_id_for_progress = tunnel_id.clone();
+                let progress_handle = tokio::spawn(async move {
+                    progress::await_tunnel_progress(
+                        &service_for_progress,
+                        &tunnel_id_for_progress,
+                        &progress_cb,
+                    )
+                    .await
+                });
 
-            let mut final_progress = progress_handle.await.unwrap()?;
+                let mut final_progress = progress_handle.await.unwrap()?;
 
-            // Re-patch connectionDetails now that the connector is Ready:True.
-            // This triggers the replicator to re-mirror the upstream-status
-            // annotation to the downstream cluster with the current Ready:True
-            // state, which in turn triggers Envoy Gateway to re-translate xDS
-            // so the extension server injects the iroh cluster config.
-            // Without this, if the annotation was captured at Ready:False
-            // (race between replicator and lease renewal), the extension
-            // server serves 503 indefinitely.
-            let _ = service.refresh_connection_details().await;
+                // Re-patch connectionDetails now that the connector is Ready:True.
+                // This triggers the replicator to re-mirror the upstream-status
+                // annotation to the downstream cluster with the current Ready:True
+                // state, which in turn triggers Envoy Gateway to re-translate xDS
+                // so the extension server injects the iroh cluster config.
+                // Without this, if the annotation was captured at Ready:False
+                // (race between replicator and lease renewal), the extension
+                // server serves 503 indefinitely.
+                let _ = service.refresh_connection_details().await;
 
-            // Hostnames are written by the gateway controller shortly after
-            // Programmed=True. Poll until one appears (usually <1s).
-            if final_progress.hostnames.is_empty() {
-                for _ in 0..20 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Ok(Some(p)) = service.get_active_progress(&tunnel_id).await {
-                        if !p.hostnames.is_empty() {
-                            final_progress = p;
-                            break;
+                // Hostnames are written by the gateway controller shortly after
+                // Programmed=True. Poll until one appears (usually <1s).
+                if final_progress.hostnames.is_empty() {
+                    for _ in 0..20 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if let Ok(Some(p)) = service.get_active_progress(&tunnel_id).await {
+                            if !p.hostnames.is_empty() {
+                                final_progress = p;
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            let hostname = final_progress.hostnames.first().cloned().ok_or_else(|| {
-                n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
-            })?;
+                let hostname = final_progress.hostnames.first().cloned().ok_or_else(|| {
+                    n0_error::anyerr!("Tunnel {tunnel_id} has no hostname after Ready")
+                })?;
 
-            // Confirm the proxy hostname is resolvable via authoritative DNS
-            // before the HTTP probes below. Deliberately a SINGLE lookup: we
-            // only reach this point after await_tunnel_progress confirmed the
-            // record is programmed/published, and resolve_hostname_dns waits
-            // a short grace period for the record to land before querying, so
-            // it avoids repeatedly poisoning the authoritative server's
-            // negative cache (negquery-cache-ttl) with misses.
-            progress::resolve_hostname_dns(&hostname).await?;
+                // Confirm the proxy hostname is resolvable via authoritative DNS
+                // before the HTTP probes below. Deliberately a SINGLE lookup: we
+                // only reach this point after await_tunnel_progress confirmed the
+                // record is programmed/published, and resolve_hostname_dns waits
+                // a short grace period for the record to land before querying, so
+                // it avoids repeatedly poisoning the authoritative server's
+                // negative cache (negquery-cache-ttl) with misses.
+                progress::resolve_hostname_dns(&hostname).await?;
 
-            // Verify origin is up and poll the tunnel URL every 10 seconds
-            // until it returns a successful (non-5xx) response. Only after
-            // this do we declare the tunnel ready to the user / Go supervisor.
-            let verify_mode = mode;
-            let service_for_refresh = service.clone();
-            progress::verify_endpoints(
-                &endpoint,
-                &hostname,
-                std::time::Duration::from_secs(10),
-                move |label, url, elapsed, status| {
-                    progress::render_verify(verify_mode, label, url, elapsed, status);
-                },
-                || {
-                    let svc = service_for_refresh.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = svc.refresh_connection_details().await {
-                            tracing::debug!("refresh during probe failed: {e:#}");
-                        }
-                    });
-                },
-            )
-            .await?;
+                // Verify origin is up and poll the tunnel URL every 10 seconds
+                // until it returns a successful (non-5xx) response. Only after
+                // this do we declare the tunnel ready to the user / Go supervisor.
+                let verify_mode = mode;
+                let service_for_refresh = service.clone();
+                progress::verify_endpoints(
+                    &endpoint,
+                    &hostname,
+                    std::time::Duration::from_secs(10),
+                    move |label, url, elapsed, status| {
+                        progress::render_verify(verify_mode, label, url, elapsed, status);
+                    },
+                    || {
+                        let svc = service_for_refresh.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = svc.refresh_connection_details().await {
+                                tracing::debug!("refresh during probe failed: {e:#}");
+                            }
+                        });
+                    },
+                )
+                .await?;
 
-            // Re-fetch the up-to-date TunnelSummary for the tunnel_ready
-            // payload (existing contract — id, label, endpoint, hostnames,
-            // endpoint_id, status, elapsed_secs).
-            let tunnel = service
-                .get_active(&tunnel_id)
-                .await?
-                .ok_or_else(|| n0_error::anyerr!("Tunnel {tunnel_id} not found after setup"))?;
+                // Re-fetch the up-to-date TunnelSummary for the tunnel_ready
+                // payload (existing contract — id, label, endpoint, hostnames,
+                // endpoint_id, status, elapsed_secs).
+                let tunnel = service
+                    .get_active(&tunnel_id)
+                    .await?
+                    .ok_or_else(|| n0_error::anyerr!("Tunnel {tunnel_id} not found after setup"))?;
+
+                n0_error::Result::<connect_lib::TunnelSummary>::Ok(tunnel)
+            };
+
+            let tunnel = tokio::select! {
+                res = setup => res?,
+                _ = tokio::signal::ctrl_c() => {
+                    cleanup_tunnel(&service, &tunnel_id, json).await;
+                    return Ok(());
+                }
+            };
 
             let elapsed = setup_start.elapsed().as_secs();
             if json {
@@ -868,60 +954,7 @@ async fn run() -> n0_error::Result<()> {
             };
 
             // --- Cleanup (runs for all exit paths) ---
-            let outcome = service.delete_active(&tunnel_id).await;
-            match &outcome {
-                Ok(o) => {
-                    if json {
-                        let mut resources = Vec::new();
-                        if let Some(ref name) = o.http_proxy {
-                            resources.push(serde_json::json!({"type": "HTTPProxy", "name": name}));
-                        }
-                        if let Some(ref name) = o.connector_ad {
-                            resources.push(
-                                serde_json::json!({"type": "ConnectorAdvertisement", "name": name}),
-                            );
-                        }
-                        if let Some(ref name) = o.traffic_protection_policy {
-                            resources.push(serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}));
-                        }
-                        if let Some(ref name) = o.connector {
-                            resources.push(serde_json::json!({"type": "Connector", "name": name}));
-                        }
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "type": "tunnel_deleted",
-                                "id": tunnel_id,
-                                "deleted": true,
-                                "resources": resources
-                            })
-                        );
-                    } else {
-                        println!("Deleted tunnel {}", tunnel_id);
-                        if let Some(ref name) = o.http_proxy {
-                            println!("  HTTPProxy {}", name);
-                        }
-                        if let Some(ref name) = o.connector_ad {
-                            println!("  ConnectorAdvertisement {}", name);
-                        }
-                        if let Some(ref name) = o.traffic_protection_policy {
-                            println!("  TrafficProtectionPolicy {}", name);
-                        }
-                        if let Some(ref name) = o.connector {
-                            println!("  Connector {}", name);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("failed to delete tunnel on shutdown: {e}");
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({"type": "tunnel_deleted", "id": tunnel_id})
-                        );
-                    }
-                }
-            }
+            cleanup_tunnel(&service, &tunnel_id, json).await;
 
             // Non-zero exit for terminal failures.
             return match exit_reason {
