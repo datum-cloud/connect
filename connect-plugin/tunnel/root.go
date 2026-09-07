@@ -5,6 +5,7 @@ import (
 
 	deletecmd "go.datum.net/datumctl-plugins/connect/tunnel/delete"
 	"go.datum.net/datumctl-plugins/connect/tunnel/install"
+	"go.datum.net/datumctl-plugins/connect/tunnel/interactive"
 	"go.datum.net/datumctl-plugins/connect/tunnel/list"
 	"go.datum.net/datumctl-plugins/connect/tunnel/listen"
 	"go.datum.net/datumctl-plugins/connect/tunnel/logs"
@@ -27,6 +28,7 @@ func NewCmd() *cobra.Command {
 
 	cmd.AddCommand(list.NewCmd())
 	cmd.AddCommand(listen.NewCmd())
+	cmd.AddCommand(interactive.NewCmd())
 	cmd.AddCommand(update.NewCmd())
 	cmd.AddCommand(deletecmd.NewCmd())
 	cmd.AddCommand(ps.NewCmd())

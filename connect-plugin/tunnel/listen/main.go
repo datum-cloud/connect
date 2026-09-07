@@ -1,14 +1,11 @@
 package listen
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -17,6 +14,7 @@ import (
 	"go.datum.net/datumctl-plugins/connect/internal/daemon"
 	"go.datum.net/datumctl-plugins/connect/internal/env"
 	rexec "go.datum.net/datumctl-plugins/connect/internal/exec"
+	"go.datum.net/datumctl-plugins/connect/internal/supervise"
 	"go.datum.net/datumctl/plugin"
 )
 
@@ -27,15 +25,6 @@ const (
 	// gracePeriod is the time to wait for clean shutdown after sending SIGINT.
 	gracePeriod = 30 * time.Second
 )
-
-// TunnelReady represents the ready message from the Rust binary.
-type TunnelReady struct {
-	ID        string   `json:"id"`
-	Label     string   `json:"label"`
-	Endpoint  string   `json:"endpoint"`
-	Hostnames []string `json:"hostnames"`
-	Status    string   `json:"status"`
-}
 
 func NewCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -115,36 +104,7 @@ func runListen(cmd *cobra.Command, args []string) error {
 		childEnv = append(childEnv, "DATUM_CONNECT_TUNNEL_NAME="+name)
 	}
 
-	// Build args
-	rustArgs := []string{"--json", "--project", pluginCtx.Project, "listen"}
-	if endpoint != "" {
-		rustArgs = append(rustArgs, "--endpoint", endpoint)
-	}
-	if id != "" {
-		rustArgs = append(rustArgs, "--id", id)
-	}
-	if label != "" {
-		rustArgs = append(rustArgs, "--label", label)
-	}
-	if yes {
-		rustArgs = append(rustArgs, "--yes")
-	}
-
-	// Create and start the command
-	rustCmd := exec.CommandContext(context.Background(), binaryPath, rustArgs...)
-	rustCmd.Env = childEnv
-
-	// Capture stdout for JSON parsing
-	stdoutReader, err := rustCmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-	// stderr forwarded transparently to plugin stderr
-	rustCmd.Stderr = os.Stderr
-
-	if err := rustCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start datum-connect: %w", err)
-	}
+	rustArgs := supervise.BuildListenArgs(pluginCtx.Project, endpoint, id, label, yes)
 
 	// Determine mode
 	isJSON := false
@@ -152,144 +112,91 @@ func runListen(cmd *cobra.Command, args []string) error {
 		isJSON = true
 	}
 
-	// Read and parse output line by line with startup timeout
-	scanner := bufio.NewScanner(stdoutReader)
-	var ready TunnelReady
-	var gotReady bool
 	// childErr holds a typed error emitted by the child before tunnel_ready.
 	// It is surfaced as the command error when the child exits during setup,
 	// instead of masking the real cause behind a generic "child exited" message.
 	var childErr string
+	var gotReady bool
 
-	// Read lines — signals ready via readyCh
-	readDone := make(chan struct{})
-	readyCh := make(chan struct{})
-	go func() {
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			if len(line) == 0 {
-				continue
+	result, err := supervise.Run(context.Background(), supervise.Config{
+		BinaryPath:     binaryPath,
+		Args:           rustArgs,
+		Env:            childEnv,
+		Stderr:         os.Stderr,
+		StartupTimeout: startupTimeout,
+		GracePeriod:    gracePeriod,
+	}, func(msg rexec.TypedMessage) bool {
+		switch msg.Type {
+		case "tunnel_ready":
+			gotReady = true
+			if isJSON {
+				// JSON mode: print ready JSON and stop reading further
+				// messages — pipe-buffered stdout won't flush without the
+				// newline Fprintln adds back (the scanner stripped it).
+				fmt.Fprintln(cmd.OutOrStdout(), string(msg.Raw))
+				return true
 			}
-			msg, ok := rexec.ParseTypedMessage(line)
-			if !ok {
-				// Invalid JSON or missing "type" — fatal error
-				rustCmd.Wait()
-				fmt.Fprintf(os.Stderr, "malformed message from child: %s\n", line)
-				return
+			// Interactive mode: print hostname
+			var ready supervise.TunnelReady
+			data, _ := json.Marshal(msg.Fields)
+			_ = json.Unmarshal(data, &ready)
+			if len(ready.Hostnames) > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "Tunnel ready: https://%s\n", ready.Hostnames[0])
 			}
-
-			switch msg.Type {
-			case "tunnel_ready":
-				readyData, _ := json.Marshal(msg.Fields)
-				json.Unmarshal(readyData, &ready)
-				gotReady = true
-
-				if isJSON {
-					// JSON mode: print ready JSON and stop reading.
-					// Add newline — the bufio.Scanner stripped it, and
-					// pipe-buffered stdout won't flush without one.
-					fmt.Fprintln(cmd.OutOrStdout(), string(line))
-					close(readyCh)
-					return
+			fmt.Fprintln(cmd.OutOrStdout(), "Press Ctrl+C to stop...")
+		case "error":
+			if msg.Message != "" {
+				if gotReady {
+					// Mid-session error after ready — surface to stderr
+					// and keep the tunnel running.
+					fmt.Fprintf(os.Stderr, "error: %s\n", msg.Message)
+				} else {
+					// Setup error before ready — capture it so it becomes
+					// the command error below, surfacing the real cause.
+					childErr = msg.Message
 				}
-				// Interactive mode: print hostname
-				if len(ready.Hostnames) > 0 {
-					fmt.Fprintf(cmd.OutOrStdout(), "Tunnel ready: https://%s\n", ready.Hostnames[0])
-				}
-				fmt.Fprintln(cmd.OutOrStdout(), "Press Ctrl+C to stop...")
-				close(readyCh)
-			case "error":
-				if msg.Message != "" {
-					if gotReady {
-						// Mid-session error after ready — surface to stderr
-						// and keep the tunnel running.
-						fmt.Fprintf(os.Stderr, "error: %s\n", msg.Message)
-					} else {
-						// Setup error before ready — capture it so it becomes
-						// the command error below, surfacing the real cause.
-						childErr = msg.Message
-					}
-				}
-			case "heartbeat", "status":
-				// Internal messages — no output
-			case "tunnel_progress", "tunnel_verifying", "tunnel_verified":
-				// Per-step setup-time status events from the Rust binary's
-				// await_tunnel_progress / verify_endpoints (Phase 12-03).
-				// Currently no-op at the supervisor layer — the human-friendly
-				// ready line is what we surface. Phase 13 may forward these
-				// to a future progress UI.
-				_ = msg
-			case "tunnel_terminal_failure", "tunnel_login_lost", "tunnel_deleted_upstream":
-				// Mid-session degradation signals from the Rust binary's runtime
-				// poll loop (Phase 12-04). Forward the message field to stderr so
-				// the user sees it; the child will exit on its own shortly.
-				if msg.Message != "" {
-					fmt.Fprintln(os.Stderr, msg.Message)
-				}
-			case "tunnel_disabled":
-				// Emitted by the Rust binary's cleanup block (Phase 12-04).
-				// No-op at supervisor layer; the child is about to exit.
-				_ = msg
-			case "tunnel_created", "tunnel_updated":
-				// Lifecycle events from create/update paths. No supervisor
-				// action needed in plugin/listen mode; tunnel_ready still
-				// drives gotReady.
-				_ = msg
-			case "tunnel_deleted":
-				// Emitted only by the `delete` subcommand. Not seen on the
-				// listen path.
-				_ = msg
-			default:
-				// Unknown type — skip
 			}
+		case "heartbeat", "status":
+			// Internal messages — no output
+		case "tunnel_progress", "tunnel_verifying", "tunnel_verified":
+			// Per-step setup-time status events from the Rust binary's
+			// await_tunnel_progress / verify_endpoints (Phase 12-03).
+			// Currently no-op at the supervisor layer — the human-friendly
+			// ready line is what we surface. Phase 13 may forward these
+			// to a future progress UI.
+		case "tunnel_terminal_failure", "tunnel_login_lost", "tunnel_deleted_upstream":
+			// Mid-session degradation signals from the Rust binary's runtime
+			// poll loop (Phase 12-04). Forward the message field to stderr so
+			// the user sees it; the child will exit on its own shortly.
+			if msg.Message != "" {
+				fmt.Fprintln(os.Stderr, msg.Message)
+			}
+		case "tunnel_disabled":
+			// Emitted by the Rust binary's cleanup block (Phase 12-04).
+			// No-op at supervisor layer; the child is about to exit.
+		case "tunnel_created", "tunnel_updated":
+			// Lifecycle events from create/update paths. No supervisor
+			// action needed in plugin/listen mode; tunnel_ready still
+			// drives gotReady.
+		case "tunnel_deleted":
+			// Emitted only by the `delete` subcommand. Not seen on the
+			// listen path.
+		default:
+			// Unknown type — skip
 		}
-		close(readDone)
-	}()
+		return false
+	})
 
-	// Wait for ready message or timeout
-	select {
-	case <-readyCh:
-		// Ready message received
-	case <-time.After(startupTimeout):
-		_ = rustCmd.Process.Signal(syscall.SIGKILL)
-		rustCmd.Wait()
-		return fmt.Errorf("timed out waiting for tunnel ready after %v", startupTimeout)
-	case <-readDone:
-		// Scanner ended — child exited without sending ready message. Surface
-		// the child's typed error when it provided one; fall back to a generic
-		// message only if the child gave no reason.
-		if childErr != "" {
+	if err != nil {
+		if errors.Is(err, supervise.ErrExitedBeforeReady) && childErr != "" {
 			return fmt.Errorf("%s", childErr)
 		}
-		return fmt.Errorf("child exited before sending ready message")
+		return err
 	}
 
-	if !gotReady {
+	if !result.GotReady {
 		return fmt.Errorf("no ready message received from child")
 	}
 
-	// Block until signal (Ctrl+C / SIGINT / SIGTERM)
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	sig := <-sigCh
-	// Forward signal to child
-	_ = rustCmd.Process.Signal(sig)
-
-	// Wait for child with grace period
-	done := make(chan error, 1)
-	go func() {
-		done <- rustCmd.Wait()
-	}()
-
-	select {
-	case <-done:
-		// Child exited after signal — intentional shutdown, not an error.
-		return nil
-	case <-time.After(gracePeriod):
-		// Grace period expired — force kill
-		_ = rustCmd.Process.Signal(syscall.SIGKILL)
-		<-done
-		return nil
-	}
+	return nil
 }

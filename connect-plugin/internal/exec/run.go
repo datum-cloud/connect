@@ -50,6 +50,10 @@ type TypedMessage struct {
 	Type    string                 `json:"type"`
 	Message string                 `json:"message,omitempty"`
 	Fields  map[string]interface{} `json:",inline"`
+	// Raw is the original JSON line this message was parsed from. Populated
+	// by ParseTypedMessage as a copy, safe to retain past the caller's
+	// buffer reuse (e.g. bufio.Scanner.Bytes()).
+	Raw []byte `json:"-"`
 }
 
 // RunResult holds the captured output and exit status from a subprocess run.
@@ -187,9 +191,12 @@ func ParseTypedMessage(line []byte) (TypedMessage, bool) {
 	if msgData, ok := msg["message"]; ok {
 		message, _ = msgData.(string)
 	}
+	raw := make([]byte, len(line))
+	copy(raw, line)
 	return TypedMessage{
 		Type:    typeStr,
 		Message: message,
 		Fields:  msg,
+		Raw:     raw,
 	}, true
 }

@@ -1,0 +1,171 @@
+tunnel interactive — implementation plan and status
+=====================================================
+
+Goal
+----
+Add an interactive mode to datumctl connect, giving a live dashboard of a
+tunnel's status and traffic, instead of the plain scrolling text `tunnel
+listen` prints today.
+
+Command surface (final)
+------------------------
+datumctl connect tunnel interactive [flags]
+
+  --origin string         Local address to expose (host:port)
+  --dummy-origin           Serve a built-in dummy HTTP origin on --origin
+                           instead of a real local service (defaults
+                           --origin to localhost:8888)
+  --label string           Display name for the tunnel
+  --id string              Existing tunnel resource name to resume
+                           (mutually exclusive with --dummy-origin)
+  --yes                    Skip confirmation prompt
+  --log-file string        Path for Rust debug log output
+
+This is a new, separate subcommand alongside `listen`/`start`/etc., not a
+flag on `listen` — it never touches --detach/--output/-o, since it is
+foreground/TTY-only by definition.
+
+Architecture / design decisions
+--------------------------------
+The two-binary protocol is unchanged: the Go plugin (connect-plugin) still
+spawns the Rust datum-connect binary and reads its line-delimited typed
+JSON messages from stdout (tunnel_ready, tunnel_progress, tunnel_verifying,
+tunnel_verified, tunnel_created, error, etc. — see connect-lib/bin/src/
+progress.rs and main.rs for the full contract). No Rust code was changed.
+
+internal/supervise (new package)
+  Extracted the spawn / typed-message-stream / startup-timeout /
+  signal-driven-shutdown logic that used to live inline in
+  tunnel/listen/main.go, so both `listen` and `interactive` share it —
+  they differ only in how they render the message stream (plain text vs.
+  a live dashboard). listen was refactored onto this with behavior
+  verified identical via the existing e2e test suite.
+
+internal/dummyorigin (new package)
+  A minimal in-process net/http server used as a stand-in local origin
+  for --dummy-origin, so there's something to tunnel to (and curl) without
+  standing up a real service. It answers every request with a small JSON
+  payload (message/method/path/time) and calls an onRequest(method, path)
+  hook for every request it serves — this is the one place we have real
+  per-request visibility today, since the Rust tunnel proxy
+  (iroh-proxy-utils::UpstreamProxy) is a protocol-agnostic TCP tunnel and
+  does not parse HTTP method/path/status at all.
+
+internal/tui (new package)
+  The bubbletea/v2 + lipgloss/v2 dashboard model (charm.land/bubbletea and
+  charm.land/lipgloss — datumctl itself already depends on these for its
+  own `internal/console`, so this follows existing project convention).
+  Renders: a header (label, live status, hostname -> origin, dummy-origin
+  address), a scrolling event log, and a footer with [q] quit. The status
+  header shows the live setup-phase step name (e.g. "connecting — route
+  programmed") decoded from tunnel_progress's step/status/resource fields
+  and tunnel_verifying/tunnel_verified's url field — these are NOT carried
+  in the message's "message" field, so they're extracted from the raw
+  JSON fields map and mapped to the same human labels
+  ProgressStepKind::label() uses on the Rust side (duplicated on the Go
+  side in internal/tui/model.go's stepLabels map, since Go can't call
+  into Rust for it).
+
+tunnel/interactive (new package, the command itself)
+  Wires binary discovery, the dummy origin server, and supervise.Run
+  together, feeding parsed messages into a tea.Program via Program.Send.
+  Two behaviors worth noting:
+   - TTY guard: rejects cleanly (clear stderr message, exit 1) if stdin or
+     stdout is not a real terminal, rather than trying to run bubbletea's
+     raw-mode/alt-screen renderer against a pipe (which would hang reading
+     input or scramble a downstream pipe with ANSI escapes).
+   - 'q'/ctrl+c handling: bubbletea puts the terminal in raw mode, which
+     disables the kernel's normal SIGINT-on-Ctrl+C generation, so the
+     keypress never arrives as a real signal. The quit handler
+     self-signals SIGINT (syscall.Kill(os.Getpid(), ...)), which reuses
+     supervise.Run's existing forward-and-grace-shutdown path unchanged.
+   - The Rust child's stderr is captured into a bounded (16KB) in-memory
+     buffer rather than discarded or forwarded to the terminal (which
+     would corrupt the alt-screen). If the child exits before tunnel_ready
+     with no typed "error" message, the captured stderr tail is surfaced
+     in the returned error — this is what turned a useless "child exited
+     before sending ready message" into an actual, actionable Rust error
+     message during testing.
+
+Testing
+-------
+- internal/dummyorigin: direct unit tests (serves payload, calls the
+  onRequest hook correctly, bind-error path).
+- e2e_test.go: interactive command flag validation (missing --origin/--id,
+  --dummy-origin + --id conflict, --dummy-origin defaulting), plus a
+  TTY-rejection test.
+- e2e_interactive_pty_test.go: a real end-to-end smoke test that drives
+  the dashboard through an actual pty (github.com/creack/pty) — reaches
+  ready, curls the dummy origin, confirms the request shows up in the
+  dashboard's log, presses 'q', and checks for a clean exit. This is the
+  one test that actually exercises the bubbletea rendering path, since
+  everything else in the suite (by long-standing project convention)
+  invokes the plugin binary directly with piped, non-TTY stdio.
+
+Other fixes made along the way
+-------------------------------
+- Taskfile.yaml: added -buildvcs=false to GO_BUILD_FLAGS. This repo is
+  commonly checked out as a git worktree (.git is a file, not a
+  directory), which Go's VCS auto-detection doesn't recognize as a repo
+  root; it then walks up looking for one and can land on an unrelated
+  repo above the checkout, failing `task build`/`task install` with
+  "error obtaining VCS status: exit status 128". The real commit hash is
+  already embedded via GO_LDFLAGS (git rev-parse --short HEAD, which
+  resolves the worktree's actual git dir correctly), so Go's own
+  stamping was redundant.
+- tunnel/interactive: added SilenceErrors to the cobra command — without
+  it, cobra's default error printer and main.go's own
+  `fmt.Fprintf(os.Stderr, "Error: %v\n", err)` both print the same error,
+  producing a confusing doubled "Error: ..." line. The same latent bug
+  exists on `listen` and probably every other subcommand (main.go prints
+  the error unconditionally); not fixed there in this pass, out of scope
+  for this feature.
+
+Known issues found in datumctl itself (different repo, NOT fixed here)
+------------------------------------------------------------------------
+Discovered while trying to run the real `datumctl connect ...` command
+end-to-end on a live machine:
+
+1. datumctl's plugin dispatch (internal/cmd/root.go) never sets
+   FParseErrWhitelist.UnknownFlags or DisableFlagParsing on the root
+   command, so cobra tries to validate any plugin flag (e.g. --endpoint,
+   --dummy-origin) against datumctl's OWN flag set before ever exec'ing
+   the plugin, and rejects anything it doesn't recognize. This breaks
+   every custom flag on every connect subcommand when invoked through the
+   real datumctl binary — it went unnoticed because this project's own
+   e2e tests always invoke the plugin binary directly. Worth filing in
+   the datumctl repo.
+2. datumctl's managed-plugin integrity check
+   (plugindispatch.VerifyManagedPluginIntegrity) compares the installed
+   binary's live sha256 against the value recorded in plugins.json at
+   install time. There's no supported "install my local dev build over
+   the managed one" workflow (`datumctl plugin install` only pulls from
+   catalogs/GitHub releases) — swapping the binary by hand requires also
+   hand-patching plugins.json's recorded sha256, or the real dispatch
+   path refuses to run it ("plugin ... binary has been modified since
+   install"). A local `--local-path` style install mode, or a `datumctl
+   plugin dev <name> <path>` command, would remove the need for this.
+
+Not yet done
+------------
+- Real per-request logs (method, path, status, latency) for a REAL local
+  origin (not --dummy-origin). The Rust tunnel proxy
+  (iroh-proxy-utils::UpstreamProxy) only tracks connection-level counters
+  per target (accepted/denied/completed/failed requests,
+  bytes_to_origin/bytes_from_origin — see UpstreamMetrics/TargetMetrics in
+  the vendored iroh-proxy-utils crate), not HTTP semantics. Getting real
+  method/path/status would need either an upstream contribution to
+  iroh-proxy-utils (a per-request hook/callback) or a thin HTTP-line-
+  sniffing shim inserted between the tunnel and the local origin socket in
+  connect-lib. Bigger, separate effort — intentionally not started here.
+- tunnel_metrics polling: even without full per-request logs, bin/src/
+  main.rs could poll ListenNode::metrics() every ~1s and emit a new
+  tunnel_metrics JSON message (active connections, bytes, denials) with
+  zero changes to the vendored proxy crate. The dashboard's log pane
+  already has a place to render this (RequestMsg/MessageMsg handling in
+  internal/tui/model.go) — this is the natural next slice for real (non-
+  dummy) origins.
+- --log-file is accepted as a flag on both `listen` and `interactive`'s
+  foreground paths but was never wired into the Rust args in either
+  command (only the --detach/daemon path uses it) — a pre-existing gap in
+  `listen`, carried over unchanged rather than fixed in this pass.

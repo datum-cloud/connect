@@ -10,7 +10,13 @@ vars:
   PLUGIN_DIR: '{{.ROOT_DIR}}/bin'
   PLUGIN_INSTALL_DIR: '$HOME/.datumctl/plugins'
 
-  GO_BUILD_FLAGS: -trimpath
+  # -buildvcs=false: this repo is commonly checked out as a git worktree
+  # (.git is a file, not a directory), which Go's VCS auto-detection doesn't
+  # recognize as a repo root — it then walks up looking for one and can land
+  # on an unrelated repo above the checkout, failing the build with
+  # "error obtaining VCS status: exit status 128". The real commit hash is
+  # already embedded below via GO_LDFLAGS, so Go's own stamping is redundant.
+  GO_BUILD_FLAGS: -trimpath -buildvcs=false
 
   GIT_COMMIT:
     sh: git rev-parse --short HEAD

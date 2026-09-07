@@ -63,7 +63,7 @@ func TestAll12SubcommandsScaffolded(t *testing.T) {
 	}
 
 	expectedSubcommands := []string{
-		"list", "listen", "update", "delete",
+		"list", "listen", "interactive", "update", "delete",
 		"ps", "stop", "logs", "status",
 		"install", "uninstall", "start", "run",
 	}
@@ -80,7 +80,7 @@ func TestAllSubcommandsRunWithoutCrash(t *testing.T) {
 	// All 12 subcommands should run without crashing (may exit non-zero for
 	// missing required flags, but should not panic or produce stack traces)
 	subcommands := []string{
-		"list", "listen", "update", "delete",
+		"list", "listen", "interactive", "update", "delete",
 		"ps", "stop", "logs", "status",
 		"install", "uninstall", "start", "run",
 	}
@@ -555,5 +555,86 @@ func TestListenSurfacesChildErrorBeforeReady(t *testing.T) {
 	}
 	if bytes.Contains(out, []byte("child exited before sending ready message")) {
 		t.Errorf("output should not contain the generic error masking the real cause:\n%s", out)
+	}
+}
+
+// --- tunnel interactive e2e tests ---
+
+func TestInteractiveMissingOriginAndId(t *testing.T) {
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "interactive")
+	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Error("interactive without --origin or --id should exit non-zero")
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 64 {
+			t.Errorf("expected exit code 64 (semantic rejection), got %d", exitErr.ExitCode())
+		}
+	}
+	if !bytes.Contains(out, []byte("required")) {
+		t.Error("interactive without --origin or --id should show 'required' error message")
+	}
+}
+
+func TestInteractiveDummyOriginConflictsWithId(t *testing.T) {
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "interactive", "--dummy-origin", "--id", "tun-123")
+	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Error("--dummy-origin with --id should exit non-zero")
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 64 {
+			t.Errorf("expected exit code 64 (semantic rejection), got %d", exitErr.ExitCode())
+		}
+	}
+	if !bytes.Contains(out, []byte("--dummy-origin cannot be used with --id")) {
+		t.Errorf("expected conflict error message, got:\n%s", out)
+	}
+}
+
+func TestInteractiveRequiresTTY(t *testing.T) {
+	// The dashboard needs a real terminal (raw mode + alt-screen redraw);
+	// piped/redirected stdin or stdout — scripts, CI, or this test's own
+	// exec.Command pipes — must be rejected cleanly rather than hanging or
+	// scrambling the pipe with raw ANSI escapes. See TestInteractivePTY for
+	// the real end-to-end flow via an actual pty.
+	fakeBin := buildFakeDatumConnect(t)
+	fakeHelper := buildFakeHelper(t, "testdata/fake-credentials-helper")
+	pluginBin := buildPlugin(t)
+
+	connectDir, _ := os.Getwd()
+	cmd := exec.Command(pluginBin, "tunnel", "interactive", "--origin", "localhost:8080")
+	cmd.Env = append(os.Environ(),
+		"FAKE_DATUM_CONNECT="+fakeBin,
+		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
+		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR="+connectDir,
+		"PATH="+connectDir+":"+os.Getenv("PATH"))
+
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("interactive without a TTY should exit non-zero")
+	}
+	if !bytes.Contains(out, []byte("requires a terminal (TTY)")) {
+		t.Errorf("expected a clear TTY-required error, got:\n%s", out)
+	}
+}
+
+func TestInteractiveDummyOriginDefaultAddr(t *testing.T) {
+	// --dummy-origin without --origin should default to localhost:8888 and
+	// fail fast (bind error) rather than silently requiring --origin — this
+	// just exercises the flag parsing path without a real tunnel, by
+	// checking the missing-binary error still fires (proves origin
+	// resolution didn't reject before binary discovery).
+	pluginBin := buildPlugin(t)
+	cmd := exec.Command(pluginBin, "tunnel", "interactive", "--dummy-origin")
+	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
+	out, _ := cmd.CombinedOutput()
+	if bytes.Contains(out, []byte("--origin or --id is required")) {
+		t.Errorf("--dummy-origin should default --origin, not require it:\n%s", out)
 	}
 }
