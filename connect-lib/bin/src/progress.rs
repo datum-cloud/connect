@@ -46,7 +46,7 @@ pub enum Mode {
 }
 
 /// How long to wait after the readiness conditions flip before issuing the
-/// single authoritative DNS lookup in `resolve_hostname_dns`. The `datumproxy.net`
+/// first authoritative DNS lookup in `resolve_hostname_dns`. The `datumproxy.net`
 /// record can lag the HTTPProxy `Programmed` condition by a few seconds, so we
 /// give it a moment to land before querying, to minimise the chance of a
 /// negative-cache (negquery-cache-ttl) miss.
@@ -448,18 +448,24 @@ async fn discover_ns_authority(
 /// Used between controller-condition polling and HTTP verification so the user
 /// sees a clear "DNS provisioned" step and we fail fast if resolution fails.
 ///
-/// This performs a SINGLE authoritative A/AAAA lookup, not a retry loop. The
-/// caller has already waited for the control-plane readiness conditions
-/// (HTTPProxy/Connector `Programmed`, `IrohDnsPublished`), but empirically the
-/// `datumproxy.net` record can lag `Programmed` by a few seconds, so we wait
-/// `PROVISION_GRACE` before the lookup to let the record land. A single lookup
-/// on an already-provisioned record avoids repeatedly poisoning the
-/// authoritative server's negative-response cache (`negquery-cache-ttl`); a
-/// retry loop re-querying a not-yet-published name WOULD. If the single lookup
-/// still misses, we report it as a real failure rather than hammering the
-/// resolver.
+/// Second attempt at this fix (see `git log -p` on this function for the
+/// first): a single lookup after `PROVISION_GRACE` (tried in
+/// `5aa2528`) avoids hammering PowerDNS's negative-response cache
+/// (`negquery-cache-ttl`, default 60s), but it fails hard whenever record
+/// creation lags past the grace period — which in practice is routine, not
+/// rare. Retrying more often than `negquery-cache-ttl` doesn't help either:
+/// any retry inside that window just replays the same cached NXDOMAIN
+/// instead of re-checking the backend. So this goes back to a plain retry
+/// loop with `max_duration`/`retry_interval` from before `5aa2528` — most
+/// retries inside a cache window are wasted queries, but harmless ones, and
+/// the loop still gets a fresh check every time a cache window rolls over.
+/// We can't do better than this until
+/// https://github.com/datum-cloud/dns-operator/issues/140 is fixed (see
+/// `PROVISION_GRACE`'s own doc comment).
 pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr>> {
     let start = Instant::now();
+    let max_duration = Duration::from_secs(120);
+    let retry_interval = Duration::from_secs(5);
 
     let sys_resolver = hickory_resolver::Resolver::builder_with_config(
         system_resolver_config(),
@@ -491,56 +497,82 @@ pub async fn resolve_hostname_dns(hostname: &str) -> Result<Vec<std::net::IpAddr
     );
     let _ = std::io::stderr().flush();
 
-    // Give the authoritative record a moment to propagate after the readiness
-    // conditions flip before issuing the (single) DNS lookup.
+    let _ = writeln!(
+        std::io::stderr(),
+        "  \u{25CB} waiting {:.0}s for DNS record to propagate ({:.1}s) [{}]",
+        PROVISION_GRACE.as_secs_f64(),
+        start.elapsed().as_secs_f64(),
+        hostname,
+    );
+    let _ = std::io::stderr().flush();
     sleep(PROVISION_GRACE).await;
 
-    let auth_resolver = hickory_resolver::Resolver::builder_with_config(
-        auth_ns_config(&ns_ips),
-        hickory_resolver::name_server::TokioConnectionProvider::default(),
-    )
-    .build();
-    let mut ips: Vec<std::net::IpAddr> = Vec::new();
-    if let Ok(lookup) = auth_resolver.ipv4_lookup(hostname).await {
-        for record in lookup.as_lookup().records() {
-            if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
-                ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
-            }
-        }
-    }
-    if ips.is_empty() {
-        if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
+    let auth_config = auth_ns_config(&ns_ips);
+    let mut last_print = Instant::now();
+    loop {
+        let auth_resolver = hickory_resolver::Resolver::builder_with_config(
+            auth_config.clone(),
+            hickory_resolver::name_server::TokioConnectionProvider::default(),
+        )
+        .build();
+        let mut ips: Vec<std::net::IpAddr> = Vec::new();
+        if let Ok(lookup) = auth_resolver.ipv4_lookup(hostname).await {
             for record in lookup.as_lookup().records() {
-                if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
-                    ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
+                if let hickory_resolver::proto::rr::RData::A(addr) = record.data() {
+                    ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)));
                 }
             }
         }
-    }
+        if ips.is_empty() {
+            if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
+                for record in lookup.as_lookup().records() {
+                    if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
+                        ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
+                    }
+                }
+            }
+        }
 
-    if ips.is_empty() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "  \u{2717} DNS provisioned ({:.1}s) [{}]: resolution failed",
-            start.elapsed().as_secs_f64(),
-            hostname,
-        );
-        let _ = std::io::stderr().flush();
-        return Err(n0_error::anyerr!(
-            "could not resolve {hostname} via authoritative DNS (the control plane reported the record as programmed, but the authoritative server returned no A/AAAA record)"
-        ));
-    }
+        if !ips.is_empty() {
+            let ip_str: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{2713} DNS provisioned ({:.1}s) [{}]: {}",
+                start.elapsed().as_secs_f64(),
+                hostname,
+                ip_str.join(", "),
+            );
+            let _ = std::io::stderr().flush();
+            return Ok(ips);
+        }
 
-    let ip_str: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
-    let _ = writeln!(
-        std::io::stderr(),
-        "  \u{2713} DNS provisioned ({:.1}s) [{}]: {}",
-        start.elapsed().as_secs_f64(),
-        hostname,
-        ip_str.join(", "),
-    );
-    let _ = std::io::stderr().flush();
-    Ok(ips)
+        if start.elapsed() >= max_duration {
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{2717} DNS provisioned ({:.1}s) [{}]: resolution failed",
+                start.elapsed().as_secs_f64(),
+                hostname,
+            );
+            let _ = std::io::stderr().flush();
+            return Err(n0_error::anyerr!(
+                "could not resolve {hostname} via authoritative DNS after {}s",
+                max_duration.as_secs(),
+            ));
+        }
+
+        if last_print.elapsed() >= Duration::from_secs(5) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "  \u{25CB} waiting for A record ({:.0}s) [{}]",
+                start.elapsed().as_secs_f64(),
+                hostname,
+            );
+            let _ = std::io::stderr().flush();
+            last_print = Instant::now();
+        }
+
+        sleep(retry_interval).await;
+    }
 }
 
 /// Probe a URL, falling back to the authoritative NS if the system resolver
