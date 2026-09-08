@@ -43,7 +43,7 @@ func NewCmd() *cobra.Command {
 	cmd.Flags().String("origin", "", "Local address to expose (host:port)")
 	cmd.Flags().Bool("dummy-origin", false, "Serve a built-in dummy HTTP origin on --origin instead of a real local service (defaults --origin to "+defaultDummyOriginAddr+")")
 	cmd.Flags().String("label", "", "Display name for the tunnel")
-	cmd.Flags().String("id", "", "Existing tunnel resource name to resume (mutually exclusive with --dummy-origin)")
+	cmd.Flags().String("id", "", "Existing tunnel resource name to resume; combine with --origin to re-point its endpoint")
 	cmd.Flags().Bool("yes", false, "Skip confirmation prompt")
 	cmd.Flags().String("log-file", "", "Path for Rust debug log output")
 	return cmd
@@ -56,10 +56,11 @@ func runInteractive(cmd *cobra.Command, args []string) error {
 	id, _ := cmd.Flags().GetString("id")
 	yes, _ := cmd.Flags().GetBool("yes")
 
-	if dummy && id != "" {
-		fmt.Fprintln(os.Stderr, "Error: --dummy-origin cannot be used with --id")
-		os.Exit(64)
-	}
+	// --dummy-origin + --id is allowed: the Rust binary already supports
+	// re-pointing an existing tunnel's endpoint via --id + --endpoint
+	// together (the same mechanism --label uses to rewire a resumed
+	// tunnel), so resuming a known-working tunnel and re-pointing it at a
+	// fresh dummy origin is a legitimate combination, not a conflict.
 	if dummy && origin == "" {
 		origin = defaultDummyOriginAddr
 	}
