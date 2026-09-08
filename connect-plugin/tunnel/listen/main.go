@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -54,6 +55,7 @@ func NewCmd() *cobra.Command {
 	cmd.Flags().String("name", "", "Tunnel name (required with --detach)")
 	cmd.Flags().String("log-file", "", "Path for Rust debug log output")
 	cmd.Flags().StringP("output", "o", "table", "Output format: table, json, yaml")
+	cmd.Flags().Int("dns-grace-period", 0, "Seconds to wait after route programming before the first authoritative DNS lookup (advanced; overrides the built-in default)")
 	return cmd
 }
 
@@ -134,6 +136,10 @@ func runListen(cmd *cobra.Command, args []string) error {
 	}
 	if yes {
 		rustArgs = append(rustArgs, "--yes")
+	}
+	if cmd.Flags().Changed("dns-grace-period") {
+		dnsGracePeriod, _ := cmd.Flags().GetInt("dns-grace-period")
+		rustArgs = append(rustArgs, "--dns-grace-period", strconv.Itoa(dnsGracePeriod))
 	}
 
 	// Create and start the command
