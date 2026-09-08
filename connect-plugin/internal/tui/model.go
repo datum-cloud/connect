@@ -169,13 +169,34 @@ func (m *Model) apply(msg rexec.TypedMessage) {
 		step, _ := msg.Fields["step"].(string)
 		status, _ := msg.Fields["status"].(string)
 		resource, _ := msg.Fields["resource"].(string)
+		reason, _ := msg.Fields["reason"].(string)
+		message, _ := msg.Fields["message"].(string)
 		label := stepLabel(step)
-		m.currentStep = label
 		icon := "○"
 		if status == "ready" {
 			icon = "✓"
+		} else {
+			// Only a still-pending step is actually blocking progress —
+			// don't let a step that just turned ready overwrite the header
+			// with "waiting on X" about something already done.
+			m.currentStep = label
 		}
-		m.appendLog(now, icon+" "+label+parenSuffix(resource))
+		line := icon + " " + label + parenSuffix(resource)
+		// Surface the underlying condition's own stated cause while a step
+		// is stuck — this is the platform's real explanation, which can be
+		// a masked failure (e.g. a quota rejection reported as a plain
+		// "Pending" status) that the step name and icon alone won't reveal.
+		// "Pending" alone is the boring, expected case and adds nothing
+		// beyond the icon; a real message is shown whenever present.
+		if status != "ready" {
+			switch {
+			case message != "":
+				line += ": " + message
+			case reason != "" && reason != "Pending":
+				line += ": " + reason
+			}
+		}
+		m.appendLog(now, line)
 
 	case "tunnel_verifying":
 		url, _ := msg.Fields["url"].(string)

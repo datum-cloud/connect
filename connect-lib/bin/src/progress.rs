@@ -19,7 +19,7 @@
 //!
 //! | Event type           | When                          | Fields                                                          |
 //! |----------------------|-------------------------------|-----------------------------------------------------------------|
-//! | `tunnel_progress`    | per step status transition    | `step` (snake_case kind), `status`, `resource` (Option<String>) |
+//! | `tunnel_progress`    | per step status transition    | `step` (snake_case kind), `status`, `resource` (Option<String>), `reason` (Option<String>, the underlying condition's `reason`), `message` (Option<String>, the underlying condition's `message` — e.g. a masked quota/scheduling failure the condition's `status`/`reason` alone wouldn't surface) |
 //! | `tunnel_verifying`   | start of HTTP probe per URL   | `url`                                                           |
 //! | `tunnel_verified`    | HTTP probe success per URL    | `url`                                                           |
 //!
@@ -125,6 +125,14 @@ pub fn render_progress_step(mode: Mode, step: &ProgressStep, _prev: StepStatus, 
             "step": step_kind_to_str(step.kind),
             "status": status_to_str(step.status),
             "resource": step.resource,
+            // The underlying condition's reason/message, refreshed every
+            // poll (see tunnels.rs's make_step) — forwarded even for a
+            // Pending step so a real cause (e.g. a masked quota/scheduling
+            // failure the platform reports as a generic "Pending" status)
+            // reaches the caller instead of being dropped on the floor
+            // until (if ever) a terminal failure is declared.
+            "reason": step.reason,
+            "message": step.message,
         });
         println!("{}", v);
     }
@@ -775,11 +783,44 @@ mod tests {
             "step": step_kind_to_str(s.kind),
             "status": status_to_str(s.status),
             "resource": s.resource,
+            "reason": s.reason,
+            "message": s.message,
         });
         let parsed: serde_json::Value = serde_json::from_str(&v.to_string()).unwrap();
         assert_eq!(parsed["type"], "tunnel_progress");
         assert_eq!(parsed["step"], "proxy_accepted");
         assert_eq!(parsed["status"], "ready");
         assert!(parsed["resource"].is_string());
+        assert!(parsed["reason"].is_null());
+        assert!(parsed["message"].is_null());
+    }
+
+    #[test]
+    fn json_progress_event_surfaces_reason_and_message_when_pending() {
+        // A step stuck Pending with a masked cause (e.g. a quota rejection
+        // the platform reports as a generic condition) must still carry the
+        // underlying reason/message through — this is the data a caller
+        // needs to tell "still legitimately working" apart from "silently
+        // stuck for an unreported reason".
+        let mut s = step(
+            ProgressStepKind::ProxyAccepted,
+            StepStatus::Pending,
+            Some("QuotaExceeded"),
+        );
+        s.message = Some("httpproxies.networking.datumapis.com quota exceeded (3/3)".to_string());
+        let v = serde_json::json!({
+            "type": "tunnel_progress",
+            "step": step_kind_to_str(s.kind),
+            "status": status_to_str(s.status),
+            "resource": s.resource,
+            "reason": s.reason,
+            "message": s.message,
+        });
+        let parsed: serde_json::Value = serde_json::from_str(&v.to_string()).unwrap();
+        assert_eq!(parsed["reason"], "QuotaExceeded");
+        assert_eq!(
+            parsed["message"],
+            "httpproxies.networking.datumapis.com quota exceeded (3/3)"
+        );
     }
 }
