@@ -44,6 +44,36 @@ use iroh::SecretKey;
 
 mod progress;
 
+/// Resolves on a shutdown request: Ctrl+C (SIGINT) everywhere, or, on Unix,
+/// SIGTERM as well. The Go supervisor (`connect/internal/supervise`)
+/// forwards whichever signal it itself receives — SIGINT or SIGTERM, from
+/// Ctrl+C, `kill`, `timeout`, a process manager, systemd stopping the
+/// service, etc. — without distinguishing between them. Reacting only to
+/// `tokio::signal::ctrl_c()` (SIGINT-only) would silently skip the
+/// delete_active tunnel/connector cleanup on every SIGTERM, orphaning them
+/// server-side with no local process left to clean them up.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                // Could not install a SIGTERM handler — fall back to Ctrl+C only.
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 type ReloadHandle = Handle<EnvFilter, Registry>;
 static RELOAD_HANDLE: OnceLock<ReloadHandle> = OnceLock::new();
 /// The filter string that `init_tracing()` actually installed.
@@ -181,7 +211,8 @@ enum Commands {
 }
 
 /// Why the Listen handler's runtime select-loop terminated. Drives the
-/// final exit status: CtrlC = clean exit 0; TerminalFailure / DeletedUpstream
+/// final exit status: CtrlC (SIGINT, or SIGTERM on Unix — see
+/// `shutdown_signal`) = clean exit 0; TerminalFailure / DeletedUpstream
 /// = exit 1 with an n0_error::anyerr! message.
 enum ExitReason {
     CtrlC,
@@ -831,7 +862,7 @@ async fn run() -> n0_error::Result<()> {
 
             let tunnel = tokio::select! {
                 res = setup => res?,
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_signal() => {
                     cleanup_tunnel(&service, &tunnel_id, json).await;
                     return Ok(());
                 }
@@ -860,7 +891,7 @@ async fn run() -> n0_error::Result<()> {
 
             // --- Mid-session watch loop (Plan 12-04) ---
             // After tunnel_ready, watch three signals concurrently:
-            //   1. ctrl_c        — user-initiated clean shutdown (exit 0)
+            //   1. shutdown_signal — ctrl_c or SIGTERM: clean shutdown (exit 0)
             //   2. login_state   — credential expiry/revocation guidance
             //                      (text or JSON; does NOT exit so user can read)
             //   3. 10s poll      — detect mid-session terminal failure
@@ -878,7 +909,7 @@ async fn run() -> n0_error::Result<()> {
 
             let exit_reason: ExitReason = loop {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
+                    _ = shutdown_signal() => {
                         break ExitReason::CtrlC;
                     }
                     res = login_rx.changed() => {
