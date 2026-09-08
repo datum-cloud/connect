@@ -309,22 +309,22 @@ func TestInstall_RequiresName(t *testing.T) {
 	}
 }
 
-func TestInstall_RequiresEndpoint(t *testing.T) {
+func TestInstall_RequiresOrigin(t *testing.T) {
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "install", "--name", "test-tun")
 	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Error("install without --endpoint should exit non-zero")
+		t.Error("install without --origin should exit non-zero")
 	}
-	if !strings.Contains(string(out), "--endpoint is required") {
-		t.Errorf("install without --endpoint should show '--endpoint is required':\n%s", out)
+	if !strings.Contains(string(out), "--origin is required") {
+		t.Errorf("install without --origin should show '--origin is required':\n%s", out)
 	}
 }
 
 func TestInstall_RequiresSession(t *testing.T) {
 	pluginBin := buildPlugin(t)
-	cmd := exec.Command(pluginBin, "tunnel", "install", "--name", "test-tun", "--endpoint", "localhost:8080")
+	cmd := exec.Command(pluginBin, "tunnel", "install", "--name", "test-tun", "--origin", "localhost:8080")
 	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
