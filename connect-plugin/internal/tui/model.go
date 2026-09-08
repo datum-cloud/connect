@@ -284,7 +284,7 @@ func (m Model) renderLog() string {
 	}
 	var b strings.Builder
 	for _, entry := range m.log[start:] {
-		b.WriteString(styleMuted.Render(entry.at.Format("15:04:05")) + "  " + entry.text + "\n")
+		b.WriteString(styleMuted.Render(entry.at.Format(time.RFC3339)) + "  " + entry.text + "\n")
 	}
 	return b.String()
 }
