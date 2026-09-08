@@ -350,7 +350,7 @@ func TestListenCommandWithFakeBinary(t *testing.T) {
 
 	connectDir, _ := os.Getwd()
 	// Start listen command
-	cmd := exec.Command(pluginBin, "tunnel", "listen", "--origin", "localhost:8080")
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080")
 	cmd.Env = append(os.Environ(),
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
@@ -405,7 +405,7 @@ func TestListenJSONMode(t *testing.T) {
 	pluginBin := buildPlugin(t)
 
 	connectDir, _ := os.Getwd()
-	cmd := exec.Command(pluginBin, "tunnel", "listen", "--origin", "localhost:8080", "--output", "json")
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080", "--output", "json")
 	cmd.Env = append(os.Environ(),
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
@@ -507,16 +507,16 @@ func TestPluginManifestProbeWorksWithoutConnectDir(t *testing.T) {
 	}
 }
 
-func TestListenMissingOriginAndId(t *testing.T) {
+func TestListenMissingEndpointAndId(t *testing.T) {
 	// EXIT-02: missing both --endpoint and --id exits with code 64.
-	// 12-02 expanded the validation: either --origin or --id satisfies
+	// 12-02 expanded the validation: either --endpoint or --id satisfies
 	// the requirement; neither still rejects.
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "listen")
 	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Error("listen without --origin or --id should exit non-zero")
+		t.Error("listen without --endpoint or --id should exit non-zero")
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		if exitErr.ExitCode() != 64 {
@@ -524,7 +524,7 @@ func TestListenMissingOriginAndId(t *testing.T) {
 		}
 	}
 	if !bytes.Contains(out, []byte("required")) {
-		t.Error("listen without --origin or --id should show 'required' error message")
+		t.Error("listen without --endpoint or --id should show 'required' error message")
 	}
 }
 
@@ -538,7 +538,7 @@ func TestListenSurfacesChildErrorBeforeReady(t *testing.T) {
 	pluginBin := buildPlugin(t)
 
 	connectDir, _ := os.Getwd()
-	cmd := exec.Command(pluginBin, "tunnel", "listen", "--origin", "localhost:8080")
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080")
 	cmd.Env = append(os.Environ(),
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"FAKE_DUMMY_MODE=error-before-ready",
@@ -578,25 +578,21 @@ func TestInteractiveMissingOriginAndId(t *testing.T) {
 	}
 }
 
-func TestInteractiveDummyOriginAllowedWithId(t *testing.T) {
-	// --dummy-origin + --id is a legitimate combination: it re-points an
-	// existing (possibly already-working) tunnel's endpoint at a fresh
-	// dummy origin, using the same --id + --endpoint rewire mechanism
-	// --label already relies on. It must NOT be rejected as a flag
-	// conflict — this should reach the TTY guard, same as any other valid
-	// invocation run without a terminal.
+func TestInteractiveDummyOriginConflictsWithId(t *testing.T) {
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "interactive", "--dummy-origin", "--id", "tun-123")
 	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Error("interactive without a TTY should exit non-zero")
+		t.Error("--dummy-origin with --id should exit non-zero")
 	}
-	if bytes.Contains(out, []byte("cannot be used with --id")) {
-		t.Errorf("--dummy-origin + --id should no longer be rejected as a conflict, got:\n%s", out)
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 64 {
+			t.Errorf("expected exit code 64 (semantic rejection), got %d", exitErr.ExitCode())
+		}
 	}
-	if !bytes.Contains(out, []byte("requires a terminal (TTY)")) {
-		t.Errorf("expected the TTY-required error, got:\n%s", out)
+	if !bytes.Contains(out, []byte("--dummy-origin cannot be used with --id")) {
+		t.Errorf("expected conflict error message, got:\n%s", out)
 	}
 }
 

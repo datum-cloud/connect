@@ -24,7 +24,7 @@ func NewCmd() *cobra.Command {
 	}
 	cmd.Flags().String("id", "", "Tunnel ID to update (required)")
 	cmd.Flags().String("label", "", "New display name")
-	cmd.Flags().String("origin", "", "New local address (host:port)")
+	cmd.Flags().String("endpoint", "", "New local address (host:port)")
 	cmd.Flags().StringP("output", "o", "table", "Output format: table, json, yaml")
 	return cmd
 }
@@ -38,7 +38,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 
 	id, _ := cmd.Flags().GetString("id")
 	label, _ := cmd.Flags().GetString("label")
-	origin, _ := cmd.Flags().GetString("origin")
+	endpoint, _ := cmd.Flags().GetString("endpoint")
 
 	if id == "" {
 		fmt.Fprintln(os.Stderr, "Error: --id is required")
@@ -59,14 +59,12 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	childEnv := env.Build(pluginCtx)
 
 	// Build args: --json update --id X [--label Y] [--endpoint Z]
-	// (--endpoint is the Rust binary's own flag name — see BuildListenArgs;
-	// --origin is only the user-facing datumctl flag name.)
 	rustArgs := []string{"--json", "update", "--id", id}
 	if label != "" {
 		rustArgs = append(rustArgs, "--label", label)
 	}
-	if origin != "" {
-		rustArgs = append(rustArgs, "--endpoint", origin)
+	if endpoint != "" {
+		rustArgs = append(rustArgs, "--endpoint", endpoint)
 	}
 
 	// Run
