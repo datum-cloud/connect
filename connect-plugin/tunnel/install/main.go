@@ -28,7 +28,9 @@ Requires a service-account session (created via 'datumctl login
 	}
 	cmd.Flags().String("name", "", "Tunnel name (required)")
 	cmd.Flags().String("label", "", "Display name")
+	cmd.Flags().String("origin", "", "Local address to expose (host:port, required)")
 	cmd.Flags().String("endpoint", "", "Local address to expose (host:port, required)")
+	cmd.Flags().MarkDeprecated("endpoint", "use --origin instead")
 	cmd.Flags().String("project", "", "Project ID (required)")
 	cmd.Flags().String("session", "", "Service-account session name (required)")
 	cmd.Flags().Bool("yes", false, "Skip confirmation")
@@ -38,7 +40,10 @@ Requires a service-account session (created via 'datumctl login
 func runInstall(cmd *cobra.Command, args []string) error {
 	name, _ := cmd.Flags().GetString("name")
 	label, _ := cmd.Flags().GetString("label")
-	endpoint, _ := cmd.Flags().GetString("endpoint")
+	origin, _ := cmd.Flags().GetString("origin")
+	if endpoint, _ := cmd.Flags().GetString("endpoint"); origin == "" && endpoint != "" {
+		origin = endpoint
+	}
 	project, _ := cmd.Flags().GetString("project")
 	session, _ := cmd.Flags().GetString("session")
 	yes, _ := cmd.Flags().GetBool("yes")
@@ -47,8 +52,8 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr, "Error: --name is required")
 		os.Exit(64)
 	}
-	if endpoint == "" {
-		fmt.Fprintln(os.Stderr, "Error: --endpoint is required")
+	if origin == "" {
+		fmt.Fprintln(os.Stderr, "Error: --origin is required")
 		os.Exit(64)
 	}
 	if session == "" {
@@ -94,7 +99,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	cfg := svcconfig.TunnelConfig{
 		Name:                  name,
 		Label:                 label,
-		Endpoint:              endpoint,
+		Endpoint:              origin,
 		Project:               project,
 		Session:               session,
 		CredentialsHelperPath: credentialsHelperPath,
