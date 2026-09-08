@@ -172,7 +172,8 @@ func (m *Model) apply(msg rexec.TypedMessage) {
 		resource, _ := msg.Fields["resource"].(string)
 		reason, _ := msg.Fields["reason"].(string)
 		message, _ := msg.Fields["message"].(string)
-		elapsed, _ := msg.Fields["elapsed_secs"].(float64)
+		stepElapsed, _ := msg.Fields["step_elapsed_secs"].(float64)
+		totalElapsed, _ := msg.Fields["total_elapsed_secs"].(float64)
 		label := stepLabel(step)
 		icon := "○"
 		if status == "ready" {
@@ -183,9 +184,10 @@ func (m *Model) apply(msg rexec.TypedMessage) {
 			// with "waiting on X" about something already done.
 			m.currentStep = label
 		}
-		// Seconds since this step was first observed — how long a Ready
-		// step took, or how long a Pending one has been stuck so far.
-		line := icon + " " + label + fmt.Sprintf(" (%.1fs)", elapsed) + bracketSuffix(resource)
+		// (step/total)s: time on this step so far, and time since the
+		// whole `tunnel listen` setup began — matches the same notation
+		// Rust's own stderr text mode uses.
+		line := icon + " " + label + fmt.Sprintf(" (%.1f/%.1fs)", stepElapsed, totalElapsed) + bracketSuffix(resource)
 		// Surface the underlying condition's own stated cause while a step
 		// is stuck — this is the platform's real explanation, which can be
 		// a masked failure (e.g. a quota rejection reported as a plain

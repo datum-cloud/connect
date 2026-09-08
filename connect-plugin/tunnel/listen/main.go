@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -43,6 +44,7 @@ func NewCmd() *cobra.Command {
 	cmd.Flags().String("name", "", "Tunnel name (required with --detach)")
 	cmd.Flags().String("log-file", "", "Path for Rust debug log output")
 	cmd.Flags().StringP("output", "o", "table", "Output format: table, json, yaml")
+	cmd.Flags().Int("dns-grace-period", 0, "Seconds to wait after route programming before the first authoritative DNS lookup (advanced; overrides the built-in default)")
 	return cmd
 }
 
@@ -110,6 +112,15 @@ func runListen(cmd *cobra.Command, args []string) error {
 	}
 
 	rustArgs := supervise.BuildListenArgs(pluginCtx.Project, origin, id, label, yes)
+	// --dns-grace-period is an advanced, listen-specific override (see
+	// connect-lib/bin/src/progress.rs's DEFAULT_PROVISION_GRACE) — kept as
+	// a conditional append here rather than folded into the shared
+	// BuildListenArgs helper, since it's not relevant to every caller of
+	// that helper (e.g. tunnel update).
+	if cmd.Flags().Changed("dns-grace-period") {
+		dnsGracePeriod, _ := cmd.Flags().GetInt("dns-grace-period")
+		rustArgs = append(rustArgs, "--dns-grace-period", strconv.Itoa(dnsGracePeriod))
+	}
 
 	// Determine mode
 	isJSON := false
