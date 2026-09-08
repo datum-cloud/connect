@@ -24,7 +24,9 @@ func NewCmd() *cobra.Command {
 	}
 	cmd.Flags().String("id", "", "Tunnel ID to update (required)")
 	cmd.Flags().String("label", "", "New display name")
+	cmd.Flags().String("origin", "", "New local address (host:port)")
 	cmd.Flags().String("endpoint", "", "New local address (host:port)")
+	cmd.Flags().MarkDeprecated("endpoint", "use --origin instead")
 	cmd.Flags().StringP("output", "o", "table", "Output format: table, json, yaml")
 	return cmd
 }
@@ -33,12 +35,15 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	// Server-of-truth (Phase 13 D-04, resolution table Item #11):
 	// This function delegates to the Rust binary which mutates the server-side
 	// HTTPProxy resource. It does NOT rewrite the local YAML config — the YAML
-	// is an install-time snapshot only. Runtime values (label, endpoint) come
+	// is an install-time snapshot only. Runtime values (label, origin) come
 	// from the server.
 
 	id, _ := cmd.Flags().GetString("id")
 	label, _ := cmd.Flags().GetString("label")
-	endpoint, _ := cmd.Flags().GetString("endpoint")
+	origin, _ := cmd.Flags().GetString("origin")
+	if endpoint, _ := cmd.Flags().GetString("endpoint"); origin == "" && endpoint != "" {
+		origin = endpoint
+	}
 
 	if id == "" {
 		fmt.Fprintln(os.Stderr, "Error: --id is required")
@@ -59,12 +64,14 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	childEnv := env.Build(pluginCtx)
 
 	// Build args: --json update --id X [--label Y] [--endpoint Z]
+	// (the Rust binary's flag is still named --endpoint; --origin is the
+	// plugin-facing name only)
 	rustArgs := []string{"--json", "update", "--id", id}
 	if label != "" {
 		rustArgs = append(rustArgs, "--label", label)
 	}
-	if endpoint != "" {
-		rustArgs = append(rustArgs, "--endpoint", endpoint)
+	if origin != "" {
+		rustArgs = append(rustArgs, "--endpoint", origin)
 	}
 
 	// Run
