@@ -627,21 +627,25 @@ func TestInteractiveMissingOriginAndId(t *testing.T) {
 	}
 }
 
-func TestInteractiveDummyOriginConflictsWithId(t *testing.T) {
+func TestInteractiveDummyOriginAllowedWithId(t *testing.T) {
+	// --dummy-origin + --id is a legitimate combination: it re-points an
+	// existing (possibly already-working) tunnel's endpoint at a fresh
+	// dummy origin, using the same --id + --endpoint rewire mechanism
+	// --label already relies on. It must NOT be rejected as a flag
+	// conflict — this should reach the TTY guard, same as any other valid
+	// invocation run without a terminal.
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "interactive", "--dummy-origin", "--id", "tun-123")
 	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Error("--dummy-origin with --id should exit non-zero")
+		t.Error("interactive without a TTY should exit non-zero")
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		if exitErr.ExitCode() != 64 {
-			t.Errorf("expected exit code 64 (semantic rejection), got %d", exitErr.ExitCode())
-		}
+	if bytes.Contains(out, []byte("cannot be used with --id")) {
+		t.Errorf("--dummy-origin + --id should no longer be rejected as a conflict, got:\n%s", out)
 	}
-	if !bytes.Contains(out, []byte("--dummy-origin cannot be used with --id")) {
-		t.Errorf("expected conflict error message, got:\n%s", out)
+	if !bytes.Contains(out, []byte("requires a terminal (TTY)")) {
+		t.Errorf("expected the TTY-required error, got:\n%s", out)
 	}
 }
 
