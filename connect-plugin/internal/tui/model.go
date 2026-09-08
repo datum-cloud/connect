@@ -10,6 +10,7 @@ package tui
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -156,7 +157,7 @@ func (m *Model) apply(msg rexec.TypedMessage) {
 		if m.status != "stopping" {
 			m.status = "ready"
 		}
-		m.appendLog(now, styleOK.Render("✓ tunnel ready"))
+		m.appendLog(now, styleOK.Render(fmt.Sprintf("✓ tunnel ready (%.0fs total)", ready.ElapsedSecs)))
 
 	case "tunnel_created":
 		id, _ := msg.Fields["id"].(string)
@@ -171,6 +172,7 @@ func (m *Model) apply(msg rexec.TypedMessage) {
 		resource, _ := msg.Fields["resource"].(string)
 		reason, _ := msg.Fields["reason"].(string)
 		message, _ := msg.Fields["message"].(string)
+		elapsed, _ := msg.Fields["elapsed_secs"].(float64)
 		label := stepLabel(step)
 		icon := "○"
 		if status == "ready" {
@@ -181,7 +183,9 @@ func (m *Model) apply(msg rexec.TypedMessage) {
 			// with "waiting on X" about something already done.
 			m.currentStep = label
 		}
-		line := icon + " " + label + parenSuffix(resource)
+		// Seconds since this step was first observed — how long a Ready
+		// step took, or how long a Pending one has been stuck so far.
+		line := icon + " " + label + fmt.Sprintf(" (%.1fs)", elapsed) + bracketSuffix(resource)
 		// Surface the underlying condition's own stated cause while a step
 		// is stuck — this is the platform's real explanation, which can be
 		// a masked failure (e.g. a quota rejection reported as a plain
@@ -232,6 +236,13 @@ func parenSuffix(s string) string {
 		return ""
 	}
 	return " (" + s + ")"
+}
+
+func bracketSuffix(s string) string {
+	if s == "" {
+		return ""
+	}
+	return " [" + s + "]"
 }
 
 func (m Model) View() tea.View {

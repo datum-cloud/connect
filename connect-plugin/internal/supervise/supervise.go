@@ -26,11 +26,12 @@ import (
 
 // TunnelReady is the "tunnel_ready" message shape emitted by the Rust binary.
 type TunnelReady struct {
-	ID        string   `json:"id"`
-	Label     string   `json:"label"`
-	Endpoint  string   `json:"endpoint"`
-	Hostnames []string `json:"hostnames"`
-	Status    string   `json:"status"`
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	Endpoint    string   `json:"endpoint"`
+	Hostnames   []string `json:"hostnames"`
+	Status      string   `json:"status"`
+	ElapsedSecs float64  `json:"elapsed_secs"`
 }
 
 // ErrExitedBeforeReady is returned by Run when the child's stdout closes —

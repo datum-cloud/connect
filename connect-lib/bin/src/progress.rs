@@ -133,6 +133,13 @@ pub fn render_progress_step(mode: Mode, step: &ProgressStep, _prev: StepStatus, 
             // until (if ever) a terminal failure is declared.
             "reason": step.reason,
             "message": step.message,
+            // Seconds since this step was first observed (see main.rs's
+            // step_started_at map) — previously only ever written to the
+            // stderr text line above, and only on the Ready transition.
+            // Forwarded here for every status so a caller watching JSON
+            // output can show how long a step has been sitting Pending,
+            // not just how long a completed one took.
+            "elapsed_secs": elapsed.as_secs_f64(),
         });
         println!("{}", v);
     }
@@ -778,6 +785,7 @@ mod tests {
         // We can't directly capture println output in a unit test trivially;
         // instead, reconstruct the same json! body and re-parse.
         let s = step(ProgressStepKind::ProxyAccepted, StepStatus::Ready, None);
+        let elapsed = Duration::from_secs_f64(1.5);
         let v = serde_json::json!({
             "type": "tunnel_progress",
             "step": step_kind_to_str(s.kind),
@@ -785,6 +793,7 @@ mod tests {
             "resource": s.resource,
             "reason": s.reason,
             "message": s.message,
+            "elapsed_secs": elapsed.as_secs_f64(),
         });
         let parsed: serde_json::Value = serde_json::from_str(&v.to_string()).unwrap();
         assert_eq!(parsed["type"], "tunnel_progress");
@@ -793,6 +802,7 @@ mod tests {
         assert!(parsed["resource"].is_string());
         assert!(parsed["reason"].is_null());
         assert!(parsed["message"].is_null());
+        assert_eq!(parsed["elapsed_secs"], 1.5);
     }
 
     #[test]
@@ -815,6 +825,7 @@ mod tests {
             "resource": s.resource,
             "reason": s.reason,
             "message": s.message,
+            "elapsed_secs": Duration::from_secs(45).as_secs_f64(),
         });
         let parsed: serde_json::Value = serde_json::from_str(&v.to_string()).unwrap();
         assert_eq!(parsed["reason"], "QuotaExceeded");
