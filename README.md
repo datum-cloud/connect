@@ -44,7 +44,7 @@ datumctl connect tunnel listen --help
 Once installed and authenticated, start a tunnel with the `connect tunnel` subcommand — see `datumctl connect tunnel listen --help` for the full set of flags (e.g. project, port, zone/service selection, foreground vs. daemon mode).
 
 ```
-datumctl connect tunnel listen --endpoint localhost:8000
+datumctl connect tunnel listen --origin localhost:8000
 ```
 
 ## Architecture

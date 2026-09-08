@@ -34,8 +34,10 @@ func NewCmd() *cobra.Command {
 		RunE:         runListen,
 	}
 	cmd.Flags().String("label", "", "Display name for the tunnel")
+	cmd.Flags().String("origin", "", "Local address to expose (host:port, required)")
 	cmd.Flags().String("endpoint", "", "Local address to expose (host:port, required)")
-	cmd.Flags().String("id", "", "Existing tunnel resource name to resume (mutually inclusive with optional --endpoint)")
+	cmd.Flags().MarkDeprecated("endpoint", "use --origin instead")
+	cmd.Flags().String("id", "", "Existing tunnel resource name to resume (mutually inclusive with optional --origin)")
 	cmd.Flags().Bool("yes", false, "Skip confirmation prompt")
 	cmd.Flags().Bool("detach", false, "Run in background (daemon mode)")
 	cmd.Flags().String("name", "", "Tunnel name (required with --detach)")
@@ -46,19 +48,22 @@ func NewCmd() *cobra.Command {
 
 func runListen(cmd *cobra.Command, args []string) error {
 	label, _ := cmd.Flags().GetString("label")
-	endpoint, _ := cmd.Flags().GetString("endpoint")
+	origin, _ := cmd.Flags().GetString("origin")
+	if endpoint, _ := cmd.Flags().GetString("endpoint"); origin == "" && endpoint != "" {
+		origin = endpoint
+	}
 	id, _ := cmd.Flags().GetString("id")
 	yes, _ := cmd.Flags().GetBool("yes")
 	detach, _ := cmd.Flags().GetBool("detach")
 	name, _ := cmd.Flags().GetString("name")
 	logFile, _ := cmd.Flags().GetString("log-file")
 
-	if endpoint == "" && id == "" {
+	if origin == "" && id == "" {
 		// Neither flag given — semantic rejection (EXIT-02).
 		// The Rust binary requires at least one of --endpoint or --id;
 		// when neither is set and stdin is non-interactive the picker
 		// also can't run, so reject here for a faster, clearer error.
-		fmt.Fprintln(os.Stderr, "Error: --endpoint or --id is required")
+		fmt.Fprintln(os.Stderr, "Error: --origin or --id is required")
 		os.Exit(64) // POSIX: semantic rejection (EXIT-02)
 	}
 
@@ -73,7 +78,7 @@ func runListen(cmd *cobra.Command, args []string) error {
 			os.Exit(64)
 		}
 		exe := daemon.SelfExe()
-		childArgs := daemon.ForegroundArgs(name, logFile, endpoint, label, yes)
+		childArgs := daemon.ForegroundArgs(name, logFile, origin, label, yes)
 		_, err := daemon.Daemonize(exe, append([]string{exe}, childArgs...))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: daemonize: %v\n", err)
@@ -98,13 +103,13 @@ func runListen(cmd *cobra.Command, args []string) error {
 
 	// Pass tunnel name to the Rust binary so it can construct the
 	// per-tunnel key path. Only set when the name is known upfront
-	// (detach mode). For --endpoint-only and picker paths, the name
+	// (detach mode). For --origin-only and picker paths, the name
 	// comes from the server after tunnel creation (handled in Rust).
 	if name != "" {
 		childEnv = append(childEnv, "DATUM_CONNECT_TUNNEL_NAME="+name)
 	}
 
-	rustArgs := supervise.BuildListenArgs(pluginCtx.Project, endpoint, id, label, yes)
+	rustArgs := supervise.BuildListenArgs(pluginCtx.Project, origin, id, label, yes)
 
 	// Determine mode
 	isJSON := false

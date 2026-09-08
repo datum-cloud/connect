@@ -350,7 +350,7 @@ func TestListenCommandWithFakeBinary(t *testing.T) {
 
 	connectDir, _ := os.Getwd()
 	// Start listen command
-	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080")
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--origin", "localhost:8080")
 	cmd.Env = append(os.Environ(),
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
@@ -405,7 +405,7 @@ func TestListenJSONMode(t *testing.T) {
 	pluginBin := buildPlugin(t)
 
 	connectDir, _ := os.Getwd()
-	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080", "--output", "json")
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--origin", "localhost:8080", "--output", "json")
 	cmd.Env = append(os.Environ(),
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
@@ -507,16 +507,16 @@ func TestPluginManifestProbeWorksWithoutConnectDir(t *testing.T) {
 	}
 }
 
-func TestListenMissingEndpointAndId(t *testing.T) {
-	// EXIT-02: missing both --endpoint and --id exits with code 64.
-	// 12-02 expanded the validation: either --endpoint or --id satisfies
+func TestListenMissingOriginAndId(t *testing.T) {
+	// EXIT-02: missing both --origin and --id exits with code 64.
+	// 12-02 expanded the validation: either --origin or --id satisfies
 	// the requirement; neither still rejects.
 	pluginBin := buildPlugin(t)
 	cmd := exec.Command(pluginBin, "tunnel", "listen")
 	cmd.Env = append(os.Environ(), "DATUM_CONNECT_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Error("listen without --endpoint or --id should exit non-zero")
+		t.Error("listen without --origin or --id should exit non-zero")
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		if exitErr.ExitCode() != 64 {
@@ -524,7 +524,56 @@ func TestListenMissingEndpointAndId(t *testing.T) {
 		}
 	}
 	if !bytes.Contains(out, []byte("required")) {
-		t.Error("listen without --endpoint or --id should show 'required' error message")
+		t.Error("listen without --origin or --id should show 'required' error message")
+	}
+}
+
+func TestListenEndpointAliasStillWorks(t *testing.T) {
+	// --endpoint is a deprecated alias for --origin, kept for tickets/docs
+	// that reference it.
+	fakeBin := buildFakeDatumConnect(t)
+	fakeHelper := buildFakeHelper(t, "testdata/fake-credentials-helper")
+	pluginBin := buildPlugin(t)
+
+	connectDir, _ := os.Getwd()
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080", "--output", "json")
+	cmd.Env = append(os.Environ(),
+		"FAKE_DATUM_CONNECT="+fakeBin,
+		"DATUM_CREDENTIALS_HELPER="+fakeHelper,
+		"DATUM_SESSION=dev",
+		"DATUM_CONNECT_DIR="+connectDir,
+		"PATH="+connectDir+":"+os.Getenv("PATH"))
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("failed to get stdout pipe: %v", err)
+	}
+	// Captured to a buffer (not a pipe) so nothing blocks waiting for it to
+	// fill/close while the tunnel is still running.
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("listen --endpoint failed to start: %v", err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	if !scanner.Scan() {
+		t.Fatal("listen --endpoint should still output ready JSON")
+	}
+	var ready map[string]interface{}
+	if err := json.Unmarshal(scanner.Bytes(), &ready); err != nil {
+		t.Fatalf("first line is not valid JSON: %s", scanner.Bytes())
+	}
+	if ready["status"] != "ready" {
+		t.Errorf("expected status='ready', got '%v'", ready["status"])
+	}
+
+	_ = cmd.Process.Signal(syscall.SIGINT)
+	cmd.Wait()
+
+	if !bytes.Contains(stderrBuf.Bytes(), []byte("deprecated")) {
+		t.Errorf("using --endpoint should print a deprecation notice; got stderr:\n%s", stderrBuf.String())
 	}
 }
 
@@ -538,7 +587,7 @@ func TestListenSurfacesChildErrorBeforeReady(t *testing.T) {
 	pluginBin := buildPlugin(t)
 
 	connectDir, _ := os.Getwd()
-	cmd := exec.Command(pluginBin, "tunnel", "listen", "--endpoint", "localhost:8080")
+	cmd := exec.Command(pluginBin, "tunnel", "listen", "--origin", "localhost:8080")
 	cmd.Env = append(os.Environ(),
 		"FAKE_DATUM_CONNECT="+fakeBin,
 		"FAKE_DUMMY_MODE=error-before-ready",
