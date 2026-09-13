@@ -5,6 +5,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, ResourceExt};
 use n0_error::{Result, StackResultExt, StdResultExt};
+use serde::Serialize;
 use serde_json::json;
 use tracing::{debug, warn};
 
@@ -39,7 +40,7 @@ const CONNECTOR_SELECTOR_FIELD: &str = "status.connectionDetails.publicKey.id";
 const ADVERTISEMENT_CONNECTOR_FIELD: &str = "spec.connectorRef.name";
 const DISPLAY_NAME_ANNOTATION: &str = "app.kubernetes.io/name";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TunnelSummary {
     pub id: String,
     pub label: String,
@@ -79,7 +80,7 @@ impl TunnelSummary {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TunnelDeleteOutcome {
     pub project_id: String,
     pub http_proxy: Option<String>,
@@ -127,7 +128,8 @@ fn condition_status(
 
 /// One checkpoint in the tunnel setup pipeline. Maps 1:1 to a controller
 /// condition; the order roughly tracks how a healthy setup progresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProgressStepKind {
     /// HTTPProxy `Accepted` — control plane accepted the resource.
     ProxyAccepted,
@@ -170,7 +172,8 @@ impl ProgressStepKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StepStatus {
     /// Controller hasn't reported on this condition yet.
     Unknown,
@@ -180,7 +183,7 @@ pub enum StepStatus {
     Ready,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProgressStep {
     pub kind: ProgressStepKind,
     pub status: StepStatus,
@@ -220,7 +223,7 @@ impl ProgressStep {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TunnelProgress {
     pub hostnames: Vec<String>,
     pub steps: Vec<ProgressStep>,

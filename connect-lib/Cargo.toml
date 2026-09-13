@@ -1,5 +1,5 @@
 [workspace]
-members = ["lib", "bin"]
+members = ["lib", "bin", "daemon"]
 resolver = "2"
 
 [workspace.lints.rust]

@@ -3,7 +3,9 @@ package pidfile
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -17,6 +19,39 @@ func PIDAlive(pid int) bool {
 		return false
 	}
 	return pidAlive(pid)
+}
+
+// TerminateGracefully sends SIGTERM to pid, polls PIDAlive until it exits or
+// grace elapses, then sends SIGKILL if it's still alive. Shared by every
+// caller that stops a supervised process (`tunnel stop`, `tunnel daemon
+// stop`) so the shutdown sequence and grace period can't silently drift
+// between them.
+func TerminateGracefully(pid int, grace time.Duration) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+
+	if runtime.GOOS == "windows" {
+		// os.Process.Signal only supports os.Kill on Windows — a SIGTERM
+		// send here silently fails, so waiting out the grace period first
+		// would just be a pointless delay before the same Kill call below.
+		return proc.Kill()
+	}
+
+	_ = proc.Signal(syscall.SIGTERM)
+
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if !PIDAlive(pid) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if PIDAlive(pid) {
+		return proc.Signal(syscall.SIGKILL)
+	}
+	return nil
 }
 
 // RunningTunnel holds info about a discovered running tunnel process.

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"go.datum.net/datumctl/plugin"
 )
@@ -26,11 +27,43 @@ import (
 // Caller responsibility: check RequireConnectDir() before calling Build;
 // if it returns an error, write FailConnectDirUnset() to stderr and
 // os.Exit(64).
+//
+// Overrides, not appends: os.Environ() already contains datumctl's own
+// DATUM_API_HOST/DATUM_CREDENTIALS_HELPER/DATUM_SESSION — datumctl sets
+// these (sometimes empty, e.g. when it couldn't resolve a context) before
+// exec-replacing into this plugin. A plain append() adds a second entry
+// for each key rather than replacing the first, and most platforms'
+// getenv-equivalent resolves duplicate keys by first occurrence — so the
+// value this function is supposed to set silently loses to datumctl's own
+// (possibly empty) one. WithOverrides removes any existing entry for each
+// key before appending the authoritative value.
 func Build(ctx plugin.PluginContext) []string {
-	result := os.Environ()
-	result = append(result, "DATUM_API_HOST="+ctx.APIHost)
-	result = append(result, "DATUM_CREDENTIALS_HELPER="+ctx.CredentialsHelper)
-	result = append(result, "DATUM_SESSION="+ctx.Session)
+	return WithOverrides(os.Environ(), map[string]string{
+		"DATUM_API_HOST":           ctx.APIHost,
+		"DATUM_CREDENTIALS_HELPER": ctx.CredentialsHelper,
+		"DATUM_SESSION":            ctx.Session,
+	})
+}
+
+// WithOverrides returns a copy of env with any existing entries for each
+// key in overrides removed, then the given key=value pairs appended — so
+// the appended value is the only one present, immune to first-occurrence-
+// wins duplicate-key lookup semantics. See Build's doc comment for why a
+// plain append() is not sufficient here.
+func WithOverrides(env []string, overrides map[string]string) []string {
+	result := make([]string, 0, len(env)+len(overrides))
+	for _, kv := range env {
+		key, _, found := strings.Cut(kv, "=")
+		if found {
+			if _, overridden := overrides[key]; overridden {
+				continue
+			}
+		}
+		result = append(result, kv)
+	}
+	for key, value := range overrides {
+		result = append(result, key+"="+value)
+	}
 	return result
 }
 

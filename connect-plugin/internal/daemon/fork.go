@@ -15,24 +15,37 @@ import (
 //
 // Returns the child PID.
 func Daemonize(exePath string, args []string) (int, error) {
+	return DaemonizeWithEnv(exePath, args, os.Environ())
+}
+
+// DaemonizeWithEnv is Daemonize with an explicit child environment, for
+// callers (like `tunnel daemon start`) that need to inject plugin-mode
+// credentials (DATUM_SESSION, DATUM_CREDENTIALS_HELPER, etc. — see
+// internal/env.Build) that aren't necessarily already present in the
+// current process's own environment.
+func DaemonizeWithEnv(exePath string, args []string, env []string) (int, error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("daemonize: no args provided")
 	}
 
 	attr := &os.ProcAttr{
 		Files: []*os.File{nil, nil, nil}, // Detach stdin/stdout/stderr
-		Env:   os.Environ(),
+		Env:   env,
 	}
 
 	proc, err := os.StartProcess(exePath, args, attr)
 	if err != nil {
 		return 0, fmt.Errorf("daemonize: start process: %w", err)
 	}
+	// Capture the PID before Release(): Go's Process.Release() resets
+	// Pid to -1 as a use-after-release safety measure, so reading
+	// proc.Pid afterward (the bug this replaced) always returns -1.
+	pid := proc.Pid
 
 	// Detach — don't wait for child
 	proc.Release()
 
-	return proc.Pid, nil
+	return pid, nil
 }
 
 // ForegroundArgs builds the args to pass to Daemonize for a foreground listen

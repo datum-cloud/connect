@@ -51,6 +51,7 @@ impl Repo {
 
     const CONFIG_FILE: &str = "config.yml";
     const CONNECT_KEY_FILE: &str = "connect_key";
+    const PEER_LISTEN_KEY_FILE: &str = "peer_listen_key";
     pub const LISTEN_KEY_FILE: &str = "listen_key";
     const STATE_FILE: &str = "state.yml";
     pub fn default_location() -> Result<PathBuf, MissingConnectDir> {
@@ -131,6 +132,29 @@ impl Repo {
 
     pub async fn connect_key(&self) -> Result<SecretKey> {
         let key_file_path = self.0.join(Self::CONNECT_KEY_FILE);
+        self.secret_key(key_file_path).await
+    }
+
+    /// Stable identity for direct app-to-app peer connections (advertising
+    /// local targets and accepting inbound peer dials) — deliberately
+    /// separate from `listen_key`/`listen_key_for_project`'s identities
+    /// (which are for tunnels routed through Datum's gateway) so a peer's
+    /// EndpointId, and thus every ticket handed out for it, stays valid
+    /// across daemon restarts.
+    ///
+    /// **Does NOT, by itself, give peer advertisements their own
+    /// `ProxyState` list** — a `ListenNode` built with this key still calls
+    /// `Repo::load_state`, which loads the *same* on-disk proxy list every
+    /// other `ListenNode` sharing this `Repo`/connect_dir does, regardless
+    /// of which secret key it was built with. A caller relying on this key
+    /// alone for isolation between peer advertisements and tunnels will be
+    /// surprised — see `daemon/src/peer.rs`'s `PeerState::advertised` for
+    /// where that isolation is actually enforced today (a persisted
+    /// resource-id allowlist at the API layer, found necessary 2026-09-07 —
+    /// see NOTES.md). A real fix belongs here, scoping `load_state` (or an
+    /// equivalent) by identity/purpose rather than by connect_dir alone.
+    pub async fn peer_listen_key(&self) -> Result<SecretKey> {
+        let key_file_path = self.0.join(Self::PEER_LISTEN_KEY_FILE);
         self.secret_key(key_file_path).await
     }
 

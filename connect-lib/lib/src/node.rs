@@ -6,12 +6,12 @@ use iroh::{
 };
 use iroh_base::RelayUrl;
 use iroh_n0des::ApiSecret;
-use iroh_proxy_utils::upstream::UpstreamMetrics;
+use iroh_proxy_utils::upstream::{TargetMetrics, UpstreamMetrics};
 use iroh_proxy_utils::{
     ALPN as IROH_HTTP_CONNECT_ALPN, Authority, HttpProxyRequest, HttpProxyRequestKind,
 };
 use iroh_proxy_utils::{
-    downstream::{DownstreamProxy, EndpointAuthority, ProxyMode},
+    downstream::{DownstreamMetrics, DownstreamProxy, EndpointAuthority, ProxyMode},
     upstream::{AuthError, AuthHandler, UpstreamProxy},
 };
 use iroh_relay::dns::{DnsProtocol, DnsResolver};
@@ -64,6 +64,40 @@ impl ListenNode {
     pub async fn new_with_key(repo: Repo, secret_key: SecretKey) -> Result<Self> {
         let n0des_api_secret = n0des_api_secret_from_env()?;
         Self::build_with_key(repo, n0des_api_secret, secret_key).await
+    }
+
+    /// Construct a listen node using a pre-generated iroh identity and an
+    /// explicit relay mode, bypassing `DATUM_CONNECT_RELAY_URLS`/the
+    /// built-in Datum relay shortlist entirely. For peers that must never
+    /// route through Datum's own infrastructure at any layer (see
+    /// `ConnectNode::new_with_relay_mode` and NOTES.md's app-to-app
+    /// tunnels section) — e.g. `iroh::endpoint::default_relay_mode()` for
+    /// iroh's own public relays.
+    pub async fn new_with_key_and_relay_mode(
+        repo: Repo,
+        secret_key: SecretKey,
+        relay_mode: iroh::endpoint::RelayMode,
+    ) -> Result<Self> {
+        let n0des_api_secret = n0des_api_secret_from_env()?;
+        let config = repo.config().await?;
+        let endpoint = build_endpoint_with_relay_mode(secret_key, &config, relay_mode).await?;
+        let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
+        let state = repo.load_state().await?;
+
+        let upstream_proxy = UpstreamProxy::new(state.clone())?;
+        let metrics = upstream_proxy.metrics();
+
+        let router = Router::builder(endpoint)
+            .accept(IROH_HTTP_CONNECT_ALPN, upstream_proxy)
+            .spawn();
+
+        Ok(Self {
+            repo,
+            router,
+            state,
+            metrics,
+            _n0des: n0des,
+        })
     }
 
     #[instrument("listen-node", skip_all)]
@@ -147,6 +181,14 @@ impl ListenNode {
 
     pub fn metrics(&self) -> &Arc<UpstreamMetrics> {
         &self.metrics
+    }
+
+    /// Per-target byte/request metrics for one advertised target, keyed the
+    /// same way the underlying proxy already keys them internally — callers
+    /// (e.g. the peer-tunnel API) never need to know `Authority` exists.
+    /// `None` if nothing has been recorded for this target yet.
+    pub fn metrics_for(&self, data: &TcpProxyData) -> Option<Arc<TargetMetrics>> {
+        self.metrics.get(&Authority::from(data.clone()))
     }
 
     pub fn proxies(&self) -> Vec<ProxyState> {
@@ -296,8 +338,46 @@ impl ConnectNode {
         })
     }
 
+    /// Construct a connect node with an explicit relay mode, bypassing
+    /// `DATUM_CONNECT_RELAY_URLS`/the built-in Datum relay shortlist
+    /// entirely — see `ListenNode::new_with_key_and_relay_mode`'s doc
+    /// comment for why this exists (app-to-app peer tunnels must not
+    /// touch Datum's infrastructure at any layer, including relay choice).
+    pub async fn new_with_relay_mode(
+        repo: Repo,
+        relay_mode: iroh::endpoint::RelayMode,
+    ) -> Result<Self> {
+        let n0des_api_secret = n0des_api_secret_from_env()?;
+        let config = repo.config().await?;
+        let secret_key = repo.connect_key().await?;
+        let endpoint = build_endpoint_with_relay_mode(secret_key, &config, relay_mode).await?;
+        let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
+        let pool = DownstreamProxy::new(endpoint.clone(), Default::default());
+        Ok(Self {
+            endpoint,
+            _n0des: n0des,
+            proxy: pool,
+        })
+    }
+
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// The raw iroh endpoint — gives callers access to `conn_type()`/
+    /// `latency()` per remote peer (direct-vs-relay, RTT), mirroring
+    /// `ListenNode::endpoint()`.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Aggregate byte/connection metrics across every outbound connection
+    /// this node has ever made — the underlying proxy pool doesn't track
+    /// bytes per individual connection, only in total, so this is the
+    /// finest-grained view available for the connect/dial side (contrast
+    /// with `ListenNode::metrics_for`, which genuinely is per-target).
+    pub fn metrics(&self) -> &Arc<DownstreamMetrics> {
+        self.proxy.metrics()
     }
 
     pub async fn connect_and_bind_local(
@@ -322,7 +402,13 @@ impl ConnectNode {
         Ok(OutboundProxyHandle {
             remote_id,
             task,
-            bound_addr: bind_addr,
+            // The resolved address, not the input `bind_addr` — when the
+            // caller passes an ephemeral-port wildcard (e.g. "127.0.0.1:0",
+            // the default for both our daemon's peer-connect endpoint and
+            // its CLI), `bind_addr` still has port 0 in it, which is not a
+            // connectable address. `local_socket.local_addr()` (already
+            // computed above as `bound_addr`) has the real assigned port.
+            bound_addr,
             advertisment: advertisment.clone(),
         })
     }
@@ -355,6 +441,18 @@ impl OutboundProxyHandle {
 
 pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<Endpoint> {
     let relay_mode = relay_mode_from_env_or_build().await?;
+    build_endpoint_with_relay_mode(secret_key, common, relay_mode).await
+}
+
+/// Same as `build_endpoint`, but with the relay mode passed in directly
+/// instead of resolved from `DATUM_CONNECT_RELAY_URLS`/the built-in Datum
+/// shortlist — for callers that must not route through Datum's relay
+/// infrastructure regardless of environment configuration.
+pub async fn build_endpoint_with_relay_mode(
+    secret_key: SecretKey,
+    common: &Config,
+    relay_mode: iroh::endpoint::RelayMode,
+) -> Result<Endpoint> {
     let mut builder = match common.discovery_mode {
         crate::config::DiscoveryMode::Dns => {
             Endpoint::empty_builder(relay_mode).secret_key(secret_key)
@@ -719,6 +817,116 @@ mod tests {
         for relay in &parsed {
             assert_eq!(relay.scheme(), "https");
         }
+    }
+
+    /// End-to-end app-to-app (peer-to-peer) tunnel: two independent
+    /// identities, no Datum Cloud client, no project, no HTTPProxy/
+    /// Connector resource, and no Datum relay servers (explicit
+    /// `default_relay_mode()` — iroh's own public relays only). This is
+    /// the mechanism NOTES.md's "App-to-app tunnels" section documents as
+    /// already existing in this crate; this test proves it, not just that
+    /// it compiles.
+    #[tokio::test]
+    async fn app_to_app_tunnel_forwards_real_tcp_traffic() {
+        use crate::state::{Advertisment, ProxyState, TcpProxyData};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A real local target: a one-shot TCP echo server on an ephemeral port.
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = target_listener.accept().await.unwrap();
+            let mut buf = [0u8; 5];
+            sock.read_exact(&mut buf).await.unwrap();
+            sock.write_all(&buf).await.unwrap();
+        });
+
+        // "Server" side: advertise the target under a stable, freshly
+        // generated identity — no disk-persisted key needed for this test.
+        let server_repo = Repo::open_or_create(std::env::temp_dir().join(format!(
+            "app-to-app-server-{}",
+            uuid::Uuid::new_v4()
+        )))
+        .await
+        .unwrap();
+        let server_key = SecretKey::generate(&mut rand::rng());
+        let server_node = ListenNode::new_with_key_and_relay_mode(
+            server_repo,
+            server_key,
+            iroh::endpoint::default_relay_mode(),
+        )
+        .await
+        .unwrap();
+
+        // Give the server's endpoint a moment to register with a relay
+        // before anyone tries to dial it — same wait `start_tunnel` in the
+        // daemon already does for exactly this reason.
+        for _ in 0..40 {
+            if server_node.endpoint().addr().relay_urls().next().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        let data = TcpProxyData {
+            host: target_addr.ip().to_string(),
+            port: target_addr.port(),
+        };
+        let advertisment = Advertisment::new(data, Some("test-target".to_string()));
+        server_node
+            .set_proxy(ProxyState::new(advertisment.clone()))
+            .await
+            .unwrap();
+        let ticket = advertisment.ticket(server_node.endpoint_id());
+
+        // Ticket round-trips through its portable string form exactly like
+        // it would over our daemon's HTTP API / a pasted CLI argument.
+        let ticket_string = ticket.to_ticket_string();
+        let ticket: crate::state::AdvertismentTicket = ticket_string.parse().unwrap();
+
+        // "Client" side: a completely independent identity/repo, dialing
+        // the server's EndpointId directly.
+        let client_repo = Repo::open_or_create(std::env::temp_dir().join(format!(
+            "app-to-app-client-{}",
+            uuid::Uuid::new_v4()
+        )))
+        .await
+        .unwrap();
+        let client_node =
+            ConnectNode::new_with_relay_mode(client_repo, iroh::endpoint::default_relay_mode())
+                .await
+                .unwrap();
+
+        let handle = client_node
+            .connect_and_bind_local(
+                ticket.endpoint,
+                ticket.service(),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Real TCP traffic through the whole path: local socket -> iroh ->
+        // server's ListenNode -> real local target -> echoed back.
+        let mut client_sock = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::net::TcpStream::connect(handle.bound_addr()),
+        )
+        .await
+        .expect("connecting to the forwarded local port timed out")
+        .unwrap();
+        client_sock.write_all(b"hello").await.unwrap();
+        let mut echoed = [0u8; 5];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client_sock.read_exact(&mut echoed),
+        )
+        .await
+        .expect("reading the echo back through the peer tunnel timed out")
+        .unwrap();
+        assert_eq!(&echoed, b"hello");
+
+        handle.abort();
     }
 
     #[tokio::test]

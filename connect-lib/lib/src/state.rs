@@ -263,6 +263,16 @@ impl AdvertismentTicket {
     pub fn service(&self) -> &TcpProxyData {
         &self.data.data
     }
+
+    /// Portable, paste-able string form (base32, `Ticket::KIND`-prefixed) —
+    /// the counterpart to `FromStr`/`str::parse`, which already round-trips
+    /// this. Exposed as a plain method (rather than requiring callers to
+    /// import and call `iroh_tickets::Ticket::serialize` themselves) so
+    /// consumers of this crate don't need `iroh-tickets` as a direct
+    /// dependency just to print a ticket.
+    pub fn to_ticket_string(&self) -> String {
+        Ticket::serialize(self)
+    }
 }
 
 impl FromStr for AdvertismentTicket {

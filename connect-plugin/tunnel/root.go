@@ -3,6 +3,8 @@ package tunnel
 import (
 	"github.com/spf13/cobra"
 
+	tunnelapi "go.datum.net/datumctl-plugins/connect/tunnel/api"
+	tunneldaemon "go.datum.net/datumctl-plugins/connect/tunnel/daemon"
 	deletecmd "go.datum.net/datumctl-plugins/connect/tunnel/delete"
 	"go.datum.net/datumctl-plugins/connect/tunnel/install"
 	"go.datum.net/datumctl-plugins/connect/tunnel/list"
@@ -37,6 +39,8 @@ func NewCmd() *cobra.Command {
 	cmd.AddCommand(uninstall.NewCmd())
 	cmd.AddCommand(start.NewCmd())
 	cmd.AddCommand(run.NewCmd())
+	cmd.AddCommand(tunneldaemon.NewCmd())
+	cmd.AddCommand(tunnelapi.NewCmd())
 
 	return cmd
 }
