@@ -13,6 +13,7 @@ import (
 // Uses OS-level checks:
 //   - Unix: signals PID 0 (doesn't actually send a signal, just checks existence)
 //   - Windows: uses tasklist /FI
+//
 // Returns false for invalid PIDs, errors, and non-existent processes.
 func PIDAlive(pid int) bool {
 	if pid <= 0 {

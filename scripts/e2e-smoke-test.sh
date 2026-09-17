@@ -76,7 +76,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== create + start ==="
-CREATE_OUT=$(cli tunnel api create --label smoke-test --endpoint "127.0.0.1:$LOCAL_PORT")
+CREATE_OUT=$(cli tunnel api create --label smoke-test --origin "127.0.0.1:$LOCAL_PORT")
 TUNNEL_ID=$(echo "$CREATE_OUT" | grep -o '"id": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
 [ -z "$TUNNEL_ID" ] && { echo "FAILED to create tunnel:"; echo "$CREATE_OUT"; cat /tmp/daemon.log; exit 1; }
 echo "tunnel id: $TUNNEL_ID"
