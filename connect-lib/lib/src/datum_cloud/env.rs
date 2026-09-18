@@ -40,15 +40,15 @@ impl ApiEnv {
     /// An empty `DATUM_API_HOST` (set to `""`) is treated as unset — the
     /// function falls through to `from_env()`.
     pub fn from_env_with_host_override() -> Self {
-        if let Ok(host) = env::var("DATUM_API_HOST") {
-            if !host.is_empty() {
-                let api_url = if host.starts_with("http://") || host.starts_with("https://") {
-                    host
-                } else {
-                    format!("https://{}", host)
-                };
-                return ApiEnv::Custom { api_url };
-            }
+        if let Ok(host) = env::var("DATUM_API_HOST")
+            && !host.is_empty()
+        {
+            let api_url = if host.starts_with("http://") || host.starts_with("https://") {
+                host
+            } else {
+                format!("https://{}", host)
+            };
+            return ApiEnv::Custom { api_url };
         }
         Self::from_env()
     }
@@ -79,6 +79,7 @@ impl Default for ApiEnv {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -91,7 +92,7 @@ mod tests {
 
     #[test]
     fn default_respects_datum_api_env_when_no_host() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         cleanup_env();
         assert!(matches!(ApiEnv::default(), ApiEnv::Production));
         unsafe {
@@ -102,7 +103,7 @@ mod tests {
 
     #[test]
     fn from_env_with_host_override_uses_datum_api_host() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         cleanup_env();
         unsafe {
             std::env::set_var("DATUM_API_HOST", "https://custom.example.com");
@@ -123,7 +124,7 @@ mod tests {
 
     #[test]
     fn from_env_with_host_override_adds_https_scheme_when_missing() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         cleanup_env();
         unsafe {
             std::env::set_var("DATUM_API_HOST", "api.datum.net");
@@ -134,7 +135,7 @@ mod tests {
 
     #[test]
     fn from_env_with_host_override_preserves_existing_scheme() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         cleanup_env();
         unsafe {
             std::env::set_var("DATUM_API_HOST", "http://internal.api.datum.net");
@@ -147,7 +148,7 @@ mod tests {
 
     #[test]
     fn from_env_with_host_override_empty_falls_back_to_production() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         cleanup_env();
         unsafe {
             std::env::set_var("DATUM_API_HOST", "");

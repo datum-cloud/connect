@@ -251,7 +251,7 @@ impl AuthHandler for StateWrapper {
                 }
             }
             HttpProxyRequestKind::Absolute { target, .. } => {
-                if let Ok(authority) = Authority::from_absolute_uri(&target) {
+                if let Ok(authority) = Authority::from_absolute_uri(target) {
                     if self.tcp_proxy_exists(&authority.host, authority.port) {
                         Ok(())
                     } else {
@@ -705,6 +705,7 @@ pub(crate) async fn build_n0des_client_opt(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -722,10 +723,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_with_key_uses_provided_key_without_disk_read() {
+    async fn new_with_key_uses_provided_key_without_disk_read()
+    -> Result<(), Box<dyn std::error::Error>> {
         let tmp = std::env::temp_dir();
         let dir = tmp.join(format!("node-test-{}", uuid::Uuid::new_v4()));
-        let repo = Repo::open_or_create(&dir).await.unwrap();
+        let repo = Repo::open_or_create(&dir).await?;
 
         // Generate a key in memory.
         let key = SecretKey::generate(&mut rand::rng());
@@ -735,13 +737,12 @@ mod tests {
                 .relay_mode(iroh::endpoint::RelayMode::Default)
                 .secret_key(key.clone())
                 .bind()
-                .await
-                .unwrap();
+                .await?;
             ep.id()
         };
 
         // new_with_key should use the key directly (no disk read needed).
-        let node = ListenNode::new_with_key(repo, key).await.unwrap();
+        let node = ListenNode::new_with_key(repo, key).await?;
 
         // The endpoint ID must match the provided key's derived ID.
         assert_eq!(
@@ -749,5 +750,6 @@ mod tests {
             expected_id,
             "endpoint ID must match the provided key"
         );
+        Ok(())
     }
 }

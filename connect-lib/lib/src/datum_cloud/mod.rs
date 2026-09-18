@@ -51,17 +51,12 @@ pub(crate) mod auth {
         pub expires_in: StdDuration,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
     pub enum LoginState {
+        #[default]
         Missing,
         Valid,
         Refreshing,
-    }
-
-    impl Default for LoginState {
-        fn default() -> Self {
-            LoginState::Missing
-        }
     }
 
     #[derive(Debug, Clone)]
@@ -100,16 +95,6 @@ pub(crate) mod auth {
 
         pub fn load(&self) -> Arc<AuthState> {
             self.0.load_full()
-        }
-
-        pub fn get(&self) -> Result<Arc<AuthState>, ()> {
-            Ok(self.0.load_full())
-        }
-    }
-
-    impl AuthState {
-        pub fn get(&self) -> Result<&AuthState, ()> {
-            Ok(self)
         }
     }
 
@@ -395,6 +380,7 @@ pub struct Project {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::test_util::setup_plugin_env;
@@ -426,8 +412,7 @@ mod tests {
         let (_dir, token_source) = setup_plugin_env();
         let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
         let auth_state = client.auth_state();
-        assert!(auth_state.get().is_ok());
-        let auth = auth_state.get().unwrap();
+        let auth = auth_state.load();
         assert_eq!(auth.profile.user_id, "external");
         assert_eq!(auth.profile.email, "external@plugin");
     }

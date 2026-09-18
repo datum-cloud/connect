@@ -382,10 +382,10 @@ fn system_nameservers() -> Vec<std::net::IpAddr> {
     let mut ips = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("nameserver ") {
-            if let Ok(ip) = rest.trim().parse::<std::net::IpAddr>() {
-                ips.push(ip);
-            }
+        if let Some(rest) = line.strip_prefix("nameserver ")
+            && let Ok(ip) = rest.trim().parse::<std::net::IpAddr>()
+        {
+            ips.push(ip);
         }
     }
     ips
@@ -479,7 +479,10 @@ async fn discover_ns_authority(
     // most labels (deepest) when n is smallest. Return the first level that
     // has NS records — that is the innermost authority.
     for n in 1..labels.len() {
-        let domain: String = labels[n - 1..].join(".");
+        let Some(tail) = labels.get(n - 1..) else {
+            continue;
+        };
+        let domain: String = tail.join(".");
         let ns_ips = resolve_ns_ips(system_resolver, &domain).await;
         if !ns_ips.is_empty() {
             return (ns_ips, domain);
@@ -580,12 +583,12 @@ pub async fn resolve_hostname_dns(
                 }
             }
         }
-        if ips.is_empty() {
-            if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
-                for record in lookup.as_lookup().records() {
-                    if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
-                        ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
-                    }
+        if ips.is_empty()
+            && let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await
+        {
+            for record in lookup.as_lookup().records() {
+                if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
+                    ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
                 }
             }
         }
@@ -807,6 +810,7 @@ async fn probe_until_reachable(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::panic)]
     use super::*;
 
     fn step(kind: ProgressStepKind, status: StepStatus, reason: Option<&str>) -> ProgressStep {
@@ -858,7 +862,8 @@ mod tests {
     }
 
     #[test]
-    fn json_progress_event_parses_back_to_expected_fields() {
+    fn json_progress_event_parses_back_to_expected_fields()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         // We can't directly capture println output in a unit test trivially;
         // instead, reconstruct the same json! body and re-parse.
         let s = step(ProgressStepKind::ProxyAccepted, StepStatus::Ready, None);
@@ -868,10 +873,21 @@ mod tests {
             "status": status_to_str(s.status),
             "resource": s.resource,
         });
-        let parsed: serde_json::Value = serde_json::from_str(&v.to_string()).unwrap();
-        assert_eq!(parsed["type"], "tunnel_progress");
-        assert_eq!(parsed["step"], "proxy_accepted");
-        assert_eq!(parsed["status"], "ready");
-        assert!(parsed["resource"].is_string());
+        let parsed: serde_json::Value = serde_json::from_str(&v.to_string())?;
+        assert_eq!(
+            parsed.get("type"),
+            Some(&serde_json::json!("tunnel_progress"))
+        );
+        assert_eq!(
+            parsed.get("step"),
+            Some(&serde_json::json!("proxy_accepted"))
+        );
+        assert_eq!(parsed.get("status"), Some(&serde_json::json!("ready")));
+        assert!(
+            parsed
+                .get("resource")
+                .is_some_and(serde_json::Value::is_string)
+        );
+        Ok(())
     }
 }
