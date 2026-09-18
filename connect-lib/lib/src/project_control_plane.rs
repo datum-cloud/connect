@@ -6,24 +6,25 @@ use http::header::USER_AGENT;
 use kube::{Client, Config};
 use n0_error::{Result, StdResultExt};
 use n0_future::task::AbortOnDropHandle;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::watch;
 use tracing::warn;
 
 use crate::datum_cloud::DatumCloudClient;
 use crate::datum_cloud::LoginState;
+use crate::datum_cloud::TokenSource;
 use crate::http_user_agent::datum_http_user_agent;
 
 #[derive(derive_more::Debug, Clone)]
 pub struct ProjectControlPlaneClient {
     project_id: String,
     server_url: String,
-    access_token: Arc<ArcSwap<String>>,
+    access_token: Arc<ArcSwap<SecretString>>,
     #[debug("kube::Client")]
     client: Arc<ArcSwap<Client>>,
     datum: DatumCloudClient,
     _auth_task: Option<Arc<AbortOnDropHandle<()>>>,
-    token_rx: Option<watch::Receiver<String>>,
+    token_rx: Option<watch::Receiver<SecretString>>,
 }
 
 impl ProjectControlPlaneClient {
@@ -37,7 +38,7 @@ impl ProjectControlPlaneClient {
         let mut this = Self {
             project_id,
             server_url,
-            access_token: Arc::new(ArcSwap::from_pointee(access_token)),
+            access_token: Arc::new(ArcSwap::from_pointee(SecretString::from(access_token))),
             client: Arc::new(ArcSwap::from_pointee(client)),
             datum,
             _auth_task: None,
@@ -50,11 +51,11 @@ impl ProjectControlPlaneClient {
     pub fn new_with_token_source(
         project_id: String,
         server_url: String,
-        token_source: crate::datum_cloud::external_token_source::ExternalTokenSource,
+        token_source: Arc<dyn TokenSource>,
     ) -> Result<Self> {
         let initial_token = token_source.token();
-        let client = Self::build_kube_client(&server_url, &initial_token)?;
-        let datum = DatumCloudClient::with_external_token_source(
+        let client = Self::build_kube_client(&server_url, initial_token.expose_secret())?;
+        let datum = DatumCloudClient::with_token_source(
             crate::ApiEnv::from_env_with_host_override(),
             token_source.clone(),
         );
@@ -79,7 +80,7 @@ impl ProjectControlPlaneClient {
         &self.server_url
     }
 
-    pub fn access_token(&self) -> String {
+    pub fn access_token(&self) -> SecretString {
         self.access_token.load_full().as_ref().clone()
     }
 
@@ -89,7 +90,7 @@ impl ProjectControlPlaneClient {
 
     pub async fn client_refreshed(&self) -> Result<Client> {
         let access_token = self.datum.token();
-        self.rebuild_if_changed(&access_token)?;
+        self.rebuild_if_changed(access_token.expose_secret())?;
         Ok(self.client())
     }
 
@@ -107,20 +108,21 @@ impl ProjectControlPlaneClient {
 
     fn rebuild_if_changed(&self, access_token: &str) -> Result<()> {
         let current = self.access_token.load_full();
-        if current.as_ref().as_str() == access_token {
+        if current.expose_secret() == access_token {
             return Ok(());
         }
 
         let client = Self::build_kube_client(&self.server_url, access_token)?;
         self.client.store(Arc::new(client));
-        self.access_token.store(Arc::new(access_token.to_string()));
+        self.access_token
+            .store(Arc::new(SecretString::from(access_token.to_owned())));
         Ok(())
     }
 
     async fn refresh_client_from_update(&self) -> Result<()> {
         if self.datum.is_plugin_mode() {
             let token = self.datum.token();
-            return self.rebuild_if_changed(&token);
+            return self.rebuild_if_changed(token.expose_secret());
         }
         let auth_state = self.datum.auth_state();
         let auth = auth_state.load();
@@ -142,8 +144,8 @@ impl ProjectControlPlaneClient {
                     if token_rx.changed().await.is_err() {
                         return;
                     }
-                    let new_token = (*token_rx.borrow()).clone();
-                    if let Err(err) = client.rebuild_if_changed(&new_token) {
+                    let new_token = token_rx.borrow().clone();
+                    if let Err(err) = client.rebuild_if_changed(new_token.expose_secret()) {
                         warn!("failed to refresh project control plane client: {err:#}");
                     }
                 }
@@ -185,7 +187,7 @@ mod tests {
     #[allow(unused_imports)]
     use super::*;
     #[allow(unused_imports)]
-    use crate::test_util::setup_plugin_env;
+    use crate::test_util::static_token_source;
 
     // These tests require rustls CryptoProvider (requires 'ring' or 'aws-lc-rs'
     // feature). Gate behind a feature flag so they don't fail in CI when
@@ -195,7 +197,7 @@ mod tests {
     #[test]
     #[cfg(feature = "integration-tests")]
     fn new_with_token_source_accepts_external_token_source() {
-        let (_dir, token_source) = setup_plugin_env();
+        let token_source = static_token_source();
         let result = ProjectControlPlaneClient::new_with_token_source(
             "test-project".to_string(),
             "https://api.datum.net/apis/resourcemanager.miloapis.com/v1alpha1/projects/test-project/control-plane".to_string(),
@@ -207,7 +209,7 @@ mod tests {
     #[test]
     #[cfg(feature = "integration-tests")]
     fn new_with_token_source_sets_project_id() {
-        let (_dir, token_source) = setup_plugin_env();
+        let token_source = static_token_source();
         let pcp = ProjectControlPlaneClient::new_with_token_source(
             "my-project-id".to_string(),
             "https://api.datum.net/apis/resourcemanager.miloapis.com/v1alpha1/projects/my-project-id/control-plane".to_string(),
@@ -221,22 +223,22 @@ mod tests {
     #[test]
     #[cfg(feature = "integration-tests")]
     fn access_token_returns_token_from_source() {
-        let (_dir, token_source) = setup_plugin_env();
-        let expected_token = token_source.token();
+        let token_source = static_token_source();
+        let expected_token = token_source.token().expose_secret().to_owned();
         let pcp = ProjectControlPlaneClient::new_with_token_source(
             "test-project".to_string(),
             "https://api.datum.net/apis/resourcemanager.miloapis.com/v1alpha1/projects/test-project/control-plane".to_string(),
             token_source,
         );
         if let Ok(pcp) = pcp {
-            assert_eq!(pcp.access_token(), expected_token);
+            assert_eq!(pcp.access_token().expose_secret(), expected_token);
         }
     }
 
     #[test]
     #[cfg(feature = "integration-tests")]
     fn server_url_is_stored() {
-        let (_dir, token_source) = setup_plugin_env();
+        let token_source = static_token_source();
         let server_url = "https://custom.api.net/apis/resourcemanager.miloapis.com/v1alpha1/projects/test/control-plane".to_string();
         let pcp = ProjectControlPlaneClient::new_with_token_source(
             "test-project".to_string(),
@@ -251,7 +253,7 @@ mod tests {
     #[test]
     #[cfg(feature = "integration-tests")]
     fn datum_is_plugin_mode_after_new_with_token_source() {
-        let (_dir, token_source) = setup_plugin_env();
+        let token_source = static_token_source();
         let pcp = ProjectControlPlaneClient::new_with_token_source(
             "test-project".to_string(),
             "https://api.datum.net/apis/resourcemanager.miloapis.com/v1alpha1/projects/test-project/control-plane".to_string(),

@@ -7,6 +7,8 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use super::token_source::TokenSource;
+
 /// Errors that can occur when constructing an [`ExternalTokenSource`] from environment.
 #[derive(Debug, thiserror::Error)]
 pub enum ExternalTokenError {
@@ -30,7 +32,7 @@ pub enum ExternalTokenError {
 #[derive(Clone)]
 pub struct ExternalTokenSource {
     token: std::sync::Arc<ArcSwap<SecretString>>,
-    token_tx: std::sync::Arc<watch::Sender<String>>,
+    token_tx: std::sync::Arc<watch::Sender<SecretString>>,
     refresh_trigger: std::sync::Arc<watch::Sender<u64>>,
 }
 
@@ -68,26 +70,15 @@ impl ExternalTokenSource {
             "ExternalTokenSource::from_env — token loaded from helper"
         );
 
+        let token = SecretString::from(token);
         let (token_tx, _) = watch::channel(token.clone());
         let (refresh_tx, _) = watch::channel(0u64);
 
         Ok(Self {
-            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
-                token.clone().into(),
-            ))),
+            token: std::sync::Arc::new(ArcSwap::from_pointee(token)),
             token_tx: std::sync::Arc::new(token_tx),
             refresh_trigger: std::sync::Arc::new(refresh_tx),
         })
-    }
-
-    /// Returns the current token as a plain `String`.
-    pub fn token(&self) -> String {
-        self.token.load_full().expose_secret().to_string()
-    }
-
-    /// Returns a watch channel subscriber for token updates.
-    pub fn watch(&self) -> watch::Receiver<String> {
-        self.token_tx.subscribe()
     }
 
     /// Atomically swaps the token and notifies watch subscribers.
@@ -96,9 +87,8 @@ impl ExternalTokenSource {
             new_token_len = new_token.len(),
             "ExternalTokenSource::swap_token"
         );
-        self.token.store(std::sync::Arc::new(SecretString::new(
-            new_token.clone().into(),
-        )));
+        let new_token = SecretString::from(new_token);
+        self.token.store(std::sync::Arc::new(new_token.clone()));
         let _ = self.token_tx.send(new_token);
     }
 
@@ -110,25 +100,11 @@ impl ExternalTokenSource {
     pub fn start_refresh(&self, helper: String, session: String) {
         let this = self.clone();
         let mut refresh_rx = self.refresh_trigger.subscribe();
-        let initial_exp = parse_jwt_expiry(&self.token()).unwrap_or_default();
+        let initial_exp = parse_jwt_expiry(self.token().expose_secret()).unwrap_or_default();
         tokio::spawn(async move {
             this.run_refresh_loop(helper, session, &mut refresh_rx, initial_exp)
                 .await;
         });
-    }
-
-    /// Triggers an immediate token refresh.
-    ///
-    /// Call this when a 401 response is observed from the API.
-    /// The refresh loop wakes up early, re-executes the credentials helper,
-    /// and calls [`swap_token()`](Self::swap_token) with the result.
-    pub fn force_refresh(&self) {
-        let current = *self.refresh_trigger.borrow();
-        info!(
-            trigger_count = current.wrapping_add(1),
-            "token refresh: forced refresh requested (401 or stale auth observed)"
-        );
-        let _ = self.refresh_trigger.send(current.wrapping_add(1));
     }
 
     fn exec_helper(helper: &str, session: &str) -> Result<String, ExternalTokenError> {
@@ -211,7 +187,9 @@ impl ExternalTokenSource {
             // Execute helper to get a fresh token
             match Self::exec_helper(&helper, &session) {
                 Ok(new_token) => {
-                    let prev_exp = parse_jwt_expiry(&self.token()).ok().flatten();
+                    let prev_exp = parse_jwt_expiry(self.token().expose_secret())
+                        .ok()
+                        .flatten();
                     let new_exp = parse_jwt_expiry(&new_token).ok().flatten();
                     self.swap_token(new_token.clone());
                     backoff = std::time::Duration::from_secs(5); // Reset backoff
@@ -243,6 +221,30 @@ impl ExternalTokenSource {
                 }
             }
         }
+    }
+}
+
+impl TokenSource for ExternalTokenSource {
+    fn token(&self) -> SecretString {
+        SecretString::from(self.token.load_full().expose_secret().to_owned())
+    }
+
+    fn watch(&self) -> watch::Receiver<SecretString> {
+        self.token_tx.subscribe()
+    }
+
+    /// Triggers an immediate token refresh.
+    ///
+    /// Call this when a 401 response is observed from the API.
+    /// The refresh loop wakes up early, re-executes the credentials helper,
+    /// and calls [`swap_token()`](Self::swap_token) with the result.
+    fn force_refresh(&self) {
+        let current = *self.refresh_trigger.borrow();
+        info!(
+            trigger_count = current.wrapping_add(1),
+            "token refresh: forced refresh requested (401 or stale auth observed)"
+        );
+        let _ = self.refresh_trigger.send(current.wrapping_add(1));
     }
 }
 
@@ -376,7 +378,7 @@ mod tests {
     #[test]
     fn from_env_succeeds_with_fake_helper() {
         let (_dir, source) = setup_plugin_env();
-        assert!(source.token().starts_with("eyJ"));
+        assert!(source.token().expose_secret().starts_with("eyJ"));
     }
 
     #[test]
@@ -398,8 +400,8 @@ mod tests {
         let new_token = make_jwt_with_exp(8888888888);
         source.swap_token(new_token.clone());
 
-        assert_eq!(source.token(), new_token);
-        assert_eq!(*rx.borrow(), new_token);
+        assert_eq!(source.token().expose_secret(), new_token);
+        assert_eq!(rx.borrow().expose_secret(), new_token);
     }
 
     #[test]
@@ -409,7 +411,7 @@ mod tests {
         for i in 1..=5 {
             let new_token = make_jwt_with_exp(7777777000 + i);
             source.swap_token(new_token.clone());
-            assert_eq!(source.token(), new_token);
+            assert_eq!(source.token().expose_secret(), new_token);
         }
     }
 
@@ -417,7 +419,7 @@ mod tests {
     fn watch_receiver_initial_value() {
         let (_dir, source) = setup_plugin_env();
         let rx = source.watch();
-        assert_eq!(*rx.borrow(), source.token());
+        assert_eq!(rx.borrow().expose_secret(), source.token().expose_secret());
     }
 
     #[test]
@@ -425,11 +427,14 @@ mod tests {
         let (_dir, source) = setup_plugin_env();
         let cloned = source.clone();
 
-        assert_eq!(source.token(), cloned.token());
+        assert_eq!(
+            source.token().expose_secret(),
+            cloned.token().expose_secret()
+        );
 
         let new_token = make_jwt_with_exp(6666666000);
         source.swap_token(new_token.clone());
-        assert_eq!(cloned.token(), new_token);
+        assert_eq!(cloned.token().expose_secret(), new_token);
     }
 
     #[test]
@@ -508,18 +513,16 @@ mod tests {
         std::fs::write(&counter_path, "0").expect("should reset counter");
         // Build the source by hand so from_env() doesn't consume the first
         // helper invocation (we want the *loop* to be the one rotating).
-        let (token_tx, _) = watch::channel(initial.clone());
+        let (token_tx, _) = watch::channel(SecretString::from(initial.clone()));
         let (refresh_tx, _) = watch::channel(0u64);
         let source = ExternalTokenSource {
-            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
-                initial.clone().into(),
-            ))),
+            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::from(initial.clone()))),
             token_tx: std::sync::Arc::new(token_tx),
             refresh_trigger: std::sync::Arc::new(refresh_tx),
         };
 
         let rx = source.watch();
-        assert_eq!(*rx.borrow(), initial, "watch initial value");
+        assert_eq!(rx.borrow().expose_secret(), initial, "watch initial value");
 
         source.start_refresh(
             helper_path.to_string_lossy().to_string(),
@@ -529,19 +532,23 @@ mod tests {
         // Nothing should have rotated yet (proactive timer is far in the
         // future). Give the loop a moment to prove a negative.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(source.token(), initial, "no proactive refresh expected yet");
+        assert_eq!(
+            source.token().expose_secret(),
+            initial,
+            "no proactive refresh expected yet"
+        );
 
         // Force a refresh (as the heartbeat does on a 401) and wait for the
         // loop to re-exec the helper and swap the token.
         source.force_refresh();
         for _ in 0..40 {
-            if source.token() != initial {
+            if source.token().expose_secret() != initial {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        let new_token = source.token();
+        let new_token = source.token().expose_secret().to_owned();
         assert_ne!(
             new_token, initial,
             "force_refresh must have rotated the token"
@@ -550,6 +557,10 @@ mod tests {
             new_token.ends_with(".rotated"),
             "rotated token should come from the counter helper: {new_token}"
         );
-        assert_eq!(*rx.borrow(), new_token, "watchers notified of new token");
+        assert_eq!(
+            rx.borrow().expose_secret(),
+            new_token,
+            "watchers notified of new token"
+        );
     }
 }

@@ -8,7 +8,10 @@
 //! panicking on setup failure is the correct assertion mechanism.
 #![allow(clippy::expect_used, clippy::panic)]
 
+use std::sync::Arc;
+
 use crate::ExternalTokenSource;
+use crate::datum_cloud::{StaticTokenSource, TokenSource};
 use base64::Engine;
 use kube::core::ErrorResponse;
 
@@ -73,8 +76,20 @@ pub fn make_jwt_with_exp(exp: u64) -> String {
     format!("{header}.{payload}.fake_sig")
 }
 
+/// An in-memory [`TokenSource`] holding a far-future JWT.
+///
+/// Use this for any test that needs a `DatumCloudClient` but is not testing
+/// the credentials helper itself. It touches no process environment, so
+/// tests using it need no `ENV_LOCK` and can run in parallel.
+pub fn static_token_source() -> Arc<dyn TokenSource> {
+    Arc::new(StaticTokenSource::new(make_jwt_with_exp(9999999999)))
+}
+
 /// Create a temporary helper script that outputs a fake JWT, set env vars,
 /// and return a configured [`ExternalTokenSource`].
+///
+/// Only `external_token_source.rs` should need this: it exercises the real
+/// helper exec path. Everything else should use [`static_token_source`].
 ///
 /// The returned `TempDir` keeps the script alive for the test scope.
 ///
