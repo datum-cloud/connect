@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use iroh::SecretKey;
 use n0_error::{Result, StackResultExt, StdResultExt};
@@ -149,7 +151,7 @@ impl Repo {
         if let Some(parent) = key_file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&key_file_path, key.to_bytes()).await?;
+        write_secret_key(&key_file_path, &key).await?;
         Ok(key)
     }
 
@@ -233,7 +235,7 @@ impl Repo {
         let tunnel_dir = self.0.join(project_id).join(tunnel_name);
         let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
         tokio::fs::create_dir_all(&tunnel_dir).await?;
-        tokio::fs::write(&key_file_path, key.to_bytes()).await?;
+        write_secret_key(&key_file_path, key).await?;
         Ok(())
     }
 
@@ -251,9 +253,9 @@ impl Repo {
         Ok(SecretKey::from_bytes(key))
     }
 
-    async fn create_key(&self, key_file_path: &PathBuf) -> Result<SecretKey> {
+    async fn create_key(&self, key_file_path: &Path) -> Result<SecretKey> {
         let key = SecretKey::generate(&mut rand::rng());
-        tokio::fs::write(key_file_path, key.to_bytes()).await?;
+        write_secret_key(key_file_path, &key).await?;
         Ok(key)
     }
 
@@ -268,6 +270,39 @@ impl Repo {
         if tunnel_dir.exists() {
             tokio::fs::remove_dir_all(&tunnel_dir).await?;
         }
+        Ok(())
+    }
+}
+
+/// Write a secret key to disk readable only by the current user.
+///
+/// On Unix the file is created with mode 0600 (and an existing file is
+/// tightened to 0600) so the iroh identity is not exposed to other local
+/// users through the default umask. On other platforms this is a plain
+/// write; there the state directory lives under the user's profile.
+async fn write_secret_key(path: &Path, key: &SecretKey) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .await?;
+        // `mode` only applies when the file is created; make sure a
+        // pre-existing key file ends up private too.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await?;
+        file.write_all(&key.to_bytes()).await?;
+        file.flush().await?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(path, key.to_bytes()).await?;
         Ok(())
     }
 }
@@ -467,6 +502,67 @@ mod tests {
             "should error when key does not exist (no legacy migration)"
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generated_keys_are_private() {
+        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+
+        repo.connect_key().await.unwrap();
+        assert_eq!(mode_of(&repo.0.join(Repo::CONNECT_KEY_FILE)), 0o600);
+
+        repo.listen_key_for_project("proj").await.unwrap();
+        assert_eq!(
+            mode_of(&repo.0.join("proj").join(Repo::LISTEN_KEY_FILE)),
+            0o600
+        );
+
+        let key = SecretKey::generate(&mut rand::rng());
+        repo.save_listen_key_for_tunnel("proj", "tun", &key)
+            .await
+            .unwrap();
+        assert_eq!(
+            mode_of(&repo.0.join("proj").join("tun").join(Repo::LISTEN_KEY_FILE)),
+            0o600
+        );
+
+        repo.listen_key(Some("proj")).await.unwrap();
+        let mut entries = tokio::fs::read_dir(&repo.0).await.unwrap();
+        let mut found = false;
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("listen_key.proj.") {
+                found = true;
+                assert_eq!(mode_of(&entry.path()), 0o600, "{name}");
+            }
+        }
+        assert!(found, "timestamped listen key must have been written");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overwriting_a_world_readable_key_tightens_permissions() {
+        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        let tunnel_dir = repo.0.join("proj").join("tun");
+        tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
+        let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
+        tokio::fs::write(&key_path, b"old").await.unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&key_path), 0o644, "precondition");
+
+        let key = SecretKey::generate(&mut rand::rng());
+        repo.save_listen_key_for_tunnel("proj", "tun", &key)
+            .await
+            .unwrap();
+        assert_eq!(mode_of(&key_path), 0o600);
+        assert_eq!(tokio::fs::read(&key_path).await.unwrap(), key.to_bytes());
     }
 }
 

@@ -700,10 +700,8 @@ async fn run() -> n0_error::Result<()> {
                 let tunnel = service.create_active(&label, &endpoint).await?;
                 // Persist the in-memory key to the per-tunnel directory.
                 if let Some(ref secret_key) = in_memory_key {
-                    let key_dir = repo.path().join(&project_id).join(&tunnel.id);
-                    let key_path = key_dir.join(Repo::LISTEN_KEY_FILE);
-                    tokio::fs::create_dir_all(&key_dir).await?;
-                    tokio::fs::write(&key_path, secret_key.to_bytes()).await?;
+                    repo.save_listen_key_for_tunnel(&project_id, &tunnel.id, secret_key)
+                        .await?;
                 }
                 if json {
                     println!(
