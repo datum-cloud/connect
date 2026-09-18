@@ -193,12 +193,17 @@ impl Repo {
     /// `Repo::listen_key()` path).
     const LEGACY_LISTEN_KEY: &'static str = "listen_key";
 
+    ///
+    /// Returns `Ok(None)` when no key exists for this tunnel and there is no
+    /// legacy key to migrate. A missing key is an expected state (the tunnel
+    /// was created on another machine, or the file was removed) and the
+    /// caller decides whether to generate a fresh identity.
     #[instrument("repo", skip_all)]
     pub async fn listen_key_for_tunnel(
         &self,
         project_id: &str,
         tunnel_name: &str,
-    ) -> Result<SecretKey> {
+    ) -> Result<Option<SecretKey>> {
         let tunnel_dir = self.0.join(project_id).join(tunnel_name);
         let key_file_path = tunnel_dir.join(Self::LISTEN_KEY_FILE);
 
@@ -214,13 +219,13 @@ impl Repo {
                 );
                 tokio::fs::rename(&legacy, &key_file_path).await?;
             } else {
-                n0_error::bail_any!("KEY_NOT_FOUND");
+                return Ok(None);
             }
         }
 
         let key = tokio::fs::read(&key_file_path).await?;
         let key = key.as_slice().try_into().anyerr()?;
-        Ok(SecretKey::from_bytes(key))
+        Ok(Some(SecretKey::from_bytes(key)))
     }
 
     /// Persist a key for a tunnel (used when regenerating a key for resume).
@@ -414,7 +419,8 @@ mod tests {
 
         let key = repo
             .listen_key_for_tunnel("my-project", "my-tunnel")
-            .await?;
+            .await?
+            .expect("key exists");
         assert!(key_path.exists(), "key must exist at per-tunnel path");
         assert_eq!(tokio::fs::read(&key_path).await?, key.to_bytes());
         Ok(())
@@ -436,7 +442,8 @@ mod tests {
         // Access per-tunnel for "default" tunnel — should migrate.
         let key = repo
             .listen_key_for_tunnel("proj-migrate", "default")
-            .await?;
+            .await?
+            .expect("legacy key migrated");
         assert_eq!(
             key.to_bytes(),
             legacy_bytes,
@@ -471,10 +478,12 @@ mod tests {
 
         let first = repo
             .listen_key_for_tunnel("stable-proj", "stable-tunnel")
-            .await?;
+            .await?
+            .expect("key exists");
         let second = repo
             .listen_key_for_tunnel("stable-proj", "stable-tunnel")
-            .await?;
+            .await?
+            .expect("key exists");
         assert_eq!(
             first.to_bytes(),
             second.to_bytes(),
@@ -495,8 +504,14 @@ mod tests {
             let seed_key = SecretKey::generate(&mut rand::rng());
             tokio::fs::write(&key_path, seed_key.to_bytes()).await?;
         }
-        let key_a = repo.listen_key_for_tunnel("multi-proj", "tunnel-a").await?;
-        let key_b = repo.listen_key_for_tunnel("multi-proj", "tunnel-b").await?;
+        let key_a = repo
+            .listen_key_for_tunnel("multi-proj", "tunnel-a")
+            .await?
+            .expect("key exists");
+        let key_b = repo
+            .listen_key_for_tunnel("multi-proj", "tunnel-b")
+            .await?
+            .expect("key exists");
         assert_ne!(
             key_a.to_bytes(),
             key_b.to_bytes(),
@@ -506,15 +521,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listen_key_for_tunnel_errors_when_key_missing()
+    async fn listen_key_for_tunnel_returns_none_when_key_missing()
     -> Result<(), Box<dyn std::error::Error>> {
         let repo = Repo::open_or_create(temp_repo_dir()).await?;
         let result = repo
             .listen_key_for_tunnel("missing-proj", "missing-tunnel")
-            .await;
+            .await?;
         assert!(
-            result.is_err(),
-            "should error when key does not exist (no legacy migration)"
+            result.is_none(),
+            "a missing key with no legacy file to migrate is Ok(None), not an error"
         );
         Ok(())
     }

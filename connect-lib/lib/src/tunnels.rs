@@ -32,7 +32,7 @@ use crate::datum_apis::traffic_protection_policy::{
     TrafficProtectionPolicyRuleSetType, TrafficProtectionPolicySpec,
 };
 use crate::datum_cloud::DatumCloudClient;
-use crate::kube_error::is_quota_check_timeout;
+use crate::kube_error::{classify_list_error, is_quota_check_timeout};
 use crate::{Advertisment, DEFAULT_PCP_NAMESPACE, ListenNode, TcpProxyData, state::ProxyState};
 const DEFAULT_CONNECTOR_CLASS_NAME: &str = "datum-connect";
 const CONNECTOR_SELECTOR_FIELD: &str = "status.connectionDetails.publicKey.id";
@@ -578,10 +578,9 @@ impl TunnelService {
             Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         let connectors_api: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
 
-        let proxy_list = proxies
-            .list(&ListParams::default())
-            .await
-            .std_context("Failed to list HTTPProxy objects")?;
+        let proxy_list = proxies.list(&ListParams::default()).await.map_err(|err| {
+            classify_list_error(project_id, "Failed to list HTTPProxy objects", err)
+        })?;
 
         let ad_list = ads
             .list(&ListParams::default())
@@ -1362,29 +1361,10 @@ impl TunnelService {
         let connectors: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
         let endpoint_id = self.listen.endpoint_id().to_string();
         let selector = format!("{CONNECTOR_SELECTOR_FIELD}={endpoint_id}");
-        let list = match connectors
+        let list = connectors
             .list(&ListParams::default().fields(&selector))
             .await
-        {
-            Ok(list) => list,
-            Err(kube::Error::Api(e)) if e.code == 403 => {
-                n0_error::bail_any!(
-                    "Permission denied listing connectors in project {project_id}. \
-                     Switch your datumctl context to this project first: \
-                     'datumctl ctx switch {project_id}'"
-                );
-            }
-            Err(kube::Error::Api(e)) if e.code == 401 => {
-                n0_error::bail_any!(
-                    "Authentication failed for project {project_id}. \
-                     Switch your datumctl context to this project first: \
-                     'datumctl ctx switch {project_id}'"
-                );
-            }
-            Err(err) => {
-                return Err(err).std_context("Failed to list connectors");
-            }
-        };
+            .map_err(|err| classify_list_error(project_id, "Failed to list connectors", err))?;
         if list.items.len() > 1 {
             debug!(
                 %selector,

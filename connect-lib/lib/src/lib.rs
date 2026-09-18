@@ -18,6 +18,7 @@ pub use datum_cloud::external_token_source::{ExternalTokenError, ExternalTokenSo
 pub use datum_cloud::{ApiEnv, AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
 pub use heartbeat::HeartbeatAgent;
 pub use http_user_agent::datum_http_user_agent;
+pub use kube_error::ControlPlaneError;
 pub use node::{ConnectNode, ListenNode, build_endpoint};
 pub use project_control_plane::ProjectControlPlaneClient;
 pub use repo::{MissingConnectDir, Repo};
