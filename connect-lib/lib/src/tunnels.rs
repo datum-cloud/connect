@@ -491,10 +491,9 @@ impl TunnelService {
         let connectors: Api<Connector> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         let ads: Api<ConnectorAdvertisement> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
 
-        let proxy_list = proxies
-            .list(&ListParams::default())
-            .await
-            .std_context("Failed to list HTTPProxy objects")?;
+        let proxy_list = proxies.list(&ListParams::default()).await.map_err(|err| {
+            classify_list_error(project_id, "Failed to list HTTPProxy objects", err)
+        })?;
 
         // Collect connector names referenced by non-deleting proxies.
         let referenced: std::collections::HashSet<String> = proxy_list
@@ -507,7 +506,9 @@ impl TunnelService {
         let connector_list = connectors
             .list(&ListParams::default())
             .await
-            .std_context("Failed to list Connector objects")?;
+            .map_err(|err| {
+                classify_list_error(project_id, "Failed to list Connector objects", err)
+            })?;
 
         let mut deleted = Vec::new();
         for c in connector_list.items {
@@ -582,10 +583,13 @@ impl TunnelService {
             classify_list_error(project_id, "Failed to list HTTPProxy objects", err)
         })?;
 
-        let ad_list = ads
-            .list(&ListParams::default())
-            .await
-            .std_context("Failed to list ConnectorAdvertisement objects")?;
+        let ad_list = ads.list(&ListParams::default()).await.map_err(|err| {
+            classify_list_error(
+                project_id,
+                "Failed to list ConnectorAdvertisement objects",
+                err,
+            )
+        })?;
         let enabled_by_name: std::collections::HashMap<String, ConnectorAdvertisement> = ad_list
             .items
             .into_iter()
@@ -596,7 +600,9 @@ impl TunnelService {
         let connector_list = connectors_api
             .list(&ListParams::default())
             .await
-            .std_context("Failed to list Connector objects")?;
+            .map_err(|err| {
+                classify_list_error(project_id, "Failed to list Connector objects", err)
+            })?;
         let connector_ready_by_name: std::collections::HashMap<String, bool> = connector_list
             .items
             .iter()
@@ -1292,10 +1298,13 @@ impl TunnelService {
 
         let mut connector_name_out: Option<String> = None;
         if let Some(connector_name) = connector_name {
-            let remaining = proxies
-                .list(&ListParams::default())
-                .await
-                .std_context("Failed to list remaining HTTPProxy objects")?;
+            let remaining = proxies.list(&ListParams::default()).await.map_err(|err| {
+                classify_list_error(
+                    project_id,
+                    "Failed to list remaining HTTPProxy objects",
+                    err,
+                )
+            })?;
             let mut remaining_for_connector = remaining
                 .items
                 .into_iter()
@@ -1313,7 +1322,13 @@ impl TunnelService {
                 let ads_list = ads
                     .list(&ListParams::default().fields(&ad_selector))
                     .await
-                    .std_context("Failed to list remaining ConnectorAdvertisements")?;
+                    .map_err(|err| {
+                        classify_list_error(
+                            project_id,
+                            "Failed to list remaining ConnectorAdvertisements",
+                            err,
+                        )
+                    })?;
                 for ad in ads_list.items {
                     if let Some(name) = ad.metadata.name.clone()
                         && let Err(err) = ads.delete(&name, &DeleteParams::default()).await

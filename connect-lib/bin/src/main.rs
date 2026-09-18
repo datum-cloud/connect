@@ -276,15 +276,15 @@ fn resolve_project(project_id: &str) -> SelectedContext {
 /// the user can do about it.
 fn control_plane_guidance(err: &ControlPlaneError) -> String {
     match err {
-        ControlPlaneError::ProjectNotFound { project_id } => format!(
+        ControlPlaneError::ProjectNotFound { project_id, .. } => format!(
             "{err}: the project's control plane is unreachable or does not exist on this \
              environment. Verify the project is correct and provisioned, then reinstall the \
              tunnel against the right project (e.g. `datumctl connect tunnel install \
              --name <tunnel> --project {project_id} --endpoint <addr> --session <session>`) \
              or confirm you are connected to the right environment."
         ),
-        ControlPlaneError::PermissionDenied { project_id }
-        | ControlPlaneError::Unauthorized { project_id } => format!(
+        ControlPlaneError::PermissionDenied { project_id, .. }
+        | ControlPlaneError::Unauthorized { project_id, .. } => format!(
             "{err}. Switch your datumctl context to this project first: \
              'datumctl ctx switch {project_id}'"
         ),

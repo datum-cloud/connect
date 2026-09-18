@@ -10,23 +10,47 @@ use n0_error::AnyError;
 /// The library deliberately reports only *what* went wrong. User-facing
 /// guidance (which `datumctl` command fixes it) belongs to the binary that
 /// knows how it was invoked.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Every variant keeps the original [`kube::Error`] as its `source` so the
+/// API status, reason and message stay available for diagnostics.
+#[derive(Debug, thiserror::Error)]
 pub enum ControlPlaneError {
     /// The project's control plane does not exist on this API host (HTTP 404
     /// on a `list`). A `list` against an existing control plane returns 200
     /// even when the namespace is empty, so a 404 can only mean the project
     /// itself is missing or unprovisioned.
     #[error("control plane for project '{project_id}' not found")]
-    ProjectNotFound { project_id: String },
+    ProjectNotFound {
+        project_id: String,
+        #[source]
+        source: kube::Error,
+    },
     /// The token is valid but not allowed to read this project (HTTP 403).
     #[error("permission denied in project '{project_id}'")]
-    PermissionDenied { project_id: String },
+    PermissionDenied {
+        project_id: String,
+        #[source]
+        source: kube::Error,
+    },
     /// The token was rejected outright (HTTP 401).
     #[error("authentication failed for project '{project_id}'")]
-    Unauthorized { project_id: String },
+    Unauthorized {
+        project_id: String,
+        #[source]
+        source: kube::Error,
+    },
 }
 
 impl ControlPlaneError {
+    /// The project this error is about.
+    pub fn project_id(&self) -> &str {
+        match self {
+            Self::ProjectNotFound { project_id, .. }
+            | Self::PermissionDenied { project_id, .. }
+            | Self::Unauthorized { project_id, .. } => project_id,
+        }
+    }
+
     /// Locate a `ControlPlaneError` anywhere in `err`'s source chain.
     ///
     /// `AnyError::downcast_ref` only inspects the outermost error, and every
@@ -49,22 +73,26 @@ impl ControlPlaneError {
 /// binary can act on them, and wrapping everything else with `context`.
 pub fn classify_list_error(project_id: &str, context: &str, err: kube::Error) -> AnyError {
     let project_id = project_id.to_string();
-    let classified = match &err {
-        kube::Error::Api(e) if e.code == 404 => {
-            Some(ControlPlaneError::ProjectNotFound { project_id })
-        }
-        kube::Error::Api(e) if e.code == 403 => {
-            Some(ControlPlaneError::PermissionDenied { project_id })
-        }
-        kube::Error::Api(e) if e.code == 401 => {
-            Some(ControlPlaneError::Unauthorized { project_id })
-        }
+    let code = match &err {
+        kube::Error::Api(e) => Some(e.code),
         _ => None,
     };
-    match classified {
-        Some(cp) => AnyError::from_std(cp).context(context.to_string()),
-        None => AnyError::from_std(err).context(context.to_string()),
-    }
+    let classified = match code {
+        Some(404) => ControlPlaneError::ProjectNotFound {
+            project_id,
+            source: err,
+        },
+        Some(403) => ControlPlaneError::PermissionDenied {
+            project_id,
+            source: err,
+        },
+        Some(401) => ControlPlaneError::Unauthorized {
+            project_id,
+            source: err,
+        },
+        _ => return AnyError::from_std(err).context(context.to_string()),
+    };
+    AnyError::from_std(classified).context(context.to_string())
 }
 
 /// Returns true if `err` is an HTTP 401 (unauthorized).
@@ -98,33 +126,43 @@ mod tests {
 
     #[test]
     fn classify_list_error_maps_project_level_status_codes() {
-        for (code, expected) in [
-            (
-                404,
-                ControlPlaneError::ProjectNotFound {
-                    project_id: "p".into(),
-                },
+        let err = classify_list_error("p", "listing", api_error(404, "NotFound"));
+        assert!(matches!(
+            ControlPlaneError::find_in(&err),
+            Some(ControlPlaneError::ProjectNotFound { project_id, .. }) if project_id == "p"
+        ));
+
+        let err = classify_list_error("p", "listing", api_error(403, "Forbidden"));
+        assert!(matches!(
+            ControlPlaneError::find_in(&err),
+            Some(ControlPlaneError::PermissionDenied { project_id, .. }) if project_id == "p"
+        ));
+
+        let err = classify_list_error("p", "listing", api_error(401, "Unauthorized"));
+        assert!(matches!(
+            ControlPlaneError::find_in(&err),
+            Some(ControlPlaneError::Unauthorized { project_id, .. }) if project_id == "p"
+        ));
+    }
+
+    #[test]
+    fn classified_error_keeps_the_kube_error_as_source() {
+        let err = classify_list_error("p", "listing", api_error(404, "NotFound"));
+        let cp = ControlPlaneError::find_in(&err).expect("classified");
+        assert_eq!(cp.project_id(), "p");
+        let source = std::error::Error::source(cp).expect("kube error retained as source");
+        assert!(
+            matches!(
+                source.downcast_ref::<kube::Error>(),
+                Some(kube::Error::Api(api)) if api.code == 404 && api.reason == "NotFound"
             ),
-            (
-                403,
-                ControlPlaneError::PermissionDenied {
-                    project_id: "p".into(),
-                },
-            ),
-            (
-                401,
-                ControlPlaneError::Unauthorized {
-                    project_id: "p".into(),
-                },
-            ),
-        ] {
-            let err = classify_list_error("p", "listing", api_error(code, "x"));
-            assert_eq!(
-                ControlPlaneError::find_in(&err),
-                Some(&expected),
-                "code {code}"
-            );
-        }
+            "source was {source}"
+        );
+        // The alternate Display walks the chain, so the API detail reaches the
+        // binary's "Underlying error" line.
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("listing"), "{rendered}");
+        assert!(rendered.contains("NotFound"), "{rendered}");
     }
 
     #[test]
@@ -145,7 +183,7 @@ mod tests {
         };
         assert!(matches!(
             ControlPlaneError::find_in(&wrapped),
-            Some(ControlPlaneError::ProjectNotFound { project_id }) if project_id == "p"
+            Some(ControlPlaneError::ProjectNotFound { project_id, .. }) if project_id == "p"
         ));
     }
 
