@@ -15,7 +15,10 @@ pub mod test_util;
 
 pub use config::{Config, DiscoveryMode};
 pub use datum_cloud::external_token_source::{ExternalTokenError, ExternalTokenSource};
-pub use datum_cloud::{ApiEnv, AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
+pub use datum_cloud::{
+    ApiEnv, AuthState, AuthTokens, LoginState, MaybeAuth, StaticTokenSource, TokenSource,
+    UserProfile,
+};
 pub use heartbeat::HeartbeatAgent;
 pub use http_user_agent::datum_http_user_agent;
 pub use kube_error::ControlPlaneError;
