@@ -2282,4 +2282,263 @@ mod tests {
         let desired_new_conn = advertisement_spec("datum-connect-NEW", target("127.0.0.1", 11434));
         assert!(!advertisement_spec_matches(&existing, &desired_new_conn));
     }
+
+    // ── TunnelService integration tests against the fake apiserver ────────
+    //
+    // Everything above this point tests pure functions (progress
+    // classification, spec-diffing, quota-error formatting). The tests
+    // below exercise the actual kube CRUD orchestration in create_project,
+    // update_project, set_enabled_project, delete_project and
+    // cleanup_orphaned_connectors_project against
+    // crate::fake_apiserver::FakeApiServer, via the DatumCloudClient
+    // test-only client-builder seam — the same construction and
+    // token-rotation code paths as production, just pointed at an
+    // in-memory store instead of a real cluster. No network, no TLS, no
+    // rustls CryptoProvider required.
+
+    async fn test_listen_node() -> ListenNode {
+        let dir = std::env::temp_dir().join(format!("tunnels-fake-test-{}", uuid::Uuid::new_v4()));
+        let repo = crate::Repo::open_or_create(&dir)
+            .await
+            .expect("open temp repo");
+        let key = iroh::SecretKey::generate(&mut rand::rng());
+        let node = ListenNode::new_with_key(repo, key)
+            .await
+            .expect("build listen node");
+        // ensure_connector only patches a connector's status.connectionDetails
+        // (which find_connector's field selector matches on) once the
+        // endpoint has a relay URL; mirrors the same bounded wait
+        // bin/src/main.rs does before its own first ensure_connector-
+        // triggering call, for the same reason.
+        for _ in 0..40 {
+            if node.endpoint().addr().relay_urls().next().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        node
+    }
+
+    async fn test_tunnel_service() -> (TunnelService, crate::fake_apiserver::FakeApiServer) {
+        let fake = crate::fake_apiserver::FakeApiServer::new();
+        let datum = DatumCloudClient::with_token_source(
+            crate::datum_cloud::ApiEnv::Production,
+            std::sync::Arc::new(crate::datum_cloud::StaticTokenSource::new("test-token")),
+        )
+        .with_test_client_builder({
+            let fake = fake.clone();
+            move |_server_url: &str, _access_token: &str| Ok(fake.client())
+        });
+        let listen = test_listen_node().await;
+        (TunnelService::new(datum, listen), fake)
+    }
+
+    fn fake_connector(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "networking.datumapis.com/v1alpha1",
+            "kind": "Connector",
+            "metadata": {"name": name},
+            "spec": {"connectorClassName": "datum-connect"},
+        })
+    }
+
+    fn fake_advertisement_for(name: &str, connector_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "networking.datumapis.com/v1alpha1",
+            "kind": "ConnectorAdvertisement",
+            "metadata": {"name": name},
+            "spec": {"connectorRef": {"name": connector_name}},
+        })
+    }
+
+    #[tokio::test]
+    async fn create_project_creates_connector_httpproxy_and_advertisement() {
+        let (service, fake) = test_tunnel_service().await;
+        let tunnel = service
+            .create_project("proj-a", "my-tunnel", "localhost:8080")
+            .await
+            .expect("create_project");
+
+        assert!(fake.get("httpproxies", "default", &tunnel.id).is_some());
+        assert_eq!(fake.names("connectors").len(), 1);
+        assert_eq!(
+            fake.names("connectoradvertisements"),
+            vec![tunnel.id.clone()]
+        );
+        assert_eq!(tunnel.label, "my-tunnel");
+        assert!(tunnel.enabled);
+    }
+
+    #[tokio::test]
+    async fn create_project_reuses_connector_across_two_tunnels_in_same_project() {
+        let (service, fake) = test_tunnel_service().await;
+        service
+            .create_project("proj-a", "first", "localhost:8080")
+            .await
+            .expect("create first");
+        service
+            .create_project("proj-a", "second", "localhost:9090")
+            .await
+            .expect("create second");
+
+        assert_eq!(
+            fake.names("connectors").len(),
+            1,
+            "both tunnels in the same project must share one connector \
+             (ensure_connector reuses rather than recreating)"
+        );
+        assert_eq!(fake.names("httpproxies").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_project_with_orphans_separates_referenced_from_unreferenced_connectors() {
+        let (service, fake) = test_tunnel_service().await;
+        service
+            .create_project("proj-a", "referenced", "localhost:8080")
+            .await
+            .expect("create referenced tunnel");
+        fake.insert(
+            "connectors",
+            "default",
+            "datum-connect-orphan",
+            fake_connector("datum-connect-orphan"),
+        );
+
+        let (tunnels, orphans) = service
+            .list_project_with_orphans("proj-a")
+            .await
+            .expect("list_project_with_orphans");
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(
+            orphans.first().expect("one orphan").name,
+            "datum-connect-orphan"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_removes_httpproxy_advertisement_and_last_connector() {
+        let (service, fake) = test_tunnel_service().await;
+        let tunnel = service
+            .create_project("proj-a", "my-tunnel", "localhost:8080")
+            .await
+            .expect("create");
+
+        let outcome = service
+            .delete_project("proj-a", &tunnel.id)
+            .await
+            .expect("delete_project");
+
+        assert_eq!(outcome.http_proxy.as_deref(), Some(tunnel.id.as_str()));
+        assert_eq!(outcome.connector_ad.as_deref(), Some(tunnel.id.as_str()));
+        assert!(
+            outcome.connector.is_some(),
+            "the deleted tunnel was the connector's last reference, so it must be deleted too"
+        );
+        assert!(fake.get("httpproxies", "default", &tunnel.id).is_none());
+        assert!(fake.names("connectors").is_empty());
+        assert!(fake.names("connectoradvertisements").is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_enabled_project_toggles_advertisement_existence() {
+        let (service, fake) = test_tunnel_service().await;
+        let tunnel = service
+            .create_project("proj-a", "my-tunnel", "localhost:8080")
+            .await
+            .expect("create");
+        assert_eq!(fake.names("connectoradvertisements").len(), 1);
+
+        let disabled = service
+            .set_enabled_project("proj-a", &tunnel.id, false)
+            .await
+            .expect("disable");
+        assert!(!disabled.enabled);
+        assert!(fake.names("connectoradvertisements").is_empty());
+
+        let enabled = service
+            .set_enabled_project("proj-a", &tunnel.id, true)
+            .await
+            .expect("re-enable");
+        assert!(enabled.enabled);
+        assert_eq!(fake.names("connectoradvertisements").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_project_is_idempotent_when_spec_already_matches() {
+        let (service, fake) = test_tunnel_service().await;
+        let tunnel = service
+            .create_project("proj-a", "my-tunnel", "localhost:8080")
+            .await
+            .expect("create");
+        let generation_after_create = fake
+            .get("httpproxies", "default", &tunnel.id)
+            .and_then(|obj| obj.pointer("/metadata/generation").cloned());
+
+        service
+            .update_project("proj-a", &tunnel.id, "my-tunnel", "localhost:8080")
+            .await
+            .expect("no-op update");
+        let generation_after_noop = fake
+            .get("httpproxies", "default", &tunnel.id)
+            .and_then(|obj| obj.pointer("/metadata/generation").cloned());
+        assert_eq!(
+            generation_after_create, generation_after_noop,
+            "a no-op update (identical label and endpoint) must skip the PATCH \
+             entirely, so metadata.generation must not move"
+        );
+
+        service
+            .update_project("proj-a", &tunnel.id, "renamed", "localhost:8080")
+            .await
+            .expect("real update");
+        let generation_after_rename = fake
+            .get("httpproxies", "default", &tunnel.id)
+            .and_then(|obj| obj.pointer("/metadata/generation").cloned());
+        assert_ne!(
+            generation_after_noop, generation_after_rename,
+            "an update that actually changes the label must patch"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_orphaned_connectors_deletes_unreferenced_connector_and_its_advertisements() {
+        let (service, fake) = test_tunnel_service().await;
+        service
+            .create_project("proj-a", "referenced", "localhost:8080")
+            .await
+            .expect("create referenced tunnel");
+        fake.insert(
+            "connectors",
+            "default",
+            "datum-connect-orphan",
+            fake_connector("datum-connect-orphan"),
+        );
+        fake.insert(
+            "connectoradvertisements",
+            "default",
+            "leftover-ad",
+            fake_advertisement_for("leftover-ad", "datum-connect-orphan"),
+        );
+
+        let deleted = service
+            .cleanup_orphaned_connectors_project("proj-a")
+            .await
+            .expect("cleanup_orphaned_connectors_project");
+
+        assert_eq!(deleted, vec!["datum-connect-orphan".to_string()]);
+        assert!(
+            fake.get("connectors", "default", "datum-connect-orphan")
+                .is_none()
+        );
+        assert!(
+            fake.get("connectoradvertisements", "default", "leftover-ad")
+                .is_none()
+        );
+        assert_eq!(
+            fake.names("connectors").len(),
+            1,
+            "the referenced tunnel's own connector must survive cleanup"
+        );
+    }
 }

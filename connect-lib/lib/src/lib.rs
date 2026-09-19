@@ -11,6 +11,8 @@ pub mod state;
 pub mod tunnels;
 
 #[cfg(test)]
+pub mod fake_apiserver;
+#[cfg(test)]
 pub mod test_util;
 
 pub use config::{Config, DiscoveryMode};

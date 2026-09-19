@@ -17,6 +17,9 @@ pub mod token_source;
 pub use self::env::ApiEnv;
 pub use self::token_source::{StaticTokenSource, TokenSource};
 
+/// Test-only client-builder override type; see `DatumCloudClient::with_test_client_builder`.
+type TestClientBuilder = Arc<dyn Fn(&str, &str) -> Result<kube::Client> + Send + Sync>;
+
 use self::external_token_source::ExternalTokenSource;
 
 /// Inline replacement for `openidconnect::AccessToken` — removed to avoid dependency.
@@ -155,6 +158,15 @@ pub struct DatumCloudClient {
     token_source: Arc<dyn TokenSource>,
     session: SessionStateWrapper,
     login_state_tx: watch::Sender<LoginState>,
+    /// Test-only override for how a `ProjectControlPlaneClient` built from
+    /// this `DatumCloudClient` constructs its `kube::Client` — substitutes
+    /// an in-memory fake apiserver for a real TLS connection. Always
+    /// present (as `None` in production) so
+    /// `ProjectControlPlaneClient::new` doesn't need a `#[cfg(test)]`
+    /// branch of its own; only the setter is test-gated. See
+    /// `Self::with_test_client_builder` and `crate::fake_apiserver`.
+    #[debug(skip)]
+    test_client_builder: Option<TestClientBuilder>,
 }
 
 impl DatumCloudClient {
@@ -166,7 +178,32 @@ impl DatumCloudClient {
             token_source,
             session: SessionStateWrapper::empty(),
             login_state_tx,
+            test_client_builder: None,
         }
+    }
+
+    /// Test-only: point every `ProjectControlPlaneClient` this client
+    /// builds (via `project_control_plane_client`, and any retained one's
+    /// token-rotation rebuild) at a custom `kube::Client` factory instead
+    /// of a real TLS connection. Not part of the public API — `pub(crate)`
+    /// and `#[cfg(test)]`, so only reachable from this crate's own test
+    /// code, typically wiring up a `crate::fake_apiserver::FakeApiServer`.
+    #[cfg(test)]
+    pub(crate) fn with_test_client_builder(
+        mut self,
+        builder: impl Fn(&str, &str) -> Result<kube::Client> + Send + Sync + 'static,
+    ) -> Self {
+        self.test_client_builder = Some(Arc::new(builder));
+        self
+    }
+
+    /// The test client-builder override, if one was set. Called
+    /// unconditionally from `ProjectControlPlaneClient::new` (production
+    /// code), so this accessor itself is not `#[cfg(test)]`-gated — it is
+    /// always `None` outside tests, which is the real value the field
+    /// carries in production.
+    pub(crate) fn test_client_builder(&self) -> Option<TestClientBuilder> {
+        self.test_client_builder.clone()
     }
 
     /// Constructs a `DatumCloudClient` using an `ExternalTokenSource` (plugin mode).
