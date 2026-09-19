@@ -15,6 +15,15 @@ use crate::datum_cloud::LoginState;
 use crate::datum_cloud::TokenSource;
 use crate::http_user_agent::datum_http_user_agent;
 
+/// Builds the `kube::Client` used to reach a project's control plane, given
+/// its server URL and current access token. Production always uses
+/// [`ProjectControlPlaneClient::build_kube_client`] (a real TLS client);
+/// tests can substitute an in-memory one (see
+/// `DatumCloudClient::with_test_client_builder` and
+/// `crate::fake_apiserver`) so the *same* construction and rotation code
+/// paths run against a fake apiserver instead of a cluster.
+type ClientBuilder = Arc<dyn Fn(&str, &str) -> Result<Client> + Send + Sync>;
+
 #[derive(derive_more::Debug, Clone)]
 pub struct ProjectControlPlaneClient {
     project_id: String,
@@ -25,6 +34,8 @@ pub struct ProjectControlPlaneClient {
     datum: DatumCloudClient,
     _auth_task: Option<Arc<AbortOnDropHandle<()>>>,
     token_rx: Option<watch::Receiver<SecretString>>,
+    #[debug(skip)]
+    build_client: ClientBuilder,
 }
 
 impl ProjectControlPlaneClient {
@@ -42,7 +53,20 @@ impl ProjectControlPlaneClient {
         access_token: String,
         datum: DatumCloudClient,
     ) -> Result<Self> {
-        let client = Self::build_kube_client(&server_url, &access_token)?;
+        let build_client: ClientBuilder = datum
+            .test_client_builder()
+            .unwrap_or_else(|| Arc::new(Self::build_kube_client));
+        Self::new_inner(project_id, server_url, access_token, datum, build_client)
+    }
+
+    fn new_inner(
+        project_id: String,
+        server_url: String,
+        access_token: String,
+        datum: DatumCloudClient,
+        build_client: ClientBuilder,
+    ) -> Result<Self> {
+        let client = build_client(&server_url, &access_token)?;
         // Share datum's token source watch channel so this client keeps
         // observing rotations for as long as it's retained, instead of only
         // ever seeing the token it was constructed with. Every
@@ -57,6 +81,7 @@ impl ProjectControlPlaneClient {
             datum,
             _auth_task: None,
             token_rx,
+            build_client,
         };
         this.start_auth_watch();
         Ok(this)
@@ -85,22 +110,17 @@ impl ProjectControlPlaneClient {
         token_source: Arc<dyn TokenSource>,
     ) -> Result<Self> {
         let initial_token = token_source.token();
-        let client = Self::build_kube_client(&server_url, initial_token.expose_secret())?;
         let datum = DatumCloudClient::with_token_source(
             crate::ApiEnv::from_env_with_host_override(),
-            token_source.clone(),
+            token_source,
         );
-        let mut this = Self {
+        Self::new_inner(
             project_id,
             server_url,
-            access_token: Arc::new(ArcSwap::from_pointee(initial_token)),
-            client: Arc::new(ArcSwap::from_pointee(client)),
+            initial_token.expose_secret().to_owned(),
             datum,
-            _auth_task: None,
-            token_rx: Some(token_source.watch()),
-        };
-        this.start_auth_watch();
-        Ok(this)
+            Arc::new(Self::build_kube_client),
+        )
     }
 
     pub fn project_id(&self) -> &str {
@@ -151,7 +171,7 @@ impl ProjectControlPlaneClient {
             return Ok(());
         }
 
-        let client = Self::build_kube_client(&self.server_url, access_token)?;
+        let client = (self.build_client)(&self.server_url, access_token)?;
         self.client.store(Arc::new(client));
         self.access_token
             .store(Arc::new(SecretString::from(access_token.to_owned())));

@@ -56,3 +56,10 @@ uuid = { version = "1", features = ["v4"] }
 # panics rather than returning `Err`, which the "if let Ok(pcp) = pcp { .. }"
 # skip pattern those tests use cannot catch.
 rustls = { version = "0.23", features = ["ring"] }
+# In-memory fake apiserver (fake_apiserver.rs): builds a kube::Client over a
+# custom tower::Service instead of a real TLS connection, so TunnelService
+# can be tested without a cluster. All three are already in the dependency
+# graph transitively via kube-client; pinned here at the same versions.
+tower = { version = "0.5", default-features = false }
+http-body-util = "0.1"
+bytes = "1"
