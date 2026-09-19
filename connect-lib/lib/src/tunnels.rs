@@ -501,7 +501,7 @@ impl TunnelService {
             .items
             .iter()
             .filter(|p| p.metadata.deletion_timestamp.is_none())
-            .filter_map(|p| proxy_connector_name(p))
+            .filter_map(proxy_connector_name)
             .collect();
 
         let connector_list = connectors
@@ -1385,9 +1385,6 @@ impl TunnelService {
                 return Err(err).std_context("Failed to list connectors");
             }
         };
-        if list.items.is_empty() {
-            return Ok(None);
-        }
         if list.items.len() > 1 {
             debug!(
                 %selector,
@@ -1395,7 +1392,9 @@ impl TunnelService {
                 "Multiple connectors found for endpoint, using first"
             );
         }
-        let mut connector = list.items.into_iter().next().unwrap();
+        let Some(mut connector) = list.items.into_iter().next() else {
+            return Ok(None);
+        };
         patch_device_annotations(&connectors, &mut connector).await;
         Ok(Some(connector))
     }
@@ -1891,6 +1890,7 @@ fn create_traffic_protection_policies_enabled() -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::datum_apis::connector::{ConnectorSpec, ConnectorStatus};
@@ -2039,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_step_carries_resource_label() {
+    fn progress_step_carries_resource_label() -> Result<(), Box<dyn std::error::Error>> {
         // Every step should know which Kubernetes resource backs it so the
         // CLI can render "[HTTPProxy/tunnel-test]" or
         // "[Connector/datum-connect-test]" alongside the line — that's
@@ -2062,18 +2062,19 @@ mod tests {
         let progress_no_conn = TunnelProgress::from_resources(&p, None);
         let iroh = progress_no_conn
             .step(ProgressStepKind::IrohDnsPublished)
-            .unwrap();
+            .ok_or("IrohDnsPublished step must exist")?;
         assert!(
             iroh.resource.is_none(),
             "connector-backed step has no resource when connector is missing"
         );
         let proxy_step = progress_no_conn
             .step(ProgressStepKind::ProxyAccepted)
-            .unwrap();
+            .ok_or("ProxyAccepted step must exist")?;
         assert_eq!(
             proxy_step.resource.as_deref(),
             Some("HTTPProxy/tunnel-test")
         );
+        Ok(())
     }
 
     fn api_error(code: u16, message: &str) -> kube::Error {
@@ -2121,7 +2122,8 @@ mod tests {
     }
 
     #[test]
-    fn progress_pending_when_status_is_stale_for_current_generation() {
+    fn progress_pending_when_status_is_stale_for_current_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
         // `tunnel listen --id` PATCHes the HTTPProxy spec to re-point the
         // backend at the current connector, bumping generation 1 → 2. The
         // controller's prior True conditions still carry observedGeneration=1
@@ -2157,11 +2159,12 @@ mod tests {
         assert_eq!(
             progress_fresh
                 .step(ProgressStepKind::ProxyProgrammed)
-                .unwrap()
+                .ok_or("ProxyProgrammed step must exist")?
                 .status,
             StepStatus::Ready,
             "matched observedGeneration must be Ready"
         );
+        Ok(())
     }
 
     fn proxy_with_backend(label: &str, endpoint: &str, connector_name: &str) -> HTTPProxy {

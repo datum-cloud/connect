@@ -273,6 +273,7 @@ impl Repo {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -283,12 +284,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listen_key_for_project_migrates_legacy_into_first_project() {
+    async fn listen_key_for_project_migrates_legacy_into_first_project()
+    -> Result<(), Box<dyn std::error::Error>> {
         // The legacy `listen_key` lived at the repo root and was reused for
         // every project the CLI talked to. The migration must move (not copy)
         // it into the first project that requests it, so the second project
         // gets a fresh identity instead of joining the cross-project DNS race.
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
         // Create a legacy key at the plain LISTEN_KEY_FILE path (no timestamp).
         let legacy = SecretKey::generate(&mut rand::rng());
         let legacy_bytes = legacy.to_bytes();
@@ -298,7 +300,7 @@ mod tests {
             .expect("should write legacy key");
         assert!(legacy_path.exists(), "precondition: legacy key exists");
 
-        let p1 = repo.listen_key_for_project("project-a").await.unwrap();
+        let p1 = repo.listen_key_for_project("project-a").await?;
         assert_eq!(
             p1.to_bytes(),
             legacy_bytes,
@@ -311,65 +313,67 @@ mod tests {
         let p1_path = repo.0.join("project-a").join(Repo::LISTEN_KEY_FILE);
         assert!(p1_path.exists(), "key must now live under the project dir");
 
-        let p2 = repo.listen_key_for_project("project-b").await.unwrap();
+        let p2 = repo.listen_key_for_project("project-b").await?;
         assert_ne!(
             p2.to_bytes(),
             legacy_bytes,
             "second project must get a fresh key, not the legacy one"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn listen_key_for_project_is_stable_across_calls() {
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
-        let first = repo.listen_key_for_project("project-x").await.unwrap();
-        let second = repo.listen_key_for_project("project-x").await.unwrap();
+    async fn listen_key_for_project_is_stable_across_calls()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
+        let first = repo.listen_key_for_project("project-x").await?;
+        let second = repo.listen_key_for_project("project-x").await?;
         assert_eq!(
             first.to_bytes(),
             second.to_bytes(),
             "repeat calls must return the same persisted key"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn listen_key_for_project_generates_fresh_without_legacy() {
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
-        let key = repo.listen_key_for_project("only-project").await.unwrap();
+    async fn listen_key_for_project_generates_fresh_without_legacy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
+        let key = repo.listen_key_for_project("only-project").await?;
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
         assert!(!legacy_path.exists(), "no legacy must be created");
         let project_path = repo.0.join("only-project").join(Repo::LISTEN_KEY_FILE);
         assert!(project_path.exists());
-        assert_eq!(
-            tokio::fs::read(&project_path).await.unwrap(),
-            key.to_bytes()
-        );
+        assert_eq!(tokio::fs::read(&project_path).await?, key.to_bytes());
+        Ok(())
     }
 
     // ── Per-tunnel key tests ──────────────────────────────────────────
 
     #[tokio::test]
-    async fn listen_key_for_tunnel_fresh_project_generates_key_at_per_tunnel_path() {
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+    async fn listen_key_for_tunnel_fresh_project_generates_key_at_per_tunnel_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
         // Pre-create the key so listen_key_for_tunnel can read it.
         let tunnel_dir = repo.0.join("my-project").join("my-tunnel");
-        tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
+        tokio::fs::create_dir_all(&tunnel_dir).await?;
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
         let seed_key = SecretKey::generate(&mut rand::rng());
-        tokio::fs::write(&key_path, seed_key.to_bytes())
-            .await
-            .unwrap();
+        tokio::fs::write(&key_path, seed_key.to_bytes()).await?;
 
         let key = repo
             .listen_key_for_tunnel("my-project", "my-tunnel")
-            .await
-            .unwrap();
+            .await?;
         assert!(key_path.exists(), "key must exist at per-tunnel path");
-        assert_eq!(tokio::fs::read(&key_path).await.unwrap(), key.to_bytes());
+        assert_eq!(tokio::fs::read(&key_path).await?, key.to_bytes());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn listen_key_for_tunnel_migrates_legacy_key_to_default_tunnel() {
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+    async fn listen_key_for_tunnel_migrates_legacy_key_to_default_tunnel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
         // Create a legacy key at the project root (plain name, no timestamp).
         let legacy_key = SecretKey::generate(&mut rand::rng());
         let legacy_bytes = legacy_key.to_bytes();
@@ -382,8 +386,7 @@ mod tests {
         // Access per-tunnel for "default" tunnel — should migrate.
         let key = repo
             .listen_key_for_tunnel("proj-migrate", "default")
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(
             key.to_bytes(),
             legacy_bytes,
@@ -402,66 +405,60 @@ mod tests {
             expected_path.exists(),
             "key must now live at per-tunnel path"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn listen_key_for_tunnel_is_stable_across_calls() {
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+    async fn listen_key_for_tunnel_is_stable_across_calls() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
         // Pre-create the key.
         let tunnel_dir = repo.0.join("stable-proj").join("stable-tunnel");
-        tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
+        tokio::fs::create_dir_all(&tunnel_dir).await?;
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
         let seed_key = SecretKey::generate(&mut rand::rng());
-        tokio::fs::write(&key_path, seed_key.to_bytes())
-            .await
-            .unwrap();
+        tokio::fs::write(&key_path, seed_key.to_bytes()).await?;
 
         let first = repo
             .listen_key_for_tunnel("stable-proj", "stable-tunnel")
-            .await
-            .unwrap();
+            .await?;
         let second = repo
             .listen_key_for_tunnel("stable-proj", "stable-tunnel")
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(
             first.to_bytes(),
             second.to_bytes(),
             "repeat calls must return the same persisted key"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn listen_key_for_tunnel_two_tunnels_get_distinct_keys() {
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+    async fn listen_key_for_tunnel_two_tunnels_get_distinct_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
         // Pre-create distinct keys for two tunnels.
         for name in ["tunnel-a", "tunnel-b"] {
             let tunnel_dir = repo.0.join("multi-proj").join(name);
-            tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
+            tokio::fs::create_dir_all(&tunnel_dir).await?;
             let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
             let seed_key = SecretKey::generate(&mut rand::rng());
-            tokio::fs::write(&key_path, seed_key.to_bytes())
-                .await
-                .unwrap();
+            tokio::fs::write(&key_path, seed_key.to_bytes()).await?;
         }
-        let key_a = repo
-            .listen_key_for_tunnel("multi-proj", "tunnel-a")
-            .await
-            .unwrap();
-        let key_b = repo
-            .listen_key_for_tunnel("multi-proj", "tunnel-b")
-            .await
-            .unwrap();
+        let key_a = repo.listen_key_for_tunnel("multi-proj", "tunnel-a").await?;
+        let key_b = repo.listen_key_for_tunnel("multi-proj", "tunnel-b").await?;
         assert_ne!(
             key_a.to_bytes(),
             key_b.to_bytes(),
             "two tunnels in the same project must get distinct keys"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn listen_key_for_tunnel_errors_when_key_missing() {
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+    async fn listen_key_for_tunnel_errors_when_key_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
         let result = repo
             .listen_key_for_tunnel("missing-proj", "missing-tunnel")
             .await;
@@ -469,10 +466,12 @@ mod tests {
             result.is_err(),
             "should error when key does not exist (no legacy migration)"
         );
+        Ok(())
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod default_location_tests {
     use super::*;
 
@@ -483,7 +482,7 @@ mod default_location_tests {
 
     #[test]
     fn returns_ok_when_var_set() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         let saved = std::env::var("DATUM_CONNECT_DIR").ok();
         unsafe {
             std::env::set_var("DATUM_CONNECT_DIR", "/tmp/test-connect-dir");
@@ -507,7 +506,7 @@ mod default_location_tests {
 
     #[test]
     fn returns_err_when_var_empty() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         let saved = std::env::var("DATUM_CONNECT_DIR").ok();
         unsafe {
             std::env::set_var("DATUM_CONNECT_DIR", "");
@@ -527,7 +526,7 @@ mod default_location_tests {
 
     #[test]
     fn returns_err_when_var_unset() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         let saved = std::env::var("DATUM_CONNECT_DIR").ok();
         unsafe {
             std::env::remove_var("DATUM_CONNECT_DIR");

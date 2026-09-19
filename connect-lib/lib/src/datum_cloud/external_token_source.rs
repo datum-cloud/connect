@@ -110,10 +110,7 @@ impl ExternalTokenSource {
     pub fn start_refresh(&self, helper: String, session: String) {
         let this = self.clone();
         let mut refresh_rx = self.refresh_trigger.subscribe();
-        let initial_exp = match parse_jwt_expiry(&self.token()) {
-            Ok(exp) => exp,
-            Err(_) => None,
-        };
+        let initial_exp = parse_jwt_expiry(&self.token()).unwrap_or_default();
         tokio::spawn(async move {
             this.run_refresh_loop(helper, session, &mut refresh_rx, initial_exp)
                 .await;
@@ -254,13 +251,11 @@ impl ExternalTokenSource {
 /// Returns `None` if the claim is missing (caller may default to 1 h).
 fn parse_jwt_expiry(token: &str) -> Result<Option<u64>, JwtParseError> {
     let parts: Vec<&str> = token.splitn(3, '.').collect();
-    if parts.len() < 2 {
-        return Err(JwtParseError::InvalidToken(
+    let payload_b64 = parts.get(1).ok_or_else(|| {
+        JwtParseError::InvalidToken(
             "JWT must have at least 2 segments (header.payload[.signature])".into(),
-        ));
-    }
-
-    let payload_b64 = parts[1];
+        )
+    })?;
 
     // Base64url decode: replace URL-safe chars with standard base64 chars, then pad.
     let mut standard_b64 = payload_b64.replace('-', "+").replace('_', "/");
@@ -295,19 +290,21 @@ enum JwtParseError {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::test_util::{TempDir, make_jwt_with_exp, setup_plugin_env};
 
     #[test]
-    fn parse_jwt_expiry_extracts_exp() {
+    fn parse_jwt_expiry_extracts_exp() -> Result<(), Box<dyn std::error::Error>> {
         let token = make_jwt_with_exp(1700000000);
-        let exp = parse_jwt_expiry(&token).unwrap().unwrap();
+        let exp = parse_jwt_expiry(&token)?.ok_or("expected exp claim")?;
         assert_eq!(exp, 1700000000);
+        Ok(())
     }
 
     #[test]
-    fn parse_jwt_expiry_returns_none_when_missing() {
+    fn parse_jwt_expiry_returns_none_when_missing() -> Result<(), Box<dyn std::error::Error>> {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             serde_json::json!({"sub":"test-user"})
@@ -315,8 +312,9 @@ mod tests {
                 .as_bytes(),
         );
         let token = format!("{header}.{payload}.sig");
-        let exp = parse_jwt_expiry(&token).unwrap();
+        let exp = parse_jwt_expiry(&token)?;
         assert!(exp.is_none());
+        Ok(())
     }
 
     #[test]
@@ -327,7 +325,7 @@ mod tests {
 
     #[test]
     fn parse_jwt_expiry_rejects_invalid_base64() {
-        let token = format!("header.!!!.sig");
+        let token = "header.!!!.sig".to_string();
         let result = parse_jwt_expiry(&token);
         assert!(result.is_err());
     }
@@ -342,19 +340,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_jwt_expiry_handles_url_safe_chars() {
+    fn parse_jwt_expiry_handles_url_safe_chars() -> Result<(), Box<dyn std::error::Error>> {
         let payload_json = serde_json::json!({"exp": 9999999999u64, "sub": "test"});
         let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(payload_json.to_string().as_bytes());
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
         let token = format!("{header}.{payload_b64}.sig");
-        let exp = parse_jwt_expiry(&token).unwrap().unwrap();
+        let exp = parse_jwt_expiry(&token)?.ok_or("expected exp claim")?;
         assert_eq!(exp, 9999999999);
+        Ok(())
     }
 
     #[test]
     fn from_env_requires_helper() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         unsafe {
             std::env::remove_var("DATUM_CREDENTIALS_HELPER");
             std::env::set_var("DATUM_SESSION", "test-session");
@@ -365,7 +364,7 @@ mod tests {
 
     #[test]
     fn from_env_requires_session() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         unsafe {
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/echo");
             std::env::remove_var("DATUM_SESSION");
@@ -382,7 +381,7 @@ mod tests {
 
     #[test]
     fn from_env_requires_datum_credentials_helper() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         unsafe {
             std::env::remove_var("DATUM_CREDENTIALS_HELPER");
             std::env::set_var("DATUM_SESSION", "test-session");
@@ -458,7 +457,6 @@ mod tests {
     /// stayed dead until the proactive timer eventually fired.
     #[tokio::test]
     async fn force_refresh_swaps_token_via_loop() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
         let dir = TempDir::new("ets-loop");
 
         // Helper that emits a distinct JWT on every invocation by reading
@@ -487,12 +485,21 @@ mod tests {
         )
         .expect("should set executable permission");
 
-        unsafe {
-            std::env::set_var(
-                "DATUM_CREDENTIALS_HELPER",
-                helper_path.to_string_lossy().as_ref(),
-            );
-            std::env::set_var("DATUM_SESSION", "test-session");
+        // The env lock is only needed around the actual env var mutation:
+        // nothing after this point re-reads `DATUM_CREDENTIALS_HELPER` or
+        // `DATUM_SESSION` from the process environment (the helper path and
+        // session are passed to `start_refresh` as owned strings), so the
+        // guard is dropped before the awaits below instead of held across
+        // them (clippy::await_holding_lock).
+        {
+            let _lock = crate::test_util::env_lock();
+            unsafe {
+                std::env::set_var(
+                    "DATUM_CREDENTIALS_HELPER",
+                    helper_path.to_string_lossy().as_ref(),
+                );
+                std::env::set_var("DATUM_SESSION", "test-session");
+            }
         }
 
         // Use a token with a far-future expiry so the proactive timer does

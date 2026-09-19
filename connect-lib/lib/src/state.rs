@@ -276,6 +276,17 @@ impl FromStr for AdvertismentTicket {
 impl Ticket for AdvertismentTicket {
     const KIND: &'static str = "datum";
 
+    // `iroh_tickets::Ticket::to_bytes` is an infallible trait method (it
+    // returns `Vec<u8>`, not `Result`), so there is no way to propagate a
+    // serialization failure to the caller. `postcard::to_allocvec` can only
+    // fail for types with a `serde::Serializer` implementation that itself
+    // errors (e.g. maps with non-string keys, or a custom `Serialize` that
+    // calls `Error::custom`); `AdvertismentTicket` and `Advertisment` are
+    // plain derived-`Serialize` structs of primitives/strings/byte arrays
+    // with no maps or custom serialization, so `to_allocvec` cannot fail in
+    // practice. Falling back to `Vec::new()` here would silently produce a
+    // corrupt ticket instead, which is worse than panicking.
+    #[allow(clippy::expect_used)]
     fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(&self).expect("serialize should work")
     }
@@ -287,25 +298,29 @@ impl Ticket for AdvertismentTicket {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_tcp_proxy_data_from_host_port() {
-        let data = TcpProxyData::from_host_port_str("example.test:443").unwrap();
+    fn parse_tcp_proxy_data_from_host_port() -> Result<(), Box<dyn std::error::Error>> {
+        let data = TcpProxyData::from_host_port_str("example.test:443")?;
         assert_eq!(data.host, "example.test");
         assert_eq!(data.port, 443);
+        Ok(())
     }
 
     #[test]
     fn parse_tcp_proxy_data_rejects_missing_port() {
-        let err = TcpProxyData::from_host_port_str("example.test").unwrap_err();
+        let err = TcpProxyData::from_host_port_str("example.test")
+            .expect_err("host without a port must be rejected");
         assert!(err.to_string().contains("missing port"));
     }
 
     #[test]
     fn parse_tcp_proxy_data_rejects_invalid_port() {
-        let err = TcpProxyData::from_host_port_str("example.test:abc").unwrap_err();
+        let err = TcpProxyData::from_host_port_str("example.test:abc")
+            .expect_err("non-numeric port must be rejected");
         assert!(err.to_string().contains("invalid port"));
     }
 }

@@ -3,10 +3,26 @@
 //! This module consolidates duplicated helper functions that were previously
 //! defined inline in multiple test modules (`project_control_plane.rs`,
 //! `datum_cloud/mod.rs`, `external_token_source.rs`, `heartbeat.rs`).
+//!
+//! `expect`/`panic` are allowed here: this is test-only infrastructure and
+//! panicking on setup failure is the correct assertion mechanism.
+#![allow(clippy::expect_used, clippy::panic)]
 
 use crate::ExternalTokenSource;
 use base64::Engine;
 use kube::core::ErrorResponse;
+
+/// Lock the shared [`crate::ENV_LOCK`] mutex used to serialize tests that
+/// mutate process environment variables.
+///
+/// Recovers from lock poisoning (a prior test panicking while holding the
+/// lock) instead of panicking itself, since a poisoned env lock does not
+/// mean the environment variables it protects are in an invalid state.
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// A temporary directory that cleans up on drop.
 ///
@@ -67,7 +83,7 @@ pub fn make_jwt_with_exp(exp: u64) -> String {
 /// Panics if the temp directory cannot be created, the helper script cannot
 /// be written, or the [`ExternalTokenSource`] cannot be constructed.
 pub fn setup_plugin_env() -> (TempDir, ExternalTokenSource) {
-    let _lock = crate::ENV_LOCK.lock().unwrap();
+    let _lock = env_lock();
     let dir = TempDir::new("plugin");
     let helper_path = dir.path().join("fake-helper.sh");
     let jwt = make_jwt_with_exp(9999999999);

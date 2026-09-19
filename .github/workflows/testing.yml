@@ -6,8 +6,32 @@ on:
       - 'connect-plugin/**/*.go'
       - 'connect-plugin/go.mod'
       - 'connect-plugin/go.sum'
+      - 'connect-lib/**'
+      - '.github/workflows/testing.yml'
 
 jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format
+        run: cargo fmt --all --check
+        working-directory: connect-lib
+      # The workspace denies clippy::unwrap_used, expect_used, panic and
+      # indexing_slicing (see connect-lib/Cargo.toml). This step is the gate
+      # that keeps production code panic-free.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+        working-directory: connect-lib
+      - name: Test
+        run: cargo test --workspace
+        working-directory: connect-lib
+
   testing:
     runs-on: ubuntu-latest
     steps:
