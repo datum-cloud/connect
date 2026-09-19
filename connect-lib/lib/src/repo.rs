@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use iroh::SecretKey;
@@ -274,42 +272,59 @@ impl Repo {
     }
 }
 
-/// Write a secret key to disk readable only by the current user.
+/// Write a secret key to disk atomically, readable only by the current user.
 ///
-/// On Unix the file is created with mode 0600 (and an existing file is
-/// tightened to 0600) so the iroh identity is not exposed to other local
-/// users through the default umask. On other platforms this is a plain
-/// write; there the state directory lives under the user's profile.
+/// The key is written to a fresh temporary file beside `path` and then
+/// renamed over it, so a crash mid-write can never leave a truncated key
+/// behind, and a reader holding a descriptor to the previous file never
+/// observes the new key.
+///
+/// On Unix the temporary file is created with mode 0600 so the iroh
+/// identity is not exposed to other local users through the default umask.
+/// On other platforms the file inherits the access control of its parent
+/// directory; the caller is responsible for choosing a directory that only
+/// the current user can read.
 async fn write_secret_key(path: &Path, key: &SecretKey) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::io::AsyncWriteExt;
+    use tokio::io::AsyncWriteExt;
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .await?;
-        // `mode` only applies when the file is created; make sure a
-        // pre-existing key file ends up private too.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .await?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("secret key path has no file name")?;
+    let tmp_path = path.with_file_name(format!(
+        "{file_name}.{}.{}.tmp",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let result = async {
+        let mut file = options.open(&tmp_path).await?;
         file.write_all(&key.to_bytes()).await?;
-        file.flush().await?;
-        Ok(())
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp_path, path).await?;
+        Ok::<(), std::io::Error>(())
     }
-    #[cfg(not(unix))]
-    {
-        tokio::fs::write(path, key.to_bytes()).await?;
-        Ok(())
+    .await;
+
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
     }
+    result?;
+    Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn temp_repo_dir() -> PathBuf {
@@ -504,65 +519,119 @@ mod tests {
         Ok(())
     }
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[cfg(unix)]
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    fn mode_of(path: &Path) -> std::io::Result<u32> {
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+    }
+
+    async fn leftover_temp_files(dir: &Path) -> std::io::Result<Vec<String>> {
+        let mut leftovers = Vec::new();
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tmp") {
+                leftovers.push(name);
+            }
+        }
+        Ok(leftovers)
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn generated_keys_are_private() {
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+    async fn generated_keys_are_private() -> TestResult {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
 
-        repo.connect_key().await.unwrap();
-        assert_eq!(mode_of(&repo.0.join(Repo::CONNECT_KEY_FILE)), 0o600);
+        repo.connect_key().await?;
+        assert_eq!(mode_of(&repo.0.join(Repo::CONNECT_KEY_FILE))?, 0o600);
 
-        repo.listen_key_for_project("proj").await.unwrap();
+        repo.listen_key_for_project("proj").await?;
         assert_eq!(
-            mode_of(&repo.0.join("proj").join(Repo::LISTEN_KEY_FILE)),
+            mode_of(&repo.0.join("proj").join(Repo::LISTEN_KEY_FILE))?,
             0o600
         );
 
         let key = SecretKey::generate(&mut rand::rng());
-        repo.save_listen_key_for_tunnel("proj", "tun", &key)
-            .await
-            .unwrap();
+        repo.save_listen_key_for_tunnel("proj", "tun", &key).await?;
         assert_eq!(
-            mode_of(&repo.0.join("proj").join("tun").join(Repo::LISTEN_KEY_FILE)),
+            mode_of(&repo.0.join("proj").join("tun").join(Repo::LISTEN_KEY_FILE))?,
             0o600
         );
 
-        repo.listen_key(Some("proj")).await.unwrap();
-        let mut entries = tokio::fs::read_dir(&repo.0).await.unwrap();
+        repo.listen_key(Some("proj")).await?;
+        let mut entries = tokio::fs::read_dir(&repo.0).await?;
         let mut found = false;
-        while let Some(entry) = entries.next_entry().await.unwrap() {
+        while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("listen_key.proj.") {
+            if name.starts_with("listen_key.proj.") && !name.ends_with(".tmp") {
                 found = true;
-                assert_eq!(mode_of(&entry.path()), 0o600, "{name}");
+                assert_eq!(mode_of(&entry.path())?, 0o600, "{name}");
             }
         }
         assert!(found, "timestamped listen key must have been written");
+        Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn overwriting_a_world_readable_key_tightens_permissions() {
-        let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
+    async fn replacing_a_world_readable_key_yields_a_private_file() -> TestResult {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
         let tunnel_dir = repo.0.join("proj").join("tun");
-        tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
+        tokio::fs::create_dir_all(&tunnel_dir).await?;
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-        tokio::fs::write(&key_path, b"old").await.unwrap();
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(mode_of(&key_path), 0o644, "precondition");
+        tokio::fs::write(&key_path, b"old").await?;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))?;
+        assert_eq!(mode_of(&key_path)?, 0o644, "precondition");
+
+        // A reader that opened the old, world-readable file must not see the
+        // new key: the write goes to a fresh inode and is renamed into place.
+        let old_handle = std::fs::File::open(&key_path)?;
 
         let key = SecretKey::generate(&mut rand::rng());
-        repo.save_listen_key_for_tunnel("proj", "tun", &key)
-            .await
-            .unwrap();
-        assert_eq!(mode_of(&key_path), 0o600);
-        assert_eq!(tokio::fs::read(&key_path).await.unwrap(), key.to_bytes());
+        repo.save_listen_key_for_tunnel("proj", "tun", &key).await?;
+        assert_eq!(mode_of(&key_path)?, 0o600);
+        assert_eq!(tokio::fs::read(&key_path).await?, key.to_bytes());
+
+        let mut through_old_handle = Vec::new();
+        std::io::Read::read_to_end(&mut &old_handle, &mut through_old_handle)?;
+        assert_eq!(
+            through_old_handle, b"old",
+            "old descriptor must still point at the old contents"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn key_writes_leave_no_temp_files_behind() -> TestResult {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
+        repo.connect_key().await?;
+        let key = SecretKey::generate(&mut rand::rng());
+        repo.save_listen_key_for_tunnel("proj", "tun", &key).await?;
+        repo.save_listen_key_for_tunnel("proj", "tun", &key).await?;
+
+        assert!(leftover_temp_files(&repo.0).await?.is_empty());
+        assert!(
+            leftover_temp_files(&repo.0.join("proj").join("tun"))
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_key_write_cleans_up_its_temp_file() -> TestResult {
+        let repo = Repo::open_or_create(temp_repo_dir()).await?;
+        // Make the rename fail by putting a non-empty directory where the key
+        // file should go.
+        let key_path = repo.0.join(Repo::CONNECT_KEY_FILE);
+        tokio::fs::create_dir_all(key_path.join("occupied")).await?;
+
+        let key = SecretKey::generate(&mut rand::rng());
+        assert!(write_secret_key(&key_path, &key).await.is_err());
+        assert!(leftover_temp_files(&repo.0).await?.is_empty());
+        Ok(())
     }
 }
 
