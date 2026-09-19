@@ -188,7 +188,16 @@ impl DatumCloudClient {
         true
     }
 
-    pub fn token(&self) -> SecretString {
+    /// Returns the current token as a plain `String` (back-compat with the
+    /// pre-`TokenSource` API). Prefer [`Self::token_secret`] for new code:
+    /// it returns a `SecretString` and this form copies the secret into an
+    /// un-zeroized `String` on every call.
+    pub fn token(&self) -> String {
+        self.token_source.token().expose_secret().to_owned()
+    }
+
+    /// Returns the current token.
+    pub fn token_secret(&self) -> SecretString {
         self.token_source.token()
     }
 
@@ -417,7 +426,15 @@ mod tests {
     #[test]
     fn token_returns_external_token() {
         let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
-        assert!(client.token().expose_secret().starts_with("eyJ"));
+        assert!(client.token().starts_with("eyJ"));
+    }
+
+    /// The back-compat `String`-typed `token()` and `token_secret()` must
+    /// agree: both read the same underlying `TokenSource`.
+    #[test]
+    fn token_and_token_secret_agree() {
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
+        assert_eq!(client.token(), client.token_secret().expose_secret());
     }
 
     #[test]
@@ -446,10 +463,7 @@ mod tests {
         let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         let cloned = client.clone();
         assert!(cloned.is_plugin_mode());
-        assert_eq!(
-            cloned.token().expose_secret(),
-            client.token().expose_secret()
-        );
+        assert_eq!(cloned.token(), client.token());
     }
 
     #[test]
@@ -467,7 +481,8 @@ mod tests {
             DatumCloudClient::with_token_source(ApiEnv::Production, Arc::new(source.clone()));
         let rotated = make_jwt_with_exp(2);
         source.set(rotated.clone());
-        assert_eq!(client.token().expose_secret(), rotated);
+        assert_eq!(client.token(), rotated);
+        assert_eq!(client.token_secret().expose_secret(), rotated);
         client.force_token_refresh();
         assert_eq!(source.refresh_requests(), 1);
     }

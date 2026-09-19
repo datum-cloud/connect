@@ -50,3 +50,9 @@ postcard = "1"
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+# Installs the rustls CryptoProvider the `integration-tests` feature's kube
+# client tests need (same crate + feature `bin/` already depends on for the
+# same purpose). Without an installed provider, kube's `Client::try_from`
+# panics rather than returning `Err`, which the "if let Ok(pcp) = pcp { .. }"
+# skip pattern those tests use cannot catch.
+rustls = { version = "0.23", features = ["ring"] }
