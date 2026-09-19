@@ -7,8 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_swap::ArcSwap;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use tokio::sync::watch;
 
 /// Source of the bearer token used against the Datum API and project
@@ -34,9 +33,18 @@ pub trait TokenSource: Send + Sync + 'static {
 /// [`set`](Self::set). It never refreshes on its own; [`force_refresh`]
 /// (TokenSource::force_refresh) only increments a counter so callers can
 /// assert that a refresh was requested.
+///
+/// The `watch::Sender` is the single source of truth for the current token —
+/// there is no separate cached copy that could drift from what subscribers
+/// observe. Updates go through [`watch::Sender::send_replace`], which,
+/// unlike `send`, updates the stored value even when no receiver currently
+/// exists. `send` silently discards the update in that case (it returns
+/// `Err` without ever writing the new value), which would otherwise mean a
+/// caller that subscribes via [`watch`](TokenSource::watch) *after* a
+/// rotation that happened with zero subscribers sees the stale
+/// pre-rotation value.
 #[derive(Clone)]
 pub struct StaticTokenSource {
-    token: Arc<ArcSwap<SecretString>>,
     token_tx: Arc<watch::Sender<SecretString>>,
     refresh_requests: Arc<AtomicU64>,
 }
@@ -54,20 +62,18 @@ impl std::fmt::Debug for StaticTokenSource {
 
 impl StaticTokenSource {
     pub fn new(token: impl Into<String>) -> Self {
-        let token = SecretString::from(token.into());
-        let (token_tx, _) = watch::channel(token.clone());
+        let (token_tx, _) = watch::channel(SecretString::from(token.into()));
         Self {
-            token: Arc::new(ArcSwap::from_pointee(token)),
             token_tx: Arc::new(token_tx),
             refresh_requests: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Replace the token and notify watchers.
+    /// Replace the token and notify watchers, including any that subscribe
+    /// later (see the struct-level doc comment on why `send_replace` matters
+    /// here).
     pub fn set(&self, token: impl Into<String>) {
-        let token = SecretString::from(token.into());
-        self.token.store(Arc::new(token.clone()));
-        let _ = self.token_tx.send(token);
+        self.token_tx.send_replace(SecretString::from(token.into()));
     }
 
     /// Number of times [`force_refresh`](TokenSource::force_refresh) was called.
@@ -78,7 +84,7 @@ impl StaticTokenSource {
 
 impl TokenSource for StaticTokenSource {
     fn token(&self) -> SecretString {
-        SecretString::from(self.token.load_full().expose_secret().to_owned())
+        self.token_tx.borrow().clone()
     }
 
     fn watch(&self) -> watch::Receiver<SecretString> {
@@ -92,6 +98,8 @@ impl TokenSource for StaticTokenSource {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     #[test]
@@ -132,5 +140,26 @@ mod tests {
     fn debug_does_not_print_the_token() {
         let source = StaticTokenSource::new("super-secret");
         assert!(!format!("{source:?}").contains("super-secret"));
+    }
+
+    /// Regression test: a rotation that happens while nothing is subscribed
+    /// must still be visible to a *later* subscriber. `watch::Sender::send`
+    /// returns early without writing the value at all when there are zero
+    /// receivers (verified against the tokio 1.51 source); `set()` must use
+    /// `send_replace`, which writes unconditionally, so this must never
+    /// regress back to `send`.
+    #[test]
+    fn late_subscriber_sees_rotation_that_happened_with_no_receivers() {
+        let source = StaticTokenSource::new("initial");
+        // No `watch()` call yet — zero receivers exist for this rotation.
+        source.set("rotated-with-nobody-listening");
+
+        // Subscribing now must observe the rotation, not the initial value.
+        let rx = source.watch();
+        assert_eq!(rx.borrow().expose_secret(), "rotated-with-nobody-listening");
+        assert_eq!(
+            source.token().expose_secret(),
+            "rotated-with-nobody-listening"
+        );
     }
 }
