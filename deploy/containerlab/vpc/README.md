@@ -8,7 +8,7 @@ It does **not** exercise any real galactic VRF/BGP/eBPF, and does not yet
 talk to a `VPCAttachment` resource — see the design doc for what's
 scaffolded ahead of the real control plane.
 
-There are two labs here:
+There are three labs here:
 
 - **`test-3region.sh` — the automated, repeatable full-mesh test.** A 3-region
   VPC (mirroring galactic's dfw/sjc/iad model) with the router on it and the
@@ -17,6 +17,11 @@ There are two labs here:
   containerlab, no root beyond Docker access), idempotent, exits non-zero on any
   failure. **Start here** — `./test-3region.sh`. Canonical containerlab form of
   the same topology: `vpc-3region.clab.yaml`.
+- **`test-host-client.sh` — a bare-metal client joining the containerized VPC.**
+  The client runs as a real process with a real TUN (needs your sudo), joining
+  the VPC over iroh. The client can be on the same machine as the containers or
+  on an entirely different machine/network (a laptop joining a VPC on a remote
+  VM). See "The host-client test" below.
 - **`vpc.clab.yaml` — the minimal 2-node walkthrough** below, for understanding
   the client/router handshake step by step by hand.
 
@@ -51,6 +56,45 @@ The containerlab form (`vpc-3region.clab.yaml`) sets up the same nodes,
 addressing, and regional links; `containerlab` needs root to deploy (supply it
 yourself), then drive the app layer as `test-3region.sh` does — start the
 client, note its endpoint id, start the router dialing it by id, ping.
+
+## The host-client test
+
+`test-host-client.sh` runs the client as a bare-metal process (a real TUN in a
+real network namespace), joining the containerized VPC over iroh. The client can
+be on the **same machine** as the containers, or on a **different machine and
+network** entirely — a laptop joining a VPC on a remote VM. iroh dials the client
+by EndpointId (no ip/port) either way.
+
+Which command runs where:
+
+- **VPC side (the docker host / VM)** — the only commands that touch docker:
+  - `./test-host-client.sh up` — stand up the VPC; prints the client command.
+  - `./test-host-client.sh dial <client-endpoint-id>` — drive the **router** to
+    dial the client, then check the VPC→client direction. `dial` is *not* the
+    client; it runs the router container.
+  - `./test-host-client.sh down` — tear down.
+- **Client side (this or any other machine)** — no docker:
+  - the `datum-connect … vpc join …` command that `up` prints (run under sudo;
+    it creates the TUN). On a remote client, copy the `datum-connect` binary and
+    `fake-credentials-helper.sh` over first, and build `datum-connect` for that
+    machine's OS/arch.
+  - `./test-host-client.sh client-check` — ping the whole VPC from the client
+    (client→VPC direction), no docker needed.
+
+Same-machine run: do all of the above on one host. Cross-machine run (laptop ↔
+remote VM):
+
+```
+[VM]     ./test-host-client.sh up                 # note the client command it prints
+[laptop] sudo env ... datum-connect ... vpc join  # from up's output; note the endpoint id
+[laptop] ./test-host-client.sh client-check        # client -> VPC
+[VM]     ./test-host-client.sh dial <endpoint-id>  # router dials client; VPC -> client
+[VM]     ./test-host-client.sh down                # Ctrl+C the client on the laptop too
+```
+
+Only one client may hold the VPC address (`fd00:cafe:1100::2`) at a time — stop
+any client already running (e.g. a same-machine one from a prior test) before
+starting another, or the second will collide.
 
 ## Topology
 
