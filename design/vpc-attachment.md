@@ -184,9 +184,14 @@ unilaterally.
   (and therefore its `Connector`) survives restarts.
 - **MTU is a fixed conservative default**, not derived from iroh's actual
   per-path overhead budget.
-- **Linux-only validated**: `create_tun_device` uses the cross-platform
-  `tun` crate, but only the Linux path has been exercised (containerlab).
-  macOS (`utun`) and Windows (wintun) are untested.
+- **Linux + macOS implemented; only Linux exercised so far.** `create_tun_device`
+  uses the cross-platform `tun` crate; `routing.rs` is OS-gated — iproute2
+  (`ip`) on Linux, `ifconfig`/`route` on macOS — and macOS `utun` names are
+  auto-assigned and read back (the kernel rejects arbitrary names). The `tun`
+  crate hides the macOS `utun` 4-byte protocol header, so the data plane is
+  identical. The Linux path is validated end-to-end (containerlab + a real
+  cross-machine client); the macOS path compiles per-target but hasn't been run
+  on real hardware. Windows (wintun) is not implemented.
 - **Framing is stream + length-prefix, not QUIC datagrams** — simpler to get
   right first, but datagrams are a better long-term match for IP's
   best-effort delivery model (see §3).

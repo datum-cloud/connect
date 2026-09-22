@@ -72,8 +72,10 @@ pub async fn run_join(repo: Repo, args: JoinArgs) -> Result<()> {
         .std_context("parsing --address as an IPv6 address")?;
 
     let tun = connect_lib::vpc_create_tun_device(&args.tun_name, args.mtu)?;
-    connect_lib::vpc_configure_interface(&args.tun_name, address, args.prefix_len, args.mtu)
-        .await?;
+    // Use the kernel-assigned name (macOS renames to utunN) for all
+    // interface/route configuration, not the requested name.
+    let ifname = connect_lib::vpc_device_name(&tun)?;
+    connect_lib::vpc_configure_interface(&ifname, address, args.prefix_len, args.mtu).await?;
     let (tun_writer, tun_reader) = tun.split().std_context("splitting tun device")?;
     let tun_reader = Arc::new(Mutex::new(tun_reader));
     let tun_writer = Arc::new(Mutex::new(tun_writer));
@@ -90,7 +92,7 @@ pub async fn run_join(repo: Repo, args: JoinArgs) -> Result<()> {
     .await?;
 
     let mode: VpcMode = args.mode.into();
-    connect_lib::vpc_install_routes(&args.tun_name, mode, &args.vpc_prefix, args.router_ip).await?;
+    connect_lib::vpc_install_routes(&ifname, mode, &args.vpc_prefix, args.router_ip).await?;
 
     let endpoint_id = listener.endpoint_id();
     // Bound direct addresses — a router with no discovery/relay path (e.g.
@@ -112,14 +114,14 @@ pub async fn run_join(repo: Repo, args: JoinArgs) -> Result<()> {
                 "endpoint_id": endpoint_id.to_string(),
                 "bound_addrs": bound_addrs,
                 "address": address.to_string(),
-                "tun_name": args.tun_name,
+                "tun_name": ifname,
                 "mode": args.mode.to_possible_value().map(|v| v.get_name().to_string()),
             })
         );
     } else {
         eprintln!(
             "  \u{25CB} Interface {} up at {} (mtu {})",
-            args.tun_name, address, args.mtu
+            ifname, address, args.mtu
         );
         eprintln!("  \u{25CB} Listening on: {}", bound_addrs.join(", "));
         match &args.router_id {

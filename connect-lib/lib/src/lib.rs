@@ -33,7 +33,8 @@ pub use tunnels::{
 };
 pub use vpc::{
     IROH_VPC_ALPN, Mode as VpcMode, VpcDialer, VpcListener, configure_interface as vpc_configure_interface,
-    create_tun_device as vpc_create_tun_device, install_routes as vpc_install_routes,
+    create_tun_device as vpc_create_tun_device, device_name as vpc_device_name,
+    install_routes as vpc_install_routes,
 };
 
 /// The root domain for datum connect URLs to subdomain from. A proxy URL will

@@ -66,7 +66,8 @@ async fn run() -> Result<()> {
         EndpointId::from_str(&args.peer_id).std_context("parsing --peer-id as an endpoint id")?;
 
     let tun = vpc_create_tun_device(&args.tun_name, args.mtu)?;
-    vpc_configure_interface(&args.tun_name, args.address, args.prefix_len, args.mtu).await?;
+    let ifname = connect_lib::vpc_device_name(&tun)?;
+    vpc_configure_interface(&ifname, args.address, args.prefix_len, args.mtu).await?;
     let (tun_writer, tun_reader) = tun.split().std_context("splitting tun device")?;
     let tun_reader = Arc::new(Mutex::new(tun_reader));
     let tun_writer = Arc::new(Mutex::new(tun_writer));
@@ -86,11 +87,11 @@ async fn run() -> Result<()> {
     match args.peer_addr {
         Some(addr) => eprintln!(
             "mock-galactic-router: interface {} up at {} — dialing {peer_id} (pinned addr {addr})",
-            args.tun_name, args.address
+            ifname, args.address
         ),
         None => eprintln!(
             "mock-galactic-router: interface {} up at {} — dialing {peer_id} via discovery",
-            args.tun_name, args.address
+            ifname, args.address
         ),
     }
 
