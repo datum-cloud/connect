@@ -1,5 +1,5 @@
 [workspace]
-members = ["lib", "bin"]
+members = ["lib", "bin", "mock-galactic-router"]
 resolver = "2"
 
 [workspace.lints.rust]

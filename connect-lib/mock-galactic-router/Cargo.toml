@@ -1,0 +1,17 @@
+[package]
+name = "mock-galactic-router"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+connect-lib = { path = "../lib" }
+clap = { version = "4", features = ["derive"] }
+n0-error = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+iroh = { version = "1", default-features = false }
+rustls = { version = "0.23", features = ["ring"] }

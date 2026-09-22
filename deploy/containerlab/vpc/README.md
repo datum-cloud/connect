@@ -1,0 +1,148 @@
+# `vpc` containerlab lab
+
+Proves the `vpc` verb's data-plane mechanism end to end — TUN creation, the
+iroh accept/dial handshake, packet framing, and routing-mode installation —
+against a `mock-galactic-router` fixture that stands in for the imagined
+galactic-side component (see `../../../design/vpc-attachment.md` §5 and §7).
+It does **not** exercise any real galactic VRF/BGP/eBPF, and does not yet
+talk to a `VPCAttachment` resource — see the design doc for what's
+scaffolded ahead of the real control plane.
+
+## Topology
+
+Two nodes, `client` and `router`, both running the same image (the built
+`datum-connect`/`mock-galactic-router` Rust binaries and the `datumctl-connect`
+Go plugin binary), reachable over containerlab's management network — no
+extra data links are needed since the "VPC" traffic runs *inside* the iroh
+tunnel, not over a separate wire.
+
+`client` runs `datumctl-connect vpc join` — the accept side, exactly as in
+production (see the design doc for why the client always starts first).
+`router` runs `mock-galactic-router` — the dial side, given the client's
+iroh endpoint id and address directly instead of discovering them via a
+claimed `VPCAttachment`.
+
+## Privileges
+
+Creating a TUN device and managing routes needs `CAP_NET_ADMIN`. The
+topology grants that to both nodes via `cap-add` and binds in
+`/dev/net/tun`; nothing in the image, the binaries, or this README invokes
+`sudo` or otherwise tries to elevate itself. If a command below fails with
+a permission error, that means the *host* you're running `docker`/
+`containerlab` on needs it (e.g. your user isn't in the `docker` group, or
+containerlab itself needs root to manage network namespaces) — supply that
+yourself; these tools deliberately fail with a clear message instead of
+guessing at how to get root.
+
+## 1. Build the image
+
+Build context must be the **repo root**, not this directory, since the
+Dockerfile needs both `connect-lib/` and `connect-plugin/`:
+
+```bash
+cd /path/to/connect
+docker build -f deploy/containerlab/vpc/Dockerfile -t connect-vpc-lab:latest .
+```
+
+## 2. Deploy the lab
+
+```bash
+cd deploy/containerlab/vpc
+containerlab deploy -t vpc.clab.yaml
+```
+
+## 3. Start the client
+
+The client always starts first — it doesn't need to know anything about
+the router yet:
+
+```bash
+docker exec -d clab-vpc-attachment-client sh -c \
+  'datumctl-connect vpc join --vpc lab-vpc --address fd00:1::2 --prefix-len 120 > /tmp/client.log 2>&1'
+```
+
+Wait a couple seconds, then read its output:
+
+```bash
+docker exec clab-vpc-attachment-client cat /tmp/client.log
+```
+
+You should see something like (verified output, IDs/ports will differ per run):
+
+```
+  ⚠ No --router-id set — accepting any dialer (trust-on-first-connect). This is only appropriate for lab/dev use; see design/vpc-attachment.md.
+VPC attachment ready: lab-vpc at fd00:1::2 via datum-vpc0 (mode vpc-only)
+Endpoint ID: b123d11e1359bd3bfadca82faad93697bea00cdb7d2bbcd396a0b428ab44a554
+Listening on: 0.0.0.0:40295, [::]:37541
+Press Ctrl+C to stop...
+```
+
+`Listening on` is iroh's wildcard bind (`0.0.0.0:<port>` / `[::]:<port>`),
+not a dialable address by itself — the router needs it combined with the
+client container's actual address, which containerlab/Docker assigns
+separately:
+
+```bash
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' clab-vpc-attachment-client
+```
+
+Note the **endpoint ID**, the **port** from the first `Listening on` entry,
+and this **container IP** — the router needs all three (as `<ip>:<port>`).
+
+## 4. Start the router
+
+```bash
+docker exec -d clab-vpc-attachment-router sh -c \
+  'mock-galactic-router \
+     --peer-id <endpoint id from step 3> \
+     --peer-addr <client container ip from step 3>:<port from step 3> \
+     --address fd00:1::1 --prefix-len 120 \
+     > /tmp/router.log 2>&1'
+```
+
+```bash
+docker exec clab-vpc-attachment-router cat /tmp/router.log
+```
+
+You should see the router print its own endpoint id and confirm it's
+dialing the client — it doesn't print anything further once connected (see
+`connect_lib::vpc::VpcDialer::dial_and_pump`, which just starts pumping
+silently); the ping in step 5 is the real confirmation the connection
+succeeded.
+
+## 5. Prove it: ping across the tunnel
+
+Both ends configured the same `/120` prefix on their own TUN device, so
+each already has an on-link route to the other via the interface `ip addr
+add` created — no extra route needed for this basic check:
+
+```bash
+docker exec clab-vpc-attachment-client ping -c4 fd00:1::1
+docker exec clab-vpc-attachment-router ping -c4 fd00:1::2
+```
+
+A successful round trip here means: the TUN devices were created and
+addressed correctly, the iroh accept/dial handshake completed, and IP
+packets are being framed, sent over the iroh stream, and unframed
+correctly in both directions.
+
+## Cleanup
+
+```bash
+containerlab destroy -t vpc.clab.yaml
+```
+
+## What this doesn't prove
+
+- **Routing modes beyond the on-link check above.** Testing `--mode
+  default-route` meaningfully needs a third "internet-side" destination to
+  route away from and a real default gateway to preserve — this 2-node lab
+  doesn't have one. Testing `--vpc-prefix` in `vpc-only` mode needs a prefix
+  that *isn't* the on-link one above (the on-link route already exists from
+  address assignment; adding the identical route again with `ip route add`
+  fails).
+- **Anything about the real galactic component** — VRF/BGP/eBPF wiring,
+  address allocation, claiming a `VPCAttachment`. See
+  `../../../design/vpc-attachment.md` §5.
+- **Non-Linux TUN creation** (macOS `utun`, Windows wintun) — untested
+  anywhere so far, containerlab included.

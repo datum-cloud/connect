@@ -1,0 +1,26 @@
+---
+name: vpc-attachment
+
+topology:
+  nodes:
+    # Runs `datumctl-connect vpc join`. Accept side of the iroh connection —
+    # see design/vpc-attachment.md for why the client always starts first.
+    client:
+      kind: linux
+      image: connect-vpc-lab:latest
+      cap-add:
+        - NET_ADMIN
+      binds:
+        - /dev/net/tun:/dev/net/tun
+
+    # Runs `mock-galactic-router`, standing in for the imagined galactic-side
+    # router component (design/vpc-attachment.md §5) — dial side, claims
+    # nothing, just dials the client directly once told its endpoint id and
+    # address.
+    router:
+      kind: linux
+      image: connect-vpc-lab:latest
+      cap-add:
+        - NET_ADMIN
+      binds:
+        - /dev/net/tun:/dev/net/tun

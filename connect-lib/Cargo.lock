@@ -2522,6 +2522,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mock-galactic-router"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "connect-lib",
+ "iroh",
+ "n0-error",
+ "rustls",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "moka"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"

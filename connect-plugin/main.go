@@ -9,6 +9,7 @@ import (
 	"go.datum.net/datumctl-plugins/connect/internal/binary"
 	"go.datum.net/datumctl-plugins/connect/internal/env"
 	"go.datum.net/datumctl-plugins/connect/tunnel"
+	"go.datum.net/datumctl-plugins/connect/vpc"
 	"go.datum.net/datumctl/plugin"
 )
 
@@ -39,6 +40,7 @@ func main() {
 	cmd := plugin.NewRootCmd("connect", "Manage Datum Connect tunnels")
 	cmd.Version = version
 	cmd.AddCommand(tunnel.NewCmd())
+	cmd.AddCommand(vpc.NewCmd())
 	cmd.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Print the plugin and Rust binary versions",

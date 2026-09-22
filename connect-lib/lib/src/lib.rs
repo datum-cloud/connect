@@ -9,6 +9,7 @@ pub mod project_control_plane;
 pub mod repo;
 pub mod state;
 pub mod tunnels;
+pub mod vpc;
 
 #[cfg(test)]
 pub mod test_util;
@@ -29,6 +30,10 @@ pub use state::{Advertisment, SelectedContext, State, StateWrapper, TcpProxyData
 pub use tunnels::{
     OrphanedConnector, ProgressStep, ProgressStepKind, StepStatus, TunnelDeleteOutcome,
     TunnelProgress, TunnelService, TunnelSummary, friendly_device_name, normalize_endpoint,
+};
+pub use vpc::{
+    IROH_VPC_ALPN, Mode as VpcMode, VpcDialer, VpcListener, configure_interface as vpc_configure_interface,
+    create_tun_device as vpc_create_tun_device, install_routes as vpc_install_routes,
 };
 
 /// The root domain for datum connect URLs to subdomain from. A proxy URL will
