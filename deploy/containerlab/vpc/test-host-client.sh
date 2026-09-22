@@ -153,11 +153,24 @@ The router dials the client by endpoint id alone — iroh discovery resolves it,
 EOF
 }
 
+# One IPv6 ping from THIS machine, bounded to ~2s, OS-aware: macOS's -W is in
+# milliseconds (Linux's is seconds) and macOS uses ping6 for IPv6, so the Linux
+# form would time out instantly on a Mac.
+host_ping1() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    ping6 -c1 -W2000 "$1" >/dev/null 2>&1
+  else
+    ping -6 -c1 -W2 "$1" >/dev/null 2>&1
+  fi
+}
+
 # Retry a ping a few times before giving up: the iroh connection is dialed by
 # endpoint id and comes up via a relay path first, then upgrades to a direct
 # path — a brief blip during that upgrade can drop a packet or two. A genuinely
 # unreachable target still fails after all attempts.
-hping()  { local dst="$1"; for _ in $(seq 1 5); do ping -6 -c1 -W2 "${dst}" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+#   hping: from this machine (client side, OS-aware).
+#   cping: from inside a container (always Linux ping).
+hping()  { local dst="$1"; for _ in $(seq 1 5); do host_ping1 "${dst}" && return 0; sleep 1; done; return 1; }
 cping()  { local ctr="$1" dst="$2"; for _ in $(seq 1 5); do docker exec "${ctr}" ping -6 -c1 -W2 "${dst}" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
 
 # dial: run on the VM (docker side). Drives the router to dial the client by
@@ -209,10 +222,10 @@ cmd_dial() {
 # client-check: run on the CLIENT machine (no docker). Pings every VPC device
 # from the client, proving the client->VPC direction over the tunnel.
 cmd_client_check() {
-  log "Waiting for the tunnel to settle (client -> router over iroh, up to 90s)"
+  log "Waiting for the tunnel to settle (client -> router over iroh)"
   local up=0
   for _ in $(seq 1 90); do
-    if ping -6 -c1 -W1 "${TUN_ROUTER}" >/dev/null 2>&1; then up=1; break; fi
+    if host_ping1 "${TUN_ROUTER}"; then up=1; break; fi
     sleep 1
   done
   if [[ ${up} -eq 0 ]]; then
