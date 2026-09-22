@@ -41,12 +41,21 @@ pub async fn configure_interface(
     {
         // MTU is set on the utun at creation (via the tun crate's Configuration);
         // macOS has no iproute2, so assign the address and bring it up with
-        // ifconfig. `ifconfig <if> inet6 <addr> prefixlen <n>` also installs the
-        // connected route for the /n, same as Linux `ip addr add`.
-        let _ = mtu;
+        // ifconfig.
+        //
+        // Assign it as a host (/128), NOT the caller's subnet prefix. On macOS a
+        // subnet prefix (e.g. /64) makes the kernel install a connected route
+        // whose next hop is the utun's own link-local, and it then selects that
+        // link-local as the source for any destination in that subnet — notably
+        // the router's own tunnel address — which the router can't answer across
+        // the tunnel. As a /128 there is no connected subnet route, so every VPC
+        // address follows the explicit VPC-prefix route from install_routes with
+        // the correct global source. The tunnel is point-to-point (one peer, the
+        // router), so an on-link subnet on the interface isn't needed.
+        let _ = (mtu, prefix_len);
         run_cmd(
             "ifconfig",
-            &[name, "inet6", &address.to_string(), "prefixlen", &prefix_len.to_string()],
+            &[name, "inet6", &address.to_string(), "prefixlen", "128"],
         )
         .await?;
         run_cmd("ifconfig", &[name, "up"]).await?;
