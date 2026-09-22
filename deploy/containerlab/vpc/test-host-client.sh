@@ -13,6 +13,18 @@
 #      deployment. Both ends reach n0 discovery + Datum relays over the
 #      container/host's normal outbound internet.
 #
+# Addressing is deliberately split so the host reaches the VPC *only* over the
+# tunnel — never via a docker bridge. Because this host is the docker host, it
+# has a direct bridge route to any docker network it creates; if the regions'
+# VPC addresses lived on those bridges, host->region would shortcut the tunnel.
+# So:
+#   - The router<->region fabric ("native", docker) uses fd00:d0c:1{a,b,c}::/64.
+#   - Each region's VPC address (fd00:cafe:1{a,b,c}::1) is a /128 on top of that
+#     link, reachable only by routing through the router.
+#   - The host has no route into fd00:cafe:: except the TUN, so every host->VPC
+#     packet goes through iroh. This mirrors the real architecture: docker plays
+#     no part in the host<->VPC path.
+#
 # Because the host step needs your sudo and must start first (it's the iroh
 # accept side, and prints the endpoint id the router then dials), this is
 # a three-step manual flow rather than one shot:
@@ -32,17 +44,18 @@ PREFIX=vpchost
 TRANSPORT_NET=${PREFIX}-transport
 declare -a REGIONS=(a b c)
 
-# Uses a distinct subnet block (fd00:cafe:1{a,b,c}::/64) from test-3region.sh's
-# (fd00:cafe:{a,b,c}::/64) so the two labs' docker networks never overlap, even
-# with leftovers from a prior run. Both sit under the same fd00:cafe::/32 VPC.
+# VPC prefix (reachable from the host only via the tunnel) and the separate
+# docker fabric prefix (router<->region links). The docker prefix (fd00:d0c)
+# also can't collide with test-3region.sh's fd00:cafe docker networks.
 VPC_AGGREGATE=fd00:cafe::/32
 TUN_LOCAL=fd00:cafe:1100::2     # the host client's VPC address
 TUN_ROUTER=fd00:cafe:1100::1
 TUN_PLEN=64
 ROUTER_XPORT=172.29.0.3
 
-region_addr() { echo "fd00:cafe:1${1}::1"; }
-router_addr() { echo "fd00:cafe:1${1}::ff"; }
+region_addr()      { echo "fd00:cafe:1${1}::1"; }    # region's VPC address (mesh target, tunnel-only)
+region_link_addr() { echo "fd00:d0c:1${1}::1"; }     # region's docker-fabric link address
+router_link_addr() { echo "fd00:d0c:1${1}::ff"; }    # router's address on that link
 region_net()  { echo "${PREFIX}-region-${1}"; }
 region_ctr()  { echo "${PREFIX}-region-${1}"; }
 ROUTER_CTR=${PREFIX}-router
@@ -74,16 +87,20 @@ cmd_up() {
   log "Creating networks"
   docker network create --subnet 172.29.0.0/24 "${TRANSPORT_NET}" >/dev/null
   for r in "${REGIONS[@]}"; do
-    docker network create --ipv6 --subnet "fd00:cafe:1${r}::/64" \
-      --gateway "fd00:cafe:1${r}::ffff" "$(region_net "$r")" >/dev/null
+    docker network create --ipv6 --subnet "fd00:d0c:1${r}::/64" \
+      --gateway "fd00:d0c:1${r}::ffff" "$(region_net "$r")" >/dev/null
   done
 
   log "Starting region devices"
   for r in "${REGIONS[@]}"; do
     docker run -d --name "$(region_ctr "$r")" --network "$(region_net "$r")" \
-      --ip6 "$(region_addr "$r")" --cap-add=NET_ADMIN "${IMAGE}" sleep infinity >/dev/null
+      --ip6 "$(region_link_addr "$r")" --cap-add=NET_ADMIN "${IMAGE}" sleep infinity >/dev/null
+    # VPC address as a /128 on top of the docker link, reachable only via the
+    # router; plus a route for the rest of the VPC back through the router.
     docker exec "$(region_ctr "$r")" \
-      ip -6 route replace "${VPC_AGGREGATE}" via "$(router_addr "$r")" >/dev/null
+      ip -6 addr add "$(region_addr "$r")/128" dev eth0 >/dev/null
+    docker exec "$(region_ctr "$r")" \
+      ip -6 route replace "${VPC_AGGREGATE}" via "$(router_link_addr "$r")" >/dev/null
   done
 
   log "Starting router (L3 hub) and attaching it to every regional segment"
@@ -93,7 +110,10 @@ cmd_up() {
     --sysctl net.ipv6.conf.default.forwarding=1 \
     "${IMAGE}" sleep infinity >/dev/null
   for r in "${REGIONS[@]}"; do
-    docker network connect --ip6 "$(router_addr "$r")" "$(region_net "$r")" "${ROUTER_CTR}" >/dev/null
+    docker network connect --ip6 "$(router_link_addr "$r")" "$(region_net "$r")" "${ROUTER_CTR}" >/dev/null
+    # Route each region's VPC /128 to it across the docker link.
+    docker exec "${ROUTER_CTR}" \
+      ip -6 route replace "$(region_addr "$r")/128" via "$(region_link_addr "$r")" >/dev/null
   done
 
   cat <<EOF
@@ -134,11 +154,22 @@ cmd_dial() {
     --peer-id ${eid} \
     --address ${TUN_ROUTER} --prefix-len ${TUN_PLEN} > /tmp/router.log 2>&1"
 
-  log "Waiting for the tunnel to come up (host -> region-a)"
-  for _ in $(seq 1 30); do
-    if ping -6 -c1 -W1 "$(region_addr a)" >/dev/null 2>&1; then break; fi
+  # Gate on the real tunnel path (host -> router's tunnel address), NOT a region
+  # — every VPC address is now tunnel-only, and the router's ::1 is the most
+  # direct tunnel check. iroh comes up via a relay path first and upgrades to a
+  # direct path; on a single machine that settle can take longer than a few
+  # seconds, so wait generously before running the matrix.
+  log "Waiting for the tunnel to settle (host -> router over iroh, up to 90s)"
+  local up=0
+  for _ in $(seq 1 90); do
+    if ping -6 -c1 -W1 "${TUN_ROUTER}" >/dev/null 2>&1; then up=1; break; fi
     sleep 1
   done
+  if [[ ${up} -eq 0 ]]; then
+    bad "tunnel did not settle (host -> ${TUN_ROUTER} never succeeded)"
+    echo "--- router.log ---"; docker exec "${ROUTER_CTR}" cat /tmp/router.log 2>/dev/null || true
+    return 1
+  fi
 
   log "Reachability from this host into the VPC"
   local fails=0
@@ -168,5 +199,5 @@ case "${1:-}" in
   up)   cmd_up ;;
   dial) shift; cmd_dial "$@" ;;
   down) teardown ;;
-  *)    echo "usage: $0 {up|dial <endpoint-id> <port>|down}" >&2; exit 2 ;;
+  *)    echo "usage: $0 {up|dial <endpoint-id>|down}" >&2; exit 2 ;;
 esac
