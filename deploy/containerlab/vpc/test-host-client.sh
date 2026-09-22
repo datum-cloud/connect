@@ -153,8 +153,11 @@ The router dials the client by endpoint id alone — iroh discovery resolves it,
 EOF
 }
 
-# One IPv6 ping from THIS machine, bounded to ~2s, OS-aware:
-#   - macOS's -W is milliseconds (Linux's is seconds), and macOS uses ping6.
+# One IPv6 ping from THIS machine, OS-aware:
+#   - Linux `ping -6` takes -W in seconds; macOS uses `ping6`, which has no
+#     per-packet reply timeout flag at all (its -W is a valueless flag, not a
+#     waittime), so we don't pass one — a single packet returns fast when the
+#     tunnel is up.
 #   - On macOS we force the source (-S) to the client's VPC address. Otherwise
 #     the kernel may pick the utun link-local as the source for a destination in
 #     the tunnel's own subnet (the router), which the router can't answer — a
@@ -162,7 +165,7 @@ EOF
 #     is the right source regardless). TUN_LOCAL is this client's VPC address.
 host_ping1() {
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    ping6 -c1 -W2000 -S "${TUN_LOCAL}" "$1" >/dev/null 2>&1
+    ping6 -c1 -S "${TUN_LOCAL}" "$1" >/dev/null 2>&1
   else
     ping -6 -c1 -W2 "$1" >/dev/null 2>&1
   fi
