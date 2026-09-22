@@ -184,14 +184,22 @@ unilaterally.
   (and therefore its `Connector`) survives restarts.
 - **MTU is a fixed conservative default**, not derived from iroh's actual
   per-path overhead budget.
-- **Linux + macOS implemented; only Linux exercised so far.** `create_tun_device`
-  uses the cross-platform `tun` crate; `routing.rs` is OS-gated — iproute2
-  (`ip`) on Linux, `ifconfig`/`route` on macOS — and macOS `utun` names are
-  auto-assigned and read back (the kernel rejects arbitrary names). The `tun`
-  crate hides the macOS `utun` 4-byte protocol header, so the data plane is
-  identical. The Linux path is validated end-to-end (containerlab + a real
-  cross-machine client); the macOS path compiles per-target but hasn't been run
-  on real hardware. Windows (wintun) is not implemented.
+- **Linux + macOS implemented; both exercised.** `create_tun_device` uses the
+  cross-platform `tun` crate; `routing.rs` is OS-gated — iproute2 (`ip`) on
+  Linux, `ifconfig`/`route` on macOS — and macOS `utun` names are auto-assigned
+  and read back (the kernel rejects arbitrary names). The `tun` crate hides the
+  macOS `utun` 4-byte protocol header, so the data plane is identical. Both are
+  validated cross-machine (a Mac at home joining a VPC on a Linux VM over iroh).
+  Windows (wintun) is not implemented.
+- **macOS on-link source selection.** On macOS the connected route for the
+  tunnel's own subnet is built with the utun's link-local as next hop, so the
+  kernel may pick that link-local — not the client's VPC address — as the source
+  for a destination *in that same subnet* (e.g. the router's own tunnel
+  address). Reaching VPC members in other prefixes (via the explicit VPC-prefix
+  route) is unaffected, and forcing the source (`ping6 -S <vpc-addr>`) works.
+  Real members generally aren't in the client's own on-link subnet, but a client
+  that must reach one should source from its VPC address explicitly; a cleaner
+  fix (installing the on-link route as an interface route) is a follow-up.
 - **Framing is stream + length-prefix, not QUIC datagrams** — simpler to get
   right first, but datagrams are a better long-term match for IP's
   best-effort delivery model (see §3).
