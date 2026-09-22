@@ -269,14 +269,14 @@ impl FromStr for AdvertismentTicket {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        iroh_tickets::Ticket::deserialize(s)
+        <Self as Ticket>::decode_string(s)
     }
 }
 
 impl Ticket for AdvertismentTicket {
     const KIND: &'static str = "datum";
 
-    // `iroh_tickets::Ticket::to_bytes` is an infallible trait method (it
+    // `iroh_tickets::Ticket::encode_bytes` is an infallible trait method (it
     // returns `Vec<u8>`, not `Result`), so there is no way to propagate a
     // serialization failure to the caller. `postcard::to_allocvec` can only
     // fail for types with a `serde::Serializer` implementation that itself
@@ -287,11 +287,11 @@ impl Ticket for AdvertismentTicket {
     // practice. Falling back to `Vec::new()` here would silently produce a
     // corrupt ticket instead, which is worse than panicking.
     #[allow(clippy::expect_used)]
-    fn to_bytes(&self) -> Vec<u8> {
+    fn encode_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(&self).expect("serialize should work")
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
+    fn decode_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
         let ticket: Self = postcard::from_bytes(bytes)?;
         Ok(ticket)
     }

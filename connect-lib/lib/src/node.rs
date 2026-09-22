@@ -1,11 +1,13 @@
 use std::{fmt::Debug, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use iroh::{
-    Endpoint, EndpointId, SecretKey, discovery::dns::DnsDiscovery, endpoint::default_relay_mode,
+    Endpoint, EndpointId, SecretKey,
+    address_lookup::{self},
+    dns::{DnsResolver, NameserverConfig},
+    endpoint::default_relay_mode,
     protocol::Router,
 };
 use iroh_base::RelayUrl;
-use iroh_n0des::ApiSecret;
 use iroh_proxy_utils::upstream::UpstreamMetrics;
 use iroh_proxy_utils::{
     ALPN as IROH_HTTP_CONNECT_ALPN, Authority, HttpProxyRequest, HttpProxyRequestKind,
@@ -14,8 +16,8 @@ use iroh_proxy_utils::{
     downstream::{DownstreamProxy, EndpointAuthority, ProxyMode},
     upstream::{AuthError, AuthHandler, UpstreamProxy},
 };
-use iroh_relay::dns::{DnsProtocol, DnsResolver};
 use iroh_relay::{RelayConfig, RelayMap};
+use iroh_services::ApiSecret;
 use n0_error::{Result, StackResultExt, StdResultExt};
 use tokio::{
     net::TcpListener,
@@ -38,7 +40,7 @@ pub struct ListenNode {
     state: StateWrapper,
     repo: Repo,
     metrics: Arc<UpstreamMetrics>,
-    _n0des: Option<Arc<iroh_n0des::Client>>,
+    _n0des: Option<Arc<iroh_services::Client>>,
 }
 
 impl ListenNode {
@@ -270,7 +272,7 @@ impl AuthHandler for StateWrapper {
 pub struct ConnectNode {
     endpoint: Endpoint,
     proxy: DownstreamProxy,
-    _n0des: Option<Arc<iroh_n0des::Client>>,
+    _n0des: Option<Arc<iroh_services::Client>>,
 }
 
 impl ConnectNode {
@@ -355,38 +357,49 @@ impl OutboundProxyHandle {
 
 pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<Endpoint> {
     let relay_mode = relay_mode_from_env_or_build().await?;
-    let mut builder = match common.discovery_mode {
-        crate::config::DiscoveryMode::Dns => {
-            Endpoint::empty_builder(relay_mode).secret_key(secret_key)
-        }
-        crate::config::DiscoveryMode::Default | crate::config::DiscoveryMode::Hybrid => {
-            Endpoint::builder()
-                .relay_mode(relay_mode)
-                .secret_key(secret_key)
-        }
-    };
+    // iroh 1.x endpoints have no implicit discovery/address-lookup default and
+    // no fallback crypto provider — both are wired explicitly below rather
+    // than via the `presets` module, so this stays independent of whichever
+    // TLS backend feature iroh itself is built with.
+    let mut builder = iroh::endpoint::Builder::empty()
+        .crypto_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+        .relay_mode(relay_mode)
+        .secret_key(secret_key);
     if let Some(addr) = common.ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
+        builder = builder.bind_addr(addr).std_context("invalid IPv4 bind address")?;
     }
     if let Some(addr) = common.ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
+        builder = builder.bind_addr(addr).std_context("invalid IPv6 bind address")?;
     }
     match common.discovery_mode {
-        crate::config::DiscoveryMode::Default => {}
+        crate::config::DiscoveryMode::Default => {
+            builder = builder
+                .address_lookup(address_lookup::PkarrPublisher::n0_dns())
+                .address_lookup(address_lookup::PkarrResolver::n0_dns())
+                .address_lookup(address_lookup::DnsAddressLookup::n0_dns());
+        }
         crate::config::DiscoveryMode::Dns | crate::config::DiscoveryMode::Hybrid => {
+            if matches!(common.discovery_mode, crate::config::DiscoveryMode::Hybrid) {
+                builder = builder
+                    .address_lookup(address_lookup::PkarrPublisher::n0_dns())
+                    .address_lookup(address_lookup::PkarrResolver::n0_dns());
+            }
             let origin = match &common.dns_origin {
                 Some(origin) => origin.clone(),
                 None => n0_error::bail_any!(
                     "dns_origin is required when discovery_mode is set to dns or hybrid"
                 ),
             };
+            let mut dns_lookup = address_lookup::DnsAddressLookup::builder(origin);
             if let Some(resolver_addr) = common.dns_resolver {
                 let resolver = DnsResolver::builder()
-                    .with_nameserver(resolver_addr, DnsProtocol::Udp)
+                    .add_nameserver_config(
+                        NameserverConfig::udp(resolver_addr.ip()).with_port(resolver_addr.port()),
+                    )
                     .build();
-                builder = builder.dns_resolver(resolver);
+                dns_lookup = dns_lookup.dns_resolver(resolver);
             }
-            builder = builder.discovery(DnsDiscovery::builder(origin));
+            builder = builder.address_lookup(dns_lookup);
         }
     }
     let endpoint = builder.bind().await?;
@@ -670,7 +683,7 @@ pub(crate) fn n0des_api_secret_from_env() -> Result<Option<ApiSecret>> {
 pub(crate) async fn build_n0des_client_opt(
     endpoint: &Endpoint,
     api_secret: Option<ApiSecret>,
-) -> Option<Arc<iroh_n0des::Client>> {
+) -> Option<Arc<iroh_services::Client>> {
     match api_secret {
         None => {
             info!("Disabling metrics collection: N0DES_API_SECRET is not set");
@@ -679,18 +692,15 @@ pub(crate) async fn build_n0des_client_opt(
         Some(n0des_api_secret) => {
             let remote_id = n0des_api_secret.remote.id;
             debug!(remote = %remote_id.fmt_short(), "connecting to n0des endpoint");
-            let builder = match iroh_n0des::Client::builder(endpoint).api_secret(n0des_api_secret) {
+            let builder = match iroh_services::Client::builder(endpoint).api_secret(n0des_api_secret)
+            {
                 Ok(b) => b,
                 Err(err) => {
                     warn!("Disabling metrics collection: Failed to build n0des client: {err:#}");
                     return None;
                 }
             };
-            match builder
-                .build()
-                .await
-                .std_context("Failed to connect to n0des endpoint")
-            {
+            match builder.build().await {
                 Ok(client) => {
                     info!(remote = %remote_id.fmt_short(), "Connected to n0des endpoint for metrics collection");
                     Some(Arc::new(client))
@@ -730,10 +740,11 @@ mod tests {
         let repo = Repo::open_or_create(&dir).await?;
 
         // Generate a key in memory.
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         // Derive expected EndpointId by creating a temporary endpoint.
         let expected_id = {
-            let ep = iroh::Endpoint::builder()
+            let ep = iroh::endpoint::Builder::empty()
+                .crypto_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
                 .relay_mode(iroh::endpoint::RelayMode::Default)
                 .secret_key(key.clone())
                 .bind()
