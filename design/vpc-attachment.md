@@ -240,24 +240,24 @@ the VPC on a Linux VM in a data center, connected over the public internet —
 the client dialed by iroh `EndpointId`, no ip/port anywhere.
 
 ```
-                    HOME                                        DATA-CENTER VM (Linux, dockerd)
-┌─────────────────────────────────┐              ┌──────────────────────────────────────────────────┐
-│  MacBook (macOS)                 │              │   ┌──────────────────────────────────────────────┐│
-│   datum-connect vpc join         │              │   │ router container (mock-galactic-router)        ││
-│   (iroh ACCEPT side)             │              │   │   IPv6 forwarding = on                         ││
-│                                  │              │   │   mock-vpc0 (TUN)  fd00:cafe:1100::1            ││
-│   utun8  fd00:cafe:1100::2/64    │              │   │        │  kernel-forwards between the tunnel    ││
-│      │ route fd00:cafe::/32      │              │   │        │  TUN and the three region segments     ││
-│      ▼   dev utun8               │              │   │   eth1 ─── eth2 ─── eth3                        ││
-│   [packet pump]                  │              │   │   fd00:d0c:1{a,b,c}::ff  (router links)         ││
-│      │                           │              │   └────┼───────┼───────┼───────────────────────────┘│
-│      │  iroh/QUIC bi-stream      │              │        │docker │bridges│  fd00:d0c:1{a,b,c}::/64     │
-│      │  ALPN datum-connect/vpc/0 │─────────────────────▶ │       │       │                            │
-└──────┼───────────────────────────┘   ▲         │    ┌───┴──┐ ┌──┴───┐ ┌─┴────┐  region containers     │
-       │      dialed by EndpointId      │         │    │region│ │region│ │region│  VPC addrs:            │
-       └────── (no ip/port — iroh ──────┘         │    │  -a  │ │  -b  │ │  -c  │  cafe:1a::1            │
-               discovery + relays)                │    └──────┘ └──────┘ └──────┘  cafe:1b::1 cafe:1c::1 │
-          PUBLIC  INTERNET                         └──────────────────────────────────────────────────┘
+                HOME                                        DATA-CENTER VM (Linux, dockerd)
+┌──────────────────────────────────┐             ┌───────────────────────────────────────────────────────┐
+│  MacBook (macOS)                 │             │    ┌─────────────────────────────────────────────────┐│
+│   datum-connect vpc join         │             │    │ router container (mock-galactic-router)         ││
+│   (iroh ACCEPT side)             │             │    │   IPv6 forwarding = on                          ││
+│                                  │             │    │   mock-vpc0 (TUN)  fd00:cafe:1100::1            ││
+│   utun8  fd00:cafe:1100::2/64    │             │    │        │  kernel-forwards between the tunnel    ││
+│      │ route fd00:cafe::/32      │             │    │        │  TUN and the three region segments     ││
+│      ▼   dev utun8               │             │    │   eth1 ─── eth2 ─── eth3                        ││
+│   [TUN ⇄ iroh forwarder]         │             │    │   fd00:d0c:1{a,b,c}::ff  (router links)         ││
+│      │                           │             │    └────┼───────┼───────┼────────────────────────────┘│
+│      │  iroh/QUIC bi-stream      │             │         │docker │bridges│  fd00:d0c:1{a,b,c}::/64     │
+│      │  ALPN datum-connect/vpc/0 │─────────────────────▶ │       │       │                             │
+└──────┼───────────────────────────┘    ▲        │     ┌───┴──┐ ┌──┴───┐ ┌─┴────┐  region containers     │
+       │      dialed by EndpointId      │        │     │region│ │region│ │region│  VPC addrs:            │
+       └─────── (no ip/port — iroh ─────┘        │     │  -a  │ │  -b  │ │  -c  │  cafe:1a::1            │
+               discovery + relays)               │     └──────┘ └──────┘ └──────┘  cafe:1b::1 cafe:1c::1 │
+          PUBLIC  INTERNET                       └───────────────────────────────────────────────────────┘
 
 VPC address space      = fd00:cafe::/32          reachable from the laptop ONLY through the iroh tunnel
 docker "native" fabric = fd00:d0c:1{a,b,c}::/64  router⇄region links; the laptop has no route to these
