@@ -157,12 +157,24 @@ docker exec -d "${ROUTER_CTR}" sh -c "mock-galactic-router \
   --peer-id ${EID} --peer-addr ${LOCAL_XPORT}:${PORT} \
   --address ${TUN_ROUTER} --prefix-len ${TUN_PLEN} > /tmp/router.log 2>&1"
 
-# Devices to include in the full mesh: local + the three regions.
+# Devices to include in the full mesh: local + the router + the three regions.
+# The router joins as a node at its tunnel-side address (fd00:cafe:100::1) — the
+# same address on which it terminates the tunnel and forwards; reaching it from a
+# region exercises region->router forwarding, from local exercises the direct
+# tunnel hop, and the router as a source exercises its own stack toward every
+# other device.
 declare -A ADDR
 ADDR[local]=${TUN_LOCAL}
+ADDR[router]=${TUN_ROUTER}
 for r in "${REGIONS[@]}"; do ADDR[region-${r}]=$(region_addr "$r"); done
-ctr_of() { case "$1" in local) echo "${LOCAL_CTR}";; region-*) echo "${PREFIX}-region-${1#region-}";; esac; }
-DEVICES=(local region-a region-b region-c)
+ctr_of() {
+  case "$1" in
+    local) echo "${LOCAL_CTR}";;
+    router) echo "${ROUTER_CTR}";;
+    region-*) echo "${PREFIX}-region-${1#region-}";;
+  esac
+}
+DEVICES=(local router region-a region-b region-c)
 
 # Wait for the tunnel/forwarding to converge (local -> region-a is the first
 # path that needs both the iroh tunnel and router forwarding working).
