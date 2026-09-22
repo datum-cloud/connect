@@ -8,6 +8,50 @@ It does **not** exercise any real galactic VRF/BGP/eBPF, and does not yet
 talk to a `VPCAttachment` resource — see the design doc for what's
 scaffolded ahead of the real control plane.
 
+There are two labs here:
+
+- **`test-3region.sh` — the automated, repeatable full-mesh test.** A 3-region
+  VPC (mirroring galactic's dfw/sjc/iad model) with the router on it and the
+  local device joining through the router, then a full-mesh ping matrix proving
+  every device reaches every other. Self-contained on plain Docker (no
+  containerlab, no root beyond Docker access), idempotent, exits non-zero on any
+  failure. **Start here** — `./test-3region.sh`. Canonical containerlab form of
+  the same topology: `vpc-3region.clab.yaml`.
+- **`vpc.clab.yaml` — the minimal 2-node walkthrough** below, for understanding
+  the client/router handshake step by step by hand.
+
+## The 3-region test
+
+```bash
+cd deploy/containerlab/vpc
+./test-3region.sh          # build image if needed, stand up, verify, tear down
+./test-3region.sh --keep   # leave it up afterwards to poke at
+./test-3region.sh --down   # tear down a --keep run
+```
+
+Topology (all nodes run `connect-vpc-lab:latest`): a `router` acts as a plain
+IPv6 L3 hub — it forwards (kernel forwarding) between three regional segments
+(`fd00:cafe:{a,b,c}::/64`) and, over the iroh tunnel, the `local` device
+(`fd00:cafe:100::2` on its `datum-vpc0` TUN). `mock-galactic-router` itself only
+creates its tunnel TUN and pumps packets; the kernel does the forwarding — the
+same division of labor a real galactic router has (its VRF/eBPF datapath
+forwards; the userspace agent just moves tunnel packets). The VPC aggregate is
+`fd00:cafe::/32` because it must cover all of `fd00:cafe:{a,b,c,100}::/64`, whose
+third 16-bit group differs — a `/48` fixes that group and would exclude them.
+
+Expected tail:
+
+```
+PASS local -> region-a (fd00:cafe:a::1)
+...
+PASS all devices can reach all other devices
+```
+
+The containerlab form (`vpc-3region.clab.yaml`) sets up the same nodes,
+addressing, and regional links; `containerlab` needs root to deploy (supply it
+yourself), then drive the app layer as `test-3region.sh` does — start the
+client, scrape its endpoint id + port, start the router dialing it, ping.
+
 ## Topology
 
 Two nodes, `client` and `router`, both running the same image (the built

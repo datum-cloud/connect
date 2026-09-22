@@ -49,12 +49,21 @@ pub async fn configure_interface(
 ///   replacing `::/0` outright, so a lower-metric, more-specific pair of
 ///   routes wins over the real default without literally removing it.
 ///
-/// Before touching the default route, this pins an explicit host route for
-/// the galactic router's own iroh path via the pre-existing default gateway.
-/// Without this, the moment the split-default routes point at the tun
-/// device, the iroh/QUIC traffic that carries this very tunnel would get
-/// routed back into itself — this is wg-quick's own well-known gotcha for
-/// full-tunnel configs, encountered independently in the WireGuard-linux
+/// Routes are plain `dev` routes out the tunnel interface, exactly as
+/// `wg-quick` installs AllowedIPs: there is only ever one peer on this
+/// interface (the galactic router), so every packet the interface accepts
+/// goes to that router regardless — a next-hop gateway would be redundant.
+/// The advertised prefixes must genuinely cover the VPC addresses the client
+/// needs to reach; a prefix that doesn't (e.g. a `/48` that doesn't contain
+/// the target `/64` subnets) simply won't match and the destination is
+/// unreachable, which is a configuration error, not a routing-layer one.
+///
+/// In `DefaultRoute` mode, before touching the default route, this pins an
+/// explicit host route for the galactic router's own iroh path via the
+/// pre-existing default gateway. Without this, the moment the split-default
+/// routes point at the tun device, the iroh/QUIC traffic that carries this
+/// very tunnel would get routed back into itself — wg-quick's own well-known
+/// full-tunnel gotcha, encountered independently in the WireGuard-linux
 /// research this feature is based on.
 pub async fn install_routes(
     name: &str,
@@ -70,14 +79,14 @@ pub async fn install_routes(
         }
         Mode::DefaultRoute => {
             if let Some(router_ip) = router_ip {
-                if let Some((gateway, iface)) = current_default_route().await? {
+                if let Some((default_gw, iface)) = current_default_route().await? {
                     run_ip(&[
                         "-6",
                         "route",
                         "add",
                         &format!("{router_ip}/128"),
                         "via",
-                        &gateway,
+                        &default_gw,
                         "dev",
                         &iface,
                     ])

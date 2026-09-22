@@ -189,9 +189,29 @@ unilaterally.
 
 ## 7. Testing
 
-See `deploy/containerlab/vpc/README.md` for the containerlab lab: a client
-node running `vpc join` against a `mock-galactic-router` fixture that
-stands in for §5's imagined component, proving the data-plane mechanism
-(TUN creation, iroh accept/dial handshake, framing, routing-mode
-installation) end-to-end without depending on anything in the galactic
-repo.
+See `deploy/containerlab/vpc/README.md`. Two labs, both driving a
+`mock-galactic-router` fixture that stands in for §5's imagined component,
+proving the data-plane mechanism (TUN creation, iroh accept/dial handshake,
+framing, routing-mode installation) end-to-end without depending on anything
+in the galactic repo:
+
+- **`test-3region.sh`** — the repeatable full-mesh test: a 3-region VPC
+  (mirroring galactic's dfw/sjc/iad model) with the router on it and the
+  local device joining through the router, then a full-mesh ping matrix over
+  all four devices. Self-contained on Docker, idempotent, non-zero exit on
+  any failure. The router is a plain IPv6 L3 hub: kernel forwarding moves
+  packets between the three regional segments and the tunnel TUN, while
+  `mock-galactic-router` only pumps the tunnel — the same split a real
+  galactic router has. Verified: all 12 ordered pairs reachable.
+- **`vpc.clab.yaml`** — a minimal 2-node client/router walkthrough.
+
+An addressing detail worth stating because it bit during bring-up: the
+advertised VPC prefix must genuinely *cover* the addresses the client needs
+to reach. Regional subnets `fd00:cafe:{a,b,c,100}::/64` differ in their third
+16-bit group, so their covering aggregate is `fd00:cafe::/32`, not
+`fd00:cafe::/48` (a `/48` fixes the third group). A prefix that doesn't cover
+a destination simply doesn't match and the destination is unreachable — a
+config error, not a routing-layer one. Routes into the VPC are plain `dev`
+routes out the tunnel, as `wg-quick` installs AllowedIPs: with exactly one
+peer on the interface (the router), every accepted packet goes to it anyway,
+so no next-hop gateway is needed.
