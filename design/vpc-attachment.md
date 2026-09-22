@@ -232,3 +232,99 @@ config error, not a routing-layer one. Routes into the VPC are plain `dev`
 routes out the tunnel, as `wg-quick` installs AllowedIPs: with exactly one
 peer on the interface (the router), every accepted packet goes to it anyway,
 so no next-hop gateway is needed.
+
+## 8. Cross-machine validation (Mac at home ↔ VM in a data center)
+
+Validated end-to-end with the client on a bare-metal macOS laptop at home and
+the VPC on a Linux VM in a data center, connected over the public internet —
+the client dialed by iroh `EndpointId`, no ip/port anywhere.
+
+```
+                    HOME                                        DATA-CENTER VM (Linux, dockerd)
+┌─────────────────────────────────┐              ┌──────────────────────────────────────────────────┐
+│  MacBook (macOS)                 │              │   ┌──────────────────────────────────────────────┐│
+│   datum-connect vpc join         │              │   │ router container (mock-galactic-router)        ││
+│   (iroh ACCEPT side)             │              │   │   IPv6 forwarding = on                         ││
+│                                  │              │   │   mock-vpc0 (TUN)  fd00:cafe:1100::1            ││
+│   utun8  fd00:cafe:1100::2/64    │              │   │        │  kernel-forwards between the tunnel    ││
+│      │ route fd00:cafe::/32      │              │   │        │  TUN and the three region segments     ││
+│      ▼   dev utun8               │              │   │   eth1 ─── eth2 ─── eth3                        ││
+│   [packet pump]                  │              │   │   fd00:d0c:1{a,b,c}::ff  (router links)         ││
+│      │                           │              │   └────┼───────┼───────┼───────────────────────────┘│
+│      │  iroh/QUIC bi-stream      │              │        │docker │bridges│  fd00:d0c:1{a,b,c}::/64     │
+│      │  ALPN datum-connect/vpc/0 │─────────────────────▶ │       │       │                            │
+└──────┼───────────────────────────┘   ▲         │    ┌───┴──┐ ┌──┴───┐ ┌─┴────┐  region containers     │
+       │      dialed by EndpointId      │         │    │region│ │region│ │region│  VPC addrs:            │
+       └────── (no ip/port — iroh ──────┘         │    │  -a  │ │  -b  │ │  -c  │  cafe:1a::1            │
+               discovery + relays)                │    └──────┘ └──────┘ └──────┘  cafe:1b::1 cafe:1c::1 │
+          PUBLIC  INTERNET                         └──────────────────────────────────────────────────┘
+
+VPC address space      = fd00:cafe::/32          reachable from the laptop ONLY through the iroh tunnel
+docker "native" fabric = fd00:d0c:1{a,b,c}::/64  router⇄region links; the laptop has no route to these
+```
+
+Key properties this validated:
+
+- **Only iroh crosses the internet.** The VPC prefix (`fd00:cafe::/32`) lives on
+  the TUN devices; the laptop has no other route into it, so every laptop↔VPC
+  packet rides the iroh tunnel.
+- **Dial-by-identity.** The router dials the laptop's iroh `EndpointId` —
+  discovery/relays resolve reachability; no IP or port is configured anywhere.
+- **The router is a plain L3 hub.** `mock-galactic-router` only pumps its TUN;
+  the Linux kernel forwards between the tunnel and the three region segments —
+  the same split a real galactic router would have.
+- **docker is invisible to the client.** The `fd00:d0c:*` links are only the
+  router⇄region fabric; splitting that prefix from the VPC prefix keeps the
+  client's traffic on the tunnel rather than a docker shortcut.
+
+The run, across the three machines/roles (`deploy/containerlab/vpc/test-host-client.sh`):
+
+On the data-center VM (docker) — stand up the containerized VPC:
+
+```
+% ./test-host-client.sh up
+==> Tearing down containers/networks (host client, if running, must be stopped separately)
+==> Creating networks
+==> Starting region devices
+==> Starting router (L3 hub) and attaching it to every regional segment
+
+==> Containerized VPC is up.
+```
+
+On the Mac — join the VPC (creates the utun; dialed by id), then verify
+client→VPC:
+
+```
+% nix build
+% sudo env DATUM_CONNECT_DIR=/tmp/vpchost-datum DATUM_SESSION=lab \
+    DATUM_CREDENTIALS_HELPER="$PWD/deploy/containerlab/vpc/fake-credentials-helper.sh" \
+    DATUM_API_HOST=https://api.lab.invalid \
+    ./result/bin/datum-connect --json vpc join --vpc lab-host \
+    --address fd00:cafe:1100::2 --prefix-len 64 --mode vpc-only --vpc-prefix fd00:cafe::/32
+{"address":"fd00:cafe:1100::2","bound_addrs":["0.0.0.0:60114","[::]:56325"],"endpoint_id":"9968ba066a6f01d0fec0f41e1a81a32ddd2af58def83178c4531b46539038eea","mode":"vpc-only","tun_name":"utun8","type":"vpc_ready","vpc":"lab-host"}
+
+% deploy/containerlab/vpc/test-host-client.sh client-check
+==> Waiting for the tunnel to settle (client -> router over iroh)
+==> Reachability from the client into the VPC
+PASS client -> region-a (fd00:cafe:1a::1)
+PASS client -> region-b (fd00:cafe:1b::1)
+PASS client -> region-c (fd00:cafe:1c::1)
+PASS client -> router (fd00:cafe:1100::1)
+
+PASS client reaches the whole VPC over the tunnel
+```
+
+Back on the VM — the router dials the Mac by its endpoint id and verifies
+VPC→client:
+
+```
+% ./test-host-client.sh dial 9968ba066a6f01d0fec0f41e1a81a32ddd2af58def83178c4531b46539038eea
+==> router: dialing the client by endpoint id (via iroh discovery)
+==> Waiting for the tunnel to settle (region-a -> client over iroh, up to 90s)
+==> Reachability from the VPC to the client (fd00:cafe:1100::2)
+PASS region-a -> client (fd00:cafe:1100::2)
+PASS region-b -> client (fd00:cafe:1100::2)
+PASS region-c -> client (fd00:cafe:1100::2)
+
+PASS VPC -> client reachable. Run './test-host-client.sh client-check' ON THE CLIENT for the client -> VPC direction.
+```
