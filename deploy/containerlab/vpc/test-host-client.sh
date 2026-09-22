@@ -32,14 +32,17 @@ PREFIX=vpchost
 TRANSPORT_NET=${PREFIX}-transport
 declare -a REGIONS=(a b c)
 
+# Uses a distinct subnet block (fd00:cafe:1{a,b,c}::/64) from test-3region.sh's
+# (fd00:cafe:{a,b,c}::/64) so the two labs' docker networks never overlap, even
+# with leftovers from a prior run. Both sit under the same fd00:cafe::/32 VPC.
 VPC_AGGREGATE=fd00:cafe::/32
-TUN_LOCAL=fd00:cafe:100::2      # the host client's VPC address
-TUN_ROUTER=fd00:cafe:100::1
+TUN_LOCAL=fd00:cafe:1100::2     # the host client's VPC address
+TUN_ROUTER=fd00:cafe:1100::1
 TUN_PLEN=64
 ROUTER_XPORT=172.29.0.3
 
-region_addr() { echo "fd00:cafe:${1}::1"; }
-router_addr() { echo "fd00:cafe:${1}::ff"; }
+region_addr() { echo "fd00:cafe:1${1}::1"; }
+router_addr() { echo "fd00:cafe:1${1}::ff"; }
 region_net()  { echo "${PREFIX}-region-${1}"; }
 region_ctr()  { echo "${PREFIX}-region-${1}"; }
 ROUTER_CTR=${PREFIX}-router
@@ -71,8 +74,8 @@ cmd_up() {
   log "Creating networks"
   docker network create --subnet 172.29.0.0/24 "${TRANSPORT_NET}" >/dev/null
   for r in "${REGIONS[@]}"; do
-    docker network create --ipv6 --subnet "fd00:cafe:${r}::/64" \
-      --gateway "fd00:cafe:${r}::ffff" "$(region_net "$r")" >/dev/null
+    docker network create --ipv6 --subnet "fd00:cafe:1${r}::/64" \
+      --gateway "fd00:cafe:1${r}::ffff" "$(region_net "$r")" >/dev/null
   done
 
   log "Starting region devices"
@@ -117,6 +120,13 @@ The router dials the host by endpoint id alone — iroh discovery resolves it, n
 EOF
 }
 
+# Retry a ping a few times before giving up: the iroh connection is dialed by
+# endpoint id and comes up via a relay path first, then upgrades to a direct
+# path — a brief blip during that upgrade can drop a packet or two. A genuinely
+# unreachable target still fails after all attempts.
+hping()  { local dst="$1"; for _ in $(seq 1 5); do ping -6 -c1 -W2 "${dst}" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+cping()  { local ctr="$1" dst="$2"; for _ in $(seq 1 5); do docker exec "${ctr}" ping -6 -c1 -W2 "${dst}" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+
 cmd_dial() {
   local eid="${1:?usage: $0 dial <endpoint-id>}"
   log "router: dialing the host client by endpoint id (via iroh discovery)"
@@ -133,17 +143,17 @@ cmd_dial() {
   log "Reachability from this host into the VPC"
   local fails=0
   for r in "${REGIONS[@]}"; do
-    if ping -6 -c2 -W2 "$(region_addr "$r")" >/dev/null 2>&1; then
+    if hping "$(region_addr "$r")"; then
       ok "host -> region-${r} ($(region_addr "$r"))"
     else
       bad "host -> region-${r} ($(region_addr "$r"))"; fails=$((fails + 1))
     fi
   done
-  if ping -6 -c2 -W2 "${TUN_ROUTER}" >/dev/null 2>&1; then ok "host -> router (${TUN_ROUTER})"; else bad "host -> router (${TUN_ROUTER})"; fails=$((fails + 1)); fi
+  if hping "${TUN_ROUTER}"; then ok "host -> router (${TUN_ROUTER})"; else bad "host -> router (${TUN_ROUTER})"; fails=$((fails + 1)); fi
 
   log "Reachability from the VPC back to this host (${TUN_LOCAL})"
   for r in "${REGIONS[@]}"; do
-    if docker exec "$(region_ctr "$r")" ping -6 -c2 -W2 "${TUN_LOCAL}" >/dev/null 2>&1; then
+    if cping "$(region_ctr "$r")" "${TUN_LOCAL}"; then
       ok "region-${r} -> host (${TUN_LOCAL})"
     else
       bad "region-${r} -> host (${TUN_LOCAL})"; fails=$((fails + 1))

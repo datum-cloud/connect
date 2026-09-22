@@ -193,12 +193,26 @@ if [[ ${converged} -eq 0 ]]; then
   [[ ${KEEP} -eq 0 ]] && teardown; exit 1
 fi
 
+# Retry each pair a few times: the iroh connection is dialed by endpoint id
+# and comes up via a relay path first, then upgrades to a direct path — a
+# brief blip during that upgrade can drop a packet or two, which shouldn't
+# fail a reachability check. A genuinely unreachable pair still fails after
+# all attempts, so this hardens against transients without hiding real breaks.
+ping_from() { # <container> <dst-addr>
+  local ctr="$1" dst="$2"
+  for _ in $(seq 1 5); do
+    docker exec "${ctr}" ping -6 -c1 -W2 "${dst}" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
 log "Full-mesh ping matrix (${#DEVICES[@]} devices, $(( ${#DEVICES[@]} * (${#DEVICES[@]} - 1) )) ordered pairs)"
 fails=0
 for src in "${DEVICES[@]}"; do
   for dst in "${DEVICES[@]}"; do
     [[ "${src}" == "${dst}" ]] && continue
-    if docker exec "$(ctr_of "${src}")" ping -6 -c2 -W2 "${ADDR[${dst}]}" >/dev/null 2>&1; then
+    if ping_from "$(ctr_of "${src}")" "${ADDR[${dst}]}"; then
       ok "${src} -> ${dst} (${ADDR[${dst}]})"
     else
       bad "${src} -> ${dst} (${ADDR[${dst}]})"; fails=$((fails + 1))
