@@ -137,24 +137,24 @@ docker exec -d "${LOCAL_CTR}" sh -c "datumctl-connect vpc join -o json \
   --mode vpc-only --vpc-prefix ${VPC_AGGREGATE} \
   > /tmp/local.log 2>&1"
 
-# Wait for the client to publish its iroh endpoint id + bound port.
-EID=""; PORT=""
+# Wait for the client to publish its iroh endpoint id. That id is all the
+# router needs — iroh discovery resolves how to reach it (no ip/port).
+EID=""
 for _ in $(seq 1 30); do
   LOCAL_LOG=$(docker exec "${LOCAL_CTR}" cat /tmp/local.log 2>/dev/null || true)
   EID=$(printf '%s' "${LOCAL_LOG}" | grep -oE '"endpoint_id":"[0-9a-f]+"' | head -1 | sed 's/.*:"//;s/"//')
-  PORT=$(printf '%s' "${LOCAL_LOG}" | grep -oE '0\.0\.0\.0:[0-9]+' | head -1 | cut -d: -f2)
-  [[ -n "${EID}" && -n "${PORT}" ]] && break
+  [[ -n "${EID}" ]] && break
   sleep 1
 done
-if [[ -z "${EID}" || -z "${PORT}" ]]; then
-  bad "client never reported an endpoint id / port"; docker exec "${LOCAL_CTR}" cat /tmp/local.log || true
+if [[ -z "${EID}" ]]; then
+  bad "client never reported an endpoint id"; docker exec "${LOCAL_CTR}" cat /tmp/local.log || true
   [[ ${KEEP} -eq 0 ]] && teardown; exit 1
 fi
-log "client endpoint ${EID} listening on ${LOCAL_XPORT}:${PORT}"
+log "client endpoint ${EID}"
 
-log "router: dialing the client to bring the tunnel up"
+log "router: dialing the client by endpoint id (via iroh discovery)"
 docker exec -d "${ROUTER_CTR}" sh -c "mock-galactic-router \
-  --peer-id ${EID} --peer-addr ${LOCAL_XPORT}:${PORT} \
+  --peer-id ${EID} \
   --address ${TUN_ROUTER} --prefix-len ${TUN_PLEN} > /tmp/router.log 2>&1"
 
 # Devices to include in the full mesh: local + the router + the three regions.

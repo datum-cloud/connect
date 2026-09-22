@@ -8,18 +8,18 @@
 # Two things differ from the all-in-containers test:
 #   1. The host client needs root (CAP_NET_ADMIN) to create/configure its TUN,
 #      so you run that one command under sudo yourself. Nothing here calls sudo.
-#   2. The router (in a container) dials the host over iroh at the docker network
-#      gateway address (the host's address on the transport bridge). Verified
-#      reachable; if your host firewall drops container->host UDP on the iroh
-#      port, open it.
+#   2. The router (in a container) dials the host purely by iroh EndpointId —
+#      no ip/port — resolved through iroh discovery, the same as a real
+#      deployment. Both ends reach n0 discovery + Datum relays over the
+#      container/host's normal outbound internet.
 #
 # Because the host step needs your sudo and must start first (it's the iroh
-# accept side, and prints the endpoint id + port the router then dials), this is
+# accept side, and prints the endpoint id the router then dials), this is
 # a three-step manual flow rather than one shot:
 #
 #   ./test-host-client.sh up                 # build + stand up the containerized VPC, print the host command
-#   sudo env ... datum-connect ... vpc join  # (printed by `up`) run on the host; note its endpoint id + port
-#   ./test-host-client.sh dial <id> <port>   # router dials the host; then ping across
+#   sudo env ... datum-connect ... vpc join  # (printed by `up`) run on the host; note its endpoint id
+#   ./test-host-client.sh dial <endpoint-id> # router dials the host by id (iroh discovery); then ping across
 #   ./test-host-client.sh down               # tear down (Ctrl+C the host client separately)
 #
 set -euo pipefail
@@ -47,8 +47,6 @@ ROUTER_CTR=${PREFIX}-router
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 bad()  { printf '\033[1;31mFAIL\033[0m %s\n' "$*"; }
-
-gateway() { docker network inspect "${TRANSPORT_NET}" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'; }
 
 teardown() {
   log "Tearing down containers/networks (host client, if running, must be stopped separately)"
@@ -95,7 +93,6 @@ cmd_up() {
     docker network connect --ip6 "$(router_addr "$r")" "$(region_net "$r")" "${ROUTER_CTR}" >/dev/null
   done
 
-  local gw; gw=$(gateway)
   cat <<EOF
 
 $(log "Containerized VPC is up. Now run the CLIENT on this host, as root:")
@@ -110,23 +107,21 @@ $(log "Containerized VPC is up. Now run the CLIENT on this host, as root:")
       --mode vpc-only --vpc-prefix ${VPC_AGGREGATE}
 
 It prints a line like:
-  {"type":"vpc_ready", ... "endpoint_id":"<ID>", "bound_addrs":["0.0.0.0:<PORT>", ...]}
+  {"type":"vpc_ready", ... "endpoint_id":"<ID>", ...}
 
-Leave it running. Then, with that ID and PORT:
+Leave it running. Then, with that ID:
 
-  $0 dial <ID> <PORT>
+  $0 dial <ID>
 
-The router will dial this host at ${gw}:<PORT> (the transport gateway = this host).
+The router dials the host by endpoint id alone — iroh discovery resolves it, no ip/port.
 EOF
 }
 
 cmd_dial() {
-  local eid="${1:?usage: $0 dial <endpoint-id> <port>}"
-  local port="${2:?usage: $0 dial <endpoint-id> <port>}"
-  local gw; gw=$(gateway)
-  log "router: dialing the host client at ${gw}:${port}"
+  local eid="${1:?usage: $0 dial <endpoint-id>}"
+  log "router: dialing the host client by endpoint id (via iroh discovery)"
   docker exec -d "${ROUTER_CTR}" sh -c "mock-galactic-router \
-    --peer-id ${eid} --peer-addr ${gw}:${port} \
+    --peer-id ${eid} \
     --address ${TUN_ROUTER} --prefix-len ${TUN_PLEN} > /tmp/router.log 2>&1"
 
   log "Waiting for the tunnel to come up (host -> region-a)"

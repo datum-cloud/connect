@@ -5,20 +5,19 @@
 //! sharing the exact same framing/pump implementation
 //! (`connect_lib::vpc`'s `VpcDialer`) that a real router would use.
 //!
-//! Dials the client directly by IP (no relay, no DNS discovery) — fine for
-//! a shared containerlab network segment, not representative of how a real
-//! deployment (behind NAT, using Datum's relays) would connect.
+//! Dials the client by iroh `EndpointId` alone — no IP/port — using the same
+//! relay + discovery configuration `connect-lib` gives every client
+//! (`build_endpoint`), so iroh resolves and connects to the endpoint exactly
+//! as a real deployment would. `--peer-addr` is optional and only pins a
+//! direct address for an offline/same-host lab where discovery isn't wanted.
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use clap::Parser;
-use connect_lib::{VpcDialer, vpc_configure_interface, vpc_create_tun_device};
-use iroh::{
-    EndpointAddr, EndpointId, SecretKey, TransportAddr,
-    endpoint::{Builder, RelayMode},
-};
+use connect_lib::{Config, VpcDialer, build_endpoint, vpc_configure_interface, vpc_create_tun_device};
+use iroh::{EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use n0_error::{Result, StdResultExt};
 use tokio::sync::Mutex;
 
@@ -29,12 +28,15 @@ use tokio::sync::Mutex;
 )]
 struct Args {
     /// iroh EndpointId of the `vpc join` client to dial (printed by
-    /// `datum-connect vpc join` as "Your endpoint ID").
+    /// `datum-connect vpc join` as the endpoint id). This is all that's
+    /// needed — iroh discovery resolves how to reach it.
     #[clap(long)]
     peer_id: String,
-    /// Direct socket address (ip:port) to dial the client at.
+    /// Optional direct socket address (ip:port) to pin for the client,
+    /// bypassing discovery. Only useful for an offline/same-host lab; omit
+    /// it to dial purely by endpoint id like a real deployment.
     #[clap(long)]
-    peer_addr: SocketAddr,
+    peer_addr: Option<SocketAddr>,
     /// This router's own address on the VPC side of the tunnel. Use the
     /// same prefix as the client's `--address`/`--prefix-len` so both ends
     /// pick up an on-link route to each other automatically.
@@ -69,28 +71,30 @@ async fn run() -> Result<()> {
     let tun_reader = Arc::new(Mutex::new(tun_reader));
     let tun_writer = Arc::new(Mutex::new(tun_writer));
 
-    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
+    // Same relay + discovery config every connect-lib client gets, so the
+    // client is resolvable by endpoint id and the two share a relay network.
     let secret_key = SecretKey::generate();
-    let endpoint = Builder::empty()
-        .crypto_provider(crypto_provider)
-        .relay_mode(RelayMode::Disabled)
-        .secret_key(secret_key)
-        .bind()
-        .await
-        .std_context("binding mock router iroh endpoint")?;
+    let endpoint = build_endpoint(secret_key, &Config::default()).await?;
+
+    // Dial by endpoint id; add a direct address only if one was pinned.
+    let mut remote = EndpointAddr::from(peer_id);
+    if let Some(addr) = args.peer_addr {
+        remote.addrs.insert(TransportAddr::Ip(addr));
+    }
 
     eprintln!("mock-galactic-router: endpoint id {}", endpoint.id());
-    eprintln!(
-        "mock-galactic-router: interface {} up at {} — dialing {peer_id} at {}",
-        args.tun_name, args.address, args.peer_addr
-    );
+    match args.peer_addr {
+        Some(addr) => eprintln!(
+            "mock-galactic-router: interface {} up at {} — dialing {peer_id} (pinned addr {addr})",
+            args.tun_name, args.address
+        ),
+        None => eprintln!(
+            "mock-galactic-router: interface {} up at {} — dialing {peer_id} via discovery",
+            args.tun_name, args.address
+        ),
+    }
 
     let dialer = VpcDialer::new(endpoint);
-    let remote = EndpointAddr {
-        id: peer_id,
-        addrs: [TransportAddr::Ip(args.peer_addr)].into_iter().collect(),
-    };
-
     dialer
         .dial_and_pump(remote, tun_reader, tun_writer, args.mtu as usize)
         .await?;

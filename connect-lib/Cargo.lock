@@ -2529,7 +2529,6 @@ dependencies = [
  "connect-lib",
  "iroh",
  "n0-error",
- "rustls",
  "tokio",
  "tracing",
  "tracing-subscriber",

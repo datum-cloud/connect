@@ -50,7 +50,7 @@ PASS all devices can reach all other devices
 The containerlab form (`vpc-3region.clab.yaml`) sets up the same nodes,
 addressing, and regional links; `containerlab` needs root to deploy (supply it
 yourself), then drive the app layer as `test-3region.sh` does — start the
-client, scrape its endpoint id + port, start the router dialing it, ping.
+client, note its endpoint id, start the router dialing it by id, ping.
 
 ## Topology
 
@@ -111,7 +111,7 @@ Wait a couple seconds, then read its output:
 docker exec clab-vpc-attachment-client cat /tmp/client.log
 ```
 
-You should see something like (verified output, IDs/ports will differ per run):
+You should see something like (verified output, the id will differ per run):
 
 ```
   ⚠ No --router-id set — accepting any dialer (trust-on-first-connect). This is only appropriate for lab/dev use; see design/vpc-attachment.md.
@@ -121,17 +121,9 @@ Listening on: 0.0.0.0:40295, [::]:37541
 Press Ctrl+C to stop...
 ```
 
-`Listening on` is iroh's wildcard bind (`0.0.0.0:<port>` / `[::]:<port>`),
-not a dialable address by itself — the router needs it combined with the
-client container's actual address, which containerlab/Docker assigns
-separately:
-
-```bash
-docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' clab-vpc-attachment-client
-```
-
-Note the **endpoint ID**, the **port** from the first `Listening on` entry,
-and this **container IP** — the router needs all three (as `<ip>:<port>`).
+Note the **endpoint ID** — that's all the router needs. iroh resolves how to
+reach it via discovery; no ip/port. (`Listening on` is just iroh's local
+wildcard bind, printed for reference.)
 
 ## 4. Start the router
 
@@ -139,10 +131,14 @@ and this **container IP** — the router needs all three (as `<ip>:<port>`).
 docker exec -d clab-vpc-attachment-router sh -c \
   'mock-galactic-router \
      --peer-id <endpoint id from step 3> \
-     --peer-addr <client container ip from step 3>:<port from step 3> \
      --address fd00:1::1 --prefix-len 120 \
      > /tmp/router.log 2>&1'
 ```
+
+The router dials the client by endpoint id alone (both ends reach iroh
+discovery + relays over normal outbound internet). `mock-galactic-router`
+also accepts an optional `--peer-addr <ip:port>` to pin a direct address and
+bypass discovery — only useful for an offline/same-host lab.
 
 ```bash
 docker exec clab-vpc-attachment-router cat /tmp/router.log

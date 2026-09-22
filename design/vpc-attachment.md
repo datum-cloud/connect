@@ -146,11 +146,13 @@ above has a real consumer in mind:
 - Own `BGPVRFInstance`/Argument per remote client rather than sharing the
   tenant's, per the return-path plan's precedent — many simultaneous remote
   clients per node must not collide in the 12-bit Argument space.
-- Opens its own TUN device and dials the client's iroh endpoint on
-  `IROH_VPC_ALPN` once claimed, then pumps packets between the TUN device
-  and the iroh stream using the same framing this repo implements
-  (`lib/src/vpc/transport.rs`'s `pump` — shared by `VpcDialer`, used by the
-  containerlab lab's mock router).
+- Opens its own TUN device and dials the client by its iroh `EndpointId` on
+  `IROH_VPC_ALPN` once claimed — no IP/port; iroh discovery resolves how to
+  reach the client (published under its `Connector` status). It then pumps
+  packets between the TUN device and the iroh stream using the same framing
+  this repo implements (`lib/src/vpc/transport.rs`'s `pump` — shared by
+  `VpcDialer`, used by the containerlab lab's mock router, which likewise
+  dials by endpoint id alone).
 - Likely a new binary rather than a mode of `galactic-router`, matching this
   codebase's split-by-failure-domain pattern (`galactic-gateway` /
   `galactic-router` / `galactic-nat66`).
@@ -167,12 +169,14 @@ unilaterally.
   `VPCAttachment` watch. Wiring it up is the natural next step once a real
   router exists to populate the CRD's status.
 - **`--router-ip` (DefaultRoute mode's anti-loop pin) is a simplification**:
-  it only works when the router is dialed at a single known direct address
-  (true in the containerlab lab). A production deployment where iroh may
-  route through relays and/or multiple discovered direct paths needs a more
-  general solution — e.g. pinning routes for the endpoint's *currently
-  connected* relay/direct addresses, updated as they change, rather than a
-  single static IP.
+  it pins one static host route so the tunnel's own iroh traffic isn't
+  swallowed by the split-default routes. But iroh dials by `EndpointId` and
+  reaches a peer over relays and/or multiple discovered direct paths that
+  change over time, so a single static IP can't reliably cover the underlay.
+  A production DefaultRoute mode needs to pin routes for the endpoint's
+  *currently connected* relay/direct addresses and update them as they
+  change (the labs use VpcOnly mode, which doesn't touch the default route,
+  so they don't hit this).
 - **No per-attachment key persistence**: each `vpc join` run generates a
   fresh iroh identity in memory (like `tunnel listen --endpoint` does before
   a tunnel exists). Once CRD-backed, this should follow `tunnel`'s
