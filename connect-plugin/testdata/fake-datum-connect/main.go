@@ -5,6 +5,7 @@
 //   expired-token: prints ready JSON with "status": "expired"
 //   401-then-recover: first call returns 401 JSON, second returns ready JSON
 //   child-crash: exits with code 1
+//   self-kill: kills its own process with SIGKILL (exit via signal, no code)
 //   error-before-ready: listen emits a typed error then exits without ready
 //
 // Subcommands: list, listen, update, delete
@@ -50,6 +51,16 @@ func main() {
 	// Handle child-crash mode
 	if mode == "child-crash" {
 		os.Exit(1)
+	}
+
+	// Handle self-kill mode: die from a signal rather than an exit code so
+	// the supervisor's 128+signal mapping can be exercised.
+	if mode == "self-kill" {
+		if p, err := os.FindProcess(os.Getpid()); err == nil {
+			_ = p.Kill()
+		}
+		// Kill is asynchronous; block until it lands.
+		select {}
 	}
 
 	// Handle 401-then-recover mode (check for a counter file)

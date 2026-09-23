@@ -5,14 +5,17 @@ use std::time::Duration as StdDuration;
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use n0_error::Result;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::watch;
 
 use crate::{ProjectControlPlaneClient, Repo, SelectedContext};
 
 pub mod env;
 pub mod external_token_source;
+pub mod token_source;
 
 pub use self::env::ApiEnv;
+pub use self::token_source::{StaticTokenSource, TokenSource};
 
 use self::external_token_source::ExternalTokenSource;
 
@@ -51,17 +54,12 @@ pub(crate) mod auth {
         pub expires_in: StdDuration,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
     pub enum LoginState {
+        #[default]
         Missing,
         Valid,
         Refreshing,
-    }
-
-    impl Default for LoginState {
-        fn default() -> Self {
-            LoginState::Missing
-        }
     }
 
     #[derive(Debug, Clone)]
@@ -100,16 +98,6 @@ pub(crate) mod auth {
 
         pub fn load(&self) -> Arc<AuthState> {
             self.0.load_full()
-        }
-
-        pub fn get(&self) -> Result<Arc<AuthState>, ()> {
-            Ok(self.0.load_full())
-        }
-    }
-
-    impl AuthState {
-        pub fn get(&self) -> Result<&AuthState, ()> {
-            Ok(self)
         }
     }
 
@@ -163,21 +151,33 @@ pub use self::auth::{AuthState, AuthTokens, LoginState, MaybeAuth, UserProfile};
 #[derive(derive_more::Debug, Clone)]
 pub struct DatumCloudClient {
     env: ApiEnv,
-    token_source: Arc<ExternalTokenSource>,
+    #[debug("TokenSource")]
+    token_source: Arc<dyn TokenSource>,
     session: SessionStateWrapper,
     login_state_tx: watch::Sender<LoginState>,
 }
 
 impl DatumCloudClient {
-    /// Constructs a `DatumCloudClient` using an `ExternalTokenSource` (plugin mode).
-    pub fn with_external_token_source(env: ApiEnv, token_source: ExternalTokenSource) -> Self {
+    /// Constructs a `DatumCloudClient` over any [`TokenSource`].
+    pub fn with_token_source(env: ApiEnv, token_source: Arc<dyn TokenSource>) -> Self {
         let (login_state_tx, _) = watch::channel(LoginState::Valid);
         Self {
             env,
-            token_source: Arc::new(token_source),
+            token_source,
             session: SessionStateWrapper::empty(),
             login_state_tx,
         }
+    }
+
+    /// Constructs a `DatumCloudClient` using an `ExternalTokenSource` (plugin mode).
+    pub fn with_external_token_source(env: ApiEnv, token_source: ExternalTokenSource) -> Self {
+        Self::with_token_source(env, Arc::new(token_source))
+    }
+
+    /// The token source backing this client, for constructing sibling
+    /// clients that must observe the same rotations.
+    pub fn token_source(&self) -> Arc<dyn TokenSource> {
+        self.token_source.clone()
     }
 
     pub fn login_state(&self) -> LoginState {
@@ -188,7 +188,16 @@ impl DatumCloudClient {
         true
     }
 
+    /// Returns the current token as a plain `String` (back-compat with the
+    /// pre-`TokenSource` API). Prefer [`Self::token_secret`] for new code:
+    /// it returns a `SecretString` and this form copies the secret into an
+    /// un-zeroized `String` on every call.
     pub fn token(&self) -> String {
+        self.token_source.token().expose_secret().to_owned()
+    }
+
+    /// Returns the current token.
+    pub fn token_secret(&self) -> SecretString {
         self.token_source.token()
     }
 
@@ -229,7 +238,9 @@ impl DatumCloudClient {
     pub fn auth_state(&self) -> Arc<MaybeAuth> {
         Arc::new(MaybeAuth::dummy(AuthState {
             tokens: AuthTokens {
-                access_token: AccessToken::new(self.token_source.token()),
+                access_token: AccessToken::new(
+                    self.token_source.token().expose_secret().to_owned(),
+                ),
                 refresh_token: None,
                 issued_at: Utc::now(),
                 expires_in: StdDuration::from_secs(3600),
@@ -284,7 +295,7 @@ impl DatumCloudClient {
         project_id: &str,
     ) -> Result<ProjectControlPlaneClient> {
         let token = self.token_source.token();
-        self.project_control_plane_client_with_token(project_id, &token)
+        self.project_control_plane_client_with_token(project_id, token.expose_secret())
     }
 
     pub async fn project_control_plane_client_active(
@@ -395,61 +406,61 @@ pub struct Project {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::test_util::setup_plugin_env;
+    use crate::test_util::{make_jwt_with_exp, static_token_source};
 
     #[test]
     fn with_external_token_source_creates_plugin_mode_client() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         assert!(client.is_plugin_mode());
     }
 
     #[test]
     fn login_state_valid_in_plugin_mode() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         assert_eq!(client.login_state(), LoginState::Valid);
     }
 
     #[test]
     fn token_returns_external_token() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
-        // The fake helper returns a JWT with exp 9999999999
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         assert!(client.token().starts_with("eyJ"));
+    }
+
+    /// The back-compat `String`-typed `token()` and `token_secret()` must
+    /// agree: both read the same underlying `TokenSource`.
+    #[test]
+    fn token_and_token_secret_agree() {
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
+        assert_eq!(client.token(), client.token_secret().expose_secret());
     }
 
     #[test]
     fn auth_state_returns_dummy_in_plugin_mode() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         let auth_state = client.auth_state();
-        assert!(auth_state.get().is_ok());
-        let auth = auth_state.get().unwrap();
+        let auth = auth_state.load();
         assert_eq!(auth.profile.user_id, "external");
         assert_eq!(auth.profile.email, "external@plugin");
     }
 
     #[test]
     fn api_url_from_env_in_plugin_mode() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         assert!(client.api_url().contains("datum.net"));
     }
 
     #[test]
     fn web_url_from_env_in_plugin_mode() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         assert!(client.web_url().contains("datum.net"));
     }
 
     #[test]
     fn datum_cloud_client_clone_in_plugin_mode() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         let cloned = client.clone();
         assert!(cloned.is_plugin_mode());
         assert_eq!(cloned.token(), client.token());
@@ -457,25 +468,35 @@ mod tests {
 
     #[test]
     fn auth_update_watch_returns_receiver_in_plugin_mode() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         let rx = client.auth_update_watch();
         // Initial value should be 0
         assert_eq!(*rx.borrow(), 0);
     }
 
     #[test]
+    fn token_rotation_is_visible_through_client() {
+        let source = StaticTokenSource::new(make_jwt_with_exp(1));
+        let client =
+            DatumCloudClient::with_token_source(ApiEnv::Production, Arc::new(source.clone()));
+        let rotated = make_jwt_with_exp(2);
+        source.set(rotated.clone());
+        assert_eq!(client.token(), rotated);
+        assert_eq!(client.token_secret().expose_secret(), rotated);
+        client.force_token_refresh();
+        assert_eq!(source.refresh_requests(), 1);
+    }
+
+    #[test]
     fn selected_context_is_none_in_plugin_mode() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         // In plugin mode, session state is empty (no OIDC repo)
         assert!(client.selected_context().is_none());
     }
 
     #[test]
     fn login_state_watch_returns_receiver_in_plugin_mode() {
-        let (_dir, token_source) = setup_plugin_env();
-        let client = DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source);
+        let client = DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source());
         let rx = client.login_state_watch();
         assert_eq!(*rx.borrow(), LoginState::Valid);
     }

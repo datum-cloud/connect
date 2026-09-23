@@ -32,7 +32,7 @@ use crate::datum_apis::traffic_protection_policy::{
     TrafficProtectionPolicyRuleSetType, TrafficProtectionPolicySpec,
 };
 use crate::datum_cloud::DatumCloudClient;
-use crate::kube_error::is_quota_check_timeout;
+use crate::kube_error::{classify_list_error, is_quota_check_timeout};
 use crate::{Advertisment, DEFAULT_PCP_NAMESPACE, ListenNode, TcpProxyData, state::ProxyState};
 const DEFAULT_CONNECTOR_CLASS_NAME: &str = "datum-connect";
 const CONNECTOR_SELECTOR_FIELD: &str = "status.connectionDetails.publicKey.id";
@@ -491,23 +491,24 @@ impl TunnelService {
         let connectors: Api<Connector> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         let ads: Api<ConnectorAdvertisement> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
 
-        let proxy_list = proxies
-            .list(&ListParams::default())
-            .await
-            .std_context("Failed to list HTTPProxy objects")?;
+        let proxy_list = proxies.list(&ListParams::default()).await.map_err(|err| {
+            classify_list_error(project_id, "Failed to list HTTPProxy objects", err)
+        })?;
 
         // Collect connector names referenced by non-deleting proxies.
         let referenced: std::collections::HashSet<String> = proxy_list
             .items
             .iter()
             .filter(|p| p.metadata.deletion_timestamp.is_none())
-            .filter_map(|p| proxy_connector_name(p))
+            .filter_map(proxy_connector_name)
             .collect();
 
         let connector_list = connectors
             .list(&ListParams::default())
             .await
-            .std_context("Failed to list Connector objects")?;
+            .map_err(|err| {
+                classify_list_error(project_id, "Failed to list Connector objects", err)
+            })?;
 
         let mut deleted = Vec::new();
         for c in connector_list.items {
@@ -578,15 +579,17 @@ impl TunnelService {
             Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         let connectors_api: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
 
-        let proxy_list = proxies
-            .list(&ListParams::default())
-            .await
-            .std_context("Failed to list HTTPProxy objects")?;
+        let proxy_list = proxies.list(&ListParams::default()).await.map_err(|err| {
+            classify_list_error(project_id, "Failed to list HTTPProxy objects", err)
+        })?;
 
-        let ad_list = ads
-            .list(&ListParams::default())
-            .await
-            .std_context("Failed to list ConnectorAdvertisement objects")?;
+        let ad_list = ads.list(&ListParams::default()).await.map_err(|err| {
+            classify_list_error(
+                project_id,
+                "Failed to list ConnectorAdvertisement objects",
+                err,
+            )
+        })?;
         let enabled_by_name: std::collections::HashMap<String, ConnectorAdvertisement> = ad_list
             .items
             .into_iter()
@@ -597,7 +600,9 @@ impl TunnelService {
         let connector_list = connectors_api
             .list(&ListParams::default())
             .await
-            .std_context("Failed to list Connector objects")?;
+            .map_err(|err| {
+                classify_list_error(project_id, "Failed to list Connector objects", err)
+            })?;
         let connector_ready_by_name: std::collections::HashMap<String, bool> = connector_list
             .items
             .iter()
@@ -1293,10 +1298,13 @@ impl TunnelService {
 
         let mut connector_name_out: Option<String> = None;
         if let Some(connector_name) = connector_name {
-            let remaining = proxies
-                .list(&ListParams::default())
-                .await
-                .std_context("Failed to list remaining HTTPProxy objects")?;
+            let remaining = proxies.list(&ListParams::default()).await.map_err(|err| {
+                classify_list_error(
+                    project_id,
+                    "Failed to list remaining HTTPProxy objects",
+                    err,
+                )
+            })?;
             let mut remaining_for_connector = remaining
                 .items
                 .into_iter()
@@ -1314,7 +1322,13 @@ impl TunnelService {
                 let ads_list = ads
                     .list(&ListParams::default().fields(&ad_selector))
                     .await
-                    .std_context("Failed to list remaining ConnectorAdvertisements")?;
+                    .map_err(|err| {
+                        classify_list_error(
+                            project_id,
+                            "Failed to list remaining ConnectorAdvertisements",
+                            err,
+                        )
+                    })?;
                 for ad in ads_list.items {
                     if let Some(name) = ad.metadata.name.clone()
                         && let Err(err) = ads.delete(&name, &DeleteParams::default()).await
@@ -1362,32 +1376,10 @@ impl TunnelService {
         let connectors: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
         let endpoint_id = self.listen.endpoint_id().to_string();
         let selector = format!("{CONNECTOR_SELECTOR_FIELD}={endpoint_id}");
-        let list = match connectors
+        let list = connectors
             .list(&ListParams::default().fields(&selector))
             .await
-        {
-            Ok(list) => list,
-            Err(kube::Error::Api(e)) if e.code == 403 => {
-                n0_error::bail_any!(
-                    "Permission denied listing connectors in project {project_id}. \
-                     Switch your datumctl context to this project first: \
-                     'datumctl ctx switch {project_id}'"
-                );
-            }
-            Err(kube::Error::Api(e)) if e.code == 401 => {
-                n0_error::bail_any!(
-                    "Authentication failed for project {project_id}. \
-                     Switch your datumctl context to this project first: \
-                     'datumctl ctx switch {project_id}'"
-                );
-            }
-            Err(err) => {
-                return Err(err).std_context("Failed to list connectors");
-            }
-        };
-        if list.items.is_empty() {
-            return Ok(None);
-        }
+            .map_err(|err| classify_list_error(project_id, "Failed to list connectors", err))?;
         if list.items.len() > 1 {
             debug!(
                 %selector,
@@ -1395,7 +1387,9 @@ impl TunnelService {
                 "Multiple connectors found for endpoint, using first"
             );
         }
-        let mut connector = list.items.into_iter().next().unwrap();
+        let Some(mut connector) = list.items.into_iter().next() else {
+            return Ok(None);
+        };
         patch_device_annotations(&connectors, &mut connector).await;
         Ok(Some(connector))
     }
@@ -1891,6 +1885,7 @@ fn create_traffic_protection_policies_enabled() -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::datum_apis::connector::{ConnectorSpec, ConnectorStatus};
@@ -2039,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_step_carries_resource_label() {
+    fn progress_step_carries_resource_label() -> Result<(), Box<dyn std::error::Error>> {
         // Every step should know which Kubernetes resource backs it so the
         // CLI can render "[HTTPProxy/tunnel-test]" or
         // "[Connector/datum-connect-test]" alongside the line — that's
@@ -2062,18 +2057,19 @@ mod tests {
         let progress_no_conn = TunnelProgress::from_resources(&p, None);
         let iroh = progress_no_conn
             .step(ProgressStepKind::IrohDnsPublished)
-            .unwrap();
+            .ok_or("IrohDnsPublished step must exist")?;
         assert!(
             iroh.resource.is_none(),
             "connector-backed step has no resource when connector is missing"
         );
         let proxy_step = progress_no_conn
             .step(ProgressStepKind::ProxyAccepted)
-            .unwrap();
+            .ok_or("ProxyAccepted step must exist")?;
         assert_eq!(
             proxy_step.resource.as_deref(),
             Some("HTTPProxy/tunnel-test")
         );
+        Ok(())
     }
 
     fn api_error(code: u16, message: &str) -> kube::Error {
@@ -2121,7 +2117,8 @@ mod tests {
     }
 
     #[test]
-    fn progress_pending_when_status_is_stale_for_current_generation() {
+    fn progress_pending_when_status_is_stale_for_current_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
         // `tunnel listen --id` PATCHes the HTTPProxy spec to re-point the
         // backend at the current connector, bumping generation 1 → 2. The
         // controller's prior True conditions still carry observedGeneration=1
@@ -2157,11 +2154,12 @@ mod tests {
         assert_eq!(
             progress_fresh
                 .step(ProgressStepKind::ProxyProgrammed)
-                .unwrap()
+                .ok_or("ProxyProgrammed step must exist")?
                 .status,
             StepStatus::Ready,
             "matched observedGeneration must be Ready"
         );
+        Ok(())
     }
 
     fn proxy_with_backend(label: &str, endpoint: &str, connector_name: &str) -> HTTPProxy {

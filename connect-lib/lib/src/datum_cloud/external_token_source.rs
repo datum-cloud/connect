@@ -1,11 +1,12 @@
 use std::env;
 use std::process::Command;
 
-use arc_swap::ArcSwap;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+
+use super::token_source::TokenSource;
 
 /// Errors that can occur when constructing an [`ExternalTokenSource`] from environment.
 #[derive(Debug, thiserror::Error)]
@@ -29,8 +30,18 @@ pub enum ExternalTokenError {
 /// and refreshed periodically before JWT expiry or on demand via [`force_refresh()`](Self::force_refresh).
 #[derive(Clone)]
 pub struct ExternalTokenSource {
-    token: std::sync::Arc<ArcSwap<SecretString>>,
-    token_tx: std::sync::Arc<watch::Sender<String>>,
+    /// Canonical current token. Both `token()`/`watch()` (the `TokenSource`
+    /// trait) and their back-compat `String`-typed inherent equivalents
+    /// below ultimately read this: there is no separate cached copy that
+    /// could drift from what a subscriber observes.
+    token_tx: std::sync::Arc<watch::Sender<SecretString>>,
+    /// Mirror of `token_tx` for the pre-`TokenSource` `String`-typed
+    /// [`watch`](Self::watch) API. A `watch::Receiver<T>` is tied to its
+    /// channel's `T` at creation, so a second channel is the only way to
+    /// offer both element types; it is written in the same call as
+    /// `token_tx` (see [`swap_token`](Self::swap_token)), never
+    /// independently, so it cannot diverge from the canonical value.
+    token_tx_compat: std::sync::Arc<watch::Sender<String>>,
     refresh_trigger: std::sync::Arc<watch::Sender<u64>>,
 }
 
@@ -68,59 +79,35 @@ impl ExternalTokenSource {
             "ExternalTokenSource::from_env — token loaded from helper"
         );
 
-        let (token_tx, _) = watch::channel(token.clone());
+        let token_str = token;
+        let (token_tx, _) = watch::channel(SecretString::from(token_str.clone()));
+        let (token_tx_compat, _) = watch::channel(token_str);
         let (refresh_tx, _) = watch::channel(0u64);
 
         Ok(Self {
-            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
-                token.clone().into(),
-            ))),
             token_tx: std::sync::Arc::new(token_tx),
+            token_tx_compat: std::sync::Arc::new(token_tx_compat),
             refresh_trigger: std::sync::Arc::new(refresh_tx),
         })
     }
 
-    /// Returns the current token as a plain `String`.
+    /// Returns the current token as a plain `String` (back-compat with the
+    /// pre-`TokenSource` API). Prefer [`TokenSource::token`] for new code:
+    /// it returns a `SecretString` and this inherent form copies the secret
+    /// into an un-zeroized `String` on every call.
     pub fn token(&self) -> String {
-        self.token.load_full().expose_secret().to_string()
+        self.token_tx.borrow().expose_secret().to_owned()
     }
 
-    /// Returns a watch channel subscriber for token updates.
+    /// Returns a watch channel subscriber for token updates as plain
+    /// `String`s (back-compat with the pre-`TokenSource` API). Prefer
+    /// [`TokenSource::watch`] for new code.
     pub fn watch(&self) -> watch::Receiver<String> {
-        self.token_tx.subscribe()
+        self.token_tx_compat.subscribe()
     }
 
-    /// Atomically swaps the token and notifies watch subscribers.
-    pub fn swap_token(&self, new_token: String) {
-        debug!(
-            new_token_len = new_token.len(),
-            "ExternalTokenSource::swap_token"
-        );
-        self.token.store(std::sync::Arc::new(SecretString::new(
-            new_token.clone().into(),
-        )));
-        let _ = self.token_tx.send(new_token);
-    }
-
-    /// Start the background refresh loop. Must be called from within a tokio runtime.
-    ///
-    /// The loop periodically re-executes the credentials helper before the current
-    /// token expires, calls [`swap_token()`](Self::swap_token) with the result,
-    /// and responds to [`force_refresh()`](Self::force_refresh) signals.
-    pub fn start_refresh(&self, helper: String, session: String) {
-        let this = self.clone();
-        let mut refresh_rx = self.refresh_trigger.subscribe();
-        let initial_exp = match parse_jwt_expiry(&self.token()) {
-            Ok(exp) => exp,
-            Err(_) => None,
-        };
-        tokio::spawn(async move {
-            this.run_refresh_loop(helper, session, &mut refresh_rx, initial_exp)
-                .await;
-        });
-    }
-
-    /// Triggers an immediate token refresh.
+    /// Triggers an immediate token refresh (back-compat inherent form of
+    /// [`TokenSource::force_refresh`], which forwards here).
     ///
     /// Call this when a 401 response is observed from the API.
     /// The refresh loop wakes up early, re-executes the credentials helper,
@@ -132,6 +119,35 @@ impl ExternalTokenSource {
             "token refresh: forced refresh requested (401 or stale auth observed)"
         );
         let _ = self.refresh_trigger.send(current.wrapping_add(1));
+    }
+
+    /// Atomically swaps the token and notifies watch subscribers, including
+    /// any that subscribe later: `send_replace` writes the new value
+    /// unconditionally, even with zero current subscribers on either
+    /// channel (see the struct-level doc comment on `token_tx_compat`).
+    pub fn swap_token(&self, new_token: String) {
+        debug!(
+            new_token_len = new_token.len(),
+            "ExternalTokenSource::swap_token"
+        );
+        self.token_tx
+            .send_replace(SecretString::from(new_token.clone()));
+        self.token_tx_compat.send_replace(new_token);
+    }
+
+    /// Start the background refresh loop. Must be called from within a tokio runtime.
+    ///
+    /// The loop periodically re-executes the credentials helper before the current
+    /// token expires, calls [`swap_token()`](Self::swap_token) with the result,
+    /// and responds to [`force_refresh()`](Self::force_refresh) signals.
+    pub fn start_refresh(&self, helper: String, session: String) {
+        let this = self.clone();
+        let mut refresh_rx = self.refresh_trigger.subscribe();
+        let initial_exp = parse_jwt_expiry(&self.token()).unwrap_or_default();
+        tokio::spawn(async move {
+            this.run_refresh_loop(helper, session, &mut refresh_rx, initial_exp)
+                .await;
+        });
     }
 
     fn exec_helper(helper: &str, session: &str) -> Result<String, ExternalTokenError> {
@@ -249,18 +265,30 @@ impl ExternalTokenSource {
     }
 }
 
+impl TokenSource for ExternalTokenSource {
+    fn token(&self) -> SecretString {
+        self.token_tx.borrow().clone()
+    }
+
+    fn watch(&self) -> watch::Receiver<SecretString> {
+        self.token_tx.subscribe()
+    }
+
+    fn force_refresh(&self) {
+        ExternalTokenSource::force_refresh(self)
+    }
+}
+
 /// Parse the `exp` (expiry) claim from the middle segment of a JWT.
 ///
 /// Returns `None` if the claim is missing (caller may default to 1 h).
 fn parse_jwt_expiry(token: &str) -> Result<Option<u64>, JwtParseError> {
     let parts: Vec<&str> = token.splitn(3, '.').collect();
-    if parts.len() < 2 {
-        return Err(JwtParseError::InvalidToken(
+    let payload_b64 = parts.get(1).ok_or_else(|| {
+        JwtParseError::InvalidToken(
             "JWT must have at least 2 segments (header.payload[.signature])".into(),
-        ));
-    }
-
-    let payload_b64 = parts[1];
+        )
+    })?;
 
     // Base64url decode: replace URL-safe chars with standard base64 chars, then pad.
     let mut standard_b64 = payload_b64.replace('-', "+").replace('_', "/");
@@ -295,19 +323,21 @@ enum JwtParseError {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::test_util::{TempDir, make_jwt_with_exp, setup_plugin_env};
 
     #[test]
-    fn parse_jwt_expiry_extracts_exp() {
+    fn parse_jwt_expiry_extracts_exp() -> Result<(), Box<dyn std::error::Error>> {
         let token = make_jwt_with_exp(1700000000);
-        let exp = parse_jwt_expiry(&token).unwrap().unwrap();
+        let exp = parse_jwt_expiry(&token)?.ok_or("expected exp claim")?;
         assert_eq!(exp, 1700000000);
+        Ok(())
     }
 
     #[test]
-    fn parse_jwt_expiry_returns_none_when_missing() {
+    fn parse_jwt_expiry_returns_none_when_missing() -> Result<(), Box<dyn std::error::Error>> {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             serde_json::json!({"sub":"test-user"})
@@ -315,8 +345,9 @@ mod tests {
                 .as_bytes(),
         );
         let token = format!("{header}.{payload}.sig");
-        let exp = parse_jwt_expiry(&token).unwrap();
+        let exp = parse_jwt_expiry(&token)?;
         assert!(exp.is_none());
+        Ok(())
     }
 
     #[test]
@@ -327,7 +358,7 @@ mod tests {
 
     #[test]
     fn parse_jwt_expiry_rejects_invalid_base64() {
-        let token = format!("header.!!!.sig");
+        let token = "header.!!!.sig".to_string();
         let result = parse_jwt_expiry(&token);
         assert!(result.is_err());
     }
@@ -342,19 +373,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_jwt_expiry_handles_url_safe_chars() {
+    fn parse_jwt_expiry_handles_url_safe_chars() -> Result<(), Box<dyn std::error::Error>> {
         let payload_json = serde_json::json!({"exp": 9999999999u64, "sub": "test"});
         let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(payload_json.to_string().as_bytes());
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
         let token = format!("{header}.{payload_b64}.sig");
-        let exp = parse_jwt_expiry(&token).unwrap().unwrap();
+        let exp = parse_jwt_expiry(&token)?.ok_or("expected exp claim")?;
         assert_eq!(exp, 9999999999);
+        Ok(())
     }
 
     #[test]
     fn from_env_requires_helper() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         unsafe {
             std::env::remove_var("DATUM_CREDENTIALS_HELPER");
             std::env::set_var("DATUM_SESSION", "test-session");
@@ -365,7 +397,7 @@ mod tests {
 
     #[test]
     fn from_env_requires_session() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         unsafe {
             std::env::set_var("DATUM_CREDENTIALS_HELPER", "/bin/echo");
             std::env::remove_var("DATUM_SESSION");
@@ -380,9 +412,20 @@ mod tests {
         assert!(source.token().starts_with("eyJ"));
     }
 
+    /// The inherent `String`-typed `token()` and the `TokenSource` trait's
+    /// `SecretString`-typed `token()` must agree: both read the same
+    /// canonical `token_tx` channel, not independent copies.
+    #[test]
+    fn inherent_and_trait_token_agree() {
+        let (_dir, source) = setup_plugin_env();
+        let inherent = source.token();
+        let via_trait = TokenSource::token(&source);
+        assert_eq!(inherent, via_trait.expose_secret().to_owned());
+    }
+
     #[test]
     fn from_env_requires_datum_credentials_helper() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_util::env_lock();
         unsafe {
             std::env::remove_var("DATUM_CREDENTIALS_HELPER");
             std::env::set_var("DATUM_SESSION", "test-session");
@@ -401,6 +444,46 @@ mod tests {
 
         assert_eq!(source.token(), new_token);
         assert_eq!(*rx.borrow(), new_token);
+    }
+
+    /// The trait's `SecretString`-typed watch channel must also see the
+    /// rotation, since `swap_token` writes both channels together.
+    #[test]
+    fn swap_token_notifies_trait_watch_too() {
+        let (_dir, source) = setup_plugin_env();
+
+        let rx = TokenSource::watch(&source);
+        let new_token = make_jwt_with_exp(8888888899);
+        source.swap_token(new_token.clone());
+
+        assert_eq!(rx.borrow().expose_secret(), &new_token);
+    }
+
+    /// Regression test for the discarded-update bug: `watch::Sender::send`
+    /// returns early (without writing the value) when there are zero
+    /// receivers. `swap_token` must use `send_replace` on both the
+    /// canonical and the compat channel so a subscriber that calls
+    /// `watch()` *after* a rotation that happened with nobody listening
+    /// still observes the rotation, not the stale pre-rotation value.
+    #[test]
+    fn late_subscriber_sees_rotation_that_happened_with_no_receivers() {
+        let (_dir, source) = setup_plugin_env();
+        let initial = source.token();
+
+        // No `watch()` call yet on either channel — zero receivers exist.
+        let rotated = make_jwt_with_exp(7777777777);
+        source.swap_token(rotated.clone());
+        assert_ne!(
+            initial, rotated,
+            "precondition: rotation actually changes the token"
+        );
+
+        // Subscribing now, on both the compat and the trait channel, must
+        // observe the rotation, not the stale initial value.
+        let compat_rx = source.watch();
+        let trait_rx = TokenSource::watch(&source);
+        assert_eq!(*compat_rx.borrow(), rotated);
+        assert_eq!(trait_rx.borrow().expose_secret(), &rotated);
     }
 
     #[test]
@@ -458,7 +541,6 @@ mod tests {
     /// stayed dead until the proactive timer eventually fired.
     #[tokio::test]
     async fn force_refresh_swaps_token_via_loop() {
-        let _lock = crate::ENV_LOCK.lock().unwrap();
         let dir = TempDir::new("ets-loop");
 
         // Helper that emits a distinct JWT on every invocation by reading
@@ -487,12 +569,21 @@ mod tests {
         )
         .expect("should set executable permission");
 
-        unsafe {
-            std::env::set_var(
-                "DATUM_CREDENTIALS_HELPER",
-                helper_path.to_string_lossy().as_ref(),
-            );
-            std::env::set_var("DATUM_SESSION", "test-session");
+        // The env lock is only needed around the actual env var mutation:
+        // nothing after this point re-reads `DATUM_CREDENTIALS_HELPER` or
+        // `DATUM_SESSION` from the process environment (the helper path and
+        // session are passed to `start_refresh` as owned strings), so the
+        // guard is dropped before the awaits below instead of held across
+        // them (clippy::await_holding_lock).
+        {
+            let _lock = crate::test_util::env_lock();
+            unsafe {
+                std::env::set_var(
+                    "DATUM_CREDENTIALS_HELPER",
+                    helper_path.to_string_lossy().as_ref(),
+                );
+                std::env::set_var("DATUM_SESSION", "test-session");
+            }
         }
 
         // Use a token with a far-future expiry so the proactive timer does
@@ -501,13 +592,12 @@ mod tests {
         std::fs::write(&counter_path, "0").expect("should reset counter");
         // Build the source by hand so from_env() doesn't consume the first
         // helper invocation (we want the *loop* to be the one rotating).
-        let (token_tx, _) = watch::channel(initial.clone());
+        let (token_tx, _) = watch::channel(SecretString::from(initial.clone()));
+        let (token_tx_compat, _) = watch::channel(initial.clone());
         let (refresh_tx, _) = watch::channel(0u64);
         let source = ExternalTokenSource {
-            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
-                initial.clone().into(),
-            ))),
             token_tx: std::sync::Arc::new(token_tx),
+            token_tx_compat: std::sync::Arc::new(token_tx_compat),
             refresh_trigger: std::sync::Arc::new(refresh_tx),
         };
 

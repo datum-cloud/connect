@@ -39,7 +39,10 @@ use tracing_subscriber::{
 use connect_lib::datum_cloud::DatumCloudClient;
 use connect_lib::datum_cloud::env::ApiEnv;
 use connect_lib::datum_cloud::external_token_source::ExternalTokenSource;
-use connect_lib::{HeartbeatAgent, ListenNode, Repo, SelectedContext, TunnelService};
+use connect_lib::{
+    ControlPlaneError, HeartbeatAgent, ListenNode, MissingConnectDir, Repo, SelectedContext,
+    TunnelService,
+};
 use iroh::SecretKey;
 
 mod progress;
@@ -144,9 +147,9 @@ async fn resolve_listen_key(
     project_id: &str,
     tunnel_id: &str,
 ) -> n0_error::Result<(SecretKey, bool)> {
-    match repo.listen_key_for_tunnel(project_id, tunnel_id).await {
-        Ok(k) => Ok((k, false)),
-        Err(e) if e.to_string().contains("KEY_NOT_FOUND") => {
+    match repo.listen_key_for_tunnel(project_id, tunnel_id).await? {
+        Some(k) => Ok((k, false)),
+        None => {
             let _ = writeln!(
                 std::io::stderr(),
                 "  \u{26A0} No listen key for tunnel {tunnel_id} — generating new key. \
@@ -156,7 +159,6 @@ async fn resolve_listen_key(
             let new_key = SecretKey::generate(&mut rand::rng());
             Ok((new_key, true))
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -243,14 +245,12 @@ async fn cleanup_tunnel(service: &TunnelService, tunnel_id: &str, json: bool) {
                     resources.push(serde_json::json!({"type": "HTTPProxy", "name": name}));
                 }
                 if let Some(ref name) = o.connector_ad {
-                    resources.push(
-                        serde_json::json!({"type": "ConnectorAdvertisement", "name": name}),
-                    );
+                    resources
+                        .push(serde_json::json!({"type": "ConnectorAdvertisement", "name": name}));
                 }
                 if let Some(ref name) = o.traffic_protection_policy {
-                    resources.push(
-                        serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}),
-                    );
+                    resources
+                        .push(serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}));
                 }
                 if let Some(ref name) = o.connector {
                     resources.push(serde_json::json!({"type": "Connector", "name": name}));
@@ -302,35 +302,23 @@ fn resolve_project(project_id: &str) -> SelectedContext {
     }
 }
 
-/// Rewrite a project control-plane lookup failure into an actionable message.
-///
-/// The raw error ("Failed to list HTTPProxy objects: ApiError:
-/// projects.resourcemanager.miloapis.com \"control-plane\" not found ...") is
-/// cryptic for a CLI user. When the control plane reports NotFound, the tunnel
-/// agent cannot reach the project's control plane — the project either doesn't
-/// exist on this environment or isn't provisioned for control-plane access.
-/// Surface that with concrete next steps instead of the raw API error.
-fn project_lookup_error(
-    project_id: &str,
-    endpoint: &str,
-    err: n0_error::AnyError,
-) -> n0_error::AnyError {
-    let msg = format!("{err:#}");
-    let not_found = msg.contains("not found")
-        || msg.contains("NotFound")
-        || msg.contains("NotFoundReason")
-        || msg.contains("404");
-    if not_found {
-        n0_error::anyerr!(
-            "could not list tunnels for project '{project_id}' (endpoint '{endpoint}'): the \
-             project's control plane is unreachable or does not exist on this environment. \
-             Verify the project is correct and provisioned, then reinstall the tunnel against the \
-             right project (e.g. `datumctl connect tunnel install --name <tunnel> \
-             --project <project> --endpoint <addr> --session <session>`) or confirm you are \
-             connected to the right environment. Underlying error: {msg}"
-        )
-    } else {
-        err
+/// User-facing guidance for a classified control-plane failure. The library
+/// reports what went wrong; this knows how the binary was invoked and what
+/// the user can do about it.
+fn control_plane_guidance(err: &ControlPlaneError) -> String {
+    match err {
+        ControlPlaneError::ProjectNotFound { project_id, .. } => format!(
+            "{err}: the project's control plane is unreachable or does not exist on this \
+             environment. Verify the project is correct and provisioned, then reinstall the \
+             tunnel against the right project (e.g. `datumctl connect tunnel install \
+             --name <tunnel> --project {project_id} --endpoint <addr> --session <session>`) \
+             or confirm you are connected to the right environment."
+        ),
+        ControlPlaneError::PermissionDenied { project_id, .. }
+        | ControlPlaneError::Unauthorized { project_id, .. } => format!(
+            "{err}. Switch your datumctl context to this project first: \
+             'datumctl ctx switch {project_id}'"
+        ),
     }
 }
 
@@ -338,13 +326,25 @@ fn project_lookup_error(
 async fn main() {
     let result = run().await;
     if let Err(err) = result {
-        eprintln!("{:#}", err);
+        // `Repo::default_location()` failing (DATUM_CONNECT_DIR unset) carries
+        // its own directive message and exit code (64); everything else uses
+        // the generic error path (exit 1).
+        if let Some(missing) = err.downcast_ref::<MissingConnectDir>() {
+            eprint!("{missing}");
+            std::process::exit(64);
+        }
+        if let Some(cp) = ControlPlaneError::find_in(&err) {
+            eprintln!("{}", control_plane_guidance(cp));
+            eprintln!("Underlying error: {:#}", err);
+        } else {
+            eprintln!("{:#}", err);
+        }
         std::process::exit(1);
     }
 }
 
 async fn run() -> n0_error::Result<()> {
-    let _ = rustls::crypto::ring::default_provider()
+    rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| n0_error::anyerr!("failed to install ring crypto provider for rustls"))?;
 
@@ -368,10 +368,10 @@ async fn run() -> n0_error::Result<()> {
     let token_source = ExternalTokenSource::from_env(session.clone())
         .map_err(|e| n0_error::anyerr!("failed to create token source: {e}"))?;
 
-    if let Some(ref s) = session {
-        if let Ok(helper) = std::env::var("DATUM_CREDENTIALS_HELPER") {
-            token_source.start_refresh(helper, s.clone());
-        }
+    if let Some(ref s) = session
+        && let Ok(helper) = std::env::var("DATUM_CREDENTIALS_HELPER")
+    {
+        token_source.start_refresh(helper, s.clone());
     }
 
     let datum = DatumCloudClient::with_external_token_source(ApiEnv::default(), token_source);
@@ -395,17 +395,14 @@ async fn run() -> n0_error::Result<()> {
 
     let project_id = match args.project {
         Some(ref pid) => pid.clone(),
-        None => {
-            let session = std::env::var("DATUM_SESSION")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    n0_error::anyerr!(
-                        "no project set — pass --project or run 'datumctl config set project <name>'"
-                    )
-                })?;
-            session
-        }
+        None => std::env::var("DATUM_SESSION")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                n0_error::anyerr!(
+                    "no project set — pass --project or run 'datumctl config set project <name>'"
+                )
+            })?,
     };
 
     let ctx = resolve_project(&project_id);
@@ -413,13 +410,7 @@ async fn run() -> n0_error::Result<()> {
 
     let repo_path = match args.repo {
         Some(p) => p,
-        None => match Repo::default_location() {
-            Ok(p) => p,
-            Err(e) => {
-                eprint!("{e}");
-                std::process::exit(64);
-            }
-        },
+        None => Repo::default_location().map_err(|e| n0_error::anyerr!(e))?,
     };
     let repo = Repo::open_or_create(repo_path).await?;
 
@@ -586,7 +577,11 @@ async fn run() -> n0_error::Result<()> {
                     let picked = if tunnels.len() == 1 {
                         // Auto-adopt the only candidate without popping a picker
                         // (informed by datum-cloud/app@cff37e7).
-                        tunnels.into_iter().next().unwrap()
+                        tunnels.into_iter().next().ok_or_else(|| {
+                            n0_error::anyerr!(
+                                "No tunnels exist in project {project_id}. Pass --endpoint to create one."
+                            )
+                        })?
                     } else {
                         // Multiple candidates: silence tracing, prompt with inquire,
                         // restore tracing. inquire is sync, so call from a
@@ -608,10 +603,18 @@ async fn run() -> n0_error::Result<()> {
                         restore_tracing(&prev_filter);
                         let idx =
                             chosen_idx_res.map_err(|e| n0_error::anyerr!("picker error: {e}"))?;
-                        tunnels.into_iter().nth(idx).unwrap()
+                        tunnels.into_iter().nth(idx).ok_or_else(|| {
+                            n0_error::anyerr!("picker returned out-of-range index {idx}")
+                        })?
                     };
-                    // Read the per-tunnel key using the picked tunnel's name.
-                    let key = repo.listen_key_for_tunnel(&project_id, &picked.id).await?;
+                    // Read the per-tunnel key using the picked tunnel's name
+                    // (same missing-key handling as --id).
+                    let (key, should_rewire) =
+                        resolve_listen_key(&repo, &project_id, &picked.id).await?;
+                    if should_rewire {
+                        in_memory_key = Some(key.clone());
+                        force_rewire = true;
+                    }
                     let node = ListenNode::new_with_key(repo.clone(), key).await?;
                     let service = TunnelService::new(datum.clone(), node.clone());
                     let ep = picked.endpoint.clone();
@@ -632,10 +635,7 @@ async fn run() -> n0_error::Result<()> {
                 None => {
                     let n = ListenNode::new(repo.clone()).await?;
                     let s = TunnelService::new(datum.clone(), n.clone());
-                    let existing = s
-                        .get_active_by_endpoint(&endpoint)
-                        .await
-                        .map_err(|err| project_lookup_error(&project_id, endpoint.as_str(), err))?;
+                    let existing = s.get_active_by_endpoint(&endpoint).await?;
                     // `--endpoint` carries a local, non-unique address (e.g.
                     // `localhost:8888`), so matching by endpoint alone would
                     // adopt a tunnel created on a different machine and rewire
@@ -668,7 +668,7 @@ async fn run() -> n0_error::Result<()> {
             let _ = writeln!(
                 std::io::stderr(),
                 "  \u{25CB} Your endpoint ID: {}",
-                endpoint_id.to_string()
+                endpoint_id
             );
             let _ = writeln!(std::io::stderr(), "  \u{25CB} Setting up tunnel...");
             let _ = std::io::stderr().flush();
@@ -727,13 +727,8 @@ async fn run() -> n0_error::Result<()> {
                 let tunnel = service.create_active(&label, &endpoint).await?;
                 // Persist the in-memory key to the per-tunnel directory.
                 if let Some(ref secret_key) = in_memory_key {
-                    let key_path = repo
-                        .path()
-                        .join(&project_id)
-                        .join(&tunnel.id)
-                        .join(Repo::LISTEN_KEY_FILE);
-                    tokio::fs::create_dir_all(key_path.parent().unwrap()).await?;
-                    tokio::fs::write(&key_path, secret_key.to_bytes()).await?;
+                    repo.save_listen_key_for_tunnel(&project_id, &tunnel.id, secret_key)
+                        .await?;
                 }
                 if json {
                     println!(
@@ -744,7 +739,11 @@ async fn run() -> n0_error::Result<()> {
                 tunnel.id
             };
 
-            let _ = service.set_enabled_active(&tunnel_id, true).await;
+            if let Err(err) = service.set_enabled_active(&tunnel_id, true).await {
+                tracing::warn!(
+                    "failed to mark tunnel {tunnel_id} enabled: {err:#}; continuing tunnel setup"
+                );
+            }
 
             // Mode (Text/Json) routes callback output:
             //   Text → stderr (one transition line per change, prefixed by resource)
@@ -773,23 +772,24 @@ async fn run() -> n0_error::Result<()> {
             let setup = async {
                 let mode_for_cb = mode;
                 let step_started_at_for_cb = step_started_at.clone();
-                let progress_cb = move |step: &connect_lib::ProgressStep,
-                                        prev: connect_lib::StepStatus| {
-                    let step_elapsed = {
-                        let mut map = step_started_at_for_cb.lock().unwrap();
-                        let timer = map
-                            .entry(step.kind.clone())
-                            .or_insert_with(std::time::Instant::now);
-                        timer.elapsed()
+                let progress_cb =
+                    move |step: &connect_lib::ProgressStep, prev: connect_lib::StepStatus| {
+                        let step_elapsed = {
+                            let mut map = step_started_at_for_cb
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let timer =
+                                map.entry(step.kind).or_insert_with(std::time::Instant::now);
+                            timer.elapsed()
+                        };
+                        progress::render_progress_step(
+                            mode_for_cb,
+                            step,
+                            prev,
+                            setup_start.elapsed(),
+                            step_elapsed,
+                        );
                     };
-                    progress::render_progress_step(
-                        mode_for_cb,
-                        step,
-                        prev,
-                        setup_start.elapsed(),
-                        step_elapsed,
-                    );
-                };
 
                 let service_for_progress = service.clone();
                 let tunnel_id_for_progress = tunnel_id.clone();
@@ -803,7 +803,9 @@ async fn run() -> n0_error::Result<()> {
                     .await
                 });
 
-                let mut final_progress = progress_handle.await.unwrap()?;
+                let mut final_progress = progress_handle
+                    .await
+                    .map_err(|e| n0_error::anyerr!("tunnel progress task failed: {e}"))??;
 
                 // Re-patch connectionDetails now that the connector is Ready:True.
                 // This triggers the replicator to re-mirror the upstream-status
@@ -813,18 +815,22 @@ async fn run() -> n0_error::Result<()> {
                 // Without this, if the annotation was captured at Ready:False
                 // (race between replicator and lease renewal), the extension
                 // server serves 503 indefinitely.
-                let _ = service.refresh_connection_details().await;
+                if let Err(err) = service.refresh_connection_details().await {
+                    tracing::warn!(
+                        "failed to refresh connection details for tunnel {tunnel_id}: {err:#}; continuing tunnel setup"
+                    );
+                }
 
                 // Hostnames are written by the gateway controller shortly after
                 // Programmed=True. Poll until one appears (usually <1s).
                 if final_progress.hostnames.is_empty() {
                     for _ in 0..20 {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if let Ok(Some(p)) = service.get_active_progress(&tunnel_id).await {
-                            if !p.hostnames.is_empty() {
-                                final_progress = p;
-                                break;
-                            }
+                        if let Ok(Some(p)) = service.get_active_progress(&tunnel_id).await
+                            && !p.hostnames.is_empty()
+                        {
+                            final_progress = p;
+                            break;
                         }
                     }
                 }

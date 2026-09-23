@@ -192,13 +192,16 @@ nix build
 
 ## Releases
 
-Push a prerelease tag (`vX.Y.Z-dev.N`), matching the `-dev.N` pattern used by
-the other datumctl plugins; `.github/workflows/release.yml` cross-compiles
-`datum-connect` (Rust) via a matrix of OS runners, then runs GoReleaser to
-produce per-platform archives containing both `datumctl-connect` and
-`datum-connect`, plus `checksums.txt`. GoReleaser's `prerelease: auto` keys off
-the tag's prerelease suffix so dev builds don't become the latest release;
-promote a build to GA with a plain `vX.Y.Z` tag.
+Push a tag (`vX.Y.Z-dev.N`, matching the `-dev.N` pattern used by the other
+datumctl plugins, or a plain `vX.Y.Z` for GA); `.github/workflows/release.yml`
+cross-compiles `datum-connect` (Rust) via a matrix of OS runners, then runs
+GoReleaser to produce per-platform archives containing both `datumctl-connect`
+and `datum-connect`, plus `checksums.txt`. Until a real GA release exists,
+every dev tag publishes as the latest (non-prerelease) release — GitHub's
+`/releases/latest`, which `datumctl plugin install datum-cloud/connect` (no
+pinned version) relies on, only ever resolves to a non-prerelease release, so
+marking dev tags as prereleases left nothing for it to find. Revisit this once
+dev/GA channels need to diverge again.
 
 The plugin is versioned independently of both `datumctl` and the `datum-connect` Rust binary. After a release, update the `Plugin` manifest at `datum-cloud/datumctl-plugins/index.yaml`.
 

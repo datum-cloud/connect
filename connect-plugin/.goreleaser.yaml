@@ -51,10 +51,14 @@ archives:
         dst: datum-connect{{ if eq .Os "windows" }}.exe{{ end }}
 
 release:
-  # Dev tags (v0.1.0-dev.2) are previews, not the release users should land
-  # on. "auto" keys off the tag's prerelease suffix, so a GA tag still
-  # publishes as the latest release.
-  prerelease: auto
+  # Until a real GA (plain vX.Y.Z) tag exists, every dev tag (v0.0.0-dev.N)
+  # publishes as the latest release, not a prerelease — otherwise
+  # `datumctl plugin install datum-cloud/connect` (no pinned version) has
+  # nothing non-prerelease to resolve "latest" to and fails outright, since
+  # GitHub's /releases/latest only ever considers non-prerelease releases.
+  # Revisit this once dev/GA channels need to diverge again.
+  prerelease: false
+  make_latest: true
 
 checksum:
   name_template: checksums.txt

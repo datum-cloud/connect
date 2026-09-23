@@ -247,7 +247,7 @@ impl HeartbeatAgent {
                 continue;
             }
             match probe_connector(
-                &project_id,
+                project_id,
                 self.inner.datum.clone(),
                 self.inner.provider.clone(),
             )
@@ -466,13 +466,13 @@ async fn run_project(
         };
 
         if cached.last_details.as_ref() != Some(&details_value) {
-            let patch = json!({ "status": { "connectionDetails": details_value } });
+            let patch = json!({ "status": { "connectionDetails": details_value.clone() } });
             match connectors
                 .patch_status(&cached.name, &PatchParams::default(), &Patch::Merge(&patch))
                 .await
             {
                 Ok(_) => {
-                    cached.last_details = Some(patch["status"]["connectionDetails"].clone());
+                    cached.last_details = Some(details_value);
                 }
                 Err(err) => {
                     warn!(
@@ -687,10 +687,11 @@ impl Backoff {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::datum_cloud::{ApiEnv, DatumCloudClient, RefreshError};
-    use crate::test_util::{api_error, setup_plugin_env};
+    use crate::test_util::{api_error, static_token_source};
 
     struct TestProvider {
         endpoint_id: String,
@@ -710,8 +711,7 @@ mod tests {
     }
 
     fn test_datum_client() -> DatumCloudClient {
-        let (_dir, token_source) = setup_plugin_env();
-        DatumCloudClient::with_external_token_source(ApiEnv::Production, token_source)
+        DatumCloudClient::with_token_source(ApiEnv::Production, static_token_source())
     }
 
     #[tokio::test]

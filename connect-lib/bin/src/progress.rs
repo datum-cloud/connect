@@ -397,10 +397,10 @@ fn system_nameservers() -> Vec<std::net::IpAddr> {
     let mut ips = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("nameserver ") {
-            if let Ok(ip) = rest.trim().parse::<std::net::IpAddr>() {
-                ips.push(ip);
-            }
+        if let Some(rest) = line.strip_prefix("nameserver ")
+            && let Ok(ip) = rest.trim().parse::<std::net::IpAddr>()
+        {
+            ips.push(ip);
         }
     }
     ips
@@ -494,7 +494,10 @@ async fn discover_ns_authority(
     // most labels (deepest) when n is smallest. Return the first level that
     // has NS records — that is the innermost authority.
     for n in 1..labels.len() {
-        let domain: String = labels[n - 1..].join(".");
+        let Some(tail) = labels.get(n - 1..) else {
+            continue;
+        };
+        let domain: String = tail.join(".");
         let ns_ips = resolve_ns_ips(system_resolver, &domain).await;
         if !ns_ips.is_empty() {
             return (ns_ips, domain);
@@ -595,12 +598,12 @@ pub async fn resolve_hostname_dns(
                 }
             }
         }
-        if ips.is_empty() {
-            if let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await {
-                for record in lookup.as_lookup().records() {
-                    if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
-                        ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
-                    }
+        if ips.is_empty()
+            && let Ok(lookup) = auth_resolver.ipv6_lookup(hostname).await
+        {
+            for record in lookup.as_lookup().records() {
+                if let hickory_resolver::proto::rr::RData::AAAA(addr) = record.data() {
+                    ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)));
                 }
             }
         }
@@ -822,6 +825,7 @@ async fn probe_until_reachable(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::panic)]
     use super::*;
 
     fn step(kind: ProgressStepKind, status: StepStatus, reason: Option<&str>) -> ProgressStep {
@@ -873,7 +877,8 @@ mod tests {
     }
 
     #[test]
-    fn json_progress_event_parses_back_to_expected_fields() {
+    fn json_progress_event_parses_back_to_expected_fields()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         // We can't directly capture println output in a unit test trivially;
         // instead, reconstruct the same json! body and re-parse.
         let s = step(ProgressStepKind::ProxyAccepted, StepStatus::Ready, None);
@@ -889,19 +894,41 @@ mod tests {
             "step_elapsed_secs": step_elapsed.as_secs_f64(),
             "total_elapsed_secs": total_elapsed.as_secs_f64(),
         });
-        let parsed: serde_json::Value = serde_json::from_str(&v.to_string()).unwrap();
-        assert_eq!(parsed["type"], "tunnel_progress");
-        assert_eq!(parsed["step"], "proxy_accepted");
-        assert_eq!(parsed["status"], "ready");
-        assert!(parsed["resource"].is_string());
-        assert!(parsed["reason"].is_null());
-        assert!(parsed["message"].is_null());
-        assert_eq!(parsed["step_elapsed_secs"], 1.5);
-        assert_eq!(parsed["total_elapsed_secs"], 12.0);
+        let parsed: serde_json::Value = serde_json::from_str(&v.to_string())?;
+        assert_eq!(
+            parsed.get("type"),
+            Some(&serde_json::json!("tunnel_progress"))
+        );
+        assert_eq!(
+            parsed.get("step"),
+            Some(&serde_json::json!("proxy_accepted"))
+        );
+        assert_eq!(parsed.get("status"), Some(&serde_json::json!("ready")));
+        assert!(
+            parsed
+                .get("resource")
+                .is_some_and(serde_json::Value::is_string)
+        );
+        assert!(parsed.get("reason").is_some_and(serde_json::Value::is_null));
+        assert!(
+            parsed
+                .get("message")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        assert_eq!(
+            parsed.get("step_elapsed_secs"),
+            Some(&serde_json::json!(1.5))
+        );
+        assert_eq!(
+            parsed.get("total_elapsed_secs"),
+            Some(&serde_json::json!(12.0))
+        );
+        Ok(())
     }
 
     #[test]
-    fn json_progress_event_surfaces_reason_and_message_when_pending() {
+    fn json_progress_event_surfaces_reason_and_message_when_pending()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         // A step stuck Pending with a masked cause (e.g. a quota rejection
         // the platform reports as a generic condition) must still carry the
         // underlying reason/message through — this is the data a caller
@@ -923,11 +950,17 @@ mod tests {
             "step_elapsed_secs": Duration::from_secs(45).as_secs_f64(),
             "total_elapsed_secs": Duration::from_secs(90).as_secs_f64(),
         });
-        let parsed: serde_json::Value = serde_json::from_str(&v.to_string()).unwrap();
-        assert_eq!(parsed["reason"], "QuotaExceeded");
+        let parsed: serde_json::Value = serde_json::from_str(&v.to_string())?;
         assert_eq!(
-            parsed["message"],
-            "httpproxies.networking.datumapis.com quota exceeded (3/3)"
+            parsed.get("reason"),
+            Some(&serde_json::json!("QuotaExceeded"))
         );
+        assert_eq!(
+            parsed.get("message"),
+            Some(&serde_json::json!(
+                "httpproxies.networking.datumapis.com quota exceeded (3/3)"
+            ))
+        );
+        Ok(())
     }
 }

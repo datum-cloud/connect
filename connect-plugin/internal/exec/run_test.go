@@ -2,25 +2,30 @@ package exec
 
 import (
 	"context"
-	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func buildFakeBinary(t *testing.T, src string) string {
 	t.Helper()
-	// Build from connect-plugin/ module root — use absolute path for reliability
-	bin := "fake-datum-connect-test"
+	// `go test` runs with the package directory as CWD; the module root
+	// (connect-plugin/) is two levels up from internal/exec.
+	moduleRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("failed to resolve module root: %v", err)
+	}
+	// Build into a per-test temp dir so parallel packages never collide and
+	// nothing is left behind in the source tree.
+	bin := filepath.Join(t.TempDir(), "fake-datum-connect-test")
 	cmd := exec.Command("go", "build", "-o", bin, "./"+src)
-	cmd.Dir = "/home/drewr/src/datum-connect-plugin-build/connect/connect-plugin"
+	cmd.Dir = moduleRoot
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build %s: %v\n%s", src, err, out)
 	}
-	t.Cleanup(func() { os.Remove(bin) })
-	// Return absolute path so Run() can find it regardless of CWD
-	absBin := "/home/drewr/src/datum-connect-plugin-build/connect/connect-plugin/" + bin
-	return absBin
+	// Absolute path so Run() can find it regardless of CWD.
+	return bin
 }
 
 func TestRunWithValidBinary(t *testing.T) {

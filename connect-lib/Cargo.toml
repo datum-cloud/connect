@@ -5,6 +5,17 @@ resolver = "2"
 [workspace.lints.rust]
 warnings = "deny"
 
+# Panic-free production code: every fallible path must surface a Result.
+# Test modules opt out locally with #![allow(clippy::unwrap_used, ...)].
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
 [workspace.dependencies]
 arc-swap = "1.8.0"
 base64 = "0.22"
