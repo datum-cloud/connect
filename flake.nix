@@ -54,7 +54,7 @@
             # reproducible builds. Update via `nix build` failure → copy the
             # expected hash into this map.
             outputHashes = {
-              "iroh-proxy-utils-0.1.0" = "sha256-ZV71q22zCWBqFdrc0jzkwyQdVc/H0r0BBB6dKrNARr8=";
+              "iroh-proxy-utils-0.3.0" = "sha256-U1WocIY106cgoKzvRJtOQ7boLmLuUNST4e+jHFgLmII=";
             };
           };
 

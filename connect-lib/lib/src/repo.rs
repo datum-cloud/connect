@@ -139,7 +139,7 @@ impl Repo {
     /// `listen` is never accidentally reused. The plain `listen_key` name is only
     /// used inside per-tunnel subdirectories where the key is intentionally stable.
     pub async fn listen_key(&self, project_id: Option<&str>) -> Result<SecretKey> {
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         let now = chrono::Local::now().format("%Y%m%d%H%M%S");
         let suffix = match project_id {
             Some(pid) => format!("{}.{}", pid, now),
@@ -257,7 +257,7 @@ impl Repo {
     }
 
     async fn create_key(&self, key_file_path: &Path) -> Result<SecretKey> {
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         write_secret_key(key_file_path, &key).await?;
         Ok(key)
     }
@@ -347,7 +347,7 @@ mod tests {
         // gets a fresh identity instead of joining the cross-project DNS race.
         let repo = Repo::open_or_create(temp_repo_dir()).await?;
         // Create a legacy key at the plain LISTEN_KEY_FILE path (no timestamp).
-        let legacy = SecretKey::generate(&mut rand::rng());
+        let legacy = SecretKey::generate();
         let legacy_bytes = legacy.to_bytes();
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
         tokio::fs::write(&legacy_path, &legacy_bytes)
@@ -414,7 +414,7 @@ mod tests {
         let tunnel_dir = repo.0.join("my-project").join("my-tunnel");
         tokio::fs::create_dir_all(&tunnel_dir).await?;
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-        let seed_key = SecretKey::generate(&mut rand::rng());
+        let seed_key = SecretKey::generate();
         tokio::fs::write(&key_path, seed_key.to_bytes()).await?;
 
         let key = repo
@@ -431,7 +431,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let repo = Repo::open_or_create(temp_repo_dir()).await?;
         // Create a legacy key at the project root (plain name, no timestamp).
-        let legacy_key = SecretKey::generate(&mut rand::rng());
+        let legacy_key = SecretKey::generate();
         let legacy_bytes = legacy_key.to_bytes();
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
         tokio::fs::write(&legacy_path, &legacy_bytes)
@@ -473,7 +473,7 @@ mod tests {
         let tunnel_dir = repo.0.join("stable-proj").join("stable-tunnel");
         tokio::fs::create_dir_all(&tunnel_dir).await?;
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-        let seed_key = SecretKey::generate(&mut rand::rng());
+        let seed_key = SecretKey::generate();
         tokio::fs::write(&key_path, seed_key.to_bytes()).await?;
 
         let first = repo
@@ -501,7 +501,7 @@ mod tests {
             let tunnel_dir = repo.0.join("multi-proj").join(name);
             tokio::fs::create_dir_all(&tunnel_dir).await?;
             let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-            let seed_key = SecretKey::generate(&mut rand::rng());
+            let seed_key = SecretKey::generate();
             tokio::fs::write(&key_path, seed_key.to_bytes()).await?;
         }
         let key_a = repo
@@ -567,7 +567,7 @@ mod tests {
             0o600
         );
 
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         repo.save_listen_key_for_tunnel("proj", "tun", &key).await?;
         assert_eq!(
             mode_of(&repo.0.join("proj").join("tun").join(Repo::LISTEN_KEY_FILE))?,
@@ -604,7 +604,7 @@ mod tests {
         // new key: the write goes to a fresh inode and is renamed into place.
         let old_handle = std::fs::File::open(&key_path)?;
 
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         repo.save_listen_key_for_tunnel("proj", "tun", &key).await?;
         assert_eq!(mode_of(&key_path)?, 0o600);
         assert_eq!(tokio::fs::read(&key_path).await?, key.to_bytes());
@@ -622,7 +622,7 @@ mod tests {
     async fn key_writes_leave_no_temp_files_behind() -> TestResult {
         let repo = Repo::open_or_create(temp_repo_dir()).await?;
         repo.connect_key().await?;
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         repo.save_listen_key_for_tunnel("proj", "tun", &key).await?;
         repo.save_listen_key_for_tunnel("proj", "tun", &key).await?;
 
@@ -643,7 +643,7 @@ mod tests {
         let key_path = repo.0.join(Repo::CONNECT_KEY_FILE);
         tokio::fs::create_dir_all(key_path.join("occupied")).await?;
 
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         assert!(write_secret_key(&key_path, &key).await.is_err());
         assert!(leftover_temp_files(&repo.0).await?.is_empty());
         Ok(())

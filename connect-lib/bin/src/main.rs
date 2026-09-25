@@ -46,6 +46,7 @@ use connect_lib::{
 use iroh::SecretKey;
 
 mod progress;
+mod vpc;
 
 type ReloadHandle = Handle<EnvFilter, Registry>;
 static RELOAD_HANDLE: OnceLock<ReloadHandle> = OnceLock::new();
@@ -126,7 +127,7 @@ async fn resolve_listen_key(
                  The hostname will stay the same but the old connector will be replaced."
             );
             let _ = std::io::stderr().flush();
-            let new_key = SecretKey::generate(&mut rand::rng());
+            let new_key = SecretKey::generate();
             Ok((new_key, true))
         }
     }
@@ -186,6 +187,46 @@ enum Commands {
     Delete {
         #[clap(long)]
         id: String,
+    },
+    /// Join a galactic VPC as a remote member (see subcommands).
+    #[command(subcommand)]
+    Vpc(VpcCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum VpcCommands {
+    /// Create a local interface and join a galactic VPC.
+    ///
+    /// Scaffolding ahead of the real galactic-side control plane: takes the
+    /// attachment's address/prefixes/mode/router-identity as flags rather
+    /// than resolving them from a VPCAttachment CRD (see
+    /// design/vpc-attachment.md and bin/src/vpc.rs).
+    Join {
+        /// VPC name/id — label only for now, not yet resolved via a CRD.
+        #[clap(long)]
+        vpc: String,
+        /// iroh EndpointId of the galactic-side router allowed to dial in.
+        /// Omit to accept any dialer (trust-on-first-connect) — lab/dev use
+        /// only, see design/vpc-attachment.md.
+        #[clap(long)]
+        router_id: Option<String>,
+        #[clap(long, default_value = "datum-vpc0")]
+        tun_name: String,
+        #[clap(long, default_value_t = 1280)]
+        mtu: u16,
+        /// vpc-only (default): route only the VPC's prefixes through the
+        /// interface. default-route: make the interface the default route
+        /// (wg-quick's ::/1 + 8000::/1 split).
+        #[clap(long, value_enum)]
+        mode: Option<vpc::ModeArg>,
+        /// Concrete IP of the galactic router, used only to pin a host
+        /// route via the pre-existing default gateway in default-route
+        /// mode, so the tunnel's own iroh traffic isn't swallowed by the
+        /// new default route it just installed. Only meaningful when the
+        /// router is dialed at a known direct address (e.g. in the
+        /// containerlab lab) rather than via relay.
+        #[clap(long)]
+        router_ip: Option<std::net::IpAddr>,
     },
 }
 
@@ -476,7 +517,7 @@ async fn run() -> n0_error::Result<()> {
             let endpoint: String = match (endpoint, id) {
                 (Some(ep), None) => {
                     // --endpoint only: generate key in memory, use new_with_key()
-                    let secret_key = SecretKey::generate(&mut rand::rng());
+                    let secret_key = SecretKey::generate();
                     in_memory_key = Some(secret_key.clone());
                     ListenNode::new_with_key(repo.clone(), secret_key).await?;
                     // No existing tunnel — preresolved_ns stays None so
@@ -1076,6 +1117,25 @@ async fn run() -> n0_error::Result<()> {
                     println!("  Connector {}", name);
                 }
             }
+        }
+        Commands::Vpc(VpcCommands::Join {
+            vpc,
+            router_id,
+            tun_name,
+            mtu,
+            mode,
+            router_ip,
+        }) => {
+            let join_args = vpc::JoinArgs {
+                vpc,
+                router_id,
+                tun_name,
+                mtu,
+                mode: mode.unwrap_or(vpc::ModeArg::VpcOnly),
+                router_ip,
+                json,
+            };
+            vpc::run_join(repo, join_args).await?;
         }
     }
     Ok(())

@@ -1,0 +1,72 @@
+---
+# Canonical containerlab topology for the 3-region VPC test. The automated,
+# self-verifying path is test-3region.sh (plain Docker, no root); this file is
+# the same topology expressed for containerlab, matching that script's
+# addressing exactly. containerlab needs root to manage netns/veth — supply
+# that yourself (e.g. `sudo containerlab deploy`); nothing here elevates.
+#
+# After `containerlab deploy -t vpc-3region.clab.yaml`, drive the app layer the
+# same way test-3region.sh does: start `datumctl-connect vpc join` on the client,
+# scrape its endpoint id + bound port, start `mock-galactic-router` on the router
+# dialing the client, then run the full-mesh ping matrix. See README.md.
+#
+# Topology: a router L3-hub bridging three regional segments and, over the iroh
+# tunnel, the local client. The router forwards (kernel IPv6 forwarding) between
+# all four; mock-galactic-router only pumps its tunnel TUN. VPC aggregate is
+# fd00:cafe::/32 (must cover fd00:cafe:{a,b,c,100}::/64 — a /48 would not; see
+# test-3region.sh). All nodes run the connect-vpc-lab:latest image.
+
+name: vpc-3region
+
+topology:
+  defaults:
+    kind: linux
+    image: connect-vpc-lab:latest
+
+  nodes:
+    # Accept side of the iroh tunnel — runs `datumctl-connect vpc join`.
+    local:
+      binds:
+        - /dev/net/tun:/dev/net/tun
+      cap-add:
+        - NET_ADMIN
+
+    # L3 hub — runs `mock-galactic-router`, forwards between all segments.
+    router:
+      binds:
+        - /dev/net/tun:/dev/net/tun
+      cap-add:
+        - NET_ADMIN
+      sysctls:
+        net.ipv6.conf.all.forwarding: 1
+        net.ipv6.conf.default.forwarding: 1
+      exec:
+        - ip -6 addr add fd00:cafe:a::ff/64 dev eth1
+        - ip -6 addr add fd00:cafe:b::ff/64 dev eth2
+        - ip -6 addr add fd00:cafe:c::ff/64 dev eth3
+
+    region-a:
+      cap-add:
+        - NET_ADMIN
+      exec:
+        - ip -6 addr add fd00:cafe:a::1/64 dev eth1
+        - ip -6 route replace fd00:cafe::/32 via fd00:cafe:a::ff
+    region-b:
+      cap-add:
+        - NET_ADMIN
+      exec:
+        - ip -6 addr add fd00:cafe:b::1/64 dev eth1
+        - ip -6 route replace fd00:cafe::/32 via fd00:cafe:b::ff
+    region-c:
+      cap-add:
+        - NET_ADMIN
+      exec:
+        - ip -6 addr add fd00:cafe:c::1/64 dev eth1
+        - ip -6 route replace fd00:cafe::/32 via fd00:cafe:c::ff
+
+  links:
+    # The local <-> router iroh underlay runs over containerlab's management
+    # network, so the only explicit links are the three regional segments.
+    - endpoints: ["router:eth1", "region-a:eth1"]
+    - endpoints: ["router:eth2", "region-b:eth1"]
+    - endpoints: ["router:eth3", "region-c:eth1"]
