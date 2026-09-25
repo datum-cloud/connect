@@ -11,6 +11,9 @@
 //! left to define here is purely the framing and the single-peer identity
 //! check that stands in for WireGuard's AllowedIPs source filter.
 
+use std::future::Future;
+use std::net::Ipv6Addr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use iroh::{
@@ -19,19 +22,95 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use n0_error::{Result, StdResultExt};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use tun::{DeviceReader, DeviceWriter};
 
-/// ALPN for the VPC data-plane protocol.
-pub const IROH_VPC_ALPN: &[u8] = b"datum-connect/vpc/0";
+/// ALPN for the VPC data-plane protocol. Bumped from `/vpc/0` to `/vpc/1`
+/// to mark the wire change: the first frame on every stream is now a
+/// JSON-encoded `Assignment`, followed by raw length-prefixed packets.
+pub const IROH_VPC_ALPN: &[u8] = b"datum-connect/vpc/1";
 
 /// Ceiling on a single framed packet's length — the framing's 2-byte length
 /// prefix allows up to `u16::MAX`, but the real bound in practice is the
 /// interface MTU (see `Mode`/MTU discussion in design/vpc-attachment.md),
 /// which is always far smaller.
 const MAX_PACKET_LEN: usize = u16::MAX as usize;
+
+// ---------------------------------------------------------------------------
+// Framing helpers
+// ---------------------------------------------------------------------------
+
+/// Writes a single u16-length-prefixed frame to `w`.
+pub async fn write_frame(w: &mut (impl AsyncWrite + Unpin + Send), data: &[u8]) -> std::io::Result<()> {
+    let len = u16::try_from(data.len()).unwrap_or(u16::MAX);
+    w.write_all(&len.to_be_bytes()).await?;
+    w.write_all(data).await?;
+    Ok(())
+}
+
+/// Reads a single u16-length-prefixed frame from `r`. Returns `None` on
+/// clean EOF (stream closed), `Some(Vec<u8>)` on success.
+pub async fn read_frame(r: &mut (impl AsyncRead + Unpin + Send)) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 2];
+    if r.read_exact(&mut len_buf).await.is_err() {
+        return Ok(None);
+    }
+    let len = usize::from(u16::from_be_bytes(len_buf)).min(MAX_PACKET_LEN);
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).await?;
+    Ok(Some(buf))
+}
+
+// ---------------------------------------------------------------------------
+// Assignment control frame
+// ---------------------------------------------------------------------------
+
+/// Router-allocated address assignment sent as the first frame on the
+/// stream. Mirrors the future `VPCAttachmentStatus.assignedAddress` +
+/// `advertisedPrefixes` CRD fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Assignment {
+    pub address: Ipv6Addr,
+    pub prefix_len: u8,
+    pub vpc_prefixes: Vec<String>,
+}
+
+/// Sends an `Assignment` as a single JSON-encoded, length-prefixed frame.
+pub async fn send_assignment(
+    w: &mut (impl AsyncWrite + Unpin + Send),
+    assignment: &Assignment,
+) -> std::io::Result<()> {
+    let json = serde_json::to_vec(assignment)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    write_frame(w, &json).await
+}
+
+/// Reads an `Assignment` from the first length-prefixed frame on the stream.
+pub async fn recv_assignment(
+    r: &mut (impl AsyncRead + Unpin + Send),
+) -> std::io::Result<Assignment> {
+    let frame = read_frame(r).await?.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream closed before assignment")
+    })?;
+    serde_json::from_slice(&frame)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+// ---------------------------------------------------------------------------
+// Accept handler (client side)
+// ---------------------------------------------------------------------------
+
+/// Callback invoked when the router sends an `Assignment` before pumping.
+/// The callback must configure the interface + routes from the assignment
+/// and return `Ok(())` before packet pumping begins.
+pub type OnAssignFn = Arc<
+    dyn Fn(Assignment) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Server-side (accept) handler. The client is always the accept side here,
 /// mirroring how `tunnel`'s client is dialed by Envoy rather than dialing
@@ -54,6 +133,7 @@ pub struct VpcAcceptHandler {
     tun_reader: Arc<Mutex<DeviceReader>>,
     tun_writer: Arc<Mutex<DeviceWriter>>,
     mtu: usize,
+    on_assign: Option<OnAssignFn>,
 }
 
 // `ProtocolHandler` requires `Debug`, but `tun::{DeviceReader, DeviceWriter}`
@@ -63,6 +143,7 @@ impl std::fmt::Debug for VpcAcceptHandler {
         f.debug_struct("VpcAcceptHandler")
             .field("allowed_router", &self.allowed_router)
             .field("mtu", &self.mtu)
+            .field("on_assign", &self.on_assign.as_ref().map(|_| ".."))
             .finish_non_exhaustive()
     }
 }
@@ -79,7 +160,16 @@ impl VpcAcceptHandler {
             tun_reader,
             tun_writer,
             mtu,
+            on_assign: None,
         }
+    }
+
+    /// Sets a callback that will be invoked with the router's `Assignment`
+    /// before packet pumping begins. The callback must configure the TUN
+    /// interface (address, routes) from the assignment.
+    pub fn with_on_assign(mut self, f: OnAssignFn) -> Self {
+        self.on_assign = Some(f);
+        self
     }
 }
 
@@ -107,7 +197,19 @@ impl ProtocolHandler for VpcAcceptHandler {
             }
         }
 
-        let (net_send, net_recv) = connection.accept_bi().await?;
+        let (net_send, mut net_recv) = connection.accept_bi().await?;
+
+        // Read the Assignment control frame before pumping.
+        let assignment = recv_assignment(&mut net_recv)
+            .await
+            .map_err(AcceptError::from_err)?;
+
+        if let Some(ref on_assign) = self.on_assign {
+            (on_assign)(assignment)
+                .await
+                .map_err(AcceptError::from_err)?;
+        }
+
         pump(
             net_send,
             net_recv,
@@ -137,26 +239,47 @@ impl VpcDialer {
         Self { endpoint }
     }
 
-    pub async fn dial_and_pump(
+    /// Dials a remote peer, sends the `Assignment` as the first frame, then
+    /// returns the raw stream halves for the caller to drive its own I/O
+    /// (e.g. an N:1 mux in the router). The caller is responsible for
+    /// reading/writing length-prefixed frames via `write_frame`/`read_frame`.
+    pub async fn dial_and_send_assignment(
         &self,
         remote: impl Into<EndpointAddr>,
-        tun_reader: Arc<Mutex<DeviceReader>>,
-        tun_writer: Arc<Mutex<DeviceWriter>>,
-        mtu: usize,
-    ) -> Result<()> {
+        assignment: &Assignment,
+    ) -> Result<(
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+    )> {
         let connection = self
             .endpoint
             .connect(remote, IROH_VPC_ALPN)
             .await
             .std_context("dialing vpc attachment endpoint")?;
-        let (net_send, net_recv) = connection
+        let (mut net_send, net_recv) = connection
             .open_bi()
             .await
             .std_context("opening vpc data stream")?;
+        send_assignment(&mut net_send, assignment)
+            .await
+            .std_context("sending assignment")?;
+        Ok((net_send, net_recv))
+    }
+
+    /// Convenience: dial, send assignment, then pump a dedicated TUN pair
+    /// (single-client shortcut, kept for simple test harnesses).
+    pub async fn dial_and_pump(
+        &self,
+        remote: impl Into<EndpointAddr>,
+        assignment: &Assignment,
+        tun_reader: Arc<Mutex<DeviceReader>>,
+        tun_writer: Arc<Mutex<DeviceWriter>>,
+        mtu: usize,
+    ) -> Result<()> {
+        let (net_send, net_recv) = self.dial_and_send_assignment(remote, assignment).await?;
         pump(net_send, net_recv, tun_reader, tun_writer, mtu)
             .await
             .std_context("vpc packet pump")?;
-        connection.closed().await;
         Ok(())
     }
 }
@@ -193,25 +316,17 @@ where
             let chunk = buf
                 .get(..n)
                 .ok_or_else(|| std::io::Error::other("tun read length exceeded buffer"))?;
-            let len = u16::try_from(n).unwrap_or(u16::MAX);
-            net_send.write_all(&len.to_be_bytes()).await?;
-            net_send.write_all(chunk).await?;
+            write_frame(&mut net_send, chunk).await?;
         }
         std::io::Result::Ok(())
     };
     let to_tun = async move {
         let mut writer = tun_writer.lock().await;
         loop {
-            let mut len_buf = [0u8; 2];
-            if net_recv.read_exact(&mut len_buf).await.is_err() {
-                // Stream closed/EOF — the peer is done, not an error worth
-                // surfacing.
-                break;
+            match read_frame(&mut net_recv).await? {
+                Some(pkt) => writer.write_all(&pkt).await?,
+                None => break,
             }
-            let len = usize::from(u16::from_be_bytes(len_buf)).min(MAX_PACKET_LEN);
-            let mut pkt = vec![0u8; len];
-            net_recv.read_exact(&mut pkt).await?;
-            writer.write_all(&pkt).await?;
         }
         std::io::Result::Ok(())
     };
@@ -299,5 +414,70 @@ mod tests {
             .await
             .expect("pump task should not panic")
             .expect("pump should exit cleanly once both sides are closed");
+    }
+
+    #[tokio::test]
+    async fn assignment_round_trips_through_framing() {
+        let (mut writer, mut reader) = duplex(4096);
+        let original = Assignment {
+            address: "fd00:cafe:1100::42".parse().expect("valid ipv6"),
+            prefix_len: 64,
+            vpc_prefixes: vec!["fd00:cafe::/32".to_string()],
+        };
+        send_assignment(&mut writer, &original)
+            .await
+            .expect("send_assignment");
+        drop(writer);
+        let received = recv_assignment(&mut reader)
+            .await
+            .expect("recv_assignment");
+        assert_eq!(original, received);
+    }
+
+    #[tokio::test]
+    async fn pump_after_assignment_on_same_stream() {
+        // Simulates the real protocol: assignment frame first, then raw
+        // packet pumping on the same stream halves.
+        let (mut net_send, mut net_recv) = duplex(8192);
+        let (tun_reader_end, _tun_in_write) = duplex(4096);
+        let (tun_writer_end, tun_out_read) = duplex(4096);
+
+        let assignment = Assignment {
+            address: "fd00:cafe:1100::7".parse().expect("valid ipv6"),
+            prefix_len: 64,
+            vpc_prefixes: vec!["fd00:cafe::/32".to_string()],
+        };
+
+        // Dial side: send assignment then a data frame.
+        send_assignment(&mut net_send, &assignment)
+            .await
+            .expect("send assignment");
+        let data_pkt = b"hello from router";
+        write_frame(&mut net_send, data_pkt)
+            .await
+            .expect("write data frame");
+        drop(net_send);
+
+        // Accept side: recv assignment, then pump the rest.
+        let got = recv_assignment(&mut net_recv)
+            .await
+            .expect("recv assignment");
+        assert_eq!(got, assignment);
+
+        // The remaining data on net_recv is a single framed packet that
+        // pump would deliver to the TUN writer. Read it manually here.
+        let frame = read_frame(&mut net_recv)
+            .await
+            .expect("read data frame");
+        assert_eq!(frame.as_deref(), Some(data_pkt.as_slice()));
+
+        // Sanity: no more frames.
+        let eof = read_frame(&mut net_recv).await.expect("eof check");
+        assert!(eof.is_none());
+
+        // Clean up unused ends.
+        drop(tun_reader_end);
+        drop(tun_writer_end);
+        drop(tun_out_read);
     }
 }

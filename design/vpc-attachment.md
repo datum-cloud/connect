@@ -299,8 +299,7 @@ client→VPC:
 % sudo env DATUM_CONNECT_DIR=/tmp/vpchost-datum DATUM_SESSION=lab \
     DATUM_CREDENTIALS_HELPER="$PWD/deploy/containerlab/vpc/fake-credentials-helper.sh" \
     DATUM_API_HOST=https://api.lab.invalid \
-    ./result/bin/datum-connect --json vpc join --vpc lab-host \
-    --address fd00:cafe:1100::2 --prefix-len 64 --mode vpc-only --vpc-prefix fd00:cafe::/32
+    ./result/bin/datum-connect --json vpc join --vpc lab-host --mode vpc-only
 {"address":"fd00:cafe:1100::2","bound_addrs":["0.0.0.0:60114","[::]:56325"],"endpoint_id":"9968ba066a6f01d0fec0f41e1a81a32ddd2af58def83178c4531b46539038eea","mode":"vpc-only","tun_name":"utun8","type":"vpc_ready","vpc":"lab-host"}
 
 % deploy/containerlab/vpc/test-host-client.sh client-check

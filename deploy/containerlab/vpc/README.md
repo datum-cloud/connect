@@ -78,23 +78,50 @@ Which command runs where:
     it creates the TUN). On a remote client, copy the `datum-connect` binary and
     `fake-credentials-helper.sh` over first, and build `datum-connect` for that
     machine's OS/arch.
-  - `./test-host-client.sh client-check` — ping the whole VPC from the client
-    (client→VPC direction), no docker needed.
+  - `./test-host-client.sh client-check [<addr>]` — ping the whole VPC from the
+    client (client→VPC direction), no docker needed. Pass the assigned address
+    the router gave this client (from `vpc_ready`); defaults to `::2` if omitted.
 
-Same-machine run: do all of the above on one host. Cross-machine run (laptop ↔
-remote VM):
+### Single-client run
+
+Same-machine or cross-machine (laptop ↔ remote VM):
 
 ```
-[VM]     ./test-host-client.sh up                 # note the client command it prints
-[laptop] sudo env ... datum-connect ... vpc join  # from up's output; note the endpoint id
-[laptop] ./test-host-client.sh client-check        # client -> VPC
-[VM]     ./test-host-client.sh dial <endpoint-id>  # router dials client; VPC -> client
-[VM]     ./test-host-client.sh down                # Ctrl+C the client on the laptop too
+[VM]     ./test-host-client.sh up                       # note the client command it prints
+[client] sudo env ... datum-connect ... vpc join         # from up's output; note endpoint id + assigned address
+[client] ./test-host-client.sh client-check              # client -> VPC
+[VM]     ./test-host-client.sh dial <endpoint-id>        # router dials client; VPC -> client
+[VM]     ./test-host-client.sh down                      # Ctrl+C the client separately
 ```
 
-Only one client may hold the VPC address (`fd00:cafe:1100::2`) at a time — stop
-any client already running (e.g. a same-machine one from a prior test) before
-starting another, or the second will collide.
+### Multi-client run (2+ devices on one VPC)
+
+The router allocates addresses sequentially from its pool (`--pool
+fd00:cafe:1100::/64`): the first client gets `::2`, the second `::3`, and so on.
+Clients don't need `--address` — the router sends each one an `Assignment` frame
+with its allocated address and VPC prefixes before packet pumping begins.
+
+```
+[VM]       ./test-host-client.sh up
+
+[client A] sudo env ... datum-connect --json vpc join --vpc lab-host --mode vpc-only
+           # prints: {"type":"vpc_ready", ..., "endpoint_id":"<A>", "address":"fd00:cafe:1100::2", ...}
+
+[client B] sudo env ... datum-connect --json vpc join --vpc lab-host --mode vpc-only --tun-name datum-vpc1
+           # prints: {"type":"vpc_ready", ..., "endpoint_id":"<B>", "address":"fd00:cafe:1100::3", ...}
+           # (use --tun-name datum-vpc1 if both clients are on the same machine)
+
+[VM]       ./test-host-client.sh dial <A> <B>            # router dials both; checks VPC -> each client
+
+[client A] ./test-host-client.sh client-check fd00:cafe:1100::2   # A -> VPC
+[client B] ./test-host-client.sh client-check fd00:cafe:1100::3   # B -> VPC
+
+[VM]       ./test-host-client.sh down
+```
+
+Client A and B can also ping each other — traffic routes through the shared TUN
+on the router (the pool's `/64` is on-link, so the kernel forwards A→B back out
+the TUN and the router's demux delivers it to B).
 
 ## Topology
 
@@ -146,7 +173,7 @@ the router yet:
 
 ```bash
 docker exec -d clab-vpc-attachment-client sh -c \
-  'datumctl-connect vpc join --vpc lab-vpc --address fd00:1::2 --prefix-len 120 > /tmp/client.log 2>&1'
+  'datumctl-connect vpc join --vpc lab-vpc --mode vpc-only > /tmp/client.log 2>&1'
 ```
 
 Wait a couple seconds, then read its output:
@@ -159,10 +186,9 @@ You should see something like (verified output, the id will differ per run):
 
 ```
   ⚠ No --router-id set — accepting any dialer (trust-on-first-connect). This is only appropriate for lab/dev use; see design/vpc-attachment.md.
-VPC attachment ready: lab-vpc at fd00:1::2 via datum-vpc0 (mode vpc-only)
-Endpoint ID: b123d11e1359bd3bfadca82faad93697bea00cdb7d2bbcd396a0b428ab44a554
-Listening on: 0.0.0.0:40295, [::]:37541
-Press Ctrl+C to stop...
+  ○ Interface datum-vpc0 created (unaddressed, mtu 1280) — waiting for router assignment
+  ○ Listening on: 0.0.0.0:40295, [::]:37541
+  ○ Your endpoint ID: b123d11e1359bd3bfadca82faad93697bea00cdb7d2bbcd396a0b428ab44a554 — waiting for any router to connect
 ```
 
 Note the **endpoint ID** — that's all the router needs. iroh resolves how to
@@ -175,7 +201,8 @@ wildcard bind, printed for reference.)
 docker exec -d clab-vpc-attachment-router sh -c \
   'mock-galactic-router \
      --peer-id <endpoint id from step 3> \
-     --address fd00:1::1 --prefix-len 120 \
+     --address fd00:1::1 --pool fd00:1::/120 \
+     --advertise fd00:1::/120 \
      > /tmp/router.log 2>&1'
 ```
 
@@ -221,7 +248,7 @@ containerlab destroy -t vpc.clab.yaml
 - **Routing modes beyond the on-link check above.** Testing `--mode
   default-route` meaningfully needs a third "internet-side" destination to
   route away from and a real default gateway to preserve — this 2-node lab
-  doesn't have one. Testing `--vpc-prefix` in `vpc-only` mode needs a prefix
+  doesn't have one. Testing VPC prefix routing in `vpc-only` mode needs a prefix
   that *isn't* the on-link one above (the on-link route already exists from
   address assignment; adding the identical route again with `ip route add`
   fails).

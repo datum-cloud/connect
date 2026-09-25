@@ -53,28 +53,21 @@ func NewCmd() *cobra.Command {
 	}
 	cmd.Flags().String("vpc", "", "VPC name/id (required; label only for now, not yet resolved via a resource)")
 	cmd.Flags().String("router-id", "", "iroh EndpointId of the galactic-side router allowed to dial in. Omit to accept any dialer (trust-on-first-connect) — lab/dev use only")
-	cmd.Flags().String("address", "", "This client's IPv6 address within the VPC (required)")
-	cmd.Flags().Int("prefix-len", 120, "Prefix length for --address")
 	cmd.Flags().String("tun-name", "datum-vpc0", "Name of the local TUN interface to create")
 	cmd.Flags().Int("mtu", 1280, "MTU for the local TUN interface")
 	cmd.Flags().String("mode", "vpc-only", "vpc-only (default) or default-route")
-	cmd.Flags().StringArray("vpc-prefix", nil, "VPC prefix to route through the interface in vpc-only mode (repeatable)")
 	cmd.Flags().String("router-ip", "", "Concrete IP of the galactic router; only used to pin a host route in default-route mode (see datum-connect vpc join --help)")
 	cmd.Flags().StringP("output", "o", "table", "Output format: table, json, yaml")
 	_ = cmd.MarkFlagRequired("vpc")
-	_ = cmd.MarkFlagRequired("address")
 	return cmd
 }
 
 func runJoin(cmd *cobra.Command, args []string) error {
 	vpcName, _ := cmd.Flags().GetString("vpc")
 	routerID, _ := cmd.Flags().GetString("router-id")
-	address, _ := cmd.Flags().GetString("address")
-	prefixLen, _ := cmd.Flags().GetInt("prefix-len")
 	tunName, _ := cmd.Flags().GetString("tun-name")
 	mtu, _ := cmd.Flags().GetInt("mtu")
 	mode, _ := cmd.Flags().GetString("mode")
-	vpcPrefixes, _ := cmd.Flags().GetStringArray("vpc-prefix")
 	routerIP, _ := cmd.Flags().GetString("router-ip")
 
 	binaryPath, err := binary.Discover()
@@ -89,17 +82,12 @@ func runJoin(cmd *cobra.Command, args []string) error {
 	rustArgs := []string{
 		"--json", "vpc", "join",
 		"--vpc", vpcName,
-		"--address", address,
-		"--prefix-len", strconv.Itoa(prefixLen),
 		"--tun-name", tunName,
 		"--mtu", strconv.Itoa(mtu),
 		"--mode", mode,
 	}
 	if routerID != "" {
 		rustArgs = append(rustArgs, "--router-id", routerID)
-	}
-	for _, p := range vpcPrefixes {
-		rustArgs = append(rustArgs, "--vpc-prefix", p)
 	}
 	if routerIP != "" {
 		rustArgs = append(rustArgs, "--router-ip", routerIP)
@@ -146,6 +134,15 @@ func runJoin(cmd *cobra.Command, args []string) error {
 			}
 
 			switch msg.Type {
+			case "vpc_listening":
+				if isJSON {
+					fmt.Fprintln(cmd.OutOrStdout(), string(line))
+				} else {
+					if eid, ok := msg.Fields["endpoint_id"]; ok {
+						fmt.Fprintf(cmd.OutOrStdout(), "Endpoint ID: %v\n", eid)
+					}
+					fmt.Fprintln(cmd.OutOrStdout(), "Waiting for router to assign address...")
+				}
 			case "vpc_ready":
 				readyData, _ := json.Marshal(msg.Fields)
 				_ = json.Unmarshal(readyData, &ready)
@@ -158,7 +155,6 @@ func runJoin(cmd *cobra.Command, args []string) error {
 				}
 				fmt.Fprintf(cmd.OutOrStdout(), "VPC attachment ready: %s at %s via %s (mode %s)\n",
 					ready.Vpc, ready.Address, ready.TunName, ready.Mode)
-				fmt.Fprintf(cmd.OutOrStdout(), "Endpoint ID: %s\n", ready.EndpointID)
 				fmt.Fprintf(cmd.OutOrStdout(), "Listening on: %s\n", strings.Join(ready.BoundAddrs, ", "))
 				fmt.Fprintln(cmd.OutOrStdout(), "Press Ctrl+C to stop...")
 				close(readyCh)

@@ -55,10 +55,16 @@ declare -a REGIONS=(a b c)
 # docker fabric prefix (router<->region links). The docker prefix (fd00:d0c)
 # also can't collide with test-3region.sh's fd00:cafe docker networks.
 VPC_AGGREGATE=fd00:cafe::/32
-TUN_LOCAL=fd00:cafe:1100::2     # the host client's VPC address
-TUN_ROUTER=fd00:cafe:1100::1
-TUN_PLEN=64
+TUN_POOL_CIDR=fd00:cafe:1100::/64
+TUN_ROUTER=fd00:cafe:1100::1      # router's own pool address
 ROUTER_XPORT=172.29.0.3
+
+# The Nth client address in the pool (N=2 → ::2, N=3 → ::3, …). The router
+# allocates sequentially from ::2; this mirrors that for dial/check helpers.
+pool_nth() {
+  local n="$1"
+  printf 'fd00:cafe:1100::%x' "${n}"
+}
 
 region_addr()      { echo "fd00:cafe:1${1}::1"; }    # region's VPC address (mesh target, tunnel-only)
 region_link_addr() { echo "fd00:d0c:1${1}::1"; }     # region's docker-fabric link address
@@ -133,23 +139,25 @@ $(log "Containerized VPC is up. Now run the CLIENT (this machine, or a remote on
     DATUM_CREDENTIALS_HELPER=<path to>/fake-credentials-helper.sh \\
     DATUM_API_HOST=https://api.lab.invalid \\
     <path to>/datum-connect --json vpc join \\
-      --vpc lab-host --address ${TUN_LOCAL} --prefix-len ${TUN_PLEN} \\
-      --mode vpc-only --vpc-prefix ${VPC_AGGREGATE}
+      --vpc lab-host --mode vpc-only
 
   (on THIS machine the paths are:
      helper = ${REPO_ROOT}/deploy/containerlab/vpc/fake-credentials-helper.sh
      binary = ${HOST_BIN}
    on a remote client, copy those two files over — build datum-connect for its OS/arch.)
 
+The router allocates an address from --pool and sends it to the client; the client
+configures its TUN from that assignment automatically.
+
 It prints a line like:
-  {"type":"vpc_ready", ... "endpoint_id":"<ID>", ...}
+  {"type":"vpc_ready", ... "endpoint_id":"<ID>", "address":"<assigned>", ...}
 
 Leave it running, then:
 
-  [on the client] $0 client-check      # ping the VPC from the client (no docker)
-  [on the VM]     $0 dial <ID>          # router dials the client by id; checks VPC->client
+  [on the client] $0 client-check <assigned-address>  # ping the VPC from the client (no docker)
+  [on the VM]     $0 dial <ID> [<ID2> ...]             # router dials 1+ clients by id
 
-The router dials the client by endpoint id alone — iroh discovery resolves it, no ip/port.
+The router dials clients by endpoint id alone — iroh discovery resolves it, no ip/port.
 EOF
 }
 
@@ -186,41 +194,58 @@ cping()  { local ctr="$1" dst="$2"; for _ in $(seq 1 5); do docker exec "${ctr}"
 # the client may be on a different machine; run `client-check` there for the
 # client->VPC direction.
 cmd_dial() {
-  local eid="${1:?usage: $0 dial <endpoint-id>}"
-  log "router: dialing the client by endpoint id (via iroh discovery)"
-  docker exec -d "${ROUTER_CTR}" sh -c "mock-galactic-router \
-    --peer-id ${eid} \
-    --address ${TUN_ROUTER} --prefix-len ${TUN_PLEN} > /tmp/router.log 2>&1"
+  if [[ $# -eq 0 ]]; then
+    echo "usage: $0 dial <endpoint-id> [<endpoint-id> ...]" >&2; exit 2
+  fi
 
-  # Gate on the tunnel from the VPC side: a region reaching the client's TUN
-  # address means the router dialed in and the tunnel + forwarding are up. iroh
-  # comes up via a relay path first and upgrades to a direct path, which can take
-  # longer than a few seconds, so wait generously.
-  log "Waiting for the tunnel to settle (region-a -> client over iroh, up to 90s)"
+  # Build --peer-id flags for each endpoint id.
+  local peer_args=()
+  local -a client_addrs=()
+  local idx=2
+  for eid in "$@"; do
+    peer_args+=(--peer-id "${eid}")
+    client_addrs+=("$(pool_nth "${idx}")")
+    idx=$((idx + 1))
+  done
+
+  log "router: dialing ${#peer_args[@]} client(s) by endpoint id (via iroh discovery)"
+  docker exec -d "${ROUTER_CTR}" sh -c "mock-galactic-router \
+    ${peer_args[*]} \
+    --address ${TUN_ROUTER} --pool ${TUN_POOL_CIDR} \
+    --advertise ${VPC_AGGREGATE} > /tmp/router.log 2>&1"
+
+  # Gate on the tunnel from the VPC side: a region reaching the first client's
+  # assigned address means the router dialed in and the tunnel + forwarding are
+  # up. iroh comes up via a relay path first and upgrades to a direct path, which
+  # can take longer than a few seconds, so wait generously.
+  local first_client="${client_addrs[0]}"
+  log "Waiting for the tunnel to settle (region-a -> client ${first_client} over iroh, up to 90s)"
   local up=0
   for _ in $(seq 1 90); do
-    if docker exec "$(region_ctr a)" ping -6 -c1 -W1 "${TUN_LOCAL}" >/dev/null 2>&1; then up=1; break; fi
+    if docker exec "$(region_ctr a)" ping -6 -c1 -W1 "${first_client}" >/dev/null 2>&1; then up=1; break; fi
     sleep 1
   done
   if [[ ${up} -eq 0 ]]; then
-    bad "tunnel did not settle (region-a -> ${TUN_LOCAL} never succeeded)"
+    bad "tunnel did not settle (region-a -> ${first_client} never succeeded)"
     echo "--- router.log ---"; docker exec "${ROUTER_CTR}" cat /tmp/router.log 2>/dev/null || true
     return 1
   fi
 
-  log "Reachability from the VPC to the client (${TUN_LOCAL})"
   local fails=0
-  for r in "${REGIONS[@]}"; do
-    if cping "$(region_ctr "$r")" "${TUN_LOCAL}"; then
-      ok "region-${r} -> client (${TUN_LOCAL})"
-    else
-      bad "region-${r} -> client (${TUN_LOCAL})"; fails=$((fails + 1))
-    fi
+  for addr in "${client_addrs[@]}"; do
+    log "Reachability from the VPC to client (${addr})"
+    for r in "${REGIONS[@]}"; do
+      if cping "$(region_ctr "$r")" "${addr}"; then
+        ok "region-${r} -> client (${addr})"
+      else
+        bad "region-${r} -> client (${addr})"; fails=$((fails + 1))
+      fi
+    done
   done
 
   echo
   if [[ ${fails} -eq 0 ]]; then
-    ok "VPC -> client reachable. Run '$0 client-check' ON THE CLIENT for the client -> VPC direction."
+    ok "VPC -> all client(s) reachable. Run '$0 client-check <addr>' ON EACH CLIENT for the client -> VPC direction."
   else
     bad "${fails} check(s) failed — see /tmp/router.log in the router container"; return 1
   fi
@@ -228,8 +253,12 @@ cmd_dial() {
 
 # client-check: run on the CLIENT machine (no docker). Pings every VPC device
 # from the client, proving the client->VPC direction over the tunnel.
+# Usage: $0 client-check [<my-assigned-address>]
+# The assigned address is optional — if omitted, defaults to fd00:cafe:1100::2
+# (first client in the pool).
 cmd_client_check() {
-  log "Waiting for the tunnel to settle (client -> router over iroh)"
+  local my_addr="${1:-fd00:cafe:1100::2}"
+  log "Waiting for the tunnel to settle (client ${my_addr} -> router over iroh)"
   local up=0
   for _ in $(seq 1 90); do
     if host_ping1 "${TUN_ROUTER}"; then up=1; break; fi
@@ -241,7 +270,7 @@ cmd_client_check() {
     return 1
   fi
 
-  log "Reachability from the client into the VPC"
+  log "Reachability from the client (${my_addr}) into the VPC"
   local fails=0
   for r in "${REGIONS[@]}"; do
     if hping "$(region_addr "$r")"; then
@@ -259,7 +288,7 @@ cmd_client_check() {
 case "${1:-}" in
   up)           cmd_up ;;
   dial)         shift; cmd_dial "$@" ;;
-  client-check) cmd_client_check ;;
+  client-check) shift; cmd_client_check "$@" ;;
   down)         teardown ;;
-  *)    echo "usage: $0 {up|dial <endpoint-id>|client-check|down}" >&2; echo "  up/dial/down run on the docker host (VM); client-check runs on the client machine (no docker)" >&2; exit 2 ;;
+  *)    echo "usage: $0 {up|dial <id> [<id>...]|client-check [<addr>]|down}" >&2; echo "  up/dial/down run on the docker host (VM); client-check runs on the client machine (no docker)" >&2; exit 2 ;;
 esac

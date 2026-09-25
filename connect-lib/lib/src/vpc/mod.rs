@@ -11,7 +11,10 @@ mod routing;
 mod transport;
 
 pub use routing::{configure_interface, install_routes};
-pub use transport::{IROH_VPC_ALPN, VpcAcceptHandler, VpcDialer};
+pub use transport::{
+    Assignment, IROH_VPC_ALPN, OnAssignFn, VpcAcceptHandler, VpcDialer, read_frame, send_assignment,
+    write_frame,
+};
 
 use std::sync::Arc;
 
@@ -114,10 +117,14 @@ impl VpcListener {
         tun_reader: Arc<Mutex<DeviceReader>>,
         tun_writer: Arc<Mutex<DeviceWriter>>,
         mtu: usize,
+        on_assign: Option<OnAssignFn>,
     ) -> Result<Self> {
         let config = repo.config().await?;
         let endpoint = build_endpoint(secret_key, &config).await?;
-        let handler = VpcAcceptHandler::new(allowed_router, tun_reader, tun_writer, mtu);
+        let mut handler = VpcAcceptHandler::new(allowed_router, tun_reader, tun_writer, mtu);
+        if let Some(f) = on_assign {
+            handler = handler.with_on_assign(f);
+        }
         let router = Router::builder(endpoint)
             .accept(IROH_VPC_ALPN, handler)
             .spawn();

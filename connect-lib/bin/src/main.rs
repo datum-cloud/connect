@@ -210,11 +210,6 @@ enum VpcCommands {
         /// only, see design/vpc-attachment.md.
         #[clap(long)]
         router_id: Option<String>,
-        /// This client's IPv6 address within the VPC.
-        #[clap(long)]
-        address: String,
-        #[clap(long, default_value_t = 120)]
-        prefix_len: u8,
         #[clap(long, default_value = "datum-vpc0")]
         tun_name: String,
         #[clap(long, default_value_t = 1280)]
@@ -224,10 +219,6 @@ enum VpcCommands {
         /// (wg-quick's ::/1 + 8000::/1 split).
         #[clap(long, value_enum)]
         mode: Option<vpc::ModeArg>,
-        /// VPC prefix to route through the interface in vpc-only mode
-        /// (repeatable).
-        #[clap(long = "vpc-prefix")]
-        vpc_prefix: Vec<String>,
         /// Concrete IP of the galactic router, used only to pin a host
         /// route via the pre-existing default gateway in default-route
         /// mode, so the tunnel's own iroh traffic isn't swallowed by the
@@ -1130,23 +1121,17 @@ async fn run() -> n0_error::Result<()> {
         Commands::Vpc(VpcCommands::Join {
             vpc,
             router_id,
-            address,
-            prefix_len,
             tun_name,
             mtu,
             mode,
-            vpc_prefix,
             router_ip,
         }) => {
             let join_args = vpc::JoinArgs {
                 vpc,
                 router_id,
-                address,
-                prefix_len,
                 tun_name,
                 mtu,
                 mode: mode.unwrap_or(vpc::ModeArg::VpcOnly),
-                vpc_prefix,
                 router_ip,
                 json,
             };

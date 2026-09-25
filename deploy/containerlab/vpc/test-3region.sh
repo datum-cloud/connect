@@ -55,9 +55,9 @@ declare -a REGIONS=(a b c)
 # fixes the third group and would exclude fd00:cafe:a:: etc. A real gVPC would
 # be a tighter block; /32 keeps the lab's addresses short and readable.
 VPC_AGGREGATE=fd00:cafe::/32
-TUN_LOCAL=fd00:cafe:100::2
+TUN_LOCAL=fd00:cafe:100::2    # first client allocation from the pool (::2)
 TUN_ROUTER=fd00:cafe:100::1
-TUN_PLEN=64
+TUN_POOL_CIDR=fd00:cafe:100::/64
 LOCAL_XPORT=172.30.0.2   # local's iroh transport (underlay) address
 ROUTER_XPORT=172.30.0.3
 
@@ -133,8 +133,7 @@ log "local: joining the VPC through the router"
 # The VPC aggregate is routed as a plain dev route out the tunnel: there is only
 # one peer on it (the router), which forwards onward to every region.
 docker exec -d "${LOCAL_CTR}" sh -c "datumctl-connect vpc join -o json \
-  --vpc lab-3region --address ${TUN_LOCAL} --prefix-len ${TUN_PLEN} \
-  --mode vpc-only --vpc-prefix ${VPC_AGGREGATE} \
+  --vpc lab-3region --mode vpc-only \
   > /tmp/local.log 2>&1"
 
 # Wait for the client to publish its iroh endpoint id. That id is all the
@@ -155,7 +154,8 @@ log "client endpoint ${EID}"
 log "router: dialing the client by endpoint id (via iroh discovery)"
 docker exec -d "${ROUTER_CTR}" sh -c "mock-galactic-router \
   --peer-id ${EID} \
-  --address ${TUN_ROUTER} --prefix-len ${TUN_PLEN} > /tmp/router.log 2>&1"
+  --address ${TUN_ROUTER} --pool ${TUN_POOL_CIDR} \
+  --advertise ${VPC_AGGREGATE} > /tmp/router.log 2>&1"
 
 # Devices to include in the full mesh: local + the router + the three regions.
 # The router joins as a node at its tunnel-side address (fd00:cafe:100::1) — the
