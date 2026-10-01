@@ -245,10 +245,17 @@ async fn private_snapshot_survives_source_replacement_and_cleans_up() {
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    let output = tokio::process::Command::new(&snapshot.executable)
-        .output()
-        .await
-        .unwrap();
+    let mut command = tokio::process::Command::new(&snapshot.executable);
+    command.stdout(std::process::Stdio::piped());
+    let output = spawn_session_helper(
+        &mut command,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap()
+    .wait_with_output()
+    .await
+    .unwrap();
     assert!(output.status.success());
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"]["token"],
@@ -268,6 +275,40 @@ async fn private_snapshot_survives_source_replacement_and_cleans_up() {
     drop(snapshot);
     assert!(!snapshot_path.exists());
     assert!(!private_dir.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn busy_helper_retry_is_bounded_and_recovers_after_writer_closes() {
+    if !user_daemon() {
+        return;
+    }
+    let (_dir, credentials) = fixture("exit 0");
+    let snapshot = snapshot_helper(Path::new(&credentials.helper_path)).unwrap();
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&snapshot.executable)
+        .unwrap();
+    let mut command = tokio::process::Command::new(&snapshot.executable);
+    let error = spawn_session_helper(
+        &mut command,
+        tokio::time::Instant::now() + Duration::from_millis(25),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    let release_writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        drop(writer);
+    });
+    let mut child = spawn_session_helper(
+        &mut command,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert!(child.wait().await.unwrap().success());
+    release_writer.await.unwrap();
 }
 
 #[test]

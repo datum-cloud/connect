@@ -320,6 +320,29 @@ struct ExecCredentialStatus {
     expiration_timestamp: String,
 }
 
+// Linux can briefly report ETXTBSY while another thread's forked child still
+// holds an inherited writable descriptor. Retry only that error, against the
+// same validated snapshot and the existing refresh deadline.
+async fn spawn_session_helper(
+    command: &mut tokio::process::Command,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<tokio::process::Child> {
+    for attempt in 0..=5 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        match command.spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 5 => {
+                tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(10)))
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("final attempt returns its result")
+}
+
 async fn session_token(
     credentials: &Credentials,
     timeout: Duration,
@@ -337,7 +360,8 @@ async fn session_token(
     .await
     .map_err(|_| Error::Invalid("Preparing datumctl login-session refresh timed out".into()))?
     .map_err(|_| Error::Invalid("Could not prepare datumctl login-session refresh".into()))??;
-    let mut child = tokio::process::Command::new(&helper.executable)
+    let mut command = tokio::process::Command::new(&helper.executable);
+    command
         .args([
             "auth",
             "get-token",
@@ -349,8 +373,9 @@ async fn session_token(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    let mut child = spawn_session_helper(&mut command, deadline)
+        .await
         .map_err(|_| {
             Error::Invalid("Could not start datumctl to refresh the saved login session".into())
         })?;
