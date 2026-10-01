@@ -95,9 +95,10 @@ jobs:
       - name: Verify macOS IPv4 and IPv6 packet flow and interface cleanup
         if: runner.os == 'macOS'
         shell: bash
+        working-directory: connect-lib
         run: |
-          test_binary=$(find connect-lib/target/debug/deps -maxdepth 1 -type f -name 'native_tun-*' ! -name '*.d' -perm -111)
-          test -n "$test_binary"
+          test_binary=$(cargo test --locked -p connect-ip-adapter --test native_tun --no-run --message-format=json |
+            jq -ser '[.[] | select(.reason == "compiler-artifact" and .target.name == "native_tun") | .executable | select(. != null)] | if length == 1 then .[0] else error("expected one native_tun executable") end')
           sudo "$test_binary" --ignored --test-threads=1
       - name: Stage official signed Wintun for Windows packet tests
         if: runner.os == 'Windows'
