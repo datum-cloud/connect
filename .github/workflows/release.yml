@@ -89,6 +89,9 @@ jobs:
               if [ "$platform" = windows ]; then suffix=".exe"; fi
               mkdir -p "../dist/rust/$platform-$arch"
               cp "../dist/rust/datum-connect-daemon-$platform-$arch$suffix" "../dist/rust/$platform-$arch/datum-connect-daemon$suffix"
+              if [ "$platform" != windows ]; then
+                chmod 755 "../dist/rust/$platform-$arch/datum-connect-daemon"
+              fi
             done
           done
       - name: Install Syft CLI
