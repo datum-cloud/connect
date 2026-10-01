@@ -349,6 +349,7 @@ async fn friendly_peer_names_are_pinned_in_saved_services_and_dials() {
     server.abort();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn oidc_session_enrollment_pins_session_and_requires_setup_to_replace() {
     let repo = tempfile::tempdir().unwrap();
@@ -357,9 +358,9 @@ async fn oidc_session_enrollment_pins_session_and_requires_setup_to_replace() {
     let token = tokio::fs::read_to_string(repo.path().join("daemon_auth/setup.token"))
         .await
         .unwrap();
-    // The mock control never executes this helper; use a trusted executable to
-    // exercise real descriptor validation without any real login credentials.
-    let helper = std::env::current_exe().unwrap();
+    // The mock control never executes this helper. Use a small trusted Unix
+    // executable: the unstripped test binary can exceed the helper size limit.
+    let helper = std::fs::canonicalize("/bin/sh").unwrap();
     let descriptor = json!({"helper_path":helper,"session":"session-a","api_endpoint":"https://api.example.test"});
     let response = client
         .post(format!("{base}/v1/up"))

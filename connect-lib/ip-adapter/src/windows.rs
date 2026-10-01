@@ -406,9 +406,19 @@ fn set_mtu(luid: NET_LUID_LH, address: IpAddr, mtu: u16) -> io::Result<()> {
         unsafe { GetIpInterfaceEntry(&mut row) },
         "read Wintun IP interface configuration",
     )?;
+    prepare_interface_update(&mut row, mtu);
+    win32_result(unsafe { SetIpInterfaceEntry(&mut row) }, "set Wintun MTU")
+}
+
+fn prepare_interface_update(row: &mut MIB_IPINTERFACE_ROW, mtu: u16) {
     row.NlMtu = u32::from(mtu);
     row.DadTransmits = 0;
-    win32_result(unsafe { SetIpInterfaceEntry(&mut row) }, "set Wintun MTU")
+    // GetIpInterfaceEntry can return a nonzero value for IPv4, but the setter
+    // requires zero. Preserve the value for IPv6.
+    // https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-setipinterfaceentry
+    if row.Family == AF_INET {
+        row.SitePrefixLength = 0;
+    }
 }
 
 fn add_address(luid: NET_LUID_LH, address: IpNet) -> io::Result<MIB_UNICASTIPADDRESS_ROW> {
@@ -527,6 +537,21 @@ fn wintun_error(error: wintun::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_update_normalizes_only_ipv4_site_prefix() {
+        for (family, expected_prefix) in [(AF_INET, 0), (AF_INET6, 64)] {
+            let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
+            row.Family = family;
+            row.SitePrefixLength = 64;
+            row.Metric = 7;
+            prepare_interface_update(&mut row, 1280);
+            assert_eq!(row.SitePrefixLength, expected_prefix);
+            assert_eq!(row.NlMtu, 1280);
+            assert_eq!(row.DadTransmits, 0);
+            assert_eq!(row.Metric, 7);
+        }
+    }
 
     #[test]
     fn sockaddr_preserves_ipv4_network_bytes() {
