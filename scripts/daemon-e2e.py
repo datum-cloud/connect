@@ -306,7 +306,17 @@ def main():
         print('PASS private default, viewer denial, token revocation, unsupported L3 failure', flush=True)
         stop('bob')
         start('bob')
-        resumed = cli('bob', 'status')
+        # Health reports API availability, not completion of asynchronous
+        # restart reconciliation. Wait for both restored listeners explicitly.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            resumed = cli('bob', 'status')
+            listening = {dial['local_port'] for dial in resumed['dials'] if dial['running']}
+            if resumed['running'] and {local, udp_local} <= listening:
+                break
+            time.sleep(.2)
+        else:
+            raise AssertionError(f'restored dial listeners did not become ready: {resumed}')
         assert resumed['connector']['public_key'] == bkey
         roundtrip(local)
         print('PASS restart preserves Connector identity and restores dial', flush=True)
