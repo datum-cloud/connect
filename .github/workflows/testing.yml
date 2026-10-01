@@ -10,7 +10,12 @@ on:
       - 'connect-lib/**/Cargo.toml'
       - 'connect-lib/Cargo.lock'
       - 'connect-lib/rust-toolchain.toml'
+      - '.cargo/config.toml'
       - '.github/workflows/testing.yml'
+      - 'scripts/stage-wintun.py'
+      - 'scripts/windows-service-smoke.ps1'
+      - 'scripts/daemon-e2e.py'
+      - 'scripts/fixtures/**'
   pull_request:
     paths:
       - 'connect-plugin/**/*.go'
@@ -20,12 +25,106 @@ on:
       - 'connect-lib/**/Cargo.toml'
       - 'connect-lib/Cargo.lock'
       - 'connect-lib/rust-toolchain.toml'
+      - '.cargo/config.toml'
       - '.github/workflows/testing.yml'
+      - 'scripts/stage-wintun.py'
+      - 'scripts/windows-service-smoke.ps1'
+      - 'scripts/daemon-e2e.py'
+      - 'scripts/fixtures/**'
 
 permissions:
   contents: read
 
 jobs:
+  windows-gnu-link:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install Windows GNU linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Link the Windows daemon, not only cargo check
+        run: cargo build --locked -p datum-connect-daemon --target x86_64-pc-windows-gnu
+        working-directory: connect-lib
+      - name: Inspect Windows executable imports
+        run: x86_64-w64-mingw32-objdump -p connect-lib/target/x86_64-pc-windows-gnu/debug/datum-connect-daemon.exe
+
+  native-platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: connect-plugin/go.mod
+          cache-dependency-path: connect-plugin/go.sum
+      - name: Test native CLI and private file permissions
+        run: go test ./...
+        working-directory: connect-plugin
+      - name: Check native Rust daemon and adapter
+        run: cargo clippy --locked -p datum-connect-daemon -p connect-ip-adapter --all-targets -- -D warnings
+        working-directory: connect-lib
+      - name: Test native storage and adapter
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p connect-lib -p connect-ip-adapter
+        working-directory: connect-lib
+      - name: Test Windows private storage
+        if: runner.os == 'Windows'
+        # Historical library helper tests execute /bin/sh. Windows explicitly
+        # does not support that helper; exercise the native ACL implementation.
+        run: cargo test --locked -p connect-lib secure_fs::windows_tests
+        working-directory: connect-lib
+      - name: Test Windows adapter
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p connect-ip-adapter
+        working-directory: connect-lib
+      - name: Test native service state transitions
+        run: cargo test --locked -p datum-connect-daemon --bin datum-connect-daemon
+        working-directory: connect-lib
+      - name: Build opt-in native packet tests
+        run: cargo test --locked -p connect-ip-adapter --test native_tun --no-run
+        working-directory: connect-lib
+      - name: Verify macOS IPv4 and IPv6 packet flow and interface cleanup
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          test_binary=$(find connect-lib/target/debug/deps -maxdepth 1 -type f -name 'native_tun-*' ! -name '*.d' -perm -111)
+          test -n "$test_binary"
+          sudo "$test_binary" --ignored --test-threads=1
+      - name: Stage official signed Wintun for Windows packet tests
+        if: runner.os == 'Windows'
+        run: python scripts/stage-wintun.py --arch amd64 --destination connect-lib/target/debug/deps
+      - name: Verify Windows IPv4 and IPv6 packet flow
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p connect-ip-adapter --test native_tun -- --ignored --test-threads=1
+        working-directory: connect-lib
+      - name: Build Windows service and CLI executables
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --locked --manifest-path connect-lib/Cargo.toml -p datum-connect-daemon
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Push-Location connect-plugin
+          try {
+            go build -o ../target/windows-amd64/datumctl-connect.exe .
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+      - name: Verify native Windows service lifecycle and protected storage
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/windows-service-smoke.ps1 `
+            -Plugin (Resolve-Path target/windows-amd64/datumctl-connect.exe) `
+            -Daemon (Resolve-Path connect-lib/target/debug/datum-connect-daemon.exe)
+
   go:
     runs-on: ubuntu-latest
     steps:
@@ -64,3 +163,17 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+      - name: Set up Go for daemon process E2E
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: connect-plugin/go.mod
+          cache-dependency-path: connect-plugin/go.sum
+      - name: Build daemon and CLI
+        run: |
+          cargo build --locked -p datum-connect-daemon
+          cd ../connect-plugin
+          go build -o datumctl-connect .
+      - name: Verify local CLI, daemon, and transport together
+        run: python3 ../scripts/daemon-e2e.py --daemon target/debug/datum-connect-daemon --plugin ../connect-plugin/datumctl-connect
+      - name: Verify OIDC session enrollment and renewal
+        run: python3 ../scripts/daemon-e2e.py --daemon target/debug/datum-connect-daemon --plugin ../connect-plugin/datumctl-connect --oidc

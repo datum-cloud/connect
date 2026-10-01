@@ -1,11 +1,13 @@
 use std::{fmt::Debug, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use iroh::{
-    Endpoint, EndpointId, SecretKey, discovery::dns::DnsDiscovery, endpoint::default_relay_mode,
+    Endpoint, EndpointId, SecretKey,
+    address_lookup::dns::DnsAddressLookup,
+    dns::{DnsProtocol, DnsResolver},
+    endpoint::{default_relay_mode, presets},
     protocol::Router,
 };
 use iroh_base::RelayUrl;
-use iroh_n0des::ApiSecret;
 use iroh_proxy_utils::upstream::UpstreamMetrics;
 use iroh_proxy_utils::{
     ALPN as IROH_HTTP_CONNECT_ALPN, Authority, HttpProxyRequest, HttpProxyRequestKind,
@@ -14,9 +16,8 @@ use iroh_proxy_utils::{
     downstream::{DownstreamProxy, EndpointAuthority, ProxyMode},
     upstream::{AuthError, AuthHandler, UpstreamProxy},
 };
-use iroh_relay::dns::{DnsProtocol, DnsResolver};
 use iroh_relay::{RelayConfig, RelayMap};
-use n0_error::{Result, StackResultExt, StdResultExt};
+use n0_error::{Result, StdResultExt};
 use tokio::{
     net::TcpListener,
     sync::futures::Notified,
@@ -38,13 +39,11 @@ pub struct ListenNode {
     state: StateWrapper,
     repo: Repo,
     metrics: Arc<UpstreamMetrics>,
-    _n0des: Option<Arc<iroh_n0des::Client>>,
 }
 
 impl ListenNode {
     pub async fn new(repo: Repo) -> Result<Self> {
-        let n0des_api_secret = n0des_api_secret_from_env()?;
-        Self::build(repo, n0des_api_secret, None).await
+        Self::build(repo, None).await
     }
 
     /// Construct a listen node using a project-scoped iroh identity. The CLI
@@ -52,8 +51,7 @@ impl ListenNode {
     /// distinct iroh public key — see [`Repo::listen_key_for_project`] for
     /// why that matters.
     pub async fn new_for_project(repo: Repo, project_id: &str) -> Result<Self> {
-        let n0des_api_secret = n0des_api_secret_from_env()?;
-        Self::build(repo, n0des_api_secret, Some(project_id)).await
+        Self::build(repo, Some(project_id)).await
     }
 
     /// Construct a listen node using a pre-generated iroh identity.
@@ -62,35 +60,21 @@ impl ListenNode {
     /// key is generated in memory (e.g., new tunnel creation) and needs to be
     /// passed through without a round-trip to disk.
     pub async fn new_with_key(repo: Repo, secret_key: SecretKey) -> Result<Self> {
-        let n0des_api_secret = n0des_api_secret_from_env()?;
-        Self::build_with_key(repo, n0des_api_secret, secret_key).await
-    }
-
-    #[instrument("listen-node", skip_all)]
-    pub async fn with_n0des_api_secret(
-        repo: Repo,
-        n0des_api_secret: Option<ApiSecret>,
-    ) -> Result<Self> {
-        Self::build(repo, n0des_api_secret, None).await
+        Self::build_with_key(repo, secret_key).await
     }
 
     pub fn repo(&self) -> &Repo {
         &self.repo
     }
 
-    #[instrument("listen-node", skip(repo, n0des_api_secret))]
-    async fn build(
-        repo: Repo,
-        n0des_api_secret: Option<ApiSecret>,
-        project_id: Option<&str>,
-    ) -> Result<Self> {
+    #[instrument("listen-node", skip(repo))]
+    async fn build(repo: Repo, project_id: Option<&str>) -> Result<Self> {
         let config = repo.config().await?;
         let secret_key = match project_id {
             Some(pid) => repo.listen_key_for_project(pid).await?,
             None => repo.listen_key(project_id).await?,
         };
         let endpoint = build_endpoint(secret_key, &config).await?;
-        let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
         let state = repo.load_state().await?;
 
         let upstream_proxy = UpstreamProxy::new(state.clone())?;
@@ -105,20 +89,14 @@ impl ListenNode {
             router,
             state,
             metrics,
-            _n0des: n0des,
         };
         Ok(this)
     }
 
-    #[instrument("listen-node", skip(repo, n0des_api_secret, secret_key))]
-    async fn build_with_key(
-        repo: Repo,
-        n0des_api_secret: Option<ApiSecret>,
-        secret_key: SecretKey,
-    ) -> Result<Self> {
+    #[instrument("listen-node", skip(repo, secret_key))]
+    async fn build_with_key(repo: Repo, secret_key: SecretKey) -> Result<Self> {
         let config = repo.config().await?;
         let endpoint = build_endpoint(secret_key, &config).await?;
-        let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
         let state = repo.load_state().await?;
 
         let upstream_proxy = UpstreamProxy::new(state.clone())?;
@@ -133,7 +111,6 @@ impl ListenNode {
             router,
             state,
             metrics,
-            _n0des: n0des,
         })
     }
 
@@ -270,28 +247,16 @@ impl AuthHandler for StateWrapper {
 pub struct ConnectNode {
     endpoint: Endpoint,
     proxy: DownstreamProxy,
-    _n0des: Option<Arc<iroh_n0des::Client>>,
 }
 
 impl ConnectNode {
     pub async fn new(repo: Repo) -> Result<Self> {
-        let n0des_api_secret = n0des_api_secret_from_env()?;
-        Self::with_n0des_api_secret(repo, n0des_api_secret).await
-    }
-
-    #[instrument("connect-node", skip_all)]
-    pub async fn with_n0des_api_secret(
-        repo: Repo,
-        n0des_api_secret: Option<ApiSecret>,
-    ) -> Result<Self> {
         let config = repo.config().await?;
         let secret_key = repo.connect_key().await?;
         let endpoint = build_endpoint(secret_key, &config).await?;
-        let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
         let pool = DownstreamProxy::new(endpoint.clone(), Default::default());
         Ok(Self {
             endpoint,
-            _n0des: n0des,
             proxy: pool,
         })
     }
@@ -356,20 +321,20 @@ impl OutboundProxyHandle {
 pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<Endpoint> {
     let relay_mode = relay_mode_from_env_or_build().await?;
     let mut builder = match common.discovery_mode {
-        crate::config::DiscoveryMode::Dns => {
-            Endpoint::empty_builder(relay_mode).secret_key(secret_key)
-        }
+        crate::config::DiscoveryMode::Dns => Endpoint::builder(presets::Empty)
+            .relay_mode(relay_mode)
+            .secret_key(secret_key),
         crate::config::DiscoveryMode::Default | crate::config::DiscoveryMode::Hybrid => {
-            Endpoint::builder()
+            Endpoint::builder(presets::N0)
                 .relay_mode(relay_mode)
                 .secret_key(secret_key)
         }
     };
     if let Some(addr) = common.ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
+        builder = builder.bind_addr(addr)?;
     }
     if let Some(addr) = common.ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
+        builder = builder.bind_addr(addr)?;
     }
     match common.discovery_mode {
         crate::config::DiscoveryMode::Default => {}
@@ -386,7 +351,7 @@ pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<En
                     .build();
                 builder = builder.dns_resolver(resolver);
             }
-            builder = builder.discovery(DnsDiscovery::builder(origin));
+            builder = builder.address_lookup(DnsAddressLookup::builder(origin));
         }
     }
     let endpoint = builder.bind().await?;
@@ -654,56 +619,6 @@ fn relays_to_map(relays: Vec<RelayUrl>) -> RelayMap {
     RelayMap::from_iter(relays.into_iter().map(RelayConfig::from))
 }
 
-pub(crate) fn n0des_api_secret_from_env() -> Result<Option<ApiSecret>> {
-    let api_secret_str = match std::env::var("N0DES_API_SECRET") {
-        Ok(s) => s,
-        Err(_) => match option_env!("BUILD_N0DES_API_SECRET") {
-            None => return Ok(None),
-            Some(s) => s.to_string(),
-        },
-    };
-    let api_secret = ApiSecret::from_str(&api_secret_str)
-        .context("Failed to parse n0des API secret from env variable N0DES_API_SECRET")?;
-    Ok(Some(api_secret))
-}
-
-pub(crate) async fn build_n0des_client_opt(
-    endpoint: &Endpoint,
-    api_secret: Option<ApiSecret>,
-) -> Option<Arc<iroh_n0des::Client>> {
-    match api_secret {
-        None => {
-            info!("Disabling metrics collection: N0DES_API_SECRET is not set");
-            None
-        }
-        Some(n0des_api_secret) => {
-            let remote_id = n0des_api_secret.remote.id;
-            debug!(remote = %remote_id.fmt_short(), "connecting to n0des endpoint");
-            let builder = match iroh_n0des::Client::builder(endpoint).api_secret(n0des_api_secret) {
-                Ok(b) => b,
-                Err(err) => {
-                    warn!("Disabling metrics collection: Failed to build n0des client: {err:#}");
-                    return None;
-                }
-            };
-            match builder
-                .build()
-                .await
-                .std_context("Failed to connect to n0des endpoint")
-            {
-                Ok(client) => {
-                    info!(remote = %remote_id.fmt_short(), "Connected to n0des endpoint for metrics collection");
-                    Some(Arc::new(client))
-                }
-                Err(err) => {
-                    warn!("Disabling metrics collection: Failed to connect to n0des: {err:#}");
-                    None
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,17 +643,8 @@ mod tests {
         let repo = Repo::open_or_create(&dir).await.unwrap();
 
         // Generate a key in memory.
-        let key = SecretKey::generate(&mut rand::rng());
-        // Derive expected EndpointId by creating a temporary endpoint.
-        let expected_id = {
-            let ep = iroh::Endpoint::builder()
-                .relay_mode(iroh::endpoint::RelayMode::Default)
-                .secret_key(key.clone())
-                .bind()
-                .await
-                .unwrap();
-            ep.id()
-        };
+        let key = SecretKey::generate();
+        let expected_id = key.public();
 
         // new_with_key should use the key directly (no disk read needed).
         let node = ListenNode::new_with_key(repo, key).await.unwrap();

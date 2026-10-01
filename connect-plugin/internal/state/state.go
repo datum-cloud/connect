@@ -1,6 +1,6 @@
 // Package state provides cross-platform plugin state directory resolution.
 //
-// State directory contains tunnel PID files, logs, and other runtime data.
+// State directory contains the daemon's credentials, desired state, and logs.
 // DATUM_CONNECT_STATE_DIR overrides the platform default when explicitly set.
 // Paths follow platform conventions:
 //
@@ -40,32 +40,15 @@ func Dir() string {
 	}
 }
 
-// TunnelDir returns the tunnels subdirectory.
-func TunnelDir() string {
-	return filepath.Join(Dir(), "tunnels")
-}
-
-// PidFilePath returns the PID file path for a named tunnel.
-func PidFilePath(name string) string {
-	return filepath.Join(TunnelDir(), name+".pid")
-}
-
-// LogDir returns the log directory.
-// On macOS uses ~/Library/Logs/ (conventional), others use <state>/logs.
-func LogDir() string {
-	switch runtime.GOOS {
-	case "darwin":
-		u, err := user.Current()
-		if err != nil {
-			return filepath.Join(Dir(), "logs")
-		}
-		return filepath.Join(u.HomeDir, "Library", "Logs", "datumctl", "connect")
-	default:
-		return filepath.Join(Dir(), "logs")
+// DaemonDir is the dedicated state directory used by the successor daemon.
+func DaemonDir() string {
+	if repo := os.Getenv("DATUM_CONNECT_DIR"); repo != "" {
+		return repo
 	}
+	return filepath.Join(Dir(), "daemon")
 }
 
-// LogFilePath returns the log file path for a named tunnel.
-func LogFilePath(name string) string {
-	return filepath.Join(LogDir(), name+".log")
+// SetupTokenPath is the daemon's privileged local setup credential.
+func SetupTokenPath() string {
+	return filepath.Join(DaemonDir(), "daemon_auth", "setup.token")
 }

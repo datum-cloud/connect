@@ -6,7 +6,7 @@ vars:
   RUST_PROJECT: connect-lib
   GO_PROJECT: connect-plugin
   PLUGIN_BINARY: datumctl-connect
-  RUST_BINARY: datum-connect
+  DAEMON_BINARY: datum-connect-daemon
   PLUGIN_DIR: '{{.ROOT_DIR}}/bin'
   PLUGIN_INSTALL_DIR: '$HOME/.datumctl/plugins'
 
@@ -17,10 +17,10 @@ vars:
   GO_LDFLAGS: -X main.version=v0.1.0+{{.GIT_COMMIT}}
 
   CARGO_TARGET_DIR: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}/target'
-  CARGO_BUILD_FLAGS: -p {{.RUST_BINARY}}
+  CARGO_BUILD_FLAGS: --locked -p {{.DAEMON_BINARY}}
   RELEASE_FLAGS: --release
 
-  E2E_SCRIPT: '{{.ROOT_DIR}}/../e2e-test.sh'
+  E2E_SCRIPT: '{{.ROOT_DIR}}/scripts/daemon-e2e.py'
 
 # ─── Tasks ──────────────────────────────────────────────────────────────────
 
@@ -74,7 +74,15 @@ tasks:
     cmds:
       - task: build
       - task: install:go
-      - task: install:rust
+      - task: install:daemon
+
+  install:daemon:
+    desc: "Install the persistent daemon alongside the plugin"
+    cmds:
+      - mkdir -p {{.PLUGIN_INSTALL_DIR}}
+      - cp {{.CARGO_TARGET_DIR}}/debug/{{.DAEMON_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.DAEMON_BINARY}}.new
+      - chmod 755 {{.PLUGIN_INSTALL_DIR}}/{{.DAEMON_BINARY}}.new
+      - mv {{.PLUGIN_INSTALL_DIR}}/{{.DAEMON_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.DAEMON_BINARY}}
 
   install:go:
     desc: "Copy the Go plugin binary to $HOME/.datumctl/plugins"
@@ -84,13 +92,6 @@ tasks:
       - cp {{.PLUGIN_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}.new && mv {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}
       - chmod +x {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}
 
-  install:rust:
-    desc: "Copy the Rust binary to $HOME/.datumctl/plugins"
-    cmds:
-      - mkdir -p {{.PLUGIN_INSTALL_DIR}}
-      - cp {{.CARGO_TARGET_DIR}}/debug/{{.RUST_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}.new && mv {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}
-      - chmod +x {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}
-
   install:release:
     desc: "Build (release) and install both binaries"
     dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
@@ -99,8 +100,9 @@ tasks:
       - mkdir -p {{.PLUGIN_INSTALL_DIR}}
       - cp {{.PLUGIN_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}.new && mv {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}
       - chmod +x {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}
-      - cp {{.CARGO_TARGET_DIR}}/release/{{.RUST_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}.new && mv {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}
-      - chmod +x {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}
+      - cp {{.CARGO_TARGET_DIR}}/release/{{.DAEMON_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.DAEMON_BINARY}}.new
+      - chmod 755 {{.PLUGIN_INSTALL_DIR}}/{{.DAEMON_BINARY}}.new
+      - mv {{.PLUGIN_INSTALL_DIR}}/{{.DAEMON_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.DAEMON_BINARY}}
 
   # ════════════════════════════════════════════════════════════════════════
   #  Test
@@ -125,9 +127,12 @@ tasks:
     dir: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}'
 
   test:e2e:
-    desc: "Run the E2E tunnel stability test script"
+    desc: "Run real local CLI/daemon/iroh E2E with simulated control plane"
     cmds:
-      - cmd: '{{.E2E_SCRIPT}}'
+      - task: build
+      - cmd: 'python3 {{.E2E_SCRIPT}} --daemon {{.CARGO_TARGET_DIR}}/debug/{{.DAEMON_BINARY}} --plugin {{.ROOT_DIR}}/{{.GO_PROJECT}}/{{.PLUGIN_BINARY}}'
+        silent: false
+      - cmd: 'python3 {{.E2E_SCRIPT}} --daemon {{.CARGO_TARGET_DIR}}/debug/{{.DAEMON_BINARY}} --plugin {{.ROOT_DIR}}/{{.GO_PROJECT}}/{{.PLUGIN_BINARY}} --oidc'
         silent: false
 
   # ════════════════════════════════════════════════════════════════════════
@@ -138,19 +143,15 @@ tasks:
     desc: "Remove all build artifacts"
     cmds:
       - rm -f {{.ROOT_DIR}}/{{.GO_PROJECT}}/{{.PLUGIN_BINARY}}
-      - rm -f {{.ROOT_DIR}}/{{.RUST_PROJECT}}/target/debug/{{.RUST_BINARY}}
-      - rm -f {{.ROOT_DIR}}/{{.RUST_PROJECT}}/target/release/{{.RUST_BINARY}}
       - rm -rf {{.ROOT_DIR}}/{{.RUST_PROJECT}}/target
 
   clean:all:
     desc: "Remove build artifacts, installed binaries, and tmp files"
     cmds:
       - task: clean
-      - rm -f $HOME/.datumctl/plugins/{{.PLUGIN_BINARY}} $HOME/.datumctl/plugins/{{.RUST_BINARY}}
+      - rm -f $HOME/.datumctl/plugins/{{.PLUGIN_BINARY}} $HOME/.datumctl/plugins/{{.DAEMON_BINARY}}
       - rm -rf {{.ROOT_DIR}}/tmp
 
   # ════════════════════════════════════════════════════════════════════════
   #  Utility
   # ════════════════════════════════════════════════════════════════════════
-
-

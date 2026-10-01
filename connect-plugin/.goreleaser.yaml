@@ -4,14 +4,27 @@
 # goreleaser, which builds the plugin and publishes archives + checksums.txt
 # to a GitHub release. Installable via `datumctl plugin install datum-cloud/connect`.
 #
-# Each archive bundles both the Go plugin binary (datumctl-connect) and the
-# Rust tunnel agent binary (datum-connect). The Rust binary is cross-compiled
-# in the workflow and placed at ../dist/rust/ before goreleaser runs.
+# Each archive bundles the Go plugin binary (datumctl-connect) and the
+# Rust daemon (datum-connect-daemon). The daemon is cross-compiled in the workflow and
+# placed at ../dist/rust/ before goreleaser runs.
 #
 # yaml-language-server: $schema=https://goreleaser.com/static/schema.json
 version: 2
 
 project_name: datumctl-connect
+
+# This branch ships previews. Never move the production "latest" pointer.
+release:
+  draft: true
+  prerelease: auto
+  make_latest: false
+  header: |
+    This is the headless Connect preview. It makes breaking CLI changes.
+    Each platform archive contains both datumctl-connect and datum-connect-daemon.
+    Read INSTALL.txt for manual plugin installation, trust, and first-run setup.
+    Checksums are not publisher signatures. macOS notarization is not included.
+  extra_files:
+    - glob: ../docs/INSTALL.txt
 
 before:
   hooks:
@@ -46,8 +59,20 @@ archives:
       - goos: windows
         formats: [zip]
     files:
-      - src: ../dist/rust/datum-connect-{{ .Os }}-{{ .Arch }}{{ if eq .Os "windows" }}.exe{{ end }}
-        dst: datum-connect{{ if eq .Os "windows" }}.exe{{ end }}
+      - src: ../docs/INSTALL.txt
+        dst: .
+        strip_parent: true
+      - src: ../LICENSE
+        dst: .
+        strip_parent: true
+      - src: ../dist/rust/{{ .Os }}-{{ .Arch }}/datum-connect-daemon{{ if eq .Os "windows" }}.exe{{ end }}
+        dst: .
+        strip_parent: true
+      - src: '{{ if eq .Os "windows" }}../dist/wintun-{{ .Arch }}/wintun.dll{{ else }}__no_wintun_files__*{{ end }}'
+        dst: .
+        strip_parent: true
+      - src: '{{ if eq .Os "windows" }}../dist/wintun-{{ .Arch }}/WINTUN-LICENSE.txt{{ else }}__no_wintun_files__*{{ end }}'
+        dst: .
         strip_parent: true
 
 checksum:

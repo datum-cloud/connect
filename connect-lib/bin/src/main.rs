@@ -403,7 +403,7 @@ async fn run() -> n0_error::Result<()> {
             let resolved: (ListenNode, TunnelService, Option<TunnelSummary>);
             let endpoint: String = match (endpoint, id) {
                 (Some(ep), None) => {
-                    let fresh_key = SecretKey::generate(&mut rand::rng());
+                    let fresh_key = SecretKey::generate();
                     let probe_node =
                         ListenNode::new_with_key(repo.clone(), fresh_key.clone()).await?;
                     let probe_service = TunnelService::new(datum.clone(), probe_node.clone());
@@ -1067,11 +1067,11 @@ mod tests {
     async fn endpoint_adoption_requires_the_existing_local_identity() {
         let directory = tempfile::tempdir().unwrap();
         let repo = Repo::open_or_create(directory.path()).await.unwrap();
-        let persisted = SecretKey::generate(&mut rand::rng());
+        let persisted = SecretKey::generate();
         repo.save_listen_key_for_tunnel("project", "tunnel", &persisted)
             .await
             .unwrap();
-        let fresh = SecretKey::generate(&mut rand::rng());
+        let fresh = SecretKey::generate();
         assert_ne!(fresh.to_bytes(), persisted.to_bytes());
 
         let (resolved, adopted) = resolve_endpoint_candidates(
@@ -1092,7 +1092,7 @@ mod tests {
     async fn endpoint_match_without_a_local_key_keeps_the_fresh_identity() {
         let directory = tempfile::tempdir().unwrap();
         let repo = Repo::open_or_create(directory.path()).await.unwrap();
-        let fresh = SecretKey::generate(&mut rand::rng());
+        let fresh = SecretKey::generate();
 
         let (resolved, adopted) = resolve_endpoint_candidates(
             &repo,
@@ -1118,7 +1118,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let repo = Repo::open_or_create(directory.path()).await.unwrap();
         for tunnel_id in ["first", "second"] {
-            let key = SecretKey::generate(&mut rand::rng());
+            let key = SecretKey::generate();
             repo.save_listen_key_for_tunnel("project", tunnel_id, &key)
                 .await
                 .unwrap();
@@ -1129,7 +1129,7 @@ mod tests {
             "project",
             "127.0.0.1:8080",
             vec![tunnel("first", None), tunnel("second", None)],
-            SecretKey::generate(&mut rand::rng()),
+            SecretKey::generate(),
         )
         .await
         .expect_err("ambiguous local ownership must fail closed");

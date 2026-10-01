@@ -1,0 +1,1027 @@
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+
+use async_trait::async_trait;
+use axum::http::StatusCode;
+use datum_connect_daemon::{
+    api::{self, AppState},
+    auth,
+    control::{Control, PingResult, ServiceOutcome},
+    error::ApiError,
+    model::{ConnectorState, DialState, Protocol, ServiceState},
+    store::Store,
+};
+use serde_json::{Value, json};
+
+#[derive(Default)]
+struct MockControl {
+    up_calls: AtomicUsize,
+    service_calls: AtomicUsize,
+    fail_service: AtomicBool,
+    fail_dial: AtomicBool,
+    network_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Control for MockControl {
+    async fn resolve_peer_key(&self, _project: &str, peer: &str) -> Result<String, ApiError> {
+        if peer == "friendly-peer" {
+            return Ok("pinned-peer-key".into());
+        }
+        Ok(peer.to_owned())
+    }
+    async fn validate_credentials(&self, _credentials_file: &str) -> Result<(), ApiError> {
+        Ok(())
+    }
+    async fn up(&self, project: &str, _credentials_file: &str) -> Result<ConnectorState, ApiError> {
+        self.up_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ConnectorState {
+            name: format!("connect-{project}"),
+            uid: "uid-1".into(),
+            public_key: "key-1".into(),
+        })
+    }
+    async fn resume(
+        &self,
+        project: &str,
+        _credentials_file: &str,
+        expected: &ConnectorState,
+    ) -> Result<ConnectorState, ApiError> {
+        self.up_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ConnectorState {
+            name: format!("connect-{project}"),
+            uid: expected.uid.clone(),
+            public_key: expected.public_key.clone(),
+        })
+    }
+    async fn down(&self, _project: &str) -> Result<(), ApiError> {
+        Ok(())
+    }
+    async fn reconcile_service(
+        &self,
+        _project: &str,
+        _service: &ServiceState,
+    ) -> Result<ServiceOutcome, ApiError> {
+        self.service_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_service.load(Ordering::SeqCst) {
+            return Err(ApiError::internal("simulated control-plane failure"));
+        }
+        Ok(ServiceOutcome {
+            hostnames: Vec::new(),
+            ready: true,
+        })
+    }
+    async fn pause_service(&self, _project: &str, _service: &ServiceState) -> Result<(), ApiError> {
+        Ok(())
+    }
+    async fn delete_service(
+        &self,
+        _project: &str,
+        _service: &ServiceState,
+    ) -> Result<(), ApiError> {
+        Ok(())
+    }
+    async fn reconcile_dial(&self, _project: &str, dial: &DialState) -> Result<u16, ApiError> {
+        if self.fail_dial.load(Ordering::SeqCst) {
+            return Err(ApiError::internal("simulated dial failure"));
+        }
+        Ok(if dial.bind == 0 { 49152 } else { dial.bind })
+    }
+    async fn delete_dial(&self, _project: &str, _port: u16) -> Result<(), ApiError> {
+        Ok(())
+    }
+    async fn ping(&self, _project: &str, address: &str) -> Result<PingResult, ApiError> {
+        Ok(PingResult {
+            address: address.into(),
+            latency_ms: 1,
+        })
+    }
+    async fn shutdown(&self) {}
+    async fn join_network(&self, project: &str, network: &str) -> Result<Value, ApiError> {
+        self.network_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"project":project,"network":network,"running":true,"ephemeral":true}))
+    }
+    async fn leave_network(&self, _project: &str, network: &str) -> Result<Value, ApiError> {
+        self.network_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"network":network,"left":true}))
+    }
+}
+
+#[tokio::test]
+async fn network_mutations_require_enrollment_and_project_operate_authority() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control.clone()).await;
+    let setup_token = tokio::fs::read_to_string(repo.path().join("daemon_auth/setup.token"))
+        .await
+        .unwrap()
+        .trim()
+        .to_owned();
+    let url = format!("{base}/v1/networks?project=alpha");
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth(&setup_token)
+            .json(&json!({"network":"vpc"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    enroll_test_project(&base, &client, repo.path()).await;
+    for role in [
+        json!({"role":"viewer"}),
+        json!({"role":"operate","scopes":["service:unrelated"]}),
+    ] {
+        let token: Value = client
+            .post(format!("{base}/v1/tokens?project=alpha"))
+            .bearer_auth(&setup_token)
+            .json(&role)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let response = client
+            .post(&url)
+            .bearer_auth(token["bearer"].as_str().unwrap())
+            .json(&json!({"network":"vpc"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+        ));
+        let response = client
+            .delete(format!("{base}/v1/networks/vpc?project=alpha"))
+            .bearer_auth(token["bearer"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+        ));
+    }
+    assert_eq!(control.network_calls.load(Ordering::SeqCst), 0);
+    let token: Value = client
+        .post(format!("{base}/v1/tokens?project=alpha"))
+        .bearer_auth(&setup_token)
+        .json(&json!({"role":"operate","scopes":["project"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = token["bearer"].as_str().unwrap();
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&json!({"network":"vpc"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/networks?project=other"))
+            .bearer_auth(token)
+            .json(&json!({"network":"vpc"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .delete(format!("{base}/v1/networks/vpc?project=alpha"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(control.network_calls.load(Ordering::SeqCst), 2);
+    client
+        .post(format!("{base}/v1/down?project=alpha"))
+        .bearer_auth(&setup_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&json!({"network":"vpc"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let state: Value = serde_json::from_slice(
+        &tokio::fs::read(repo.path().join("daemon/state.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state["projects"]["alpha"].get("networks").is_none(),
+        "local network intent must not be persisted"
+    );
+    server.abort();
+}
+
+async fn setup(
+    repo: &Path,
+    control: Arc<MockControl>,
+) -> (String, reqwest::Client, tokio::task::JoinHandle<()>) {
+    let store = Store::open(repo).await.unwrap();
+    auth::initialize_setup_token(&store, repo).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = AppState {
+        store,
+        control,
+        default_credentials_file: None,
+        mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let task = tokio::spawn(async move {
+        axum::serve(listener, api::router(state)).await.unwrap();
+    });
+    (format!("http://{address}"), reqwest::Client::new(), task)
+}
+
+async fn enroll_test_project(base: &str, client: &reqwest::Client, repo: &Path) -> String {
+    let token = tokio::fs::read_to_string(repo.join("daemon_auth/setup.token"))
+        .await
+        .unwrap()
+        .trim()
+        .to_owned();
+    let credentials = repo.join("source-credentials.json");
+    tokio::fs::write(&credentials, b"{}").await.unwrap();
+    let response = client
+        .post(format!("{base}/v1/up"))
+        .bearer_auth(&token)
+        .json(&json!({"project":"alpha", "credentials_file":credentials}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    token
+}
+
+#[tokio::test]
+async fn friendly_peer_names_are_pinned_in_saved_services_and_dials() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control).await;
+    let token = enroll_test_project(&base, &client, repo.path()).await;
+    for (path, intent) in [
+        (
+            "services",
+            json!({"endpoint":"localhost:8080","allow":["friendly-peer"]}),
+        ),
+        (
+            "dials",
+            json!({"connector":"friendly-peer","port":8080,"bind":18080}),
+        ),
+    ] {
+        let response = client
+            .post(format!("{base}/v1/{path}?project=alpha"))
+            .bearer_auth(&token)
+            .json(&intent)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let value: Value = response.json().await.unwrap();
+        if path == "services" {
+            assert_eq!(value["allow"], json!(["pinned-peer-key"]));
+            assert_eq!(value["connector"], "connect-alpha");
+        } else {
+            assert_eq!(value["connector"], "pinned-peer-key");
+            assert_eq!(value["connector_name"], "friendly-peer");
+        }
+    }
+    let saved: Value = serde_json::from_slice(
+        &tokio::fs::read(repo.path().join("daemon/state.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        saved["projects"]["alpha"]["dials"]["18080"]["connector"],
+        "pinned-peer-key"
+    );
+    let response = client
+        .post(format!("{base}/v1/up"))
+        .bearer_auth(&token)
+        .json(&json!({"project":"alpha","name":"renamed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    for name in ["../bad", "UPPER", "-bad", "bad-"] {
+        let response = client
+            .post(format!("{base}/v1/up"))
+            .bearer_auth(&token)
+            .json(&json!({"project":"alpha","name":name}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn oidc_session_enrollment_pins_session_and_requires_setup_to_replace() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control).await;
+    let token = tokio::fs::read_to_string(repo.path().join("daemon_auth/setup.token"))
+        .await
+        .unwrap();
+    // The mock control never executes this helper; use a trusted executable to
+    // exercise real descriptor validation without any real login credentials.
+    let helper = std::env::current_exe().unwrap();
+    let descriptor = json!({"helper_path":helper,"session":"session-a","api_endpoint":"https://api.example.test"});
+    let response = client
+        .post(format!("{base}/v1/up"))
+        .bearer_auth(token.trim())
+        .json(&json!({"project":"alpha","datumctl_session":descriptor}))
+        .send()
+        .await
+        .unwrap();
+    #[cfg(unix)]
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value = response.json().await.unwrap();
+        assert!(
+            error.to_string().contains("System daemons cannot use"),
+            "root must receive actionable service-account guidance: {error}"
+        );
+        assert!(
+            !repo
+                .path()
+                .join("daemon/projects/alpha/credentials.json")
+                .exists(),
+            "rejected host sessions must not persist credentials"
+        );
+        server.abort();
+        return;
+    }
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+    let credentials_path = repo.path().join("daemon/projects/alpha/credentials.json");
+    let saved: Value =
+        serde_json::from_slice(&tokio::fs::read(&credentials_path).await.unwrap()).unwrap();
+    assert_eq!(saved["type"], "datumctl_session");
+    assert_eq!(saved["session"], "session-a");
+    assert_eq!(saved["project_id"], "alpha");
+
+    let operator: Value = client
+        .post(format!("{base}/v1/tokens?project=alpha"))
+        .bearer_auth(token.trim())
+        .json(&json!({"role":"operate","scopes":["project"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let operator = operator["bearer"].as_str().unwrap();
+    let changed = json!({"helper_path":helper,"session":"session-b","api_endpoint":"https://other.example.test"});
+    // A new host context does not silently overwrite a saved enrollment,
+    // including when an operate token resumes it.
+    let resumed: Value = client
+        .post(format!("{base}/v1/up"))
+        .bearer_auth(operator)
+        .json(&json!({"project":"alpha","datumctl_session":changed}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resumed["authentication"]["session"], "session-a");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&tokio::fs::read(&credentials_path).await.unwrap())
+            .unwrap(),
+        saved
+    );
+    let forbidden = client
+        .post(format!("{base}/v1/up"))
+        .bearer_auth(operator)
+        .json(&json!({"project":"alpha","auth":"oidc","datumctl_session":changed}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    let replaced: Value = client
+        .post(format!("{base}/v1/up"))
+        .bearer_auth(token.trim())
+        .json(&json!({"project":"alpha","auth":"oidc","datumctl_session":changed}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replaced["authentication"]["session"], "session-b");
+    server.abort();
+}
+
+#[tokio::test]
+async fn oidc_invalid_modes_and_unprivileged_binding_never_persist_credentials() {
+    let repo = tempfile::tempdir().unwrap();
+    let (base, client, server) = setup(repo.path(), Arc::new(MockControl::default())).await;
+    let token = tokio::fs::read_to_string(repo.path().join("daemon_auth/setup.token"))
+        .await
+        .unwrap();
+    let descriptor = json!({"helper_path":"relative-helper","session":"session-a","api_endpoint":"https://api.example.test"});
+    for body in [
+        json!({"project":"alpha","auth":"unknown"}),
+        json!({"project":"alpha","auth":"stored","datumctl_session":descriptor}),
+        json!({"project":"alpha","auth":"oidc"}),
+        json!({"project":"alpha","auth":"oidc","credentials_file":"/unused"}),
+        json!({"project":"alpha","auth":"stored","credentials_file":"/unused"}),
+        json!({"project":"alpha","auth":"oidc","datumctl_session":descriptor}),
+    ] {
+        let response = client
+            .post(format!("{base}/v1/up"))
+            .bearer_auth(token.trim())
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "{body}: {}",
+            response.status()
+        );
+        assert!(
+            !repo
+                .path()
+                .join("daemon/projects/alpha/credentials.json")
+                .exists()
+        );
+    }
+    let operator: Value = client
+        .post(format!("{base}/v1/tokens?project=alpha"))
+        .bearer_auth(token.trim())
+        .json(&json!({"role":"operate","scopes":["project"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let denied = client
+        .post(format!("{base}/v1/up"))
+        .bearer_auth(operator["bearer"].as_str().unwrap())
+        .json(&json!({"project":"alpha","datumctl_session":descriptor}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !repo
+            .path()
+            .join("daemon/projects/alpha/credentials.json")
+            .exists()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn service_retries_preserve_identity_and_refuse_access_changes() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control.clone()).await;
+    let token = enroll_test_project(&base, &client, repo.path()).await;
+    let url = format!("{base}/v1/services?project=alpha");
+    let intent = json!({"endpoint":"localhost:8080", "allow":["peer-a", "peer-b"]});
+    control.fail_service.store(true, Ordering::SeqCst);
+    let failure = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&intent)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failure.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let failure: Value = failure.json().await.unwrap();
+    assert!(failure["error"].as_str().unwrap().contains("intent"));
+    assert!(
+        failure["error"]
+            .as_str()
+            .unwrap()
+            .contains("datumctl connect unserve")
+    );
+    let before: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = before["services"][0]["id"].clone();
+    control.fail_service.store(false, Ordering::SeqCst);
+    let retry = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&json!({"endpoint":"localhost:8080", "allow":["peer-b", "peer-a", "peer-a"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retried: Value = retry.json().await.unwrap();
+    assert_eq!(retried["id"], id);
+    assert_eq!(retried["ready"], true);
+    for change in [
+        json!({"endpoint":"localhost:8080"}),
+        json!({"endpoint":"localhost:8080", "public":true}),
+        json!({"endpoint":"otherhost:8080", "allow":["peer-a", "peer-b"]}),
+    ] {
+        let response = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&change)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response.text().await.unwrap().contains("unserve"));
+    }
+    let after: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["services"].as_array().unwrap().len(), 1);
+    assert_eq!(after["services"][0]["allow"], intent["allow"]);
+    assert_eq!(control.service_calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn invalid_service_options_never_save_intent_and_ambiguous_unserve_is_safe() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control.clone()).await;
+    let token = enroll_test_project(&base, &client, repo.path()).await;
+    let url = format!("{base}/v1/services?project=alpha");
+    for intent in [
+        json!({"endpoint":"localhost:8080", "public":true, "protocol":"udp"}),
+        json!({"endpoint":"localhost:8080", "public":true, "allow":["peer"]}),
+        json!({"endpoint":"localhost:8080", "hostname":"example.test"}),
+        json!({"endpoint":"localhost:0"}),
+    ] {
+        assert_eq!(
+            client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&intent)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let status: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status["services"].as_array().unwrap().is_empty());
+    assert_eq!(control.service_calls.load(Ordering::SeqCst), 0);
+    for protocol in ["tcp", "udp"] {
+        assert_eq!(
+            client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&json!({"endpoint":"localhost:8080", "protocol":protocol}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+    }
+    assert_eq!(
+        client
+            .delete(format!("{base}/v1/services/localhost:8080?project=alpha"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let status: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["services"].as_array().unwrap().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_dial_can_be_retried_without_duplicate_intent() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control.clone()).await;
+    let token = enroll_test_project(&base, &client, repo.path()).await;
+    let url = format!("{base}/v1/dials?project=alpha");
+    let intent = json!({"connector":"peer", "port":22, "bind":2222});
+    control.fail_dial.store(true, Ordering::SeqCst);
+    let failure = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&intent)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failure.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(failure.text().await.unwrap().contains("hangup 2222"));
+    control.fail_dial.store(false, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&intent)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let change = json!({"connector":"different-peer", "port":22, "bind":2222});
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&change)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let status: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["dials"].as_array().unwrap().len(), 1);
+    assert_eq!(status["dials"][0]["connector"], "peer");
+    server.abort();
+}
+
+#[tokio::test]
+async fn setup_errors_have_stable_codes_and_failed_ephemeral_dial_can_be_removed() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control.clone()).await;
+    let token = tokio::fs::read_to_string(repo.path().join("daemon_auth/setup.token"))
+        .await
+        .unwrap()
+        .trim()
+        .to_owned();
+    let response: Value = client
+        .post(format!("{base}/v1/services?project=alpha"))
+        .bearer_auth(&token)
+        .json(&json!({"endpoint":"0.0.0.0:800"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["code"], "project_not_configured");
+    let response: Value = client
+        .post(format!("{base}/v1/up"))
+        .bearer_auth(&token)
+        .json(&json!({"project":"alpha"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["code"], "credentials_required");
+    enroll_test_project(&base, &client, repo.path()).await;
+    control.fail_dial.store(true, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/dials?project=alpha"))
+            .bearer_auth(&token)
+            .json(&json!({"connector":"peer", "port":22, "bind":0}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        client
+            .delete(format!("{base}/v1/dials/0?project=alpha"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    client
+        .post(format!("{base}/v1/down?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let response: Value = client
+        .post(format!("{base}/v1/services?project=alpha"))
+        .bearer_auth(&token)
+        .json(&json!({"endpoint":"localhost:800"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["code"], "project_down");
+    let status: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status["dials"].as_array().unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn api_enforces_auth_roles_scope_and_revocation() {
+    let repo = tempfile::tempdir().unwrap();
+    let (base, client, server) = setup(repo.path(), Arc::new(MockControl::default())).await;
+    let setup_token = tokio::fs::read_to_string(repo.path().join("daemon_auth/setup.token"))
+        .await
+        .unwrap();
+    let setup_token = setup_token.trim();
+    tokio::fs::write(repo.path().join("source-credentials.json"), b"{}")
+        .await
+        .unwrap();
+
+    let response = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().contains_key("x-request-id"));
+
+    let response = client.post(format!("{base}/v1/up")).bearer_auth(setup_token)
+        .json(&json!({"project":"alpha","credentials_file":repo.path().join("source-credentials.json")})).send().await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+
+    let viewer: Value = client
+        .post(format!("{base}/v1/tokens?project=alpha"))
+        .bearer_auth(setup_token)
+        .json(&json!({"role":"viewer"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let viewer = viewer["bearer"].as_str().unwrap();
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/status?project=alpha"))
+            .bearer_auth(viewer)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/down?project=alpha"))
+            .bearer_auth(viewer)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let operate: Value = client
+        .post(format!("{base}/v1/tokens?project=alpha"))
+        .bearer_auth(setup_token)
+        .json(&json!({"role":"operate","scopes":["service:some-service"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let operate = operate["bearer"].as_str().unwrap();
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/down?project=alpha"))
+            .bearer_auth(operate)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let id = viewer.split_once('.').unwrap().0;
+    assert_eq!(
+        client
+            .delete(format!("{base}/v1/tokens/{id}?project=alpha"))
+            .bearer_auth(setup_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/status?project=alpha"))
+            .bearer_auth(viewer)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn restart_reconciles_only_desired_active_intent() {
+    let repo = tempfile::tempdir().unwrap();
+    let store = Store::open(repo.path()).await.unwrap();
+    let control = Arc::new(MockControl::default());
+    let state = AppState {
+        store: store.clone(),
+        control: control.clone(),
+        default_credentials_file: None,
+        mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    store
+        .transact(|root| {
+            let project = root.projects.entry("alpha".into()).or_default();
+            project.desired_up = true;
+            project.enrolled = true;
+            project.connector = Some(ConnectorState {
+                name: "connect-alpha".into(),
+                uid: "uid-1".into(),
+                public_key: "key-1".into(),
+            });
+            project.credentials_file = Some("/private/credentials.json".into());
+            project.services.insert(
+                "active".into(),
+                ServiceState {
+                    id: "active".into(),
+                    endpoint: "127.0.0.1:80".into(),
+                    protocol: Protocol::Tcp,
+                    public: false,
+                    hostname: None,
+                    allow: vec!["peer".into()],
+                    desired_active: true,
+                    running: false,
+                    ready: false,
+                    hostnames: vec![],
+                    last_error: None,
+                    last_error_stage: None,
+                    last_actor: "setup".into(),
+                },
+            );
+            project.services.insert(
+                "paused".into(),
+                ServiceState {
+                    id: "paused".into(),
+                    endpoint: "127.0.0.1:81".into(),
+                    protocol: Protocol::Tcp,
+                    public: false,
+                    hostname: None,
+                    allow: vec!["peer".into()],
+                    desired_active: false,
+                    running: false,
+                    ready: false,
+                    hostnames: vec![],
+                    last_error: None,
+                    last_error_stage: None,
+                    last_actor: "setup".into(),
+                },
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    drop(state);
+    drop(store);
+
+    let reopened = Store::open(repo.path()).await.unwrap();
+    let restarted = AppState {
+        store: reopened,
+        control: control.clone(),
+        default_credentials_file: None,
+        mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    api::reconcile_all(&restarted).await;
+    assert_eq!(control.up_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(control.service_calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_persistence_does_not_publish_memory_transition() {
+    let repo = tempfile::tempdir().unwrap();
+    let store = Store::open(repo.path()).await.unwrap();
+    let daemon_dir = repo.path().join("daemon");
+    // A directory at the destination deterministically rejects atomic rename,
+    // including when tests run as root or storage repairs directory modes.
+    tokio::fs::rename(
+        daemon_dir.join("state.json"),
+        daemon_dir.join("state.saved"),
+    )
+    .await
+    .unwrap();
+    tokio::fs::create_dir(daemon_dir.join("state.json"))
+        .await
+        .unwrap();
+    let result = store
+        .transact(|root| {
+            root.projects
+                .insert("must-not-appear".into(), Default::default());
+            Ok(())
+        })
+        .await;
+    assert!(result.is_err());
+    assert!(
+        !store
+            .snapshot()
+            .await
+            .projects
+            .contains_key("must-not-appear")
+    );
+}

@@ -1,61 +1,26 @@
 package state
 
 import (
-	"runtime"
-	"strings"
+	"path/filepath"
 	"testing"
 )
 
-func TestDir_NotEmpty(t *testing.T) {
-	d := Dir()
-	if d == "" {
-		t.Fatal("Dir() returned empty string")
-	}
-	if !strings.Contains(d, "datumctl") {
-		t.Errorf("Dir() should contain 'datumctl', got %q", d)
-	}
-}
-
-func TestDir_IncludesConnect(t *testing.T) {
-	d := Dir()
-	if !strings.HasSuffix(d, "connect") && !strings.HasSuffix(d, "connect/") {
-		t.Errorf("Dir() should end with 'connect', got %q", d)
-	}
-}
-
-func TestDirHonorsExplicitOverride(t *testing.T) {
+func TestDaemonDirectoryAndTokenPaths(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("DATUM_CONNECT_STATE_DIR", root)
-
-	if got := Dir(); got != root {
-		t.Fatalf("Dir() = %q, want %q", got, root)
+	t.Setenv("DATUM_CONNECT_DIR", "")
+	if Dir() != root {
+		t.Fatalf("state directory ignores override: %s", Dir())
 	}
-}
-
-func TestTunnelDir(t *testing.T) {
-	td := TunnelDir()
-	if !strings.HasSuffix(td, "tunnels") && !strings.HasSuffix(td, "tunnels/") {
-		t.Errorf("TunnelDir() should end with 'tunnels', got %q", td)
+	if DaemonDir() != filepath.Join(root, "daemon") {
+		t.Fatalf("unexpected daemon directory: %s", DaemonDir())
 	}
-}
-
-func TestPidFilePath(t *testing.T) {
-	p := PidFilePath("mytun")
-	if !strings.HasSuffix(p, "mytun.pid") {
-		t.Errorf("PidFilePath('mytun') should end with 'mytun.pid', got %q", p)
+	if SetupTokenPath() != filepath.Join(root, "daemon", "daemon_auth", "setup.token") {
+		t.Fatalf("unexpected token path: %s", SetupTokenPath())
 	}
-}
-
-func TestLogDir(t *testing.T) {
-	ld := LogDir()
-	if runtime.GOOS == "darwin" && !strings.Contains(ld, "Library/Logs") && !strings.Contains(ld, "Library\\Logs") {
-		t.Errorf("LogDir() on darwin should contain Library/Logs, got %q", ld)
-	}
-}
-
-func TestLogFilePath(t *testing.T) {
-	p := LogFilePath("mytun")
-	if !strings.HasSuffix(p, "mytun.log") {
-		t.Errorf("LogFilePath('mytun') should end with 'mytun.log', got %q", p)
+	explicit := t.TempDir()
+	t.Setenv("DATUM_CONNECT_DIR", explicit)
+	if DaemonDir() != explicit {
+		t.Fatalf("daemon directory ignores override: %s", DaemonDir())
 	}
 }

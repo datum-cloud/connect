@@ -1,5 +1,7 @@
 target/
+dist/
 *.so
 connect-plugin/datumctl-connect
 .drewr-y4nd1b/
-connect-plugin/internal/daemon/fake-datum-connect
+__pycache__/
+*.pyc

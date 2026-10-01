@@ -6,6 +6,7 @@ require (
 	github.com/kardianos/service v1.2.4
 	github.com/spf13/cobra v1.10.2
 	go.datum.net/datumctl v0.15.0
+	golang.org/x/term v0.43.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

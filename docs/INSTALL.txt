@@ -1,0 +1,118 @@
+Datum Connect preview: manual installation on macOS and Linux
+===========================================================
+
+This archive includes the datumctl plugin and its matching daemon. Install
+datumctl separately first. Use datumctl v0.15.0 or newer. Do not install this
+preview over an existing production plugin or daemon without planning migration.
+Windows uses explicit privileged service setup; see docs/headless-preview.md
+in the matching source release for Windows requirements.
+
+1. Verify and extract the platform archive
+
+   Download the archive and checksums.txt from the SAME tagged GitHub release.
+   Apple Silicon: datumctl-connect_Darwin_arm64.tar.gz
+   Intel Mac:     datumctl-connect_Darwin_x86_64.tar.gz
+   Linux arm64:   datumctl-connect_Linux_arm64.tar.gz
+   Linux amd64:   datumctl-connect_Linux_x86_64.tar.gz
+
+   Example for an Apple Silicon Mac, from your download directory:
+
+     CONNECT_ARCHIVE=datumctl-connect_Darwin_arm64.tar.gz
+     awk -v asset="$CONNECT_ARCHIVE" '$2 == asset {print}' checksums.txt | shasum -a 256 -c -
+     CONNECT_PREVIEW_DIR=$(mktemp -d "$HOME/datum-connect-preview.XXXXXX")
+     tar -xzf "$CONNECT_ARCHIVE" -C "$CONNECT_PREVIEW_DIR"
+     chmod 700 "$CONNECT_PREVIEW_DIR/datumctl-connect" "$CONNECT_PREVIEW_DIR/datum-connect-daemon"
+
+   Stop if verification fails or does not report the expected archive as OK.
+   These are unsigned/unnotarized preview binaries. Checksums verify integrity,
+   not publisher identity. Do not disable Gatekeeper or other OS protections.
+   Use only artifacts whose origin you trust. On macOS, use the normal Privacy
+   & Security approval flow if the OS blocks execution.
+
+2. Let datumctl discover and trust the plugin
+
+   Keep the extracted directory in place. The following PATH change applies
+   only to this terminal; repeat it in a new terminal using that same directory.
+
+     export PATH="$CONNECT_PREVIEW_DIR:$PATH"
+     export DATUMCTL_PLUGINS_DIR="$CONNECT_PREVIEW_DIR/plugin-registry"
+     command -v datumctl-connect
+     datumctl plugin trust connect
+     datumctl connect version
+     datumctl connect serve --help
+
+   Check that the resolved binary and printed plugin version match your preview.
+   The daemon currently reports its crate version (0.1.0), not the preview tag.
+   Keep the two binaries from the same archive together.
+   The separate plugin registry keeps this preview's trust record isolated from
+   your normal plugins. Repeat both exports when using a new terminal. Without
+   this registry override, a managed connect plugin in ~/.datumctl/plugins takes
+   precedence over PATH. Do not overwrite its files manually. This override
+   isolates plugin discovery only, not your daemon, projects, or login sessions.
+   After replacing a manually installed binary, explicitly trust it again.
+
+3. Share your application
+
+   Start your application first, then run this in an interactive user terminal:
+
+     datumctl connect serve localhost:8080
+
+   Accept the background-service installation and enrollment prompts. Connect
+   downloads the matching released daemon, verifies its checksum, starts it,
+   and guides datumctl login and project selection when needed. Services are
+   private by default. Add --public only when you intend public HTTP ingress.
+
+   If you received this bundle directly, before its GitHub release is published,
+   or need to install the daemon without downloading it again, run this once:
+
+     datumctl connect install --executable "$CONNECT_PREVIEW_DIR/datum-connect-daemon"
+     datumctl connect serve localhost:8080
+
+   Keep that directory: the service references the executable by absolute path.
+   This installer does not upgrade or overwrite existing services. Inspect an
+   existing service with datumctl connect daemon status before changing it.
+   Do not delete existing daemon state or credentials during migration.
+
+4. Test with a teammate
+
+   Both peers need access to the SAME Datum project. Enrollment still requires
+   exactly one ConnectorClass advertising connect.datum.net/transport=masque-v1.
+   A deployed MASQUE gateway is not needed for direct peer traffic, but --public
+   requires a compatible gateway. The bundle does not modify your control plane.
+
+   Peer A, with an application listening on localhost:8080:
+
+     datumctl connect serve localhost:8080
+     datumctl connect status
+
+   Peer B:
+
+     datumctl connect up
+     datumctl connect dial PEER_A_CONNECTOR:8080 --bind 18080
+     curl http://localhost:18080
+
+   Replace PEER_A_CONNECTOR with A's actual Connector name from status. After B
+   enrolls, A can explicitly restrict access with --allow PEER_B_CONNECTOR when
+   creating a service. By default, private services allow project devices.
+
+5. Diagnose or stop
+
+     datumctl connect status
+     datumctl connect daemon status
+     datumctl connect ping PEER_A_CONNECTOR --verbose
+     datumctl connect unserve localhost:8080
+     datumctl connect down
+
+   Structured logs: daemon.log in the daemon state directory.
+   macOS default: ~/Library/Application Support/datumctl/connect/daemon/daemon.log
+   Linux default: ~/.local/state/datumctl/connect/daemon/daemon.log
+   Do not share setup tokens, credential files, or your datumctl login state.
+   This preview does not include production VPC enrollment or automatic upgrades.
+
+Local build qualification
+-------------------------
+If BUILDINFO.txt is present, this is a local evaluation bundle. Read that file
+before sharing it; do not treat it as a verified release build. Official preview
+artifacts use Rust 1.98 and locked dependencies in the release workflow.
+Package/CLI smoke tests do not prove that two computers communicate over the
+internet.

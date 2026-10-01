@@ -8,7 +8,10 @@ pub mod kube_error;
 pub mod node;
 pub mod project_control_plane;
 pub mod repo;
+#[doc(hidden)]
+pub mod secure_fs;
 pub mod state;
+pub mod successor;
 pub mod tunnels;
 
 #[cfg(test)]

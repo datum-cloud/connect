@@ -23,7 +23,7 @@ fi
 if [[ "${1:-}" == "--test" ]]; then
     echo ""
     echo "Running E2E tests..."
-    if go test -count=1 ./e2e_test.go; then
+    if go test -count=1 ./...; then
         echo "E2E tests passed"
     else
         echo "E2E tests failed" >&2

@@ -8,10 +8,13 @@ use n0_error::{Result, StackResultExt, StdResultExt};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, instrument, warn};
 
-use crate::{ProjectId, TunnelId, config::Config, state::State};
+use crate::{ProjectId, TunnelId, config::Config, secure_fs, state::State};
 
-const PRIVATE_DIR_MODE: u32 = 0o700;
-const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(all(test, unix))]
+use secure_fs::PRIVATE_DIR_MODE;
+#[cfg(unix)]
+use secure_fs::PRIVATE_FILE_MODE;
+use secure_fs::{ensure_private_dir, set_private_file_permissions};
 const TEMP_FILE_ATTEMPTS: usize = 16;
 
 #[derive(Debug)]
@@ -59,16 +62,9 @@ pub(crate) async fn atomic_write_private(path: &Path, data: &[u8]) -> io::Result
                 rand::random::<u64>()
             );
             let candidate = parent.join(temporary_name);
-            let mut options = tokio::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                options.mode(PRIVATE_FILE_MODE);
-            }
-
-            match options.open(&candidate).await {
+            match secure_fs::create_new_private(&candidate, false, true) {
                 Ok(file) => {
-                    opened = Some((candidate, file));
+                    opened = Some((candidate, tokio::fs::File::from_std(file)));
                     break;
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -101,7 +97,7 @@ async fn write_temporary_file(
     file.flush().await?;
     file.sync_all().await?;
     drop(file);
-    tokio::fs::rename(temporary_path, destination).await?;
+    secure_fs::atomic_replace(temporary_path, destination).await?;
     sync_parent_directory(destination).await;
     Ok(())
 }
@@ -130,26 +126,6 @@ async fn sync_parent_directory(destination: &Path) {
 #[cfg(not(unix))]
 async fn sync_parent_directory(_destination: &Path) {}
 
-async fn ensure_private_dir(path: &Path) -> io::Result<()> {
-    tokio::fs::create_dir_all(path).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE)).await?;
-    }
-    Ok(())
-}
-
-async fn set_private_file_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-            .await?;
-    }
-    Ok(())
-}
-
 async fn write_new_private(path: &Path, data: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
@@ -157,14 +133,7 @@ async fn write_new_private(path: &Path, data: &[u8]) -> io::Result<()> {
         .unwrap_or_else(|| Path::new("."));
     ensure_private_dir(parent).await?;
 
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        options.mode(PRIVATE_FILE_MODE);
-    }
-
-    let mut file = options.open(path).await?;
+    let mut file = tokio::fs::File::from_std(secure_fs::create_new_private(path, false, true)?);
     if let Err(error) = set_private_file_permissions(path).await {
         drop(file);
         let _ = tokio::fs::remove_file(path).await;
@@ -206,12 +175,12 @@ impl std::error::Error for MissingConnectDir {}
 
 const MISSING_CONNECT_DIR_MSG: &str = "error: DATUM_CONNECT_DIR is not set
 
-The datum-connect binary expects this variable to point to its state
+The legacy datum-connect development harness expects this variable to point to its state
 directory (where it stores the iroh listen_key, config, and per-project
-state). It is normally set by the datumctl plugin host.
+state). The current datumctl plugin does not launch this harness.
 
 To run via datumctl (preferred):
-  datumctl connect tunnel <subcommand> ...
+  datumctl connect --help
 
 To run datum-connect directly (development):
   export DATUM_CONNECT_DIR=\"$HOME/.datumctl/connect\"
@@ -290,15 +259,7 @@ impl Repo {
         ensure_private_dir(&self.0).await?;
         let lock_path = self.0.join(Self::STATE_LOCK_FILE);
         let file = tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(true).create(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(PRIVATE_FILE_MODE);
-            }
-
-            let file = options.open(lock_path)?;
+            let file = secure_fs::open_private_lock(&lock_path)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -318,15 +279,7 @@ impl Repo {
         ensure_private_dir(&self.0).await?;
         let lock_path = self.0.join(Self::KEY_LOCK_FILE);
         let file = tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(true).create(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(PRIVATE_FILE_MODE);
-            }
-
-            let file = options.open(lock_path)?;
+            let file = secure_fs::open_private_lock(&lock_path)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -404,7 +357,7 @@ impl Repo {
     /// used inside per-tunnel subdirectories where the key is intentionally stable.
     pub async fn listen_key(&self, project_id: Option<&str>) -> Result<SecretKey> {
         let key_lock = self.lock_keys().await?;
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         let now = chrono::Local::now().format("%Y%m%d%H%M%S");
         let suffix = match project_id {
             Some(project_id) => {
@@ -611,7 +564,7 @@ impl Repo {
         key_file_path: &Path,
         key_lock: &KeyLockGuard,
     ) -> Result<SecretKey> {
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         match write_new_private(key_file_path, &key.to_bytes()).await {
             Ok(()) => Ok(key),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -788,7 +741,7 @@ mod tests {
         // gets a fresh identity instead of joining the cross-project DNS race.
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
         // Create a legacy key at the plain LISTEN_KEY_FILE path (no timestamp).
-        let legacy = SecretKey::generate(&mut rand::rng());
+        let legacy = SecretKey::generate();
         let legacy_bytes = legacy.to_bytes();
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
         tokio::fs::write(&legacy_path, &legacy_bytes)
@@ -873,7 +826,7 @@ mod tests {
     async fn concurrent_project_key_migration_preserves_the_legacy_key() {
         let directory = temp_repo_dir();
         Repo::open_or_create(&directory).await.unwrap();
-        let legacy = SecretKey::generate(&mut rand::rng());
+        let legacy = SecretKey::generate();
         tokio::fs::write(directory.join(Repo::LISTEN_KEY_FILE), legacy.to_bytes())
             .await
             .unwrap();
@@ -935,7 +888,7 @@ mod tests {
         let tunnel_dir = repo.0.join("my-project").join("my-tunnel");
         tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-        let seed_key = SecretKey::generate(&mut rand::rng());
+        let seed_key = SecretKey::generate();
         tokio::fs::write(&key_path, seed_key.to_bytes())
             .await
             .unwrap();
@@ -952,7 +905,7 @@ mod tests {
     async fn listen_key_for_tunnel_migrates_legacy_key_to_default_tunnel() {
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
         // Create a legacy key at the project root (plain name, no timestamp).
-        let legacy_key = SecretKey::generate(&mut rand::rng());
+        let legacy_key = SecretKey::generate();
         let legacy_bytes = legacy_key.to_bytes();
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
         tokio::fs::write(&legacy_path, &legacy_bytes)
@@ -992,7 +945,7 @@ mod tests {
         let tunnel_dir = repo.0.join("stable-proj").join("stable-tunnel");
         tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-        let seed_key = SecretKey::generate(&mut rand::rng());
+        let seed_key = SecretKey::generate();
         tokio::fs::write(&key_path, seed_key.to_bytes())
             .await
             .unwrap();
@@ -1020,7 +973,7 @@ mod tests {
             let tunnel_dir = repo.0.join("multi-proj").join(name);
             tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
             let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-            let seed_key = SecretKey::generate(&mut rand::rng());
+            let seed_key = SecretKey::generate();
             tokio::fs::write(&key_path, seed_key.to_bytes())
                 .await
                 .unwrap();
@@ -1055,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn save_listen_key_for_tunnel_is_idempotent_for_the_same_key() {
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
 
         repo.save_listen_key_for_tunnel("project", "tunnel", &key)
             .await
@@ -1074,8 +1027,8 @@ mod tests {
     #[tokio::test]
     async fn save_listen_key_for_tunnel_rejects_a_different_existing_key() {
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
-        let original = SecretKey::generate(&mut rand::rng());
-        let replacement = SecretKey::generate(&mut rand::rng());
+        let original = SecretKey::generate();
+        let replacement = SecretKey::generate();
         repo.save_listen_key_for_tunnel("project", "tunnel", &original)
             .await
             .unwrap();
@@ -1097,8 +1050,8 @@ mod tests {
     async fn concurrent_different_tunnel_key_saves_have_one_winner() {
         let directory = temp_repo_dir();
         Repo::open_or_create(&directory).await.unwrap();
-        let first_key = SecretKey::generate(&mut rand::rng());
-        let second_key = SecretKey::generate(&mut rand::rng());
+        let first_key = SecretKey::generate();
+        let second_key = SecretKey::generate();
         let first_bytes = first_key.to_bytes();
         let second_bytes = second_key.to_bytes();
         let first_repo = Repo::from_path(directory.clone());
@@ -1162,7 +1115,7 @@ mod tests {
         let directory = temp_repo_dir();
         let repo = Repo::open_or_create(&directory).await.unwrap();
         repo.connect_key().await.unwrap();
-        let tunnel_key = SecretKey::generate(&mut rand::rng());
+        let tunnel_key = SecretKey::generate();
         repo.save_listen_key_for_tunnel("project", "tunnel", &tunnel_key)
             .await
             .unwrap();
@@ -1197,7 +1150,7 @@ mod tests {
     async fn repository_rejects_unsafe_project_and_tunnel_paths() {
         let directory = temp_repo_dir();
         let repo = Repo::open_or_create(&directory).await.unwrap();
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
 
         let project_error = repo
             .save_listen_key_for_tunnel("../outside", "safe-tunnel", &key)
@@ -1292,7 +1245,7 @@ mod default_location_tests {
         // Pure formatting check — no env mutation needed.
         let msg = format!("{}", MissingConnectDir);
         assert!(msg.contains("DATUM_CONNECT_DIR is not set"), "msg = {msg}");
-        assert!(msg.contains("datumctl connect tunnel"), "msg = {msg}");
+        assert!(msg.contains("datumctl connect --help"), "msg = {msg}");
         assert!(
             msg.contains("export DATUM_CONNECT_DIR=\"$HOME/.datumctl/connect\""),
             "msg = {msg}"

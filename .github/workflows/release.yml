@@ -25,11 +25,11 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: darwin-arm64
-          - target: x86_64-pc-windows-gnu
-            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
             name: windows-amd64.exe
-          - target: aarch64-pc-windows-gnu
-            os: ubuntu-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
             name: windows-arm64.exe
     runs-on: ${{ matrix.os }}
     steps:
@@ -42,26 +42,22 @@ jobs:
       - name: Install Linux arm64 cross-compiler
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Install Windows cross-compiler
-        if: contains(matrix.target, 'windows')
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
       - name: Build Rust binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-          CARGO_TARGET_AARCH64_PC_WINDOWS_GNU_LINKER: aarch64-w64-mingw32-gcc
-        run: cargo build --release -p datum-connect --target ${{ matrix.target }}
+        run: cargo build --locked --release -p datum-connect-daemon --target ${{ matrix.target }}
         working-directory: connect-lib
       - name: Rename binary with platform suffix
         run: |
-          cp connect-lib/target/${{ matrix.target }}/release/datum-connect${{ contains(matrix.target, 'windows') && '.exe' || '' }} \
-            /tmp/rust-bin/datum-connect-${{ matrix.name }}
+          mkdir -p dist/rust-bin
+          cp connect-lib/target/${{ matrix.target }}/release/datum-connect-daemon${{ contains(matrix.target, 'windows') && '.exe' || '' }} \
+            dist/rust-bin/datum-connect-daemon-${{ matrix.name }}
         shell: bash
       - name: Upload Rust binary
         uses: actions/upload-artifact@v4
         with:
           name: rust-${{ matrix.name }}
-          path: /tmp/rust-bin/datum-connect-${{ matrix.name }}
+          path: dist/rust-bin/*
 
   goreleaser:
     needs: rust-cross
@@ -78,6 +74,8 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: connect-plugin/go.mod
+      - name: Verify CLI and installer before publishing
+        run: go test ./...
       - name: Download all Rust binaries
         uses: actions/download-artifact@v4
         with:
@@ -86,14 +84,26 @@ jobs:
         run: |
           mkdir -p ../dist/rust
           find /tmp/rust-artifacts -type f -exec cp {} ../dist/rust/ \;
-          ls -la ../dist/rust/
+          for platform in linux darwin windows; do
+            for arch in amd64 arm64; do
+              suffix=""
+              if [ "$platform" = windows ]; then suffix=".exe"; fi
+              mkdir -p "../dist/rust/$platform-$arch"
+              cp "../dist/rust/datum-connect-daemon-$platform-$arch$suffix" "../dist/rust/$platform-$arch/datum-connect-daemon$suffix"
+            done
+          done
       - name: Install Syft CLI
         run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+      - name: Stage pinned official signed Windows drivers and licenses
+        run: |
+          python3 ../scripts/stage-wintun.py --arch amd64 --destination ../dist/wintun-amd64
+          python3 ../scripts/stage-wintun.py --arch arm64 --destination ../dist/wintun-arm64
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: "~> v2"
           args: release --clean
+          workdir: connect-plugin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

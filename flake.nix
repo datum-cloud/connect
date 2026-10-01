@@ -1,5 +1,5 @@
 {
-  description = "Datum Connect plugin — Rust binary (datum-connect) + Go plugin (datumctl-connect)";
+  description = "Datum Connect — Rust daemon and flat datumctl plugin";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -41,34 +41,27 @@
       in
       {
         # ── Packaged Rust binary ──────────────────────────────────────────
-        # `nix build` produces the datum-connect Rust binary used by the
-        # Go plugin as a subprocess in plugin mode.
+        # `nix build` produces the persistent daemon. The Go CLI talks to its API.
         packages.default = rustPlatform.buildRustPackage {
-          pname = "datum-connect";
+          pname = "datum-connect-daemon";
           version = "0.1.0";
           src = ./connect-lib;
 
           cargoLock = {
             lockFile = ./connect-lib/Cargo.lock;
-            # iroh-proxy-utils is a git dependency; its hash is required for
-            # reproducible builds. Update via `nix build` failure → copy the
-            # expected hash into this map.
-            outputHashes = {
-              "iroh-proxy-utils-0.1.0" = "sha256-ZV71q22zCWBqFdrc0jzkwyQdVc/H0r0BBB6dKrNARr8=";
-            };
           };
 
           inherit nativeBuildInputs buildInputs;
 
-          cargoBuildFlags = [ "-p" "datum-connect" ];
+          cargoBuildFlags = [ "-p" "datum-connect-daemon" ];
           doCheck = true;
           cargoTestFlags = [ "--workspace" "--locked" ];
 
           meta = with pkgs.lib; {
-            description = "Datum Connect tunnel agent (plugin-mode Rust binary)";
+            description = "Persistent Datum Connect daemon";
             homepage = "https://github.com/datum-cloud/datumctl-plugins";
             license = licenses.agpl3Only;
-            mainProgram = "datum-connect";
+            mainProgram = "datum-connect-daemon";
           };
         };
 
