@@ -7,3 +7,4 @@ resources:
 - protected-resources/connector-classes.yaml
 - protected-resources/connect-gateways.yaml
 - protected-resources/connect-network-bindings.yaml
+- roles/gateway-staging-test.yaml
