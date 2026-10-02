@@ -1,0 +1,17 @@
+apiVersion: iam.miloapis.com/v1alpha1
+kind: ProtectedResource
+metadata:
+  name: connect.datumapis.com-connectorclass
+spec:
+  serviceRef:
+    name: connect.datumapis.com
+  kind: ConnectorClass
+  plural: connectorclasses
+  singular: connectorclass
+  permissions:
+  - list
+  - get
+  - watch
+  parentResources:
+  - apiGroup: resourcemanager.miloapis.com
+    kind: Project

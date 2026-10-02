@@ -1,0 +1,22 @@
+apiVersion: iam.miloapis.com/v1alpha1
+kind: ProtectedResource
+metadata:
+  name: connect.datumapis.com-connectnetworkbinding
+spec:
+  serviceRef:
+    name: connect.datumapis.com
+  kind: ConnectNetworkBinding
+  plural: connectnetworkbindings
+  singular: connectnetworkbinding
+  permissions:
+  - list
+  - get
+  - create
+  - update
+  - patch
+  - delete
+  - watch
+  - updateStatus
+  parentResources:
+  - apiGroup: resourcemanager.miloapis.com
+    kind: Project

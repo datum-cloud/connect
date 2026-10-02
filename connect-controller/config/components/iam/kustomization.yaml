@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+- protected-resources/connectors.yaml
+- protected-resources/connector-advertisements.yaml
+- protected-resources/connector-classes.yaml
+- protected-resources/connect-gateways.yaml
+- protected-resources/connect-network-bindings.yaml
