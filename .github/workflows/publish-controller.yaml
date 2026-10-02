@@ -29,5 +29,5 @@ jobs:
       bundle-name: ghcr.io/datum-cloud/connect-kustomize
       bundle-path: connect-controller/config
       images: |
-        - { path: base/manager, name: ghcr.io/datum-cloud/connect-controller, tag: "${{ needs.publish-controller-image.outputs.tag }}" }
+        - { path: connect-controller/config/base/manager, name: ghcr.io/datum-cloud/connect-controller, tag: "${{ needs.publish-controller-image.outputs.tag }}" }
     secrets: inherit
