@@ -1,8 +1,10 @@
-Datum Connect preview: manual installation on macOS and Linux
-===========================================================
+Datum Connect v1.0.0-preview.3: manual installation with datumctl
+==============================================================
 
 This archive includes the datumctl plugin and its matching daemon. Install
-datumctl separately first. Use datumctl v0.15.0 or newer. Do not install this
+datumctl separately first. These instructions are verified with datumctl v0.20.0.
+You do NOT need "datumctl plugin install connect": install the downloaded
+executable on PATH, then grant explicit trust as described below. Do not install this
 preview over an existing production plugin or daemon without planning migration.
 Windows uses explicit privileged service setup; see docs/headless-preview.md
 in the matching source release for Windows requirements.
@@ -15,19 +17,35 @@ in the matching source release for Windows requirements.
    Linux arm64:   datumctl-connect_Linux_arm64.tar.gz
    Linux amd64:   datumctl-connect_Linux_x86_64.tar.gz
 
-   Example for an Apple Silicon Mac, from your download directory:
+   Example download for an Apple Silicon Mac. Change CONNECT_ARCHIVE for another
+   platform. Check each command succeeds before continuing:
 
+     CONNECT_VERSION=v1.0.0-preview.3
      CONNECT_ARCHIVE=datumctl-connect_Darwin_arm64.tar.gz
-     awk -v asset="$CONNECT_ARCHIVE" '$2 == asset {print}' checksums.txt | shasum -a 256 -c -
-     CONNECT_PREVIEW_DIR=$(mktemp -d "$HOME/datum-connect-preview.XXXXXX")
-     tar -xzf "$CONNECT_ARCHIVE" -C "$CONNECT_PREVIEW_DIR"
-     chmod 700 "$CONNECT_PREVIEW_DIR/datumctl-connect" "$CONNECT_PREVIEW_DIR/datum-connect-daemon"
+     CONNECT_RELEASE_URL="https://github.com/datum-cloud/connect/releases/download/$CONNECT_VERSION"
+     CONNECT_DOWNLOAD_DIR=$(mktemp -d)
+     curl -fL --retry 3 "$CONNECT_RELEASE_URL/$CONNECT_ARCHIVE" -o "$CONNECT_DOWNLOAD_DIR/$CONNECT_ARCHIVE"
+     curl -fL --retry 3 "$CONNECT_RELEASE_URL/checksums.txt" -o "$CONNECT_DOWNLOAD_DIR/checksums.txt"
+     (cd "$CONNECT_DOWNLOAD_DIR" && awk -v asset="$CONNECT_ARCHIVE" '$2 == asset {print}' checksums.txt | shasum -a 256 -c -)
+
+   Linux can use "sha256sum -c -" instead of "shasum -a 256 -c -". Choose the
+   archive matching "uname -s" and "uname -m" (aarch64 means Linux arm64).
 
    Stop if verification fails or does not report the expected archive as OK.
    These are unsigned/unnotarized preview binaries. Checksums verify integrity,
    not publisher identity. Do not disable Gatekeeper or other OS protections.
    Use only artifacts whose origin you trust. On macOS, use the normal Privacy
    & Security approval flow if the OS blocks execution.
+
+   After verification, extract into a persistent, versioned directory:
+
+     CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/$CONNECT_VERSION"
+     mkdir -p "$CONNECT_PREVIEW_DIR"
+     tar -xzf "$CONNECT_DOWNLOAD_DIR/$CONNECT_ARCHIVE" -C "$CONNECT_PREVIEW_DIR"
+     chmod 755 "$CONNECT_PREVIEW_DIR/datumctl-connect" "$CONNECT_PREVIEW_DIR/datum-connect-daemon"
+
+   If this version is already extracted, reuse its directory. Do not overwrite
+   binaries used by a running service. Keep both binaries together.
 
 2. Let datumctl discover and trust the plugin
 
@@ -38,10 +56,11 @@ in the matching source release for Windows requirements.
      export DATUMCTL_PLUGINS_DIR="$CONNECT_PREVIEW_DIR/plugin-registry"
      command -v datumctl-connect
      datumctl plugin trust connect
-     datumctl connect version
+     datumctl connect --version
      datumctl connect serve --help
 
-   Check that the resolved binary and printed plugin version match your preview.
+   Expected output: "connect version v1.0.0-preview.3". Check that the trust
+   command identifies the executable inside CONNECT_PREVIEW_DIR.
    The daemon currently reports its crate version (0.1.0), not the preview tag.
    Keep the two binaries from the same archive together.
    The separate plugin registry keeps this preview's trust record isolated from
@@ -51,7 +70,29 @@ in the matching source release for Windows requirements.
    isolates plugin discovery only, not your daemon, projects, or login sessions.
    After replacing a manually installed binary, explicitly trust it again.
 
+   To keep using this preview in new terminals, repeat these exports or add them
+   to your shell startup file (~/.zshrc on macOS or ~/.bashrc on Linux):
+
+     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.3"
+     export PATH="$CONNECT_PREVIEW_DIR:$PATH"
+     export DATUMCTL_PLUGINS_DIR="$CONNECT_PREVIEW_DIR/plugin-registry"
+
+   The registry override affects all plugin discovery in that terminal. Other
+   managed plugins may not appear until you unset DATUMCTL_PLUGINS_DIR. To return
+   to your normal plugins, remove the startup lines and open a new terminal.
+   Keep the preview directory if a service still references its daemon binary.
+
 3. Share your application
+
+   For staging, sign in and choose the shared project:
+
+     datumctl login --hostname auth.staging.env.datum.net
+     datumctl whoami
+
+   Confirm that whoami shows api.staging.env.datum.net and the intended project.
+   Skip login if your current session is already correct. Use "datumctl ctx"
+   to list available contexts. Both peers need their own account in the SAME
+   environment and project; do not share credential or login files.
 
    Start your application first, then run this in an interactive user terminal:
 
@@ -72,6 +113,9 @@ in the matching source release for Windows requirements.
    This installer does not upgrade or overwrite existing services. Inspect an
    existing service with datumctl connect daemon status before changing it.
    Do not delete existing daemon state or credentials during migration.
+   Do not run these per-user service commands with sudo. Scripts, JSON/YAML
+   output, explicit tokens, custom daemon URLs, root, and Windows do not use the
+   interactive guided setup. For an existing headless preview, see section 6.
 
 4. Test with a teammate
 
@@ -95,12 +139,22 @@ in the matching source release for Windows requirements.
    enrolls, A can explicitly restrict access with --allow PEER_B_CONNECTOR when
    creating a service. By default, private services allow project devices.
 
+   You can use the exact dial command printed by serve; it now specifies a local
+   --bind port. Use that port in your client instead of the example's 18080.
+   Skip up if already connected. Change --bind if that local port is occupied.
+   Pass --project YOUR_SHARED_PROJECT to the commands if it is not selected.
+   UDP needs --protocol udp on both serve and dial. TCP is the default.
+   For TLS targets such as google.com:443, preserve the original TLS server
+   name in your client; https://127.0.0.1:LOCALPORT usually fails certificate
+   name verification. A plain HTTP dev server is simpler for the first test.
+
 5. Diagnose or stop
 
      datumctl connect status
      datumctl connect daemon status
      datumctl connect ping PEER_A_CONNECTOR --verbose
      datumctl connect unserve localhost:8080
+     datumctl connect hangup 18080
      datumctl connect down
 
    Structured logs: daemon.log in the daemon state directory.
@@ -108,6 +162,72 @@ in the matching source release for Windows requirements.
    Linux default: ~/.local/state/datumctl/connect/daemon/daemon.log
    Do not share setup tokens, credential files, or your datumctl login state.
    This preview does not include production VPC enrollment or automatic upgrades.
+
+   Run unserve on the sender and hangup on the receiver. If TCP and UDP share
+   one address, use the service ID from status to disambiguate unserve.
+
+   Wrong plugin version or old output: run "type -a datumctl-connect" to find
+   duplicate PATH copies. Recheck PATH and DATUMCTL_PLUGINS_DIR. A managed
+   Connect plugin takes precedence over PATH without the registry override.
+
+   "Unmanaged plugin has not been trusted" or help-forwarding errors: confirm
+   the path, then run "datumctl plugin trust connect" again after replacement.
+
+   Missing MASQUE ConnectorClass: ask your platform administrator to configure
+   the project. Installing a plugin does not create this resource. Do not mark
+   an incompatible legacy class as MASQUE-capable.
+
+   Staging sessions automatically use the central and east Datum staging relays.
+   Startup waits up to 15 seconds for a relay connection. Inspect
+   relay_configuration, relay_ready, and relay_startup_timeout in daemon.log.
+   Check network connectivity, relay DNS and TLS if it times out. Explicit
+   DATUM_CONNECT_RELAY_URLS overrides belong on the daemon service, not just
+   the shell running datumctl.
+
+6. Upgrade an existing headless preview daemon
+
+   Replacing the plugin does NOT upgrade a running daemon. These steps apply
+   only to a standard per-user macOS/Linux headless preview service, not to
+   the legacy desktop app or tunnel CLI. Preserve any custom state path, port,
+   credential-file, system-service, or IP approval settings using your original
+   installation configuration rather than replacing them with these defaults.
+
+   After downloading and trusting the new plugin in sections 1-2, securely back
+   up private daemon state and retain the previous executable for rollback:
+
+     datumctl connect daemon status
+     datumctl connect daemon stop
+     datumctl connect daemon uninstall
+     datumctl connect install --executable "$CONNECT_PREVIEW_DIR/datum-connect-daemon"
+     datumctl connect status
+
+   Stop/uninstall removes the service registration, NOT saved configuration,
+   credentials, keys, or Cloud Connectors. The new service reuses default state
+   and reconciles saved intent. Restarting briefly interrupts tunnels.
+   If earlier enrollment failed, finish it with:
+
+     datumctl connect up
+     datumctl connect serve localhost:8080
+
+   Do not delete state to clear a 409 or 422 error. This release waits for relay
+   readiness, retries conflicting status updates, and identifies invalid fields.
+   The daemon's crate version alone cannot identify the running build; inspect
+   the executable path in its service definition if behavior is still outdated.
+   If port 47780 is occupied, inspect the existing process/service rather than
+   killing an unknown listener. Stop a manually run daemon with its original
+   terminal or service manager before installing a background service.
+
+7. Windows
+
+   Download datumctl-connect_Windows_x86_64.zip or
+   datumctl-connect_Windows_arm64.zip and verify its checksum. The archive
+   includes the plugin, daemon, signed Wintun DLL, and license. PATH discovery
+   and explicit plugin trust also apply, but automatic user-service setup and
+   interactive OIDC do not. Windows needs elevated service installation, a
+   protected executable location, and renewable credential-file authentication.
+   Follow the matching version's Windows platform guide:
+
+   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.3/docs/headless-preview.md
 
 Local build qualification
 -------------------------

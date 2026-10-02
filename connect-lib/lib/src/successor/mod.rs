@@ -26,6 +26,16 @@ pub enum Error {
     Authentication(u16),
     #[error("control plane rejected request (HTTP {0})")]
     Api(u16),
+    #[error(
+        "control plane rejected {method} {resource} (HTTP {status}): {reason}; invalid fields: {fields}"
+    )]
+    Validation {
+        status: u16,
+        method: String,
+        resource: String,
+        reason: String,
+        fields: String,
+    },
     #[error("resource is not owned by this Connector: {0}")]
     Ownership(String),
     #[error("platform capability unavailable: {0}")]
@@ -196,7 +206,46 @@ impl CloudConnector {
                 return Ok(None);
             }
             if !response.status().is_success() {
-                return Err(Error::Api(response.status().as_u16()));
+                let status = response.status().as_u16();
+                let resource = url
+                    .strip_prefix(&self.base)
+                    .unwrap_or("control-plane resource");
+                tracing::warn!(%method, resource, status, "control_plane_request_rejected");
+                if status == 422 {
+                    // Only return bounded field paths and reason identifiers. Kubernetes
+                    // messages can echo rejected values, so never expose raw response bodies.
+                    let body = bounded_body(response).await?;
+                    let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let identifier = |value: &Value| -> String {
+                        value
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .chars()
+                            .take(160)
+                            .filter(|c| {
+                                c.is_ascii_alphanumeric()
+                                    || matches!(c, '.' | '_' | '-' | '[' | ']')
+                            })
+                            .collect()
+                    };
+                    let fields = value
+                        .pointer("/details/causes")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .take(8)
+                        .map(|cause| identifier(&cause["field"]))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::Validation {
+                        status,
+                        method: method.to_string(),
+                        resource: resource.to_owned(),
+                        reason: identifier(&value["reason"]),
+                        fields,
+                    });
+                }
+                return Err(Error::Api(status));
             }
             let bytes = bounded_body(response).await?;
             return if bytes.is_empty() {
@@ -308,7 +357,35 @@ impl CloudConnector {
     }
 
     pub async fn renew(&self, details: &ConnectionDetails) -> Result<PeerIdentity> {
+        let mut uid = None;
+        for attempt in 0..4 {
+            match self.renew_once(details, &mut uid).await {
+                Err(Error::Api(409)) if attempt < 3 => {
+                    tracing::warn!(connector = %self.name, attempt = attempt + 1, "connector_renew_conflict_retry");
+                    tokio::time::sleep(Duration::from_millis(50 << attempt)).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("last renewal attempt returns")
+    }
+
+    async fn renew_once(
+        &self,
+        details: &ConnectionDetails,
+        expected_uid: &mut Option<String>,
+    ) -> Result<PeerIdentity> {
         let mut connector = self.owned_connector().await?;
+        let uid = string(&connector, "/metadata/uid")?;
+        if expected_uid
+            .as_ref()
+            .is_some_and(|expected| expected != &uid)
+        {
+            return Err(Error::Ownership(
+                "Connector was replaced during renewal".into(),
+            ));
+        }
+        *expected_uid = Some(uid);
         let old_key = connector
             .pointer("/status/connectionDetails/publicKey/id")
             .and_then(Value::as_str);

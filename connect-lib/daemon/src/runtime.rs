@@ -41,6 +41,7 @@ pub struct RealControl {
     up_lock: Arc<Mutex<()>>,
     mutation_lock: Arc<Mutex<()>>,
     local_ip: Option<Arc<crate::local_ip::LocalIpConfig>>,
+    relay_urls: Option<Vec<iroh::RelayUrl>>,
 }
 
 struct ProjectRuntime {
@@ -70,11 +71,17 @@ impl RealControl {
             up_lock: Arc::new(Mutex::new(())),
             mutation_lock,
             local_ip: None,
+            relay_urls: None,
         }
     }
 
     pub fn with_local_ip_config(mut self, config: Option<crate::local_ip::LocalIpConfig>) -> Self {
         self.local_ip = config.map(Arc::new);
+        self
+    }
+
+    pub fn with_relay_urls(mut self, relays: Option<Vec<iroh::RelayUrl>>) -> Self {
+        self.relay_urls = relays;
         self
     }
 
@@ -339,6 +346,11 @@ impl RealControl {
             Self::stop_runtime(previous, false).await?;
         }
         let mut transport_config = TransportConfig::new(key);
+        if let Some(mode) =
+            crate::relays::select(&credentials.api_endpoint, self.relay_urls.as_deref())?
+        {
+            transport_config = transport_config.relay_mode(mode);
+        }
         if let Some(config) = &self.local_ip {
             // Bind before publishing the Connector or creating any TUN. A
             // wildcard socket can discover overlay addresses and recurse into
@@ -351,6 +363,33 @@ impl RealControl {
         let transport = Transport::bind(transport_config)
             .await
             .map_err(transport_error)?;
+        // Binding only opens sockets. Publishing before relay discovery completes
+        // sends an empty homeRelay, which the control plane rejects with HTTP 422.
+        let relay_started = std::time::Instant::now();
+        if tokio::time::timeout(Duration::from_secs(15), transport.endpoint().online())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                project,
+                duration_ms = relay_started.elapsed().as_millis() as u64,
+                "relay_startup_timeout"
+            );
+            transport.shutdown().await;
+            return Err(ApiError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Could not connect to an iroh relay within 15 seconds. Check network connectivity, relay DNS/TLS, and the daemon's DATUM_CONNECT_RELAY_URLS configuration; retry connect up.")
+                .with_code("relay_unavailable"));
+        }
+        let initial_details = cloud_details(&transport);
+        if initial_details.relay_url.is_empty() {
+            transport.shutdown().await;
+            return Err(ApiError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Relay connection has no published address; retry connect up.",
+            )
+            .with_code("relay_unavailable"));
+        }
+        tracing::info!(project, relay = %initial_details.relay_url, direct_address_count = initial_details.addresses.len(), duration_ms = relay_started.elapsed().as_millis() as u64, "relay_ready");
         let mut cloud = CloudConnector::new(credentials, project.to_owned(), public_key)
             .map_err(cloud_error)?;
         let saved = self.store.snapshot().await;
@@ -364,9 +403,9 @@ impl RealControl {
             cloud = cloud.with_name(name).map_err(cloud_error)?;
         }
         let identity_result = if expected.is_some() {
-            cloud.renew(&cloud_details(&transport)).await
+            cloud.renew(&initial_details).await
         } else {
-            cloud.ensure_connector(&cloud_details(&transport)).await
+            cloud.ensure_connector(&initial_details).await
         };
         let identity = match identity_result {
             Ok(identity) => identity,

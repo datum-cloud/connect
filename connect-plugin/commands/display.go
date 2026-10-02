@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -215,30 +216,53 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 		if err := json.Unmarshal(data, &s); err != nil {
 			return err
 		}
-		fmt.Fprintf(&out, "Service %s: %s (%s, %s).\n", s.ID, s.Endpoint, strings.ToUpper(s.Protocol), serviceState(s))
-		fmt.Fprintf(&out, "Access: %s.\n", serviceAccess(s))
+		project, _ := cmd.Flags().GetString("project")
+		projectFlag := ""
+		if project != "" {
+			projectFlag = " --project " + shellArg(project)
+		}
+		if serviceState(s) == "active" {
+			fmt.Fprintf(&out, "Sharing %s (%s) in the background.\n", s.Endpoint, strings.ToUpper(s.Protocol))
+		} else {
+			fmt.Fprintf(&out, "%s (%s): %s.\n", s.Endpoint, strings.ToUpper(s.Protocol), serviceState(s))
+		}
 		if s.Public {
-			if !s.Ready {
+			if s.Ready {
+				out.WriteString("Access: public.\n")
+			} else {
 				out.WriteString("Public access is pending gateway readiness; no public URL is confirmed yet.\n")
 			}
 			if len(s.Hostnames) > 0 {
 				fmt.Fprintf(&out, "Hostnames: %s\n", strings.Join(s.Hostnames, ", "))
 			}
 		} else if len(s.Allow) > 0 {
-			fmt.Fprintf(&out, "Allowed Connectors: %s\n", strings.Join(s.Allow, ", "))
+			if len(s.Allow) == 1 {
+				out.WriteString("Access: only the device you allowed.\n")
+			} else {
+				fmt.Fprintf(&out, "Access: only the %d devices you allowed.\n", len(s.Allow))
+			}
+		} else if project != "" {
+			fmt.Fprintf(&out, "Access: devices in project %q only.\n", project)
+		} else {
+			out.WriteString("Access: project devices only.\n")
 		}
 		writeFailure(&out, s.LastErrorStage, s.LastError)
-		if !s.Public && s.Running && s.Connector != "" {
+		if !s.Public && serviceState(s) == "active" && s.Connector != "" {
 			if _, port, err := net.SplitHostPort(s.Endpoint); err == nil {
 				protocol := ""
 				if s.Protocol == "udp" {
 					protocol = " --protocol udp"
 				}
-				project, _ := cmd.Flags().GetString("project")
-				fmt.Fprintf(&out, "\nOn the other device (enroll first with datumctl connect up):\n  datumctl connect dial %s%s --project %s\nThe command prints the allocated local port.\n", shellArg(s.Connector+":"+port), protocol, shellArg(project))
+				localPort := suggestedLocalPort(port)
+				fmt.Fprintf(&out, "\nOn the other device (skip up if already connected):\n  datumctl connect up%s\n  datumctl connect dial %s --bind %s%s%s\n", projectFlag, shellArg(s.Connector+":"+port), localPort, protocol, projectFlag)
+				fmt.Fprintf(&out, "\nConnect your app to 127.0.0.1:%s on that device.\nTraffic forwards through this device to %s.\n", localPort, s.Endpoint)
 			}
 		}
-		fmt.Fprintf(&out, "Stop: datumctl connect unserve %s%s\n", s.ID, displayProjectFlag(cmd))
+		selector := s.Endpoint
+		if selector == "" {
+			selector = s.ID
+		}
+		fmt.Fprintf(&out, "\nStop sharing:\n  datumctl connect unserve %s%s\n", shellArg(selector), projectFlag)
 	case "dial":
 		var d dialDisplay
 		if err := json.Unmarshal(data, &d); err != nil {
@@ -328,6 +352,24 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 	}
 	_, err := io.WriteString(w, out.String())
 	return err
+}
+
+// Suggest an unprivileged port on the other device, not an allocated local port.
+// The peer can change --bind if this port is already in use.
+func suggestedLocalPort(remote string) string {
+	switch remote {
+	case "22":
+		return "2222"
+	case "80":
+		return "8080"
+	case "443":
+		return "8443"
+	}
+	port, err := strconv.ParseUint(remote, 10, 16)
+	if err == nil && port < 1024 {
+		return strconv.Itoa(10000 + int(port))
+	}
+	return remote
 }
 
 func displayProjectFlag(cmd *cobra.Command) string {

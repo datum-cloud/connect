@@ -2,7 +2,7 @@
 #
 # Release a version by pushing a semver tag (vX.Y.Z). The workflow runs
 # goreleaser, which builds the plugin and publishes archives + checksums.txt
-# to a GitHub release. Installable via `datumctl plugin install datum-cloud/connect`.
+# to a GitHub release. Manual PATH installation and trust are documented in INSTALL.txt.
 #
 # Each archive bundles the Go plugin binary (datumctl-connect) and the
 # Rust daemon (datum-connect-daemon). The daemon is cross-compiled in the workflow and

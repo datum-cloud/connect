@@ -214,10 +214,10 @@ func TestDeviceNamesAndShellSafeHints(t *testing.T) {
 	cmd := &cobra.Command{Use: "serve"}
 	cmd.SetOut(&out)
 	cmd.Flags().String("project", "demo", "")
-	if err := writeHuman(cmd, json.RawMessage(`{"id":"s","connector":"alice-mac","endpoint":"localhost:5353","running":true,"protocol":"udp"}`)); err != nil {
+	if err := writeHuman(cmd, json.RawMessage(`{"id":"s","connector":"alice-mac","endpoint":"localhost:5353","desired_active":true,"running":true,"protocol":"udp"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "datumctl connect dial alice-mac:5353 --protocol udp --project demo") {
+	if !strings.Contains(out.String(), "datumctl connect dial alice-mac:5353 --bind 5353 --protocol udp --project demo") {
 		t.Fatal(out.String())
 	}
 	if got := hostEnvironment([]string{"PATH=/bin", "DATUM_SESSION=old", "DATUM_PROJECT=p", "DATUM_CONNECT_GUIDED_LOGIN=1"}); !reflect.DeepEqual(got, []string{"PATH=/bin", "DATUM_CONNECT_GUIDED_LOGIN=1"}) {

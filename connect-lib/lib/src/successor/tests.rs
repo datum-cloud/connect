@@ -88,6 +88,89 @@ fn connector() -> Value {
 }
 
 #[tokio::test]
+async fn renewal_retries_conflicts_with_fresh_resource_version_and_preserves_conditions() {
+    let mut first = connector();
+    first["metadata"]["resourceVersion"] = json!("1");
+    let mut fresh = first.clone();
+    fresh["metadata"]["resourceVersion"] = json!("2");
+    fresh["status"]["conditions"] = json!([{"type":"Accepted","status":"True"}]);
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, first),
+        Reply::Json(409, json!({})),
+        Reply::Json(200, fresh),
+        Reply::EchoCreated,
+    ])
+    .await;
+    client(&base)
+        .renew(&ConnectionDetails {
+            relay_url: "https://relay.example.com/".into(),
+            addresses: vec![],
+        })
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert_eq!(requests[2].1["metadata"]["resourceVersion"], "1");
+    assert_eq!(requests[4].1["metadata"]["resourceVersion"], "2");
+    assert_eq!(requests[4].1["status"]["conditions"][0]["type"], "Accepted");
+}
+
+#[tokio::test]
+async fn renewal_never_retries_into_replaced_connector() {
+    let mut replaced = connector();
+    replaced["metadata"]["uid"] = json!("replacement");
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, connector()),
+        Reply::Json(409, json!({})),
+        Reply::Json(200, replaced),
+    ])
+    .await;
+    assert!(matches!(
+        client(&base).renew(&ConnectionDetails::default()).await,
+        Err(Error::Ownership(_))
+    ));
+    assert_eq!(
+        task.await
+            .unwrap()
+            .iter()
+            .filter(|(line, _)| line.starts_with("PUT "))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn renewal_conflict_retries_are_bounded() {
+    let mut replies = vec![token()];
+    for _ in 0..4 {
+        replies.push(Reply::Json(200, connector()));
+        replies.push(Reply::Json(409, json!({})));
+    }
+    let (base, task) = server(replies).await;
+    assert!(matches!(
+        client(&base).renew(&ConnectionDetails::default()).await,
+        Err(Error::Api(409))
+    ));
+    assert_eq!(task.await.unwrap().len(), 9);
+}
+
+#[tokio::test]
+async fn validation_error_exposes_field_not_rejected_values() {
+    let (base, task) = server(vec![token(), Reply::Json(200, connector()), Reply::Json(422, json!({"reason":"Invalid","message":"secret-do-not-print", "details":{"causes":[{"field":"status.connectionDetails.publicKey.homeRelay","message":"secret-do-not-print"}]}}))]).await;
+    let error = client(&base)
+        .renew(&ConnectionDetails::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("status.connectionDetails.publicKey.homeRelay"));
+    assert!(error.contains("PUT"));
+    assert!(error.contains("HTTP 422"));
+    assert!(!error.contains("secret-do-not-print"));
+    assert_eq!(task.await.unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn named_connector_is_resolved_by_name_and_by_exact_public_key() {
     let mut named = connector();
     named["metadata"]["name"] = json!("alice-mac");

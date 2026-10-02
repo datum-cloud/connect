@@ -19,7 +19,7 @@ func TestHumanOutput(t *testing.T) {
 		{"running", "up", `{"project":"demo","running":true,"credential_configured":true,"connector":{"name":"device-a"}}`, []string{"Connected", "Connector: device-a", "No services"}, nil},
 		{"oidc authentication", "status", `{"project":"demo","running":true,"credential_configured":true,"authentication":{"kind":"oidc","session":"personal"}}`, []string{"Authentication: datumctl session personal (user permissions)"}, nil},
 		{"file authentication", "status", `{"project":"demo","running":true,"credential_configured":true,"authentication":{"kind":"credential_file"}}`, []string{"Authentication: credential file"}, nil},
-		{"private", "serve", `{"id":"s1","endpoint":"localhost:22","protocol":"tcp","desired_active":true,"running":true,"ready":true}`, []string{"private (same project)", "unserve s1"}, []string{"publicly available"}},
+		{"private", "serve", `{"id":"s1","endpoint":"localhost:22","protocol":"tcp","desired_active":true,"running":true,"ready":true}`, []string{"Sharing localhost:22 (TCP) in the background.", "project devices only", "unserve localhost:22"}, []string{"publicly available", "s1"}},
 		{"pending public", "serve", `{"id":"s2","endpoint":"localhost:8080","protocol":"tcp","public":true,"desired_active":true,"running":true,"ready":false,"hostnames":["demo.example"]}`, []string{"pending", "no public URL is confirmed", "demo.example"}, []string{"active)"}},
 		{"dial", "dial", `{"connector":"peer","port":22,"bind":2222,"local_port":2222,"protocol":"tcp","desired_active":true,"running":true}`, []string{"Listening", "127.0.0.1:2222", "depends on the remote service", "hangup 2222"}, []string{"Connected"}},
 		{"retained error", "status", `{"project":"demo","credential_configured":true,"desired_up":true,"last_error":"authorization unavailable","last_error_stage":"renew","services":[{"id":"s1","endpoint":"localhost:22","protocol":"tcp","last_error":"origin refused","last_error_stage":"service_reconcile"}]}`, []string{"needs attention", "renew", "authorization unavailable", "s1", "origin refused"}, nil},
@@ -67,8 +67,98 @@ func TestHumanCleanupPreservesProject(t *testing.T) {
 	if err := writeHuman(cmd, json.RawMessage(`{"id":"s1","endpoint":"localhost:22"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), `unserve s1 --project "different-project"`) {
+	if !strings.Contains(out.String(), `unserve localhost:22 --project different-project`) {
 		t.Fatal(out.String())
+	}
+}
+
+func TestServeOutputExplainsBothDevices(t *testing.T) {
+	var out bytes.Buffer
+	cmd := &cobra.Command{Use: "serve"}
+	cmd.SetOut(&out)
+	cmd.Flags().String("project", "datum-cloud", "")
+	data := json.RawMessage(`{"connector":"scot-mac","id":"service-123","endpoint":"google.com:443","protocol":"tcp","desired_active":true,"running":true,"ready":true}`)
+	if err := writeHuman(cmd, data); err != nil {
+		t.Fatal(err)
+	}
+	want := `Sharing google.com:443 (TCP) in the background.
+Access: devices in project "datum-cloud" only.
+
+On the other device (skip up if already connected):
+  datumctl connect up --project datum-cloud
+  datumctl connect dial scot-mac:443 --bind 8443 --project datum-cloud
+
+Connect your app to 127.0.0.1:8443 on that device.
+Traffic forwards through this device to google.com:443.
+
+Stop sharing:
+  datumctl connect unserve google.com:443 --project datum-cloud
+`
+	if out.String() != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", out.String(), want)
+	}
+}
+
+func TestServeInstructionsRespectProtocolAccessAndState(t *testing.T) {
+	for _, tt := range []struct {
+		name, data       string
+		contains, absent []string
+	}{
+		{"udp IPv6", `{"connector":"peer","id":"s1","endpoint":"[::1]:5353","protocol":"udp","desired_active":true,"running":true,"allow":["key-a"]}`, []string{"only the device you allowed", "dial peer:5353 --bind 5353 --protocol udp", "unserve '[::1]:5353'"}, []string{"project devices only", "key-a"}},
+		{"failed", `{"connector":"peer","id":"s1","endpoint":"localhost:80","protocol":"tcp","desired_active":true,"running":true,"last_error":"authorization failed"}`, []string{"needs attention", "authorization failed"}, []string{"Sharing ", "connect dial", "Connect your app"}},
+		{"stopped", `{"connector":"peer","id":"s1","endpoint":"localhost:80","protocol":"tcp","desired_active":false,"running":true}`, []string{"stopped"}, []string{"Sharing ", "connect dial"}},
+		{"public", `{"connector":"peer","id":"s1","endpoint":"localhost:8080","protocol":"tcp","desired_active":true,"running":true,"ready":true,"public":true,"hostnames":["demo.example"]}`, []string{"Access: public", "demo.example"}, []string{"connect dial", "project devices only"}},
+		{"legacy identifier", `{"connector":"connect-e913e322c930ca04359b6c9f5852e54152be1e62","id":"s1","endpoint":"localhost:22","protocol":"tcp","desired_active":true,"running":true}`, []string{"dial connect-e913e322c930ca04359b6c9f5852e54152be1e62:22 --bind 2222"}, []string{"unserve s1"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			cmd := &cobra.Command{Use: "serve"}
+			cmd.SetOut(&out)
+			if err := writeHuman(cmd, json.RawMessage(tt.data)); err != nil {
+				t.Fatal(err)
+			}
+			for _, value := range tt.contains {
+				if !strings.Contains(out.String(), value) {
+					t.Errorf("missing %q in %s", value, out.String())
+				}
+			}
+			for _, value := range tt.absent {
+				if strings.Contains(out.String(), value) {
+					t.Errorf("unexpected %q in %s", value, out.String())
+				}
+			}
+		})
+	}
+}
+
+func TestSuggestedLocalPortIsUnprivileged(t *testing.T) {
+	for remote, want := range map[string]string{"22": "2222", "80": "8080", "443": "8443", "53": "10053", "1023": "11023", "1024": "1024", "8080": "8080", "65535": "65535"} {
+		if got := suggestedLocalPort(remote); got != want {
+			t.Errorf("%s: got %s, want %s", remote, got, want)
+		}
+	}
+}
+
+func TestServeJSONKeepsMachineReadableIdentifiers(t *testing.T) {
+	var out bytes.Buffer
+	cmd := &cobra.Command{Use: "serve"}
+	cmd.SetOut(&out)
+	cmd.Flags().String("output", "json", "")
+	data := json.RawMessage(`{"id":"service-123","endpoint":"google.com:443","connector":"peer"}`)
+	if err := writeJSON(cmd, data); err != nil {
+		t.Fatal(err)
+	}
+	var got, want any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &want); err != nil {
+		t.Fatal(err)
+	}
+	gotJSON, _ := json.Marshal(got)
+	wantJSON, _ := json.Marshal(want)
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("changed JSON: %s", out.String())
 	}
 }
 

@@ -133,6 +133,7 @@ pub struct Policy {
 pub struct TransportConfig {
     secret_key: SecretKey,
     bind_addr: Option<SocketAddr>,
+    relay_mode: Option<iroh::RelayMode>,
 }
 
 impl TransportConfig {
@@ -141,11 +142,18 @@ impl TransportConfig {
         Self {
             secret_key,
             bind_addr: None,
+            relay_mode: None,
         }
     }
     /// Overrides the UDP bind address.
     pub fn bind_addr(mut self, bind_addr: SocketAddr) -> Self {
         self.bind_addr = Some(bind_addr);
+        self
+    }
+
+    /// Overrides the preset's relay network without changing the device identity.
+    pub fn relay_mode(mut self, relay_mode: iroh::RelayMode) -> Self {
+        self.relay_mode = Some(relay_mode);
         self
     }
 }
@@ -235,6 +243,9 @@ impl Transport {
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(config.secret_key)
             .alpns(vec![ALPN.to_vec(), ip::ALPN.to_vec()]);
+        if let Some(mode) = config.relay_mode {
+            builder = builder.relay_mode(mode);
+        }
         if let Some(addr) = config.bind_addr {
             // Explicit binding is an underlay restriction, not an additional
             // socket alongside the preset's wildcard IPv4/IPv6 transports.

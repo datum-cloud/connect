@@ -4,6 +4,10 @@ Use `datumctl connect` to connect your device, expose a local service, and open
 ports to other Connectors. A persistent Rust daemon owns networking and state.
 The Go CLI sends authenticated requests to its loopback API.
 
+For a preview binary, follow the [manual installation guide](docs/INSTALL.txt).
+It covers download verification, PATH discovery, `datumctl plugin trust connect`,
+staging login, testing with a friend, and upgrading an existing daemon.
+
 ## Command-line interface
 
 The interface is flat. There is no `tunnel` noun or compatibility command tree.
@@ -68,6 +72,20 @@ Guided setup never runs for scripts, JSON/YAML output, explicit daemon tokens,
 custom daemon URLs, Windows, or root. Those paths retain explicit daemon setup
 and `up`. No command silently grants automation access to the setup token.
 The platform's MASQUE ConnectorClass requirement still applies.
+
+Sessions pinned to `https://api.staging.env.datum.net` use Datum's staging relays:
+`https://iroh-relay.us-central-1.datum-staging.net` and
+`https://iroh-relay.us-east-1.datum-staging.net`. Other API environments retain
+iroh's preset relays. The daemon accepts `--relay-urls URL,URL` or
+`DATUM_CONNECT_RELAY_URLS` to override this selection. Set environment overrides
+on the daemon service, not just the shell running the plugin. Invalid overrides
+fail explicitly; they never fall back to another relay network.
+
+Enrollment waits up to 15 seconds for a relay connection before publishing its
+address. Logs report `relay_configuration`, `relay_ready`, and
+`relay_startup_timeout`. Status conflicts retry with fresh resource versions and
+ownership checks. API validation errors identify the rejected resource and field
+without printing rejected values or credentials.
 
 This branch is a local preview, not a production release. The platform must
 implement the new MASQUE contract before you can use the deployed gateway.

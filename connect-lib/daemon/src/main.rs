@@ -43,6 +43,10 @@ struct Args {
     #[arg(long)]
     local_ip_config: Option<PathBuf>,
 
+    /// Comma-separated HTTPS relay origins. Staging sessions default to Datum staging relays.
+    #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
+    relay_urls: Option<String>,
+
     /// Run under the Windows Service Control Manager.
     #[cfg(windows)]
     #[arg(long, hide = true)]
@@ -98,7 +102,13 @@ async fn run(
     };
     let control: Arc<dyn Control> = Arc::new(
         RealControl::new(args.repo.clone(), store.clone(), mutation_lock.clone())
-            .with_local_ip_config(local_ip),
+            .with_local_ip_config(local_ip)
+            .with_relay_urls(
+                args.relay_urls
+                    .as_deref()
+                    .map(datum_connect_daemon::relays::parse)
+                    .transpose()?,
+            ),
     );
     if args.offline {
         tracing::warn!(
