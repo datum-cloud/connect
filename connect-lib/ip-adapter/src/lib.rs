@@ -5,6 +5,70 @@ use std::{io, net::IpAddr};
 
 pub use ipnet::{IpNet, Ipv4Net};
 
+#[cfg(unix)]
+pub mod helper;
+
+/// A native interface, or an interface owned by the separately approved helper.
+/// Only the helper owns privileged OS handles; the daemon retains its user identity.
+pub enum PacketDevice {
+    Native(Tun),
+    #[cfg(unix)]
+    Helper(helper::Client),
+}
+
+impl PacketDevice {
+    pub async fn create(
+        name: &str,
+        address: IpNet,
+        mtu: u16,
+        routes: &[IpNet],
+        helper: Option<&std::path::Path>,
+    ) -> io::Result<Self> {
+        validate(name, address, mtu, routes)?;
+        if let Some(socket) = helper {
+            #[cfg(unix)]
+            return helper::Client::connect(socket, name, address, mtu, routes)
+                .await
+                .map(Self::Helper);
+            #[cfg(not(unix))]
+            {
+                let _ = socket;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "The networking helper currently supports Unix only",
+                ));
+            }
+        }
+        Tun::create(name, address, mtu, routes)
+            .await
+            .map(Self::Native)
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Native(tun) => tun.name(),
+            #[cfg(unix)]
+            Self::Helper(client) => client.name(),
+        }
+    }
+
+    pub async fn read_packet(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Native(tun) => tun.read_packet(buffer).await,
+            #[cfg(unix)]
+            Self::Helper(client) => client.read_packet(buffer).await,
+        }
+    }
+
+    pub async fn write_packet(&self, packet: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Native(tun) => tun.write_packet(packet).await,
+            #[cfg(unix)]
+            Self::Helper(client) => client.write_packet(packet).await,
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]

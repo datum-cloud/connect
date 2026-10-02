@@ -22,7 +22,7 @@ datumctl connect
   hangup LOCALPORT
   install (optional; serve guides first-time user setup)
   daemon install | uninstall | start | stop | status
-  health | version
+  doctor | health | version
 ```
 
 Services are private by default. Use `--public` to request an HTTPProxy.
@@ -105,15 +105,41 @@ unsupported.
 Static `peer_bindings` also support direct daemon-to-daemon CONNECT-IP, using the
 same Connector key and endpoint. Each binding approves one peer host and explicit
 inbound/outbound TCP ports, UDP ports, or ICMP echo. `join NETWORK` activates it;
-membership alone grants no traffic access. This prototype does not forward peer
-subnets or provide transit routing. Run `scripts/connect-peer-ip-local.py --help`
+membership alone grants no traffic access. Explicit subnet attachments use
+`--routes` on the client and matching `--advertise-routes` on the router, with
+approved destination ports. Guided setup currently uses IPv6. The router
+operator configures forwarding, firewall, and source NAT or return routes
+separately; Connect never enables them globally. The client still has one
+approved source address, so this is not arbitrary site-to-site transit.
+Run `scripts/connect-peer-ip-local.py --help`
 for the isolated two-daemon test harness.
 Production VPC/NetworkBinding integration, least-privilege per-Connector
 credentials, identity rotation, and the desktop thin client remain unfinished.
-Without local IP configuration, `join` and `leave` fail explicitly. `ping`
+On macOS/Linux, first-time direct-peer setup no longer requires JSON files:
+
+```sh
+# On your device:
+datumctl connect join friend --peer THEIR_CONNECTOR --allow-tcp 8080 --allow-ping
+# On their device (use the same network name):
+datumctl connect join friend --peer YOUR_CONNECTOR --allow-tcp 8080 --allow-ping
+```
+
+The daemon pins each peer's key, derives matching IPv6 host addresses, and saves
+the explicit packet rules. Interactive `join` offers administrator-approved
+installation of the separate networking helper. Later, use `join friend` to
+reuse the saved configuration. Active attachments remain ephemeral; restarting
+does not automatically rejoin. `connect doctor` checks helper readiness without
+opening an interface. VPC membership still requires future control-plane work.
+`ping`
 currently probes a Connector, not an arbitrary VPC address. Native adapters use
-Linux TUN, macOS utun, and Windows Wintun. CONNECT-IP requires a privileged
-daemon. Windows uses protected file ACLs and a native system service; it requires
+Linux TUN, macOS utun, and Windows Wintun. On macOS/Linux, the optional
+`datum-connect-network-helper` owns approved peer interfaces while your daemon
+keeps its user identity and OIDC session. `daemon helper` is the advanced
+troubleshooting surface; see the
+[helper setup](connect-lib/daemon/README.md#set-up-peer-ip-from-the-cli).
+Peer bindings with `discover: true` resolve pinned Connector keys and their
+relay addresses through the project API. Administrator-approved host pairs and
+daemon traffic rules remain explicit. Windows uses protected file ACLs and a native system service; it requires
 credential-file authentication, not an interactive OIDC session. The Windows
 driver and native service still require validation on a Windows host.
 
@@ -128,11 +154,15 @@ services, token scopes, diagnostics, platform requirements, and test limits.
 | `connect-plugin/internal/daemonservice` | Native service installation and lifecycle |
 | `connect-lib/daemon` | Loopback API, authorization, durable intent, reconciliation, and diagnostics |
 | `connect-lib/transport` | iroh 1.0, HTTP/3 CONNECT, CONNECT-UDP, local CONNECT-IP, and peer access policy |
+| `connect-lib/network-helper` | Separate privileged service executable; no cloud credentials or Connector keys |
+| `connect-lib/ip-adapter` | Native interfaces, authenticated helper IPC, and exact host-route enforcement |
 | `connect-lib/lib/src/successor` | Host-session or in-process file credentials and Connector-owned control-plane resources |
 
 The Rust workspace retains historical library code and the `connect-lib/bin`
 development harness. The CLI does not invoke that harness. Product builds and
-release archives include only `datumctl-connect` and `datum-connect-daemon`.
+release archives include `datumctl-connect`, `datum-connect-daemon`, and the
+networking helper on macOS/Linux. The helper is not installed or elevated for
+ordinary `serve` and `dial` commands.
 
 ## Build and validate
 

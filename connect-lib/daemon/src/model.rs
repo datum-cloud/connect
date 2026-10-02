@@ -28,6 +28,9 @@ impl Default for DaemonState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectState {
+    /// Saved peer approvals, not an instruction to reconnect after restart.
+    #[serde(default)]
+    pub peer_networks: BTreeMap<String, crate::peer_ip::Binding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
     pub desired_up: bool,

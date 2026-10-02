@@ -70,7 +70,7 @@ jobs:
         run: go test ./...
         working-directory: connect-plugin
       - name: Check native Rust daemon and adapter
-        run: cargo clippy --locked -p datum-connect-daemon -p connect-ip-adapter --all-targets -- -D warnings
+        run: cargo clippy --locked -p datum-connect-daemon -p connect-ip-adapter -p datum-connect-network-helper --all-targets -- -D warnings
         working-directory: connect-lib
       - name: Test native storage and adapter
         if: runner.os == 'macOS'

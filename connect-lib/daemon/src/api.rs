@@ -46,6 +46,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/dials", post(create_dial))
         .route("/v1/dials/{port}", delete(delete_dial))
         .route("/v1/networks", post(join_network))
+        .route("/v1/networks/prepare", post(prepare_network))
+        .route("/v1/networks/{network}/setup", get(network_setup))
         .route("/v1/networks/{network}", delete(leave_network))
         .route("/v1/ping", post(ping))
         .route("/v1/tokens", post(mint_token).get(list_tokens))
@@ -149,11 +151,15 @@ async fn status(
     let mut result = ProjectStatus::from_state(query.project, project);
     result.transport = diagnostics;
     result.networks = networks;
+    if actor.role != Role::Operate || actor.scopes.iter().any(|scope| scope == "project") {
+        result.networking = networking_status(&snapshot, &result.project).await;
+    }
     Ok(Json(result))
 }
 
 #[derive(Debug, Serialize)]
 struct ProjectStatus {
+    networking: Value,
     transport: Value,
     project: String,
     desired_up: bool,
@@ -172,6 +178,7 @@ struct ProjectStatus {
 impl ProjectStatus {
     fn from_state(project: String, state: ProjectState) -> Self {
         Self {
+            networking: Value::Null,
             transport: Value::Null,
             project,
             desired_up: state.desired_up,
@@ -537,22 +544,43 @@ async fn create_service(
         .transact(|root| {
             let project = require_project_mut(root, &query.project)?;
             if !project.desired_up {
-                return Err(ApiError::new(StatusCode::CONFLICT, "project is down").with_code("project_down"));
+                return Err(ApiError::new(StatusCode::CONFLICT, "project is down")
+                    .with_code("project_down"));
             }
-            if let Some(existing) = project.services.values_mut().find(|existing| {
+            if let Some(existing) = project.services.values().find(|existing| {
                 existing.protocol == service_for_state.protocol
                     && validate_endpoint(&existing.endpoint).ok() == Some(advertised_port)
             }) {
                 if existing.desired_active && same_service_intent(existing, &service_for_state) {
+                    let existing_id = existing.id.clone();
+                    let existing = project.services.get_mut(&existing_id).unwrap();
                     existing.last_actor = actor.label();
                     return Ok((existing.clone(), false));
                 }
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    format!("Service {} already uses this protocol and port with different settings or is stopping. Your existing access settings have not changed. Inspect it with `datumctl connect status --project {}`. To replace it, run `datumctl connect unserve {} --project {}` first.", existing.id, query.project, existing.id, query.project),
+                // Endpoint selectors are friendlier, but are ambiguous when TCP
+                // and UDP both use the same destination. Keep the ID in that case.
+                let selector = if project
+                    .services
+                    .values()
+                    .filter(|s| s.endpoint == existing.endpoint)
+                    .count()
+                    == 1
+                {
+                    &existing.endpoint
+                } else {
+                    &existing.id
+                };
+                return Err(service_conflict(
+                    existing,
+                    &service_for_state,
+                    advertised_port,
+                    selector,
+                    &query.project,
                 ));
             }
-            project.services.insert(id.clone(), service_for_state.clone());
+            project
+                .services
+                .insert(id.clone(), service_for_state.clone());
             append_audit(
                 root,
                 audit_entry(
@@ -966,6 +994,152 @@ async fn delete_dial(
     Ok(Json(json!({ "deleted": true, "port": port })))
 }
 
+async fn prepare_network(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+    headers: HeaderMap,
+    Json(request): Json<crate::networking::PrepareRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = authorized(&state, &headers, &query.project).await?;
+    actor.require_setup()?;
+    let _guard = state.mutation_lock.lock().await;
+    let snapshot = state.store.snapshot().await;
+    let project = snapshot.projects.get(&query.project).ok_or_else(|| {
+        ApiError::not_found("Connect this device before configuring a peer attachment")
+            .with_code("project_not_configured")
+    })?;
+    if !project.enrolled || !project.running {
+        return Err(
+            ApiError::bad_request("Run connect up before configuring a peer attachment")
+                .with_code("project_down"),
+        );
+    }
+    let binding = state
+        .control
+        .prepare_network(&query.project, &request)
+        .await?;
+    if let Some(existing) = project.peer_networks.get(&request.network)
+        && existing != &binding
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "This saved attachment has different permissions or a different pinned peer; existing access was not changed. Choose a new attachment name.",
+        ));
+    }
+    let mut proposed = snapshot.clone();
+    proposed
+        .projects
+        .get_mut(&query.project)
+        .expect("project exists")
+        .peer_networks
+        .insert(request.network.clone(), binding.clone());
+    let plan = setup_plan(&proposed, &query.project, &request.network)?;
+    state
+        .store
+        .transact(|root| {
+            root.projects
+                .get_mut(&query.project)
+                .expect("locked project")
+                .peer_networks
+                .insert(request.network.clone(), binding);
+            append_audit(
+                root,
+                audit_entry(
+                    "peer_network_prepared",
+                    &query.project,
+                    Some(request.network.clone()),
+                    &actor.label(),
+                ),
+            );
+            Ok(())
+        })
+        .await?;
+    Ok(Json(plan))
+}
+
+async fn network_setup(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+    Path(network): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorized(&state, &headers, &query.project)
+        .await?
+        .require_setup()?;
+    setup_plan(&state.store.snapshot().await, &query.project, &network).map(Json)
+}
+
+fn setup_plan(state: &DaemonState, project: &str, network: &str) -> Result<Value, ApiError> {
+    let binding = state
+        .projects
+        .get(project)
+        .and_then(|p| p.peer_networks.get(network))
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "No saved peer attachment; supply --peer CONNECTOR on the first join",
+            )
+            .with_code("network_not_configured")
+        })?;
+    #[cfg(unix)]
+    {
+        let mut approvals = crate::networking::approvals(state)?;
+        // Consent applies to this attachment only, never other pending projects.
+        approvals
+            .approvals
+            .retain(|approval| approval.interface_name == binding.interface_name);
+        Ok(
+            json!({"network":network, "binding":binding, "helper_socket":crate::networking::helper_socket()?, "helper_config":approvals}),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = binding;
+        Err(ApiError::bad_request(
+            "Guided networking requires macOS or Linux",
+        ))
+    }
+}
+
+async fn networking_status(state: &DaemonState, project: &str) -> Value {
+    let Some(project) = state
+        .projects
+        .get(project)
+        .filter(|p| !p.peer_networks.is_empty())
+    else {
+        return json!({"state":"not_required"});
+    };
+    let saved: Vec<_> = project.peer_networks.values().collect();
+    #[cfg(unix)]
+    {
+        let result = match crate::networking::helper_socket() {
+            Ok(socket) => connect_ip_adapter::helper::inspect(&socket)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.message),
+        };
+        match result {
+            Ok(helper) => {
+                let approved = saved.iter().all(|binding| {
+                    helper.approvals.iter().any(|a| {
+                        a.interface_name == binding.interface_name
+                            && a.assigned_address.to_string() == binding.assigned_address
+                            && a.peer_address.to_string() == binding.peer_address
+                            && a.mtu == binding.mtu
+                    })
+                });
+                json!({"state":if approved {"ready"} else {"approval_required"}, "helper_protocol":helper.version, "saved_attachments":saved})
+            }
+            Err(error) => {
+                json!({"state":"setup_required", "last_error":error, "saved_attachments":saved})
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        json!({"state":"unsupported", "saved_attachments":saved})
+    }
+}
+
 #[derive(Deserialize)]
 struct NetworkRequest {
     network: String,
@@ -993,6 +1167,36 @@ async fn join_network(
             "Project must be connected before joining a network",
         )
         .with_code("project_down"));
+    }
+    #[cfg(unix)]
+    if let Some(binding) = project.peer_networks.get(&request.network) {
+        let helper =
+            connect_ip_adapter::helper::inspect(&crate::networking::helper_socket()?).await;
+        let approval = connect_ip_adapter::helper::Approval {
+            interface_name: binding.interface_name.clone(),
+            assigned_address: binding.local_address()?,
+            peer_address: binding.remote_address()?,
+            mtu: binding.mtu,
+            routes: binding
+                .routes
+                .iter()
+                .map(|r| {
+                    r.parse()
+                        .map_err(|_| ApiError::bad_request("Invalid route"))
+                })
+                .collect::<Result<_, _>>()?,
+            advertise_routes: binding
+                .advertise_routes
+                .iter()
+                .map(|r| {
+                    r.parse()
+                        .map_err(|_| ApiError::bad_request("Invalid route"))
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        if !helper.is_ok_and(|helper| helper.approvals.contains(&approval)) {
+            return Err(ApiError::new(StatusCode::CONFLICT, "Administrator approval is required for this IP attachment. Run connect join interactively on this device to set up networking.").with_code("network_setup_required"));
+        }
     }
     let result = state
         .control
@@ -1369,6 +1573,63 @@ fn find_service(
         ));
     }
     Ok(service.clone())
+}
+
+fn service_conflict(
+    existing: &ServiceState,
+    desired: &ServiceState,
+    port: u16,
+    selector: &str,
+    project: &str,
+) -> ApiError {
+    let protocol = match existing.protocol {
+        Protocol::Tcp => "TCP",
+        Protocol::Udp => "UDP",
+    };
+    let explanation = if !existing.desired_active {
+        format!(
+            "{} ({protocol}) is stopping or paused and still reserves port {port}.",
+            existing.endpoint
+        )
+    } else if existing.endpoint != desired.endpoint {
+        format!(
+            "Cannot share {}: {protocol} port {port} is already shared as {}.\nThis device can share only one destination per {protocol} port in project {project}.",
+            desired.endpoint, existing.endpoint
+        )
+    } else {
+        let mut changes = Vec::new();
+        if existing.public != desired.public {
+            changes.push("public/private access");
+        }
+        if existing.allow != desired.allow {
+            changes.push("allowed Connectors");
+        }
+        if existing.hostname != desired.hostname {
+            changes.push("public hostname");
+        }
+        format!(
+            "{} ({protocol}) is already shared with different {}.",
+            existing.endpoint,
+            changes.join(" and ")
+        )
+    };
+    ApiError::new(StatusCode::CONFLICT, format!(
+        "{explanation}\nNothing changed.\n\nTo replace the existing share, stop it first:\n  datumctl connect unserve {} --project {}\nThen run your serve command again.",
+        command_arg(selector), command_arg(project),
+    )).with_code("service_conflict")
+}
+
+// Quote unusual user input before including it in a copyable shell command.
+fn command_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 fn same_service_intent(existing: &ServiceState, desired: &ServiceState) -> bool {

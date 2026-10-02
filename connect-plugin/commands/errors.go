@@ -34,6 +34,10 @@ func friendlyError(cmd *cobra.Command, opts *options, projectID string, err erro
 		fmt.Fprintf(cmd.ErrOrStderr(), "connect: %v\n", response)
 	}
 	switch response.Code {
+	case "service_conflict":
+		// An expected configuration conflict already includes recovery steps.
+		// Verbose mode still emits HTTP status and the request ID above.
+		return errors.New(strings.TrimSpace(response.Message))
 	case "local_ip_approval_required", "local_ip_grant_mismatch", "local_ip_gateway_approval_required", "local_ip_gateway_setup_failed", "local_ip_handshake_failed", "local_ip_datagrams_unsupported", "local_ip_datagram_mtu_insufficient":
 		return fmt.Errorf("%s\nRetry with --verbose for diagnostics", strings.TrimSpace(response.Message))
 	case "project_not_configured", "credentials_required":

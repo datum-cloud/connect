@@ -46,7 +46,7 @@ func InstallCommand() *cobra.Command {
 	}}
 	addScopeFlag(cmd, &o.system)
 	cmd.Flags().StringVar(&o.credentialsFile, "credentials-file", "", "Credential JSON to copy into service-owned state")
-	cmd.Flags().StringVar(&o.localIPConfig, "local-ip-config", "", "Absolute path to static local CONNECT-IP approvals (requires a privileged system service)")
+	cmd.Flags().StringVar(&o.localIPConfig, "local-ip-config", "", "Absolute path to CONNECT-IP approvals (system daemon or approved networking helper)")
 	cmd.Flags().Uint16Var(&o.port, "port", 47780, "Loopback HTTP port")
 	cmd.Flags().StringVar(&o.executable, "executable", "", "Path to datum-connect-daemon (defaults to PATH lookup)")
 	return cmd
@@ -254,13 +254,32 @@ func validateLocalIPConfig(value string, system, hasCredentials bool) (string, e
 	if err != nil {
 		return "", fmt.Errorf("local IP config: %w", err)
 	}
-	if info.IsDir() {
-		return "", fmt.Errorf("local IP config %s is a directory", clean)
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("local IP config %s must be a regular file", clean)
 	}
 	if !system {
-		return "", fmt.Errorf("--local-ip-config creates a TUN interface and routes and requires a privileged system service; rerun install with --system (using sudo or an elevated shell as required by the OS)")
+		if info.Size() > 4<<20 {
+			return "", fmt.Errorf("local IP config exceeds 4 MiB")
+		}
+		file, err := os.Open(clean)
+		if err != nil {
+			return "", err
+		}
+		defer file.Close()
+		data, err := io.ReadAll(io.LimitReader(file, (4<<20)+1))
+		if err != nil {
+			return "", err
+		}
+		var shape struct {
+			NetworkHelper string            `json:"network_helper"`
+			Bindings      []json.RawMessage `json:"bindings"`
+			Peers         []json.RawMessage `json:"peer_bindings"`
+		}
+		if (runtime.GOOS != "darwin" && runtime.GOOS != "linux") || len(data) > 4<<20 || json.Unmarshal(data, &shape) != nil || !filepath.IsAbs(shape.NetworkHelper) || len(shape.Bindings) != 0 || len(shape.Peers) == 0 {
+			return "", fmt.Errorf("user CONNECT-IP requires network_helper with approved peer_bindings; install the networking helper first, or use a system daemon with credentials")
+		}
 	}
-	if runtime.GOOS == "darwin" && !hasCredentials {
+	if system && runtime.GOOS == "darwin" && !hasCredentials {
 		return "", fmt.Errorf("a macOS system service with --local-ip-config cannot use the current user's datumctl login; also pass --credentials-file with service-account credentials. For unprivileged L4 serve/dial with OIDC, omit --system and --local-ip-config")
 	}
 	return clean, nil

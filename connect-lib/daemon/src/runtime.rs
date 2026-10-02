@@ -45,6 +45,7 @@ pub struct RealControl {
 }
 
 struct ProjectRuntime {
+    underlay: Option<std::net::IpAddr>,
     cloud: CloudConnector,
     transport: Transport,
     services: Mutex<HashMap<String, ServiceState>>,
@@ -62,7 +63,72 @@ struct DialRuntime {
     task: JoinHandle<()>,
 }
 
+struct CloudPeerResolver {
+    cloud: CloudConnector,
+    config: Arc<crate::local_ip::LocalIpConfig>,
+}
+
+#[async_trait]
+impl crate::peer_ip::PeerResolver for CloudPeerResolver {
+    async fn resolve(&self, peer: EndpointId) -> Result<EndpointAddr, ApiError> {
+        let mut identity = self
+            .cloud
+            .resolve_peer(&peer.to_string())
+            .await
+            .map_err(cloud_error)?;
+        if identity.public_key != peer.to_string() {
+            return Err(ApiError::bad_request(
+                "Discovered Connector key differs from approved peer",
+            ));
+        }
+        identity
+            .addresses
+            .retain(|address| self.config.permits_peer_socket(*address));
+        if !identity.relay_url.is_empty() {
+            let relays = crate::relays::parse(&identity.relay_url)?;
+            if relays.len() != 1 {
+                return Err(ApiError::bad_request(
+                    "Peer must publish one HTTPS home relay",
+                ));
+            }
+            // Literal relay addresses obey the same no-overlay recursion rule.
+            if let Some(host) = relays[0].host_str()
+                && let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>()
+                && !self.config.permits_peer_socket(std::net::SocketAddr::new(
+                    ip,
+                    relays[0].port().unwrap_or(443),
+                ))
+            {
+                return Err(ApiError::bad_request(
+                    "Peer relay address overlaps an overlay or uses an unsupported underlay family",
+                ));
+            }
+        }
+        if identity.addresses.is_empty() && identity.relay_url.is_empty() {
+            return Err(ApiError::bad_request(
+                "Approved peer has no usable underlay addresses or relay",
+            ));
+        }
+        tracing::debug!(%peer, direct_addresses=identity.addresses.len(), relay_available=!identity.relay_url.is_empty(), stage="peer_ip_discovery", "peer_ip_resolved");
+        endpoint_addr(&identity)
+    }
+}
+
 impl RealControl {
+    async fn ip_config(
+        &self,
+        runtime: &ProjectRuntime,
+    ) -> Result<Option<Arc<crate::local_ip::LocalIpConfig>>, ApiError> {
+        if let Some(config) = &self.local_ip {
+            return Ok(Some(config.clone()));
+        }
+        let state = self.store.snapshot().await;
+        if state.projects.values().all(|p| p.peer_networks.is_empty()) {
+            return Ok(None);
+        }
+        let underlay = runtime.underlay.ok_or_else(|| ApiError::bad_request("No physical underlay is available; reconnect with connect up after restoring your network"))?;
+        Ok(Some(Arc::new(crate::networking::config(&state, underlay)?)))
+    }
     pub fn new(repo: PathBuf, store: Arc<Store>, mutation_lock: Arc<Mutex<()>>) -> Self {
         Self {
             repo,
@@ -231,6 +297,16 @@ impl RealControl {
                                     runtime.cloud.resolve_peer(&dial.connector).await.map_err(cloud_error)?;
                                 }
                             }
+                            // Revoke listeners waiting for a peer too, not only connected sessions.
+                            if let Some(config) = control.ip_config(&runtime).await? {
+                                let networks: Vec<_> = runtime.networks.lock().await.keys().cloned().collect();
+                                for network in networks {
+                                    if let crate::local_ip::Approval::Peer(binding) = config.approval(&project, &network)?
+                                        && binding.discover {
+                                        runtime.cloud.resolve_peer(&binding.peer).await.map_err(cloud_error)?;
+                                    }
+                                }
+                            }
                             Self::refresh_policy(&runtime).await
                         }.await;
                         if let Err(error) = result {
@@ -351,13 +427,20 @@ impl RealControl {
         {
             transport_config = transport_config.relay_mode(mode);
         }
-        if let Some(config) = &self.local_ip {
+        let underlay = if let Some(config) = &self.local_ip {
+            Some(config.underlay_address)
+        } else {
+            default_underlay().await
+        };
+        if let Some(address) = underlay {
             // Bind before publishing the Connector or creating any TUN. A
             // wildcard socket can discover overlay addresses and recurse into
             // a CONNECT-IP route after an attachment is established.
             transport_config = transport_config.bind_addr(std::net::SocketAddr::from((
-                config.underlay_address,
-                config.underlay_port,
+                address,
+                self.local_ip
+                    .as_ref()
+                    .map_or(0, |config| config.underlay_port),
             )));
         }
         let transport = Transport::bind(transport_config)
@@ -438,6 +521,7 @@ impl RealControl {
             ));
         }
         let runtime = Arc::new(ProjectRuntime {
+            underlay,
             cloud,
             transport,
             services: Mutex::new(HashMap::new()),
@@ -460,6 +544,45 @@ impl RealControl {
 
 #[async_trait]
 impl Control for RealControl {
+    async fn prepare_network(
+        &self,
+        project: &str,
+        request: &crate::networking::PrepareRequest,
+    ) -> Result<crate::peer_ip::Binding, ApiError> {
+        if self.local_ip.is_some() {
+            return Err(ApiError::bad_request(
+                "This daemon uses operator-managed --local-ip-config; remove that override before using guided peer setup",
+            ));
+        }
+        crate::networking::helper_socket()?;
+        let runtime = self.project(project).await?;
+        require_network_authorization(&runtime.authorized, &runtime.cancel)?;
+        let peer = runtime
+            .cloud
+            .resolve_peer(&request.peer)
+            .await
+            .map_err(cloud_error)?;
+        let binding = crate::networking::binding(
+            project,
+            &runtime.identity.public_key,
+            &peer.public_key,
+            request,
+        )?;
+        let mut snapshot = self.store.snapshot().await;
+        snapshot
+            .projects
+            .entry(project.into())
+            .or_default()
+            .peer_networks
+            .insert(request.network.clone(), binding.clone());
+        let underlay = runtime.underlay.ok_or_else(|| {
+            ApiError::bad_request(
+                "No physical underlay is available; restore your network and run connect up",
+            )
+        })?;
+        crate::networking::config(&snapshot, underlay)?;
+        Ok(binding)
+    }
     async fn resolve_peer_key(&self, project: &str, peer: &str) -> Result<String, ApiError> {
         Ok(self
             .project(project)
@@ -665,9 +788,9 @@ impl Control for RealControl {
         project: &str,
         network: &str,
     ) -> Result<serde_json::Value, ApiError> {
-        let config = self.local_ip.as_ref().ok_or_else(|| ApiError::new(axum::http::StatusCode::NOT_IMPLEMENTED, "VPC attachment is unavailable. Configure a privileged native daemon with --local-ip-config; no production NetworkBinding is created"))?;
-        let binding = config.approval(project, network)?;
         let runtime = self.project(project).await?;
+        let config = self.ip_config(&runtime).await?.ok_or_else(|| ApiError::new(axum::http::StatusCode::NOT_IMPLEMENTED, "No saved IP attachment. For a direct peer, run connect join NETWORK --peer CONNECTOR with explicit traffic permissions. VPC membership is not implemented.").with_code("network_not_configured"))?;
+        let binding = config.approval(project, network)?;
         let mut networks = runtime.networks.lock().await;
         require_network_authorization(&runtime.authorized, &runtime.cancel)?;
         if let Some(existing) = networks.get(network)
@@ -691,9 +814,17 @@ impl Control for RealControl {
             }
             crate::local_ip::Approval::Peer(binding) => crate::local_ip::NetworkAttachment::Peer(
                 crate::peer_ip::join(
-                    binding,
+                    // Names never retarget an approval: the config pins a public key.
+                    binding.clone(),
                     runtime.transport.clone(),
                     runtime.cancel.child_token(),
+                    config.network_helper.as_deref(),
+                    binding.discover.then(|| {
+                        Arc::new(CloudPeerResolver {
+                            cloud: runtime.cloud.clone(),
+                            config: config.clone(),
+                        }) as Arc<dyn crate::peer_ip::PeerResolver>
+                    }),
                 )
                 .await?,
             ),
@@ -712,13 +843,20 @@ impl Control for RealControl {
         project: &str,
         network: &str,
     ) -> Result<serde_json::Value, ApiError> {
-        let config = self.local_ip.as_ref().ok_or_else(|| {
-            ApiError::new(
-                axum::http::StatusCode::NOT_IMPLEMENTED,
-                "Local CONNECT-IP is not configured on this daemon",
-            )
-        })?;
-        config.approval(project, network)?;
+        if let Some(config) = &self.local_ip {
+            config.approval(project, network)?;
+        } else if !self
+            .store
+            .snapshot()
+            .await
+            .projects
+            .get(project)
+            .is_some_and(|p| p.peer_networks.contains_key(network))
+        {
+            return Err(ApiError::not_found(
+                "No saved peer attachment with this name",
+            ));
+        }
         if let Some(runtime) = self.projects.lock().await.get(project).cloned()
             && let Some(attachment) = runtime.networks.lock().await.remove(network)
         {
@@ -737,6 +875,23 @@ impl Control for RealControl {
         }
         serde_json::json!(values)
     }
+}
+
+// UDP connect selects a route/source without sending a packet. Bind transport
+// before opening overlays so it cannot advertise or recurse through their IPs.
+async fn default_underlay() -> Option<std::net::IpAddr> {
+    for (bind, destination) in [("0.0.0.0:0", "192.0.2.1:9"), ("[::]:0", "[2001:db8::1]:9")] {
+        if let Ok(socket) = UdpSocket::bind(bind).await
+            && socket.connect(destination).await.is_ok()
+            && let Ok(address) = socket.local_addr()
+            && !address.ip().is_unspecified()
+            && !address.ip().is_loopback()
+        {
+            tracing::info!(underlay=%address.ip(), stage="network_underlay", "physical_underlay_selected");
+            return Some(address.ip());
+        }
+    }
+    None
 }
 
 fn require_network_authorization(

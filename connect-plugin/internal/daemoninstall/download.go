@@ -44,10 +44,17 @@ type receipt struct {
 // Installer has injectable HTTP transport for offline fixture tests. The CLI
 // does not expose arbitrary download URLs, tokens, or checksum bypasses.
 type Installer struct {
+	component    string
 	Client       *http.Client
 	Root         string
 	GOOS, GOARCH string
 	Progress     io.Writer
+}
+
+// AcquireHelper uses the same pinned release and archive checks as the daemon.
+func (i Installer) AcquireHelper(ctx context.Context, version string) (string, error) {
+	i.component = "datum-connect-network-helper"
+	return i.Acquire(ctx, version)
 }
 
 func assetName(version, goos, arch string) (string, error) {
@@ -66,6 +73,10 @@ func assetName(version, goos, arch string) (string, error) {
 // installation must validate against its receipt; corruption never triggers
 // an overwrite of a potentially running executable.
 func (i Installer) Acquire(ctx context.Context, version string) (string, error) {
+	executableName := binaryName
+	if i.component != "" {
+		executableName = i.component
+	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -84,10 +95,13 @@ func (i Installer) Acquire(ctx context.Context, version string) (string, error) 
 		return "", err
 	}
 	destination := filepath.Join(root, version+"-"+i.GOOS+"-"+i.GOARCH)
+	if executableName != binaryName {
+		destination += "-network-helper"
+	}
 	if _, err := os.Lstat(destination); err == nil {
-		executable, err := verifyInstalled(destination, version, i.GOOS+"/"+i.GOARCH)
+		executable, err := verifyInstalledExecutable(destination, version, i.GOOS+"/"+i.GOARCH, executableName)
 		if err == nil {
-			fmt.Fprintf(i.Progress, "Using verified cached Connect daemon %s.\n", version)
+			fmt.Fprintf(i.Progress, "Using verified cached %s %s.\n", executableName, version)
 		}
 		return executable, err
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -112,7 +126,7 @@ func (i Installer) Acquire(ctx context.Context, version string) (string, error) 
 		return nil
 	}
 	base := releases + version + "/"
-	fmt.Fprintf(i.Progress, "Downloading Connect daemon %s for %s/%s…\n", version, i.GOOS, i.GOARCH)
+	fmt.Fprintf(i.Progress, "Downloading %s %s for %s/%s…\n", executableName, version, i.GOOS, i.GOARCH)
 	var manifest strings.Builder
 	if err := download(ctx, &copyClient, base+"checksums.txt", &manifest, 1<<20); err != nil {
 		return "", err
@@ -143,7 +157,7 @@ func (i Installer) Acquire(ctx context.Context, version string) (string, error) 
 	if _, err := archive.Seek(0, io.SeekStart); err != nil {
 		return "", err
 	}
-	binaryHash, err := extractDaemon(archive, filepath.Join(stage, binaryName))
+	binaryHash, err := extractExecutable(archive, filepath.Join(stage, executableName), executableName)
 	if err != nil {
 		return "", err
 	}
@@ -166,13 +180,13 @@ func (i Installer) Acquire(ctx context.Context, version string) (string, error) 
 	}
 	if err := os.Rename(stage, destination); err != nil {
 		// A concurrent installer may have completed the same immutable version.
-		if existing, checkErr := verifyInstalled(destination, version, r.Platform); checkErr == nil {
+		if existing, checkErr := verifyInstalledExecutable(destination, version, r.Platform, executableName); checkErr == nil {
 			return existing, nil
 		}
 		return "", fmt.Errorf("activate downloaded daemon: %w", err)
 	}
-	fmt.Fprintln(i.Progress, "Verified release archive checksum and installed the daemon.")
-	return filepath.Join(destination, binaryName), nil
+	fmt.Fprintf(i.Progress, "Verified release archive checksum and installed %s.\n", executableName)
+	return filepath.Join(destination, executableName), nil
 }
 
 func trustedDownloadURL(u *url.URL) bool {
@@ -257,6 +271,10 @@ func checksumFor(manifest, asset string) (string, error) {
 }
 
 func extractDaemon(archive io.Reader, destination string) (string, error) {
+	return extractExecutable(archive, destination, binaryName)
+}
+
+func extractExecutable(archive io.Reader, destination, executableName string) (string, error) {
 	gz, err := gzip.NewReader(archive)
 	if err != nil {
 		return "", fmt.Errorf("invalid release archive: %w", err)
@@ -280,7 +298,7 @@ func extractDaemon(archive io.Reader, destination string) (string, error) {
 		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeDir {
 			return "", fmt.Errorf("release archive links and special files are forbidden")
 		}
-		if name != binaryName {
+		if name != executableName {
 			continue
 		}
 		if result != "" || header.Typeflag != tar.TypeReg || header.Size <= 0 || header.Size > maxBinary {
@@ -308,12 +326,16 @@ func extractDaemon(archive io.Reader, destination string) (string, error) {
 		return "", fmt.Errorf("expanded release archive exceeds size limit")
 	}
 	if result == "" {
-		return "", fmt.Errorf("release archive does not contain %s", binaryName)
+		return "", fmt.Errorf("release archive does not contain %s", executableName)
 	}
 	return result, nil
 }
 
 func verifyInstalled(dir, version, platform string) (string, error) {
+	return verifyInstalledExecutable(dir, version, platform, binaryName)
+}
+
+func verifyInstalledExecutable(dir, version, platform, executableName string) (string, error) {
 	if err := checkPrivate(dir, true); err != nil {
 		return "", err
 	}
@@ -331,7 +353,7 @@ func verifyInstalled(dir, version, platform string) (string, error) {
 	if err != nil || r.Version != version || r.Platform != platform {
 		return "", fmt.Errorf("invalid installed daemon receipt; installation left unchanged")
 	}
-	executable := filepath.Join(dir, binaryName)
+	executable := filepath.Join(dir, executableName)
 	if err := checkPrivate(executable, false); err != nil {
 		return "", err
 	}

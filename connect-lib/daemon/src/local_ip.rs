@@ -20,6 +20,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalIpConfig {
+    /// Root-owned helper socket. Keeps this daemon and its OIDC session unprivileged.
+    #[serde(default)]
+    pub network_helper: Option<std::path::PathBuf>,
     pub underlay_address: IpAddr,
     #[serde(default)]
     pub underlay_port: u16,
@@ -56,7 +59,19 @@ impl LocalIpConfig {
         Ok(value)
     }
 
-    fn validate(&self) -> Result<(), ApiError> {
+    pub(crate) fn validate(&self) -> Result<(), ApiError> {
+        if let Some(socket) = &self.network_helper
+            && (!cfg!(unix)
+                || !socket.is_absolute()
+                || socket
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                || !self.bindings.is_empty())
+        {
+            return Err(ApiError::bad_request(
+                "network_helper requires Unix, an absolute socket path, and peer_bindings only",
+            ));
+        }
         if !valid_transport_address(self.underlay_address) {
             return Err(ApiError::bad_request(
                 "Local IP underlay_address must be an explicit unicast IPv4 or global/ULA IPv6 address; wildcard, loopback, link-local, and IPv4-mapped IPv6 addresses are forbidden",
@@ -128,7 +143,10 @@ impl LocalIpConfig {
             {
                 return Err(ApiError::bad_request("Invalid local TUN interface name"));
             }
-            if binding.addresses.is_empty()
+            let discovered = self.peer_bindings.iter().any(|p| {
+                p.project == binding.project && p.network == binding.network && p.discover
+            });
+            if (binding.addresses.is_empty() && !discovered)
                 || binding.addresses.len() > 16
                 || binding
                     .addresses
@@ -215,12 +233,51 @@ impl LocalIpConfig {
                 }
             }
         }
+        for (i, binding) in bindings.iter().enumerate() {
+            let routes = binding.parsed_routes()?;
+            for other in &bindings[..i] {
+                if routes.iter().any(|route| {
+                    other.parsed_routes().is_ok_and(|others| {
+                        others
+                            .iter()
+                            .any(|r| r.contains(&route.network()) || route.contains(&r.network()))
+                    })
+                }) {
+                    return Err(ApiError::bad_request(
+                        "Installed IP routes must not overlap another attachment",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
     pub fn binding(&self, project: &str, network: &str) -> Result<Binding, ApiError> {
         self.bindings.iter().find(|b| b.project == project && b.network == network).cloned()
             .ok_or_else(|| ApiError::new(axum::http::StatusCode::FORBIDDEN, "This project/network has no local IP approval; ask the daemon operator to configure it").with_code("local_ip_approval_required"))
+    }
+
+    /// Discovered underlay addresses never enter any approved overlay route.
+    pub(crate) fn permits_peer_socket(&self, socket: SocketAddr) -> bool {
+        if !valid_transport_address(socket.ip())
+            || socket.port() == 0
+            || socket.is_ipv4() != self.underlay_address.is_ipv4()
+        {
+            return false;
+        }
+        let bindings = self.bindings.iter().cloned().chain(
+            self.peer_bindings
+                .iter()
+                .map(crate::peer_ip::Binding::as_gateway_binding),
+        );
+        bindings.into_iter().all(|binding| {
+            binding
+                .address()
+                .is_ok_and(|assigned| assigned.addr() != socket.ip())
+                && binding
+                    .parsed_routes()
+                    .is_ok_and(|routes| !routes.iter().any(|route| route.contains(&socket.ip())))
+        })
     }
     pub fn approval(&self, project: &str, network: &str) -> Result<Approval, ApiError> {
         if let Some(binding) = self
@@ -625,6 +682,41 @@ mod tests {
     }
     fn peer_config() -> Value {
         json!({"underlay_address":"172.20.0.2","underlay_port":7777,"peer_bindings":[{"project":"demo","network":"peer-net","peer":iroh::SecretKey::from_bytes(&[8;32]).public().to_string(),"addresses":["172.20.0.3:7777"],"assigned_address":"192.0.2.2/32","peer_address":"192.0.2.3/32","interface_name":"dcp0","mtu":1280,"allow_inbound":[{"protocol":"tcp","ports":[22]}],"allow_outbound":[{"protocol":"icmp_echo"}]}]})
+    }
+    #[test]
+    fn discovered_peer_config_filters_overlay_and_wrong_family_addresses() {
+        let mut value = peer_config();
+        value["peer_bindings"][0]["discover"] = json!(true);
+        value["peer_bindings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("addresses");
+        value["network_helper"] =
+            json!("/Library/PrivilegedHelperTools/datum-connect-network-501/helper.sock");
+        let config: LocalIpConfig = serde_json::from_value(value.clone()).unwrap();
+        if cfg!(unix) {
+            config.validate().unwrap();
+        }
+        assert!(config.permits_peer_socket("172.20.0.3:7777".parse().unwrap()));
+        for socket in [
+            "192.0.2.2:7777",
+            "192.0.2.3:7777",
+            "127.0.0.1:7777",
+            "172.20.0.3:0",
+            "[fd00::3]:7777",
+        ] {
+            assert!(
+                !config.permits_peer_socket(socket.parse().unwrap()),
+                "accepted {socket}"
+            );
+        }
+        value["peer_bindings"][0]["addresses"] = json!(["172.20.0.3:7777"]);
+        assert!(
+            serde_json::from_value::<LocalIpConfig>(value)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
     #[test]
     fn peer_approvals_require_exact_hosts_and_bounded_explicit_rules() {

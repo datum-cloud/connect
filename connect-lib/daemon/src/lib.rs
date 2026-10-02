@@ -4,6 +4,7 @@ pub mod control;
 pub mod error;
 pub mod local_ip;
 pub mod model;
+pub mod networking;
 pub mod peer_ip;
 pub mod relays;
 pub mod runtime;

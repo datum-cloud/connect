@@ -44,13 +44,16 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
       - name: Build Rust binary
-        run: cargo build --locked --release -p datum-connect-daemon --target ${{ matrix.target }}
+        run: cargo build --locked --release -p datum-connect-daemon -p datum-connect-network-helper --target ${{ matrix.target }}
         working-directory: connect-lib
       - name: Rename binary with platform suffix
         run: |
           mkdir -p dist/rust-bin
           cp connect-lib/target/${{ matrix.target }}/release/datum-connect-daemon${{ contains(matrix.target, 'windows') && '.exe' || '' }} \
             dist/rust-bin/datum-connect-daemon-${{ matrix.name }}
+          if [[ '${{ matrix.target }}' != *windows* ]]; then
+            cp connect-lib/target/${{ matrix.target }}/release/datum-connect-network-helper dist/rust-bin/datum-connect-network-helper-${{ matrix.name }}
+          fi
         shell: bash
       - name: Upload Rust binary
         uses: actions/upload-artifact@v4
@@ -91,6 +94,8 @@ jobs:
               cp "../dist/rust/datum-connect-daemon-$platform-$arch$suffix" "../dist/rust/$platform-$arch/datum-connect-daemon$suffix"
               if [ "$platform" != windows ]; then
                 chmod 755 "../dist/rust/$platform-$arch/datum-connect-daemon"
+                cp "../dist/rust/datum-connect-network-helper-$platform-$arch" "../dist/rust/$platform-$arch/datum-connect-network-helper"
+                chmod 755 "../dist/rust/$platform-$arch/datum-connect-network-helper"
               fi
             done
           done

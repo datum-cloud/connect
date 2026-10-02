@@ -62,6 +62,8 @@ impl Rules {
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 struct FlowKey {
     sending: bool,
+    source_ip: IpAddr,
+    destination_ip: IpAddr,
     protocol: u8,
     source: u16,
     destination: u16,
@@ -70,6 +72,8 @@ impl FlowKey {
     fn reverse(self) -> Self {
         Self {
             sending: !self.sending,
+            source_ip: self.destination_ip,
+            destination_ip: self.source_ip,
             source: self.destination,
             destination: self.source,
             ..self
@@ -114,6 +118,8 @@ struct Flow {
 pub struct PeerPolicy {
     local: IpAddr,
     remote: IpAddr,
+    local_routes: Vec<super::IpPrefix>,
+    remote_routes: Vec<super::IpPrefix>,
     inbound: Rules,
     outbound: Rules,
     flows: HashMap<FlowKey, Flow>,
@@ -138,11 +144,37 @@ impl PeerPolicy {
         Ok(Self {
             local,
             remote,
+            local_routes: Vec::new(),
+            remote_routes: Vec::new(),
             inbound: Rules::parse(inbound)?,
             outbound: Rules::parse(outbound)?,
             flows: HashMap::new(),
             last_denial: None,
         })
+    }
+    /// Explicit subnet-router mode. Only one side may provide routed destinations.
+    /// The other side retains a single authenticated host source address.
+    pub fn with_routes(
+        mut self,
+        local: Vec<super::IpPrefix>,
+        remote: Vec<super::IpPrefix>,
+    ) -> Result<Self, &'static str> {
+        if (!local.is_empty() && !remote.is_empty()) || local.len() + remote.len() > 32 {
+            return Err("subnet routing requires one router and at most 32 prefixes");
+        }
+        for prefix in local.iter().chain(&remote) {
+            if prefix.address.is_ipv4() != self.local.is_ipv4()
+                || prefix.contains(self.local)
+                || prefix.contains(self.remote)
+            {
+                return Err(
+                    "subnet routes must exclude both peer host addresses and match their family",
+                );
+            }
+        }
+        self.local_routes = local;
+        self.remote_routes = remote;
+        Ok(self)
     }
     pub fn authorize_send(&mut self, packet: &[u8]) -> bool {
         self.authorize(packet, true, Instant::now())
@@ -183,7 +215,28 @@ impl PeerPolicy {
         } else {
             (self.remote, self.local)
         };
-        if (parsed.source, parsed.destination) != expected {
+        let local_allowed = |address| {
+            if self.local_routes.is_empty() {
+                address == self.local
+            } else {
+                self.local_routes.iter().any(|p| p.contains(address))
+            }
+        };
+        let remote_allowed = |address| {
+            if self.remote_routes.is_empty() {
+                address == self.remote
+            } else {
+                self.remote_routes.iter().any(|p| p.contains(address))
+            }
+        };
+        let allowed_addresses = if self.local_routes.is_empty() && self.remote_routes.is_empty() {
+            (parsed.source, parsed.destination) == expected
+        } else if sending {
+            local_allowed(parsed.source) && remote_allowed(parsed.destination)
+        } else {
+            remote_allowed(parsed.source) && local_allowed(parsed.destination)
+        };
+        if !allowed_addresses {
             self.last_denial = Some("address_policy");
             return false;
         }
@@ -197,6 +250,8 @@ impl PeerPolicy {
         };
         let key = FlowKey {
             sending,
+            source_ip: parsed.source,
+            destination_ip: parsed.destination,
             protocol: parsed.protocol,
             source: parsed.a,
             destination: parsed.b,
@@ -335,6 +390,8 @@ impl PeerPolicy {
                     self.flows
                         .remove(&FlowKey {
                             sending: !sending,
+                            source_ip: key.destination_ip,
+                            destination_ip: key.source_ip,
                             ..key
                         })
                         .is_some()
@@ -571,6 +628,51 @@ mod tests {
         payload[2..4].copy_from_slice(&b.to_be_bytes());
         payload[5] = 8;
         packet(source, destination, 17, payload)
+    }
+    #[test]
+    fn routed_flows_are_scoped_to_each_destination_and_client() {
+        for (client, router, first, second, prefix) in [
+            (
+                "192.0.2.1",
+                "192.0.2.2",
+                "10.50.0.1",
+                "10.50.0.2",
+                "10.50.0.0/24",
+            ),
+            ("fd01::1", "fd01::2", "fd02::1", "fd02::2", "fd02::/64"),
+        ] {
+            let (client, router, first, second) = (
+                client.parse().unwrap(),
+                router.parse().unwrap(),
+                first.parse().unwrap(),
+                second.parse().unwrap(),
+            );
+            let rules = vec![Rule {
+                protocol: Protocol::Udp,
+                ports: vec![5353],
+            }];
+            let mut c = PeerPolicy::new(client, router, vec![], rules.clone())
+                .unwrap()
+                .with_routes(vec![], vec![prefix.parse().unwrap()])
+                .unwrap();
+            let mut r = PeerPolicy::new(router, client, rules, vec![])
+                .unwrap()
+                .with_routes(vec![prefix.parse().unwrap()], vec![])
+                .unwrap();
+            let request = udp(client, first, 40000, 5353);
+            assert!(c.authorize_send(&request));
+            assert!(r.authorize_receive(&request));
+            let forged = udp(second, client, 5353, 40000);
+            assert!(!c.authorize_receive(&forged));
+            assert!(!r.authorize_send(&forged));
+            let reply = udp(first, client, 5353, 40000);
+            assert!(r.authorize_send(&reply));
+            assert!(c.authorize_receive(&reply));
+            assert!(!r.authorize_receive(&udp(router, first, 40000, 5353)));
+            assert!(!c.authorize_send(&udp(client, router, 40000, 5353)));
+            assert!(!c.authorize_send(&udp(client, first, 40000, 5354)));
+            assert!(!r.authorize_send(&udp(first, client, 40001, 5353)));
+        }
     }
     fn tcp(
         source: IpAddr,

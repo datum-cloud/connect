@@ -29,6 +29,14 @@ struct MockControl {
 
 #[async_trait]
 impl Control for MockControl {
+    async fn prepare_network(
+        &self,
+        project: &str,
+        request: &datum_connect_daemon::networking::PrepareRequest,
+    ) -> Result<datum_connect_daemon::peer_ip::Binding, ApiError> {
+        let local = iroh::SecretKey::from_bytes(&[1; 32]).public().to_string();
+        datum_connect_daemon::networking::binding(project, &local, &request.peer, request)
+    }
     async fn resolve_peer_key(&self, _project: &str, peer: &str) -> Result<String, ApiError> {
         if peer == "friendly-peer" {
             return Ok("pinned-peer-key".into());
@@ -110,6 +118,126 @@ impl Control for MockControl {
         self.network_calls.fetch_add(1, Ordering::SeqCst);
         Ok(json!({"network":network,"left":true}))
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_peer_plans_are_setup_scoped_durable_and_do_not_grant_privileges() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control.clone()).await;
+    let token = enroll_test_project(&base, &client, repo.path()).await;
+    let peer = iroh::SecretKey::from_bytes(&[2; 32]).public().to_string();
+    let plan = json!({"network":"friend","peer":peer,"allow_inbound":[{"protocol":"icmp_echo"}],"allow_outbound":[{"protocol":"icmp_echo"}]});
+    let url = format!("{base}/v1/networks/prepare?project=alpha");
+    let operator: Value = client
+        .post(format!("{base}/v1/tokens?project=alpha"))
+        .bearer_auth(&token)
+        .json(&json!({"role":"operate","scopes":["project"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth(operator["bearer"].as_str().unwrap())
+            .json(&plan)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for name in ["friend", "another"] {
+        let mut request = plan.clone();
+        request["network"] = json!(name);
+        let response = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["helper_config"]["approvals"].as_array().unwrap().len(),
+            1,
+            "must not approve another pending attachment"
+        );
+        assert_eq!(body["binding"]["peer"], peer);
+    }
+    let again = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&plan)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        again.status(),
+        StatusCode::OK,
+        "same configuration is idempotent"
+    );
+    let mut changed = plan.clone();
+    changed["allow_inbound"] = json!([]);
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&changed)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let disk: Value = serde_json::from_slice(
+        &tokio::fs::read(repo.path().join("daemon/state.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        disk["projects"]["alpha"]["peer_networks"]["friend"]["peer"],
+        peer
+    );
+    assert_eq!(
+        disk["projects"]["alpha"]["peer_networks"]["friend"]["allow_inbound"],
+        json!([{"protocol":"icmp_echo","ports":[]}])
+    );
+    let status: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        status["networks"],
+        json!([]),
+        "preparation must not open a network"
+    );
+    assert_eq!(control.network_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/networks/friend/setup?project=alpha"))
+            .bearer_auth(operator["bearer"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    server.abort();
 }
 
 #[tokio::test]
@@ -575,7 +703,23 @@ async fn service_retries_preserve_identity_and_refuse_access_changes() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert!(response.text().await.unwrap().contains("unserve"));
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["code"], "service_conflict");
+        let message = body["error"].as_str().unwrap();
+        assert!(message.contains("datumctl connect unserve localhost:8080 --project alpha"));
+        assert!(message.contains("Nothing changed."));
+        assert!(!message.contains(id.as_str().unwrap()));
+        if change["endpoint"] == "otherhost:8080" {
+            assert!(message.contains(
+                "Cannot share otherhost:8080: TCP port 8080 is already shared as localhost:8080"
+            ));
+            assert!(message.contains("only one destination per TCP port"));
+        } else {
+            assert!(message.contains("allowed Connectors"));
+            if change["public"] == true {
+                assert!(message.contains("public/private access"));
+            }
+        }
     }
     let after: Value = client
         .get(format!("{base}/v1/status?project=alpha"))
@@ -588,7 +732,36 @@ async fn service_retries_preserve_identity_and_refuse_access_changes() {
         .unwrap();
     assert_eq!(after["services"].as_array().unwrap().len(), 1);
     assert_eq!(after["services"][0]["allow"], intent["allow"]);
+    assert_eq!(after["services"][0]["endpoint"], intent["endpoint"]);
+    assert_eq!(after["services"][0]["public"], false);
     assert_eq!(control.service_calls.load(Ordering::SeqCst), 2);
+    let paused = client
+        .post(format!(
+            "{base}/v1/services/{}/pause?project=alpha",
+            id.as_str().unwrap()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paused.status(), StatusCode::OK);
+    let conflict: Value = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&intent)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(conflict["code"], "service_conflict");
+    assert!(
+        conflict["error"]
+            .as_str()
+            .unwrap()
+            .contains("localhost:8080 (TCP) is stopping or paused")
+    );
     server.abort();
 }
 
@@ -661,6 +834,29 @@ async fn invalid_service_options_never_save_intent_and_ambiguous_unserve_is_safe
         .await
         .unwrap();
     assert_eq!(status["services"].as_array().unwrap().len(), 2);
+    for protocol in ["tcp", "udp"] {
+        let response = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&json!({"endpoint":"otherhost:8080", "protocol":protocol}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = response.json().await.unwrap();
+        let service = status["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["protocol"] == protocol)
+            .unwrap();
+        let message = body["error"].as_str().unwrap();
+        assert!(message.contains(&format!(
+            "unserve {} --project alpha",
+            service["id"].as_str().unwrap()
+        )));
+        assert!(message.contains(&format!("{} port 8080", protocol.to_uppercase())));
+    }
     server.abort();
 }
 

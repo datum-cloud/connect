@@ -268,6 +268,16 @@ def main():
         assert named_dial['connector'] == akey and named_dial['connector_name'] == 'alice-mac'
         cli('bob', 'dial', f'{akey}:{origin.server_port}', '--bind', str(local))
         roundtrip(local)
+        conflict = cli('alice', 'serve', f'localhost:{origin.server_port}', '--allow', bkey, expect=1)
+        assert f'Cannot share localhost:{origin.server_port}' in conflict
+        assert f'already shared as 127.0.0.1:{origin.server_port}' in conflict
+        assert f'unserve 127.0.0.1:{origin.server_port} --project demo' in conflict
+        assert 'Retry with --verbose' not in conflict and service['id'] not in conflict
+        saved = cli('alice', 'status')['services']
+        assert len(saved) == 1 and saved[0]['endpoint'] == service['endpoint']
+        assert saved[0]['allow'] == [bkey] and not saved[0]['public']
+        roundtrip(local)
+        print('PASS conflicting serve names both destinations and preserves the working share', flush=True)
         diagnostics = cli('bob', 'status')['transport']
         assert diagnostics['bytes_sent'] > 0 and diagnostics['bytes_received'] > 0
         assert diagnostics['peers'] and diagnostics['peers'][0]['path'] in ('direct', 'relay')
@@ -491,6 +501,17 @@ def oidc_e2e(args):
         inspect_descriptors()
         cli('alice', 'up', overrides={'DATUM_SESSION': 'different-current-context'})
         inspect_descriptors()
+        if os.name == 'posix' and os.geteuid() != 0:
+            for side, peer in (('alice', 'bob-mac'), ('bob', 'alice-mac')):
+                error = cli(side, 'join', 'friend', '--peer', peer, '--allow-ping', '--allow-tcp', '8080', expect=1)
+                assert 'administrator approval' in error and 'never elevate' in error
+            aplan = cli('alice', 'doctor')['networking']['saved_attachments'][0]
+            bplan = cli('bob', 'doctor')['networking']['saved_attachments'][0]
+            assert aplan['peer'] == bkey and bplan['peer'] == akey
+            assert aplan['assigned_address'] == bplan['peer_address']
+            assert aplan['peer_address'] == bplan['assigned_address']
+            assert not cli('alice', 'status')['networks'] and not cli('bob', 'status')['networks']
+            print('PASS real CLI/daemon peer setup pins discovered keys, derives symmetric addresses, and never elevates automation', flush=True)
         service = cli('alice', 'serve', f'127.0.0.1:{origin.server_port}', '--allow', bkey)
         local = free_port()
         cli('bob', 'dial', f'{akey}:{origin.server_port}', '--bind', str(local))
@@ -522,6 +543,9 @@ def oidc_e2e(args):
                 break
             time.sleep(.2)
         assert resumed['connector']['public_key'] == bkey and resumed['running']
+        if os.name == 'posix' and os.geteuid() != 0:
+            assert resumed['networking']['saved_attachments'][0]['peer'] == akey
+            assert not resumed['networks'], 'saved peer configuration must not auto-join after restart'
         roundtrip(local)
         inspect_descriptors()
         calls = [json.loads(line) for line in (root / 'helper-calls.jsonl').read_text().splitlines()]

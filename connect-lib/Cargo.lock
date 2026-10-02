@@ -537,10 +537,17 @@ dependencies = [
 name = "connect-ip-adapter"
 version = "0.1.0"
 dependencies = [
+ "fs2",
+ "futures-util",
  "ipnet",
  "libc",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "tokio-util",
+ "tracing",
  "windows-sys 0.52.0",
  "wintun",
 ]
@@ -947,6 +954,16 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows",
+]
+
+[[package]]
+name = "datum-connect-network-helper"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "connect-ip-adapter",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

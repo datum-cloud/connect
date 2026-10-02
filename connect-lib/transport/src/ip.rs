@@ -511,7 +511,7 @@ pub async fn connect(
             let (session, outgoing, incoming) = session_parts(config.clone(), Role::Client, local.clone());
             session.counters.capacity.store(capacity, Ordering::Relaxed);
             let counters = session.counters.clone(); let task_cancel = local.clone();
-            tokio::spawn(async move { let _bridge = bridge_guard; run_session(io, DatagramPath { connection: conn, stream_id }, config, Role::Client, outgoing, incoming, task_cancel, counters).await; });
+            tokio::spawn(async move { let _bridge = bridge_guard; run_session(io, DatagramPath { connection: conn, stream_id, low_capacity_since: None }, config, Role::Client, outgoing, incoming, task_cancel, counters).await; });
             Ok(session)
         }) => result.map_err(|_| Error::Timeout)?,
     };
@@ -728,6 +728,7 @@ pub(crate) async fn serve_connection(
             DatagramPath {
                 connection: conn,
                 stream_id,
+                low_capacity_since: None,
             },
         ))
     };
@@ -759,7 +760,7 @@ pub(crate) async fn serve_connection(
 #[allow(clippy::too_many_arguments)] // Session ownership and bounded channels stay explicit.
 async fn run_session(
     mut io: DuplexStream,
-    path: DatagramPath,
+    mut path: DatagramPath,
     config: SessionConfig,
     role: Role,
     mut outgoing: mpsc::Receiver<Bytes>,
@@ -795,7 +796,10 @@ async fn run_session(
                 _ = monitor.tick() => { path.check(config.mtu, &counters)?; },
                 next = outgoing.recv() => {
                     let Some(packet) = next else { return Ok(()); };
-                    path.check(config.mtu, &counters)?;
+                    if !path.check(config.mtu, &counters)? {
+                        counters.dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let wire = encode_datagram(path.stream_id, &packet);
                     match path.connection.send_datagram(wire) {
                         Ok(()) => { counters.sent.fetch_add(1, Ordering::Relaxed); counters.datagrams_sent.fetch_add(1, Ordering::Relaxed); },
@@ -858,9 +862,10 @@ async fn run_session(
 struct DatagramPath {
     connection: iroh::endpoint::Connection,
     stream_id: u64,
+    low_capacity_since: Option<tokio::time::Instant>,
 }
 impl DatagramPath {
-    fn check(&self, mtu: u16, counters: &Counters) -> Result<usize> {
+    fn check(&mut self, mtu: u16, counters: &Counters) -> Result<bool> {
         let capacity = datagram_capacity(self.connection.max_datagram_size(), self.stream_id)?;
         let previous = counters.capacity.swap(capacity, Ordering::Relaxed);
         if previous != capacity {
@@ -868,9 +873,49 @@ impl DatagramPath {
                 tracing::debug!(peer=%self.connection.remote_id(), local=?path.local_addr(), remote=?path.remote_addr(), selected=path.is_selected(), effective_datagram_ip_capacity=capacity, previous_capacity=previous, stage="ip_path_capacity", "CONNECT-IP datagram capacity changed");
             }
         }
-        require_capacity(capacity, mtu)?;
-        Ok(capacity)
+        let was_reprobing = self.low_capacity_since.is_some();
+        let ready = capacity_ready(
+            capacity,
+            mtu,
+            &mut self.low_capacity_since,
+            tokio::time::Instant::now(),
+        )?;
+        if !ready && !was_reprobing {
+            tracing::info!(
+                stage = "ip_path_capacity",
+                capacity,
+                mtu,
+                "CONNECT-IP pauses sends while path MTU is re-probed"
+            );
+        } else if ready && was_reprobing {
+            tracing::info!(
+                stage = "ip_path_capacity",
+                capacity,
+                mtu,
+                "CONNECT-IP path MTU recovered"
+            );
+        }
+        Ok(ready)
     }
+}
+
+// Multipath reports the minimum across paths, including newly probed ones.
+// Never send oversized packets, but allow a bounded interval for path validation.
+fn capacity_ready(
+    capacity: usize,
+    mtu: u16,
+    low_since: &mut Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Result<bool> {
+    if capacity >= usize::from(mtu) {
+        *low_since = None;
+        return Ok(true);
+    }
+    let start = *low_since.get_or_insert(now);
+    if now.duration_since(start) >= DATAGRAM_SETUP_TIMEOUT {
+        require_capacity(capacity, mtu)?;
+    }
+    Ok(false)
 }
 
 async fn wait_h3_datagrams(state: &mut impl ConnectionState) -> Result<()> {

@@ -1,0 +1,128 @@
+apiVersion: networking.datumapis.com/v1alpha
+kind: Network
+metadata:
+  name: connect-subnet-lab-vpc
+  labels:
+    connect.datum.net/lab: subnet-20261002
+spec:
+  ipFamilies: [IPv6]
+  ipam: {mode: Auto}
+  mtu: 1440
+---
+apiVersion: networking.datumapis.com/v1alpha
+kind: Network
+metadata:
+  name: connect-subnet-lab-client
+  labels:
+    connect.datum.net/lab: subnet-20261002
+spec:
+  ipFamilies: [IPv6]
+  ipam: {mode: Auto}
+  mtu: 1440
+---
+apiVersion: compute.datumapis.com/v1alpha
+kind: Workload
+metadata:
+  name: connect-subnet-lab-router
+  labels:
+    connect.datum.net/lab: subnet-20261002
+spec:
+  placements:
+    - name: dfw
+      locationSelector:
+        matchLabels: {topology.datum.net/city-code: DFW}
+      scaleSettings: {minReplicas: 1}
+  template:
+    metadata:
+      labels: {connect.datum.net/lab: subnet-20261002}
+    spec:
+      networkInterfaces:
+        - name: eth0
+          network: {name: connect-subnet-lab-vpc}
+          ipFamilies: [IPv6]
+      runtime:
+        class: general-purpose
+        resources: {instanceType: datumcloud/d1-standard-2}
+        sandbox:
+          sysctls:
+            - name: net.ipv6.conf.all.forwarding
+              value: "1"
+            - name: net.ipv6.conf.default.forwarding
+              value: "1"
+          containers:
+            - name: lab
+              image: docker.io/library/ubuntu:24.04
+              command: [/bin/bash, -ec]
+              args:
+                - apt-get -o Acquire::http::Timeout=15 -o Acquire::Retries=2 -o Acquire::http::Pipeline-Depth=0 update && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Timeout=15 -o Acquire::Retries=2 install -y iproute2 iputils-ping nftables curl ca-certificates python3 procps sudo && mkdir -p /lab /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && touch /lab/ready && exec sleep infinity
+              securityContext:
+                capabilities:
+                  add: [NET_ADMIN, NET_RAW, MKNOD, CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+---
+apiVersion: compute.datumapis.com/v1alpha
+kind: Workload
+metadata:
+  name: connect-subnet-lab-client
+  labels:
+    connect.datum.net/lab: subnet-20261002
+spec:
+  placements:
+    - name: dfw
+      locationSelector:
+        matchLabels: {topology.datum.net/city-code: DFW}
+      scaleSettings: {minReplicas: 1}
+  template:
+    metadata:
+      labels: {connect.datum.net/lab: subnet-20261002}
+    spec:
+      networkInterfaces:
+        - name: eth0
+          network: {name: connect-subnet-lab-client}
+          ipFamilies: [IPv6]
+      runtime:
+        class: general-purpose
+        resources: {instanceType: datumcloud/d1-standard-2}
+        sandbox:
+          containers:
+            - name: lab
+              image: docker.io/library/ubuntu:24.04
+              command: [/bin/bash, -ec]
+              args:
+                - apt-get -o Acquire::http::Timeout=15 -o Acquire::Retries=2 -o Acquire::http::Pipeline-Depth=0 update && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Timeout=15 -o Acquire::Retries=2 install -y iproute2 iputils-ping nftables curl ca-certificates python3 procps sudo && mkdir -p /lab /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && touch /lab/ready && exec sleep infinity
+              securityContext:
+                capabilities:
+                  add: [NET_ADMIN, NET_RAW, MKNOD, CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+---
+apiVersion: compute.datumapis.com/v1alpha
+kind: Workload
+metadata:
+  name: connect-subnet-lab-origin
+  labels:
+    connect.datum.net/lab: subnet-20261002
+spec:
+  placements:
+    - name: dfw
+      locationSelector:
+        matchLabels: {topology.datum.net/city-code: DFW}
+      scaleSettings: {minReplicas: 1}
+  template:
+    metadata:
+      labels: {connect.datum.net/lab: subnet-20261002}
+    spec:
+      networkInterfaces:
+        - name: eth0
+          network: {name: connect-subnet-lab-vpc}
+          ipFamilies: [IPv6]
+      runtime:
+        class: general-purpose
+        resources: {instanceType: datumcloud/d1-standard-2}
+        sandbox:
+          containers:
+            - name: lab
+              image: docker.io/library/ubuntu:24.04
+              command: [/bin/bash, -ec]
+              args:
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 curl ca-certificates python3 && mkdir -p /lab && touch /lab/ready && exec sleep infinity
+              securityContext:
+                capabilities:
+                  add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]

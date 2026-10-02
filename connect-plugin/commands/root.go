@@ -62,6 +62,7 @@ func Add(root *cobra.Command) {
 	root.AddCommand(newDial(opts))
 	root.AddCommand(newHangup(opts))
 	root.AddCommand(newJoin(opts))
+	root.AddCommand(newDoctor(opts))
 	root.AddCommand(newLeave(opts))
 	root.AddCommand(newPing(opts))
 	root.AddCommand(newDaemon())
@@ -373,7 +374,6 @@ func newHangup(opts *options) *cobra.Command {
 	}}
 }
 
-func newJoin(opts *options) *cobra.Command  { return networkCommand(opts, "join", http.MethodPost) }
 func newLeave(opts *options) *cobra.Command { return networkCommand(opts, "leave", http.MethodDelete) }
 
 func networkCommand(opts *options, name, method string) *cobra.Command {
@@ -457,6 +457,6 @@ func parseProtocol(value string) (string, error) {
 
 func newDaemon() *cobra.Command {
 	cmd := &cobra.Command{Use: "daemon", Short: "Manage the local Datum Connect daemon service"}
-	cmd.AddCommand(daemonservice.InstallCommand(), daemonservice.UninstallCommand(), daemonservice.StartCommand(), daemonservice.StopCommand(), daemonservice.StatusCommand())
+	cmd.AddCommand(daemonservice.InstallCommand(), daemonservice.UninstallCommand(), daemonservice.StartCommand(), daemonservice.StopCommand(), daemonservice.StatusCommand(), daemonservice.HelperCommand())
 	return cmd
 }

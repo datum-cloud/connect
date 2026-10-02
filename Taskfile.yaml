@@ -17,7 +17,7 @@ vars:
   GO_LDFLAGS: -X main.version=v0.1.0+{{.GIT_COMMIT}}
 
   CARGO_TARGET_DIR: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}/target'
-  CARGO_BUILD_FLAGS: --locked -p {{.DAEMON_BINARY}}
+  CARGO_BUILD_FLAGS: --locked -p {{.DAEMON_BINARY}} -p datum-connect-network-helper
   RELEASE_FLAGS: --release
 
   E2E_SCRIPT: '{{.ROOT_DIR}}/scripts/daemon-e2e.py'

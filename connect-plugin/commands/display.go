@@ -50,6 +50,7 @@ type networkDisplay struct {
 	Address            string   `json:"assigned_address"`
 	Interface          string   `json:"interface_name"`
 	Routes             []string `json:"routes"`
+	AdvertiseRoutes    []string `json:"advertise_routes"`
 	Running            bool     `json:"running"`
 	LastError          string   `json:"last_error"`
 	LastConnectError   string   `json:"last_connect_error"`
@@ -78,7 +79,7 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 		} else {
 			fmt.Fprintf(&out, "Connect daemon health: %s\n", value.Status)
 		}
-	case "status", "up", "down":
+	case "status", "up", "down", "doctor":
 		var value struct {
 			Project              string `json:"project"`
 			DesiredUp            bool   `json:"desired_up"`
@@ -93,11 +94,18 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 				Name      string `json:"name"`
 				PublicKey string `json:"public_key"`
 			} `json:"connector"`
-			Services       []serviceDisplay `json:"services"`
-			Dials          []dialDisplay    `json:"dials"`
-			Networks       []networkDisplay `json:"networks"`
-			LastError      string           `json:"last_error"`
-			LastErrorStage string           `json:"last_error_stage"`
+			Services   []serviceDisplay `json:"services"`
+			Dials      []dialDisplay    `json:"dials"`
+			Networks   []networkDisplay `json:"networks"`
+			Networking *struct {
+				State     string `json:"state"`
+				LastError string `json:"last_error"`
+				Saved     []struct {
+					Network string `json:"network"`
+				} `json:"saved_attachments"`
+			} `json:"networking"`
+			LastError      string `json:"last_error"`
+			LastErrorStage string `json:"last_error_stage"`
 		}
 		if err := json.Unmarshal(data, &value); err != nil {
 			return err
@@ -125,6 +133,26 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 		}
 		if value.Connector != nil {
 			fmt.Fprintf(&out, "Connector: %s\n", value.Connector.Name)
+		}
+		if value.Networking != nil && value.Networking.State != "not_required" {
+			fmt.Fprintf(&out, "IP networking helper: %s\n", strings.ReplaceAll(value.Networking.State, "_", " "))
+			if value.Networking.LastError != "" {
+				fmt.Fprintf(&out, "  %s\n", value.Networking.LastError)
+			}
+			for _, saved := range value.Networking.Saved {
+				active := false
+				for _, network := range value.Networks {
+					if network.Network == saved.Network && network.Running {
+						active = true
+					}
+				}
+				if !active {
+					fmt.Fprintf(&out, "  Saved attachment %s: inactive. Join: datumctl connect join %s%s\n", saved.Network, shellArg(saved.Network), displayProjectFlag(cmd))
+				}
+			}
+		}
+		if cmd.Name() == "doctor" {
+			out.WriteString("Read-only checks; no interface, service, or route was changed. Helper readiness does not prove peer reachability.\n")
 		}
 		if !value.CredentialConfigured {
 			fmt.Fprintf(&out, "\nNext: %s\n", setupCommand(value.Project))
@@ -184,6 +212,9 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			}
 			fmt.Fprintf(&out, "Network %s: %s, %s on %s (ephemeral native preview).\n", network.Network, state, network.Address, network.Interface)
 			fmt.Fprintf(&out, "  Routes: %s\n", strings.Join(network.Routes, ", "))
+			if len(network.AdvertiseRoutes) > 0 {
+				fmt.Fprintf(&out, "  Approved subnet access for peer: %s\n  Forwarding, firewall, and return routing are managed separately on this device.\n", strings.Join(network.AdvertiseRoutes, ", "))
+			}
 			if network.Mode == "peer" {
 				fmt.Fprintf(&out, "  Peer: %s (%s)\n", network.Peer, network.PeerAddress)
 				if network.Running && !network.Connected {
@@ -326,6 +357,9 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			}
 		}
 		fmt.Fprintf(&out, "Routes: %s\nEphemeral native preview: down or daemon restart removes this attachment.\nLeave: datumctl connect leave %s%s\n", strings.Join(network.Routes, ", "), network.Network, displayProjectFlag(cmd))
+		if len(network.AdvertiseRoutes) > 0 {
+			fmt.Fprintf(&out, "Approved subnet access for peer: %s\nForwarding, firewall, and return routing are managed separately on this device.\n", strings.Join(network.AdvertiseRoutes, ", "))
+		}
 	case "leave":
 		var value struct {
 			Network string `json:"network"`

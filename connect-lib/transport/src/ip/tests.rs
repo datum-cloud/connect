@@ -748,6 +748,7 @@ async fn invalid_wire_packets_drop_and_full_receiver_does_not_block_cancel() {
         DatagramPath {
             connection: server_conn,
             stream_id: 0,
+            low_capacity_since: None,
         },
         config.clone(),
         Role::Gateway,
@@ -985,6 +986,7 @@ async fn path_capacity_failure_records_reason_before_close() {
         DatagramPath {
             connection: server_conn,
             stream_id: 0,
+            low_capacity_since: None,
         },
         config,
         Role::Gateway,
@@ -994,10 +996,13 @@ async fn path_capacity_failure_records_reason_before_close() {
         counters,
     ));
     assert!(
-        tokio::time::timeout(Duration::from_secs(1), session.recv())
-            .await
-            .unwrap()
-            .is_none()
+        tokio::time::timeout(
+            DATAGRAM_SETUP_TIMEOUT + Duration::from_secs(1),
+            session.recv()
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
     assert!(session.last_error().unwrap().contains("MTU 1280"));
     assert_eq!(session.stats().mtu_errors, 1);
@@ -1029,6 +1034,7 @@ async fn reliable_packet_fallback_is_rejected_and_remote_mtu_reason_is_safe() {
             DatagramPath {
                 connection: server_conn,
                 stream_id: 0,
+                low_capacity_since: None,
             },
             config,
             Role::Gateway,
@@ -1064,4 +1070,34 @@ async fn reliable_packet_fallback_is_rejected_and_remote_mtu_reason_is_safe() {
         client.close().await;
         server.close().await;
     }
+}
+#[test]
+fn transient_path_mtu_probe_pauses_but_persistent_low_mtu_fails() {
+    let now = tokio::time::Instant::now();
+    let mut low = None;
+    assert!(!super::capacity_ready(1160, 1280, &mut low, now).unwrap());
+    assert!(
+        !super::capacity_ready(
+            1160,
+            1280,
+            &mut low,
+            now + std::time::Duration::from_secs(1)
+        )
+        .unwrap()
+    );
+    assert!(
+        super::capacity_ready(
+            1400,
+            1280,
+            &mut low,
+            now + std::time::Duration::from_secs(2)
+        )
+        .unwrap()
+    );
+    assert!(low.is_none());
+    assert!(!super::capacity_ready(1160, 1280, &mut low, now).unwrap());
+    assert!(matches!(
+        super::capacity_ready(1160, 1280, &mut low, now + super::DATAGRAM_SETUP_TIMEOUT),
+        Err(super::Error::InsufficientDatagramMtu { .. })
+    ));
 }

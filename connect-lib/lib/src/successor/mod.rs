@@ -411,7 +411,10 @@ impl CloudConnector {
                 self.base
             );
             if let Some(mut resource) = self.request(Method::GET, &lease_url, None).await? {
-                resource["spec"]["renewTime"] = json!(chrono::Utc::now().to_rfc3339());
+                // Kubernetes Lease uses metav1.MicroTime, whose decoder requires
+                // exactly six fractional digits rather than RFC3339 nanoseconds.
+                resource["spec"]["renewTime"] =
+                    json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
                 self.request(Method::PUT, &lease_url, Some(&resource))
                     .await?;
             }

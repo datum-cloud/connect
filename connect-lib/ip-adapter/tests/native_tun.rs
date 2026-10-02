@@ -2,7 +2,7 @@
 //! cargo test -p connect-ip-adapter --test native_tun -- --ignored --test-threads=1
 //! Creates a fresh interface and one documentation/ULA host route; never changes
 //! a default route, global forwarding, firewall, or any existing interface.
-use connect_ip_adapter::{IpNet, Tun};
+use connect_ip_adapter::{IpNet, PacketDevice};
 use std::{
     io,
     net::{IpAddr, SocketAddr},
@@ -30,12 +30,15 @@ async fn roundtrip(local: &str, remote: &str) {
     let local: IpNet = local.parse().unwrap();
     let remote: IpNet = remote.parse().unwrap();
     // Test process ID limits accidental name clashes on non-macOS platforms.
-    let label = format!(
-        "dct{}{}",
-        if local.addr().is_ipv4() { 4 } else { 6 },
-        std::process::id()
-    );
-    let tun = Tun::create(&label, local, 1280, &[remote])
+    let label = std::env::var("DATUM_CONNECT_HELPER_TEST_LABEL").unwrap_or_else(|_| {
+        format!(
+            "dct{}{}",
+            if local.addr().is_ipv4() { 4 } else { 6 },
+            std::process::id()
+        )
+    });
+    let helper = std::env::var_os("DATUM_CONNECT_HELPER_TEST_SOCKET").map(std::path::PathBuf::from);
+    let tun = PacketDevice::create(&label, local, 1280, &[remote], helper.as_deref())
         .await
         .expect("create native TUN (run elevated; Windows also requires trusted wintun.dll)");
     let name = tun.name().to_owned();
@@ -112,6 +115,186 @@ async fn roundtrip(local: &str, remote: &str) {
         .await
         .expect("owned interface must disappear after closing the device");
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires root; runs adapter client as an unprivileged UID on a disposable host"]
+async fn helper_ipv4_packet_roundtrip() {
+    helper_roundtrip(
+        "192.0.2.241/32",
+        "192.0.2.242/32",
+        "helper_ipv4_packet_roundtrip",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires root; runs adapter client as an unprivileged UID on a disposable host"]
+async fn helper_ipv6_packet_roundtrip() {
+    helper_roundtrip(
+        "fd4d:6174:756d:ffff::241/128",
+        "fd4d:6174:756d:ffff::242/128",
+        "helper_ipv6_packet_roundtrip",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+async fn helper_roundtrip(local: &str, remote: &str, test_name: &str) {
+    use connect_ip_adapter::helper::{Approval, Config};
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("DATUM_CONNECT_HELPER_TEST_SOCKET").is_some() {
+        assert_ne!(unsafe { libc::geteuid() }, 0, "client must not run as root");
+        let socket =
+            std::path::PathBuf::from(std::env::var_os("DATUM_CONNECT_HELPER_TEST_SOCKET").unwrap());
+        let label = std::env::var("DATUM_CONNECT_HELPER_TEST_LABEL").unwrap();
+        let status = connect_ip_adapter::helper::inspect(&socket).await.unwrap();
+        assert_eq!(status.version, 1);
+        assert_eq!(
+            status.approvals[0].mtu, 1280,
+            "new requests must load the updated root approval file"
+        );
+        let assigned: IpNet = local.parse().unwrap();
+        let peer: IpNet = remote.parse().unwrap();
+        assert!(
+            PacketDevice::create(&label, assigned, 1400, &[peer], Some(&socket))
+                .await
+                .is_err(),
+            "unapproved MTU must be rejected"
+        );
+        roundtrip(local, remote).await;
+        let device = PacketDevice::create(&label, assigned, 1280, &[peer], Some(&socket))
+            .await
+            .unwrap();
+        assert!(
+            PacketDevice::create(&label, assigned, 1280, &[peer], Some(&socket))
+                .await
+                .is_err(),
+            "duplicate interface request must be rejected"
+        );
+        let name = std::ffi::CString::new(device.name()).unwrap();
+        // Bypassing the daemon cannot authorize packet injection outside the host pair.
+        device.write_packet(&[0x45u8; 20]).await.unwrap();
+        let mut buffer = vec![0; 1280];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), device.read_packet(&mut buffer))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        drop(device);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while unsafe { libc::if_nametoindex(name.as_ptr()) } != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        return;
+    }
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run this opt-in test as root"
+    );
+    let parent = if cfg!(target_os = "macos") {
+        "/Library/PrivilegedHelperTools"
+    } else {
+        "/run"
+    };
+    std::fs::create_dir_all(parent).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("datum-helper-test-")
+        .tempdir_in(parent)
+        .unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    let socket = dir.path().join("helper.sock");
+    let label = format!(
+        "dch{}{}",
+        if local.contains(':') { 6 } else { 4 },
+        std::process::id()
+    );
+    let uid = if cfg!(target_os = "macos") { 501 } else { 1000 };
+    let config = Config {
+        allowed_uid: uid,
+        approvals: vec![Approval {
+            interface_name: label.clone(),
+            assigned_address: local.parse().unwrap(),
+            peer_address: remote.parse().unwrap(),
+            mtu: 1280,
+            routes: vec![],
+            advertise_routes: vec![],
+        }],
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let config_path = dir.path().join("approvals.json");
+    let mut initial = config.clone();
+    initial.approvals[0].mtu = 1400;
+    std::fs::write(&config_path, serde_json::to_vec(&initial).unwrap()).unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let server_socket = socket.clone();
+    let server_config = config_path.clone();
+    let server = tokio::spawn(async move {
+        connect_ip_adapter::helper::serve_reloadable(
+            initial,
+            &server_socket,
+            Some(&server_config),
+            async {
+                let _ = stopped.await;
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            assert!(!server.is_finished(), "helper failed before binding");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    // Root bypasses socket filesystem permissions, but is not the approved
+    // client UID. The helper must still reject it at the IPC boundary.
+    assert!(
+        PacketDevice::create(
+            &label,
+            local.parse().unwrap(),
+            1280,
+            &[remote.parse().unwrap()],
+            Some(&socket)
+        )
+        .await
+        .is_err()
+    );
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", test_name, "--nocapture"])
+            .env("DATUM_CONNECT_HELPER_TEST_SOCKET", &socket)
+            .env("DATUM_CONNECT_HELPER_TEST_LABEL", label)
+            .uid(uid)
+            .gid(uid)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !socket.exists(),
+        "helper socket must be removed on shutdown"
+    );
 }
 
 fn udp_reply(

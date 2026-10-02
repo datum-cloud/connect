@@ -68,6 +68,9 @@ archives:
       - src: ../dist/rust/{{ .Os }}-{{ .Arch }}/datum-connect-daemon{{ if eq .Os "windows" }}.exe{{ end }}
         dst: .
         strip_parent: true
+      - src: '{{ if ne .Os "windows" }}../dist/rust/{{ .Os }}-{{ .Arch }}/datum-connect-network-helper{{ else }}__no_network_helper_files__*{{ end }}'
+        dst: .
+        strip_parent: true
       - src: '{{ if eq .Os "windows" }}../dist/wintun-{{ .Arch }}/wintun.dll{{ else }}__no_wintun_files__*{{ end }}'
         dst: .
         strip_parent: true

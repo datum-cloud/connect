@@ -122,18 +122,20 @@ enrollment, token roles, and project scopes still apply. `ping` retains its
 Connector-probe meaning; use your operating system's `ping` command for an approved VPC address.
 
 If path capacity shrinks below the approved MTU during a session, the transport
-fails closed. The daemon removes the owned interface and routes, and status
+pauses outgoing packets for up to three seconds while iroh probes new paths.
+Packets during this interval are dropped and counted; application-level UDP
+retries remain necessary. If capacity stays too small, the transport fails closed.
+The daemon removes the owned interface and routes, and status
 reports the MTU failure. It does not silently fragment packets, reduce your
 approved MTU, or switch to reliable packet delivery. Correct the path or matching
 endpoint configuration before you run `join` again.
 
 ## Install a native privileged daemon
 
-Unprivileged macOS user services continue to support OIDC, TCP, and UDP. They
-cannot create utun interfaces. CONNECT-IP currently requires a system daemon
-with credential-file authentication. Privilege separation for an interactive
-user's network adapter is not implemented; do not pass that user's OIDC session
-to a root daemon.
+Unprivileged user services support OIDC, TCP, and UDP. For peer CONNECT-IP on
+macOS/Linux, use the networking helper below to retain your user daemon and login.
+The system-daemon alternative in this section requires credential-file
+authentication. Do not pass a user's OIDC session to a root daemon.
 
 Install the executable in a root-owned, non-writable-by-users location before
 installing the macOS system service. For example, after building locally:
@@ -266,6 +268,187 @@ occupied test port. It removes only test-owned artifacts after confirming servic
 removal. If cleanup fails, it preserves state and the executable for diagnosis.
 Run the separate native packet tests above to validate the driver and IP routing.
 
+## Set up peer IP from the CLI
+
+Use matching new plugin, daemon, and helper builds on both devices. Published
+`v1.0.0-preview.3` does not contain this workflow. No JSON configuration or
+`--local-ip-config` is needed for guided setup. Your daemon must run as your
+ordinary user on macOS or Linux.
+
+```sh
+# On Alice's device:
+datumctl connect join friend --peer bob-mac --allow-tcp 8080 --allow-ping
+# On Bob's device:
+datumctl connect join friend --peer alice-mac --allow-tcp 8080 --allow-ping
+```
+
+Use the same attachment name and project. The command guides enrollment if
+needed, pins the discovered Connector key, and generates matching IPv6 host
+addresses. `--allow-tcp`, `--allow-udp`, and `--allow-ping` permit the selected
+traffic in both directions; both peers must grant it. All other traffic stays
+denied. Subnet routes and transit routing are not supported.
+
+On first use, review the peer key, host addresses, and packet rules. Approving
+the prompt lets the CLI download the helper from its exact release, verify the
+archive checksum, and invoke a short-lived installer through `sudo`. The installer
+copies the helper into immutable, root-owned, content-addressed storage. It
+checks the digest again before execution. The persistent helper receives only
+administrator-approved host pairs, never cloud credentials or Connector keys.
+The approved local user's processes share those host-pair privileges; the user
+daemon separately enforces the displayed packet rules.
+
+For local builds, pass `--helper-executable` with the absolute path to
+`connect-lib/target/debug/datum-connect-network-helper`. Development builds do
+not download an unrelated release. Build with `task build`, install the new
+plugin with `task install:go`, and use the matching daemon executable. Updating
+an existing user daemon remains explicit; preserve its existing repository and
+service options. Do not leave an operator-managed `--local-ip-config` override
+enabled when switching to guided setup.
+
+After initial setup:
+
+```sh
+datumctl connect join friend
+datumctl connect status
+datumctl connect doctor
+datumctl connect leave friend
+```
+
+Status shows the overlay addresses, active connections, packet counters, and
+helper readiness. Use OS `ping` or an IPv6-capable application against the peer's
+overlay address. `doctor` performs read-only checks; helper readiness does not
+prove end-to-end peer reachability. `leave`, `down`, or a daemon restart removes
+the live interface. Saved peer configuration remains available for explicit
+rejoin. Retrying setup cannot silently change an existing pinned peer or its
+rules; use a new attachment name for a different grant.
+
+Adding another approved host pair reloads the root-owned approval file for new
+requests without restarting active interfaces. A binary upgrade requires
+`join friend --upgrade-helper` and explicit confirmation. It restarts only the
+networking helper, disconnecting active IP attachments, not your daemon's normal
+TCP/UDP services or OIDC session. Failed activation attempts restore the previous
+helper service where possible and report failures; existing root approval files
+and old binaries remain for recovery. Manually managed helper installations are
+never silently replaced.
+
+Scripts, JSON/YAML output, custom daemon URLs, and scoped tokens never trigger
+elevation. An administrator must complete setup locally first. API clients with
+the setup role can prepare an attachment with `POST /v1/networks/prepare`, inspect
+its single-attachment approval plan with `GET /v1/networks/NAME/setup`, and then
+use the normal join endpoint. Preparing a plan does not grant OS privileges or
+open an interface. The daemon exposes helper health under `networking` in status.
+It chooses and binds a physical underlay before creating overlays; after a
+physical network change, reconnect with `up` to select a new source address.
+
+Native macOS service installation, administrator prompting, and a real two-Mac
+internet test still need validation. The automated API and CLI fixtures do not
+claim to exercise OS authorization or production cloud membership.
+
+## Configure the networking helper manually
+
+The helper owns only administrator-approved interfaces and exact peer host routes.
+Your existing user daemon retains its OIDC session, Connector keys, authorization,
+iroh endpoint, and packet policy. The helper receives neither credentials nor keys.
+This feature requires matching newly built plugin, daemon, and helper binaries;
+the published `v1.0.0-preview.3` archives do not include it.
+
+This remains a manual prototype. On each Mac, choose a free, matching host pair,
+exchange Connector public keys from `connect status --output json`, and identify
+your local physical IP and user ID (`id -u`). These examples use documentation
+addresses; check for conflicts with your existing VPNs and routes first.
+
+Create `helper-approvals.json`, replacing `501` with your user ID:
+
+```json
+{
+  "allowed_uid": 501,
+  "approvals": [{
+    "interface_name": "dcpeer",
+    "assigned_address": "192.0.2.2/32",
+    "peer_address": "192.0.2.3/32",
+    "mtu": 1280
+  }]
+}
+```
+
+Create a private `peer-ip.json` for your user daemon. Replace the physical IP,
+remote key, and socket UID. On the other device, reverse the two overlay addresses
+and use your Connector's public key. Both sides must approve the desired traffic:
+
+```json
+{
+  "underlay_address": "192.168.1.10",
+  "network_helper": "/Library/PrivilegedHelperTools/datum-connect-network-501/helper.sock",
+  "peer_bindings": [{
+    "project": "datum-cloud",
+    "network": "friend",
+    "peer": "REMOTE_CONNECTOR_PUBLIC_KEY",
+    "discover": true,
+    "assigned_address": "192.0.2.2/32",
+    "peer_address": "192.0.2.3/32",
+    "interface_name": "dcpeer",
+    "mtu": 1280,
+    "allow_inbound": [{"protocol": "icmp_echo"}, {"protocol": "tcp", "ports": [8080]}],
+    "allow_outbound": [{"protocol": "icmp_echo"}, {"protocol": "tcp", "ports": [8080]}]
+  }]
+}
+```
+
+`discover: true` resolves the pinned public key and its direct/relay addresses.
+It excludes overlay addresses from direct candidates, refreshes discovery on
+connection attempts, and rechecks peer authorization every 30 seconds. Discovery
+does not grant traffic access: the explicit rules still apply. The helper accepts
+requests from the approved local UID, not a particular signed application; treat
+that user's processes as sharing the approved host-pair network privilege.
+
+Build with `task build`, then run `task install:go` to install the matching plugin.
+This does not replace or restart your installed daemon. Stage the helper as a
+root-owned executable, then install
+its service. Invoke the built plugin directly under sudo to avoid changing root's
+datumctl login or plugin registry:
+
+```sh
+chmod 600 helper-approvals.json peer-ip.json
+sudo install -o root -g wheel -m 755 connect-lib/target/debug/datum-connect-network-helper /Library/PrivilegedHelperTools/datum-connect-network-helper
+sudo "$PWD/connect-plugin/datumctl-connect" daemon helper install \
+  --uid "$(id -u)" --config "$PWD/helper-approvals.json" \
+  --executable /Library/PrivilegedHelperTools/datum-connect-network-helper
+```
+
+Do not replace a helper executable used by another installation. Installation
+refuses an existing service or state directory rather than overwriting approvals.
+The service copies approvals into root-owned private state. Its Unix socket checks
+the client's UID, and the user daemon checks that the server runs as root. The
+protocol accepts only exact approved interface settings and bounded IP packets.
+Helper crash or IPC disconnect removes owned interfaces and routes.
+
+Next, update the user daemon's service configuration. This interrupts existing
+tunnels briefly but preserves the standard user's saved identity and login.
+Use the matching new daemon at a persistent absolute path. Preserve any custom
+state paths, service ports, and existing IP approvals instead of using these defaults:
+
+```sh
+datumctl connect daemon stop
+datumctl connect daemon uninstall
+datumctl connect daemon install --executable "$PWD/connect-lib/target/debug/datum-connect-daemon" --local-ip-config "$PWD/peer-ip.json"
+datumctl connect daemon start
+datumctl connect up --project datum-cloud
+datumctl connect join friend --project datum-cloud
+```
+
+Run `join friend` on both Macs. Once status reports `connected`, use OS `ping`
+against the other overlay address, or start an HTTP server listening on that
+address/`0.0.0.0` at port 8080 and open `http://PEER_IP:8080`. You do not use
+`serve` or `dial` for this IP test. Use `connect leave friend` on both devices to
+remove the attachment. Restarting either daemon requires both sides to rejoin.
+
+Use `connect status --output json` for `network_helper`, `discovery`, packet/drop
+counters, connection attempts, and MTU failures. Helper service status is
+`connect daemon helper status --uid UID`; `stop`, `start`, and `uninstall` require
+administrator privileges. Logs live under the helper's state directory as
+`datum-connect-network-helper-UID.err`. Uninstall preserves approval files.
+Windows continues to require its existing system-daemon path.
+
 ## Attach two approved peers directly
 
 You can approve one remote Connector per binding without a gateway. This local
@@ -311,9 +494,17 @@ After both directions send TCP FIN, the record expires after 30 idle seconds;
 late ACKs and FIN retries still pass during that window. A half-closed connection
 retains the normal established timeout so the other side can finish its response.
 
-Peer bindings install only the exact remote `/32` or `/128` route. They reject
-subnets, transit traffic, self-peer keys, and addresses that overlap another
-binding's assigned addresses or routes. Both host addresses must use the same
+Host-mode peer bindings install only the exact remote `/32` or `/128` route.
+For subnet access, set `routes` on the client and exactly matching
+`advertise_routes` on the router. Both sides explicitly approve destination
+ports. The client installs the subnet routes; the router installs only the
+client host route. The router operator separately configures IP forwarding,
+firewall rules, and SNAT or a VPC return route. Connect does not change those
+global settings. Only the client's assigned host address can initiate traffic;
+this does not enable arbitrary site-to-site transit. Replies are tracked by
+source/destination address, protocol, and ports within the authenticated session.
+Bindings reject self-peer keys and addresses that overlap another
+binding's assigned addresses or installed routes. Both host addresses must use the same
 family. The underlay family can differ. A fixed `underlay_port` supports one
 project per daemon; omit it or use zero for ephemeral transport ports. For a
 static lab, configure the approved fixed port on each device before restarting
@@ -341,13 +532,37 @@ persists across daemon restarts.
 
 ## Test direct peers locally
 
-From the Connect checkout, build and run the isolated Linux lab:
+From the Connect checkout, build and run the Linux lab with privileged helpers
+and unprivileged OIDC daemons. Enrollment waits for a reachable relay, so this
+command explicitly allows container egress to Datum staging:
 
 ```sh
-python3 scripts/connect-peer-ip-local.py --docker-context colima-kata --ipv6 \
+python3 scripts/connect-peer-ip-local.py --docker-context colima-kata \
+  --helper --oidc --discover \
+  --relay-urls https://iroh-relay.us-central-1.datum-staging.net \
   --build --datumctl-source /absolute/path/to/datumctl \
-  --binaries target/peer-ip-linux-bin --keep
+  --binaries target/helper-ip-linux-bin --keep
 ```
+
+For subsequent runs, reuse the built binaries:
+
+```sh
+python3 scripts/connect-peer-ip-local.py --helper --oidc --discover \
+  --relay-urls https://iroh-relay.us-central-1.datum-staging.net \
+  --binaries target/helper-ip-linux-bin
+```
+
+Add `--relay-only` to block discovered direct peer addresses inside the test
+containers and assert that every CONNECT-IP session uses the relay. This does
+not modify your host firewall or routes.
+
+Add `--ipv6-overlay` for IPv6 packets over an IPv4 underlay. `--ipv6` instead
+requires an IPv6-reachable relay and IPv6 egress. The helper mode runs daemons as
+UID 1000 with no effective capabilities and keeps root helpers separate. `--oidc`
+uses isolated fake login sessions, never your real credentials. The CLI, helpers,
+OS interfaces, iroh transport, and relay enrollment are real. This is still two
+containers, not two internet-connected Macs. Build the helper alongside the daemon;
+`--build --helper --datumctl-source PATH` includes it automatically.
 
 Replace the datumctl source path on another machine. Keep the sibling
 `iroh-gateway` checkout for the shared Linux build helper and test image. The

@@ -88,6 +88,37 @@ fn connector() -> Value {
 }
 
 #[tokio::test]
+async fn lease_renewal_uses_kubernetes_microtime_precision() {
+    let mut value = connector();
+    value["status"]["leaseRef"] = json!({"name":"connector-lease"});
+    let lease = json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"connector-lease","resourceVersion":"7"},"spec":{"leaseDurationSeconds":30}});
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, value.clone()),
+        Reply::Json(200, value),
+        Reply::Json(200, lease),
+        Reply::EchoCreated,
+    ])
+    .await;
+    client(&base)
+        .renew(&ConnectionDetails {
+            relay_url: "https://relay.example.com/".into(),
+            addresses: vec![],
+        })
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    let renewal = &requests[4];
+    assert!(renewal.0.contains("/leases/connector-lease"));
+    assert_eq!(renewal.1["metadata"]["resourceVersion"], "7");
+    let timestamp = renewal.1["spec"]["renewTime"].as_str().unwrap();
+    assert_eq!(timestamp.len(), 27);
+    assert!(timestamp.ends_with('Z'));
+    assert_eq!(timestamp.split_once('.').unwrap().1.len(), 7);
+    chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+}
+
+#[tokio::test]
 async fn renewal_retries_conflicts_with_fresh_resource_version_and_preserves_conditions() {
     let mut first = connector();
     first["metadata"]["resourceVersion"] = json!("1");

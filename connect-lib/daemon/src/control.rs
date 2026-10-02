@@ -88,6 +88,16 @@ pub trait Control: Send + Sync + 'static {
     async fn networks(&self, _project: &str) -> serde_json::Value {
         serde_json::json!([])
     }
+    async fn prepare_network(
+        &self,
+        _project: &str,
+        _request: &crate::networking::PrepareRequest,
+    ) -> Result<crate::peer_ip::Binding, ApiError> {
+        Err(ApiError::new(
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "Managed peer networking is unavailable on this daemon",
+        ))
+    }
 }
 
 /// Used only until the real control-plane/transport adapter has been
