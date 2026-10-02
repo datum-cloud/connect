@@ -113,8 +113,13 @@ separately; Connect never enables them globally. The client still has one
 approved source address, so this is not arbitrary site-to-site transit.
 Run `scripts/connect-peer-ip-local.py --help`
 for the isolated two-daemon test harness.
-Production VPC/NetworkBinding integration, least-privilege per-Connector
-credentials, identity rotation, and the desktop thin client remain unfinished.
+The `connect-controller` module now defines a project `ConnectGateway` and
+`ConnectNetworkBinding` API and reconciles the gateway into a Compute Workload.
+That controller path is a staging prototype; the `datumctl connect join`
+control-plane discovery and binding creation path still uses the existing NSO
+Connector APIs and needs migration before the desired one-command VPC workflow
+is available. Identity rotation and the desktop thin client also remain
+unfinished.
 On macOS/Linux, first-time direct-peer setup no longer requires JSON files:
 
 ```sh

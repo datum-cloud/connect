@@ -27,6 +27,8 @@ spec:
         imagePullPolicy: IfNotPresent
         args:
         - --internal-service-discovery=$(INTERNAL_SERVICE_DISCOVERY)
+        - --discovery-kubeconfig=/etc/kubernetes/projects/auth/milo-kubeconfig.yaml
+        - --project-kubeconfig=/etc/kubernetes/projects/auth/milo-kubeconfig.yaml
         env:
         - name: INTERNAL_SERVICE_DISCOVERY
           valueFrom:
@@ -49,8 +51,36 @@ spec:
         resources:
           requests: {cpu: 25m, memory: 64Mi}
           limits: {cpu: 500m, memory: 256Mi}
+        volumeMounts:
+        - name: milo-kubeconfig
+          mountPath: /etc/kubernetes/projects/auth
+          readOnly: true
+        - name: milo-client-certificate
+          mountPath: /etc/kubernetes/projects/pki/client
+          readOnly: true
+        - name: milo-trust-bundle
+          mountPath: /etc/kubernetes/pki/trust
+          readOnly: true
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
           capabilities:
             drop: ["ALL"]
+      volumes:
+      - name: milo-kubeconfig
+        configMap:
+          name: connect-project-kubeconfigs
+      - name: milo-client-certificate
+        csi:
+          driver: csi.cert-manager.io
+          readOnly: true
+          volumeAttributes:
+            csi.cert-manager.io/common-name: system:control@connect.datumapis.com
+            csi.cert-manager.io/fs-group: "65532"
+            csi.cert-manager.io/issuer-kind: ClusterIssuer
+            csi.cert-manager.io/issuer-name: datum-control-plane
+            csi.cert-manager.io/key-usages: client auth
+            csi.cert-manager.io/organizations: system:masters,system:datum-cloud
+      - name: milo-trust-bundle
+        configMap:
+          name: datum-control-plane-trust-bundle

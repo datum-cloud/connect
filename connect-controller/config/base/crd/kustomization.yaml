@@ -5,3 +5,4 @@ resources:
 - bases/connect.datumapis.com_connectorclasses.yaml
 - bases/connect.datumapis.com_connectoradvertisements.yaml
 - bases/connect.datumapis.com_connectgateways.yaml
+- bases/connect.datumapis.com_connectnetworkbindings.yaml

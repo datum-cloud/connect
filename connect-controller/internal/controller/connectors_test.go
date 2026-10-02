@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +12,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -28,7 +31,9 @@ func testClient(t *testing.T, objs ...runtime.Object) *fake.ClientBuilder {
 	if err := coordinationv1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
-	return fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objs...).WithStatusSubresource(&connectv1alpha1.Connector{}, &connectv1alpha1.ConnectorClass{}, &connectv1alpha1.ConnectorAdvertisement{}, &connectv1alpha1.ConnectGateway{})
+	s.AddKnownTypeWithName(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"}, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "WorkloadList"}, &unstructured.UnstructuredList{})
+	return fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objs...).WithStatusSubresource(&connectv1alpha1.Connector{}, &connectv1alpha1.ConnectorClass{}, &connectv1alpha1.ConnectorAdvertisement{}, &connectv1alpha1.ConnectGateway{}, &connectv1alpha1.ConnectNetworkBinding{})
 }
 
 func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
@@ -71,19 +76,84 @@ func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	}
 }
 
-func TestReconcileGatewayReportsUnimplementedNetworkIntegration(t *testing.T) {
+func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *testing.T) {
 	ctx := context.Background()
-	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "router"}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
-	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc"}, Spec: connectv1alpha1.ConnectGatewaySpec{ConnectorRef: "router", NetworkRef: "private-net"}}
+	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}, Image: "ghcr.io/datum-cloud/iroh-gateway:connect-ip"}}
 	c := testClient(t, connector, gateway).Build()
-	if err := reconcileGateway(ctx, c, gateway); err != nil {
+	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
-	condition := gateway.Status.Conditions[0]
-	if condition.Status != metav1.ConditionUnknown || condition.Reason != "IntegrationPending" {
-		t.Fatalf("condition=%#v", condition)
+	if gateway.Status.EndpointID == "" || gateway.Status.WorkloadRef == "" {
+		t.Fatalf("gateway status missing endpoint or workload ref: %#v", gateway.Status)
 	}
-	if err := c.Get(ctx, types.NamespacedName{Name: "vpc"}, &connectv1alpha1.ConnectGateway{}); err != nil {
+	workload := &unstructured.Unstructured{}
+	workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
+	if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: "project"}, workload); err != nil {
 		t.Fatal(err)
+	}
+	interfaces, _, _ := unstructured.NestedSlice(workload.Object, "spec", "template", "spec", "networkInterfaces")
+	if len(interfaces) != 1 {
+		t.Fatalf("network interfaces=%v, want one VPC interface", interfaces)
+	}
+	attachments, _, _ := unstructured.NestedSlice(workload.Object, "spec", "template", "spec", "runtime", "sandbox", "containers")
+	if len(attachments) != 1 {
+		t.Fatalf("gateway containers=%v, want one", attachments)
+	}
+
+	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
+	if err := c.Create(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileNetworkBinding(ctx, c, "project-id", binding); err != nil {
+		t.Fatal(err)
+	}
+	if !meta.IsStatusConditionTrue(binding.Status.Conditions, "Accepted") || binding.Status.AssignedAddress == "" || binding.Status.PeerAddress == "" {
+		t.Fatalf("binding not accepted or addresses missing: %#v", binding.Status)
+	}
+	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: "project"}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		Grants []map[string]interface{} `json:"grants"`
+	}
+	if err := json.Unmarshal([]byte(configMap.Data["grants.json"]), &config); err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Grants) != 1 {
+		t.Fatalf("grants=%v, want the approved Connector grant", config.Grants)
+	}
+	if err := unstructured.SetNestedSlice(workload.Object, []interface{}{map[string]interface{}{"type": "Available", "status": "True"}}, "status", "conditions"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(ctx, workload); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+		t.Fatal(err)
+	}
+	if !meta.IsStatusConditionTrue(gateway.Status.Conditions, "Ready") {
+		t.Fatalf("gateway should be ready after Compute Workload Available: %#v", gateway.Status.Conditions)
+	}
+}
+
+func TestGatewayPeerAddressDerivationIsSymmetric(t *testing.T) {
+	client := strings.Repeat("1", 64)
+	gateway := strings.Repeat("2", 64)
+	clientAddress, gatewayAddress, _ := gatewayPeerAddresses("project", "vpc", client, gateway)
+	reverseClientAddress, reverseGatewayAddress, _ := gatewayPeerAddresses("project", "vpc", gateway, client)
+	if clientAddress != reverseGatewayAddress || gatewayAddress != reverseClientAddress {
+		t.Fatalf("addresses are not symmetric: (%s, %s) vs (%s, %s)", clientAddress, gatewayAddress, reverseClientAddress, reverseGatewayAddress)
+	}
+}
+
+func TestGatewayRejectsDefaultRoute(t *testing.T) {
+	spec := connectv1alpha1.ConnectGatewaySpec{NetworkRef: "vpc", LocationRef: "DFW", Image: "gateway:dev", Routes: []string{"::/0"}}
+	if err := validateGatewaySpec(spec); err == nil {
+		t.Fatal("expected default route to be rejected for relay-only gateway")
 	}
 }

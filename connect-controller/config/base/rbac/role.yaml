@@ -5,9 +5,29 @@ metadata:
   name: connect-manager
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  verbs:
+  - create
+  - get
+  - patch
+  - update
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - workloads
+  verbs:
+  - create
+  - get
+  - patch
+  - update
+- apiGroups:
   - connect.datumapis.com
   resources:
   - connectgateways
+  - connectnetworkbindings
   - connectoradvertisements
   - connectorclasses
   - connectors
@@ -19,6 +39,7 @@ rules:
   - connect.datumapis.com
   resources:
   - connectgateways/status
+  - connectnetworkbindings/status
   - connectoradvertisements/status
   - connectorclasses/status
   - connectors/status

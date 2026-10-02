@@ -5,22 +5,22 @@ metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
     discovery.miloapis.com/parent-contexts: Project
-  name: connectgateways.connect.datumapis.com
+  name: connectnetworkbindings.connect.datumapis.com
 spec:
   group: connect.datumapis.com
   names:
-    kind: ConnectGateway
-    listKind: ConnectGatewayList
-    plural: connectgateways
-    singular: connectgateway
+    kind: ConnectNetworkBinding
+    listKind: ConnectNetworkBindingList
+    plural: connectnetworkbindings
+    singular: connectnetworkbinding
   scope: Namespaced
   versions:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: |-
-          ConnectGateway runs a managed gateway in a project VPC. Project Connectors
-          attach through ConnectNetworkBinding resources.
+          ConnectNetworkBinding is a Connector's approved attachment to a managed
+          ConnectGateway and its VPC routes.
         properties:
           apiVersion:
             description: |-
@@ -41,38 +41,18 @@ spec:
             type: object
           spec:
             properties:
-              image:
-                description: Image must be a Linux gateway image with Datum CONNECT-IP
-                  support.
+              connectorRef:
                 type: string
-              instanceType:
-                description: InstanceType selects the Compute instance size. The platform
-                  default is used when empty.
+              gatewayRef:
                 type: string
-              locationRef:
-                type: string
-              networkRef:
-                type: string
-              relayURLs:
-                description: RelayURLs pins the gateway to operator-managed iroh relays
-                  when set.
-                items:
-                  type: string
-                type: array
-              routes:
-                items:
-                  type: string
-                maxItems: 32
-                minItems: 1
-                type: array
             required:
-            - image
-            - locationRef
-            - networkRef
-            - routes
+            - connectorRef
+            - gatewayRef
             type: object
           status:
             properties:
+              assignedAddress:
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -134,8 +114,16 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
-              workloadRef:
+              peerAddress:
                 type: string
+              relayURLs:
+                items:
+                  type: string
+                type: array
+              routes:
+                items:
+                  type: string
+                type: array
             type: object
         type: object
     served: true

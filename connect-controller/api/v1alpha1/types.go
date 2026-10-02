@@ -120,9 +120,8 @@ type ConnectorAdvertisementList struct {
 	Items           []ConnectorAdvertisement `json:"items"`
 }
 
-// ConnectGateway is an intent to attach a Connect Connector to a VPC network.
-// This API reference does not itself create a workload or NetworkBinding; those
-// integrations are intentionally reported as pending until implemented.
+// ConnectGateway runs a managed gateway in a project VPC. Project Connectors
+// attach through ConnectNetworkBinding resources.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:metadata:annotations="discovery.miloapis.com/parent-contexts=Project"
@@ -134,14 +133,27 @@ type ConnectGateway struct {
 }
 
 type ConnectGatewaySpec struct {
-	ConnectorRef string   `json:"connectorRef"`
-	NetworkRef   string   `json:"networkRef"`
-	LocationRef  string   `json:"locationRef,omitempty"`
-	Routes       []string `json:"routes,omitempty"`
+	// +kubebuilder:validation:Required
+	NetworkRef string `json:"networkRef"`
+	// +kubebuilder:validation:Required
+	LocationRef string `json:"locationRef,omitempty"`
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
+	Routes []string `json:"routes,omitempty"`
+	// Image must be a Linux gateway image with Datum CONNECT-IP support.
+	// +kubebuilder:validation:Required
+	Image string `json:"image"`
+	// InstanceType selects the Compute instance size. The platform default is used when empty.
+	InstanceType string `json:"instanceType,omitempty"`
+	// RelayURLs pins the gateway to operator-managed iroh relays when set.
+	RelayURLs []string `json:"relayURLs,omitempty"`
 }
 
 type ConnectGatewayStatus struct {
 	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	WorkloadRef        string             `json:"workloadRef,omitempty"`
+	EndpointID         string             `json:"endpointID,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 }
 
@@ -152,6 +164,42 @@ type ConnectGatewayList struct {
 	Items           []ConnectGateway `json:"items"`
 }
 
+// ConnectNetworkBinding is a Connector's approved attachment to a managed
+// ConnectGateway and its VPC routes.
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:metadata:annotations="discovery.miloapis.com/parent-contexts=Project"
+type ConnectNetworkBinding struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              ConnectNetworkBindingSpec   `json:"spec,omitempty"`
+	Status            ConnectNetworkBindingStatus `json:"status,omitempty"`
+}
+
+type ConnectNetworkBindingSpec struct {
+	// +kubebuilder:validation:Required
+	GatewayRef string `json:"gatewayRef"`
+	// +kubebuilder:validation:Required
+	ConnectorRef string `json:"connectorRef"`
+}
+
+type ConnectNetworkBindingStatus struct {
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	EndpointID         string             `json:"endpointID,omitempty"`
+	AssignedAddress    string             `json:"assignedAddress,omitempty"`
+	PeerAddress        string             `json:"peerAddress,omitempty"`
+	Routes             []string           `json:"routes,omitempty"`
+	RelayURLs          []string           `json:"relayURLs,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type ConnectNetworkBindingList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ConnectNetworkBinding `json:"items"`
+}
+
 func init() {
-	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &Connector{}, &ConnectorList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{})
+	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &Connector{}, &ConnectorList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{}, &ConnectNetworkBinding{}, &ConnectNetworkBindingList{})
 }

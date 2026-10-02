@@ -3,6 +3,14 @@ kind: Kustomization
 namespace: connect-system
 resources:
 - namespace.yaml
+- milo-configuration-certificate.yaml
 - ../base/crd
 - ../base/rbac
 - ../base/manager
+
+configMapGenerator:
+- name: connect-project-kubeconfigs
+  files:
+  - milo-kubeconfig.yaml
+  options:
+    disableNameSuffixHash: true

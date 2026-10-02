@@ -2,9 +2,17 @@ package controller
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"net/netip"
+	"net/url"
 	"reflect"
+	"strings"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -12,7 +20,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -33,9 +43,11 @@ type ConnectReconciler struct {
 	classClient client.Client
 }
 
-// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectors;connectoradvertisements;connectgateways,verbs=get;list;watch
-// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectors;connectoradvertisements;connectgateways;connectnetworkbindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectnetworkbindings/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloads,verbs=get;create;update;patch
+// +kubebuilder:rbac:groups=core,resources=configmaps;secrets,verbs=get;create;update;patch
 
 func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	local := mgr.GetLocalManager()
@@ -49,6 +61,7 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		{"connector", &connectv1alpha1.Connector{}},
 		{"connectoradvertisement", &connectv1alpha1.ConnectorAdvertisement{}},
 		{"connectgateway", &connectv1alpha1.ConnectGateway{}},
+		{"connectnetworkbinding", &connectv1alpha1.ConnectNetworkBinding{}},
 	} {
 		builder := mcbuilder.ControllerManagedBy(mgr).Named(item.name).For(item.obj,
 			mcbuilder.WithEngageWithLocalCluster(false))
@@ -110,13 +123,24 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 			}
 			return ctrl.Result{}, err
 		}
-		if err := reconcileGateway(ctx, c, &obj); err != nil {
+		if err := reconcileGateway(ctx, c, string(req.ClusterName), &obj); err != nil {
 			logger.Error(err, "reconcile ConnectGateway")
 			return ctrl.Result{}, err
 		}
-		if condition := meta.FindStatusCondition(obj.Status.Conditions, "Ready"); condition != nil && (condition.Reason == "ConnectorNotFound" || condition.Reason == "ConnectorNotReady") {
-			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
+	case "connectnetworkbinding":
+		var obj connectv1alpha1.ConnectNetworkBinding
+		if err := c.Get(ctx, key, &obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{}, err
 		}
+		if err := reconcileNetworkBinding(ctx, c, string(req.ClusterName), &obj); err != nil {
+			logger.Error(err, "reconcile ConnectNetworkBinding")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -248,20 +272,32 @@ func reconcileAdvertisement(ctx context.Context, c client.Client, obj *connectv1
 	return c.Status().Update(ctx, obj)
 }
 
-func reconcileGateway(ctx context.Context, c client.Client, obj *connectv1alpha1.ConnectGateway) error {
+func reconcileGateway(ctx context.Context, c client.Client, project string, obj *connectv1alpha1.ConnectGateway) error {
 	before := obj.Status.DeepCopy()
-	status, reason, message := metav1.ConditionUnknown, "IntegrationPending", "gateway reconciliation requires NetworkBinding and Compute workload integration"
-	if obj.Spec.ConnectorRef == "" || obj.Spec.NetworkRef == "" {
-		status, reason, message = metav1.ConditionFalse, "InvalidReference", "connectorRef and networkRef are required"
+	status, reason, message := metav1.ConditionUnknown, "Provisioning", "gateway resources are being reconciled"
+	if err := validateGatewaySpec(obj.Spec); err != nil {
+		status, reason, message = metav1.ConditionFalse, "InvalidSpec", err.Error()
 	} else {
-		var connector connectv1alpha1.Connector
-		err := c.Get(ctx, types.NamespacedName{Name: obj.Spec.ConnectorRef}, &connector)
-		if apierrors.IsNotFound(err) {
-			status, reason, message = metav1.ConditionFalse, "ConnectorNotFound", "referenced Connector does not exist in this project"
-		} else if err != nil {
+		if err := reconcileGatewayResources(ctx, c, project, obj); err != nil {
 			return err
-		} else if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
-			status, reason, message = metav1.ConditionFalse, "ConnectorNotReady", "referenced Connector is not ready"
+		}
+		workload := &unstructured.Unstructured{}
+		workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
+		if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(obj.Name, "workload"), Namespace: obj.Namespace}, workload); err != nil {
+			return err
+		}
+		workloadAvailable := false
+		conditions, _, _ := unstructured.NestedSlice(workload.Object, "status", "conditions")
+		for _, raw := range conditions {
+			condition, ok := raw.(map[string]interface{})
+			if ok && condition["type"] == "Available" && condition["status"] == "True" {
+				workloadAvailable = true
+			}
+		}
+		if workloadAvailable {
+			status, reason, message = metav1.ConditionTrue, "GatewayAvailable", "gateway Workload is available in the requested VPC"
+		} else {
+			status, reason, message = metav1.ConditionUnknown, "WorkloadProvisioning", "waiting for the Compute gateway Workload to become available"
 		}
 	}
 	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Ready", Status: status, Reason: reason, Message: message, ObservedGeneration: obj.Generation})
@@ -270,6 +306,228 @@ func reconcileGateway(ctx context.Context, c client.Client, obj *connectv1alpha1
 		return nil
 	}
 	return c.Status().Update(ctx, obj)
+}
+
+func validateGatewaySpec(spec connectv1alpha1.ConnectGatewaySpec) error {
+	for name, value := range map[string]string{"networkRef": spec.NetworkRef, "locationRef": spec.LocationRef, "image": spec.Image} {
+		if value == "" {
+			return fmt.Errorf("%s is required", name)
+		}
+	}
+	if len(spec.Routes) == 0 || len(spec.Routes) > 32 {
+		return fmt.Errorf("routes must contain between 1 and 32 IPv6 prefixes")
+	}
+	if len(spec.RelayURLs) > 5 {
+		return fmt.Errorf("relayURLs cannot contain more than 5 entries")
+	}
+	seenRelays := map[string]bool{}
+	for _, relay := range spec.RelayURLs {
+		parsed, err := url.Parse(relay)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return fmt.Errorf("relay URL %q must be an HTTPS URL without credentials, query, or fragment", relay)
+		}
+		if seenRelays[relay] {
+			return fmt.Errorf("relay URL %q is duplicated", relay)
+		}
+		seenRelays[relay] = true
+	}
+	parsed := make([]netip.Prefix, 0, len(spec.Routes))
+	for _, route := range spec.Routes {
+		prefix, err := netip.ParsePrefix(route)
+		if err != nil || !prefix.Addr().Is6() || prefix.Addr().Is4In6() {
+			return fmt.Errorf("route %q must be a valid IPv6 prefix", route)
+		}
+		if prefix.Bits() < 2 {
+			return fmt.Errorf("route %q is too broad for a relay-only gateway", route)
+		}
+		for _, previous := range parsed {
+			if previous.Contains(prefix.Addr()) || prefix.Contains(previous.Addr()) {
+				return fmt.Errorf("routes %q and %q overlap", previous, prefix)
+			}
+		}
+		parsed = append(parsed, prefix)
+	}
+	return nil
+}
+
+func reconcileGatewayResources(ctx context.Context, c client.Client, project string, gateway *connectv1alpha1.ConnectGateway) error {
+	scheme := schemeForGateway()
+	secretName := gatewayChildName(gateway.Name, "identity")
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: gateway.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, c, secret, func() error {
+		if len(secret.Data["key"]) != ed25519.SeedSize {
+			seed := make([]byte, ed25519.SeedSize)
+			if _, err := rand.Read(seed); err != nil {
+				return err
+			}
+			secret.Data = map[string][]byte{"key": seed}
+		}
+		secret.Type = corev1.SecretTypeOpaque
+		return controllerutil.SetControllerReference(gateway, secret, scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("reconcile gateway identity Secret: %w", err)
+	}
+	seed := secret.Data["key"]
+	publicKey := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+	endpointID := hex.EncodeToString(publicKey)
+	bindings := &connectv1alpha1.ConnectNetworkBindingList{}
+	if err := c.List(ctx, bindings, client.InNamespace(gateway.Namespace)); err != nil {
+		return err
+	}
+	grants := make([]interface{}, 0, len(bindings.Items))
+	for i := range bindings.Items {
+		binding := &bindings.Items[i]
+		if binding.Spec.GatewayRef != gateway.Name || !meta.IsStatusConditionTrue(binding.Status.Conditions, "Accepted") {
+			continue
+		}
+		var connector connectv1alpha1.Connector
+		if err := c.Get(ctx, types.NamespacedName{Name: binding.Spec.ConnectorRef, Namespace: binding.Namespace}, &connector); err != nil {
+			continue
+		}
+		grant := map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": strings.ToLower(connector.Spec.PublicKey), "client_address": binding.Status.AssignedAddress, "gateway_address": binding.Status.PeerAddress, "routes": gateway.Spec.Routes, "interface_name": gatewayInterfaceName(project, gateway.Spec.NetworkRef, endpointID), "mtu": 1280}
+		grants = append(grants, grant)
+	}
+	grantJSON, err := json.Marshal(map[string]interface{}{"grants": grants})
+	if err != nil {
+		return err
+	}
+	gatewayYAML := "ipv6_addr: \"[::]:0\"\ndiscovery_mode: default\ntransport: masque\nip_config: /etc/connect/gateway/grants.json\n"
+	configMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: gatewayChildName(gateway.Name, "config"), Namespace: gateway.Namespace}}
+	_, err = controllerutil.CreateOrUpdate(ctx, c, configMap, func() error {
+		configMap.Data = map[string]string{"gateway.yaml": gatewayYAML, "grants.json": string(grantJSON)}
+		return controllerutil.SetControllerReference(gateway, configMap, scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("reconcile gateway config ConfigMap: %w", err)
+	}
+	workload := &unstructured.Unstructured{}
+	workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
+	workload.SetName(gatewayChildName(gateway.Name, "workload"))
+	workload.SetNamespace(gateway.Namespace)
+	desired := gatewayWorkloadSpec(gateway.Spec, configMap.Name, secretName)
+	_, err = controllerutil.CreateOrUpdate(ctx, c, workload, func() error {
+		if err := controllerutil.SetControllerReference(gateway, workload, scheme); err != nil {
+			return err
+		}
+		workload.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "connect-controller", "connect.datumapis.com/gateway": gateway.Name})
+		return unstructured.SetNestedMap(workload.Object, desired, "spec")
+	})
+	if err != nil {
+		return fmt.Errorf("reconcile Compute gateway Workload: %w", err)
+	}
+	gateway.Status.WorkloadRef = workload.GetName()
+	gateway.Status.EndpointID = endpointID
+	return nil
+}
+
+func reconcileNetworkBinding(ctx context.Context, c client.Client, project string, binding *connectv1alpha1.ConnectNetworkBinding) error {
+	before := binding.Status.DeepCopy()
+	status, reason, message := metav1.ConditionFalse, "GatewayNotFound", "referenced ConnectGateway does not exist in this project"
+	var gateway connectv1alpha1.ConnectGateway
+	err := c.Get(ctx, types.NamespacedName{Name: binding.Spec.GatewayRef, Namespace: binding.Namespace}, &gateway)
+	if err == nil {
+		var connector connectv1alpha1.Connector
+		err = c.Get(ctx, types.NamespacedName{Name: binding.Spec.ConnectorRef, Namespace: binding.Namespace}, &connector)
+		if apierrors.IsNotFound(err) {
+			reason, message = "ConnectorNotFound", "referenced Connector does not exist in this project"
+		} else if err != nil {
+			return err
+		} else if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
+			status, reason, message = metav1.ConditionFalse, "ConnectorNotReady", "referenced Connector is not online"
+		} else if gateway.Status.EndpointID == "" {
+			status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway identity to be created"
+		} else {
+			clientAddress, peerAddress, _ := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, strings.ToLower(connector.Spec.PublicKey), strings.ToLower(gateway.Status.EndpointID))
+			binding.Status.EndpointID = gateway.Status.EndpointID
+			binding.Status.AssignedAddress = clientAddress + "/128"
+			binding.Status.PeerAddress = peerAddress + "/128"
+			binding.Status.Routes = append([]string(nil), gateway.Spec.Routes...)
+			binding.Status.RelayURLs = append([]string(nil), gateway.Spec.RelayURLs...)
+			status, reason, message = metav1.ConditionTrue, "Approved", "project ConnectGateway automatically approves this Connector for its configured routes"
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	meta.SetStatusCondition(&binding.Status.Conditions, metav1.Condition{Type: "Accepted", Status: status, Reason: reason, Message: message, ObservedGeneration: binding.Generation})
+	binding.Status.ObservedGeneration = binding.Generation
+	if reflect.DeepEqual(before, &binding.Status) {
+		return nil
+	}
+	return c.Status().Update(ctx, binding)
+}
+
+func gatewayInterfaceName(project, network, gatewayKey string) string {
+	digest := gatewayDigest(project, network, gatewayKey)
+	return fmt.Sprintf("dc%x", digest[:5])
+}
+
+func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, secretName string) map[string]interface{} {
+	instanceType := spec.InstanceType
+	if instanceType == "" {
+		instanceType = "datumcloud-d1-standard-2"
+	}
+	container := map[string]interface{}{"name": "connect-gateway", "image": spec.Image, "args": []interface{}{"--config-file=/etc/connect/gateway/gateway.yaml", "--key-file=/etc/connect/key/key"}, "securityContext": map[string]interface{}{"capabilities": map[string]interface{}{"add": []interface{}{"NET_ADMIN"}}}, "volumeAttachments": []interface{}{map[string]interface{}{"name": "connect-config", "mountPath": "/etc/connect/gateway"}, map[string]interface{}{"name": "connect-key", "mountPath": "/etc/connect/key"}}}
+	if len(spec.RelayURLs) > 0 {
+		container["env"] = []interface{}{map[string]interface{}{"name": "IROH_GATEWAY_RELAY_URLS", "value": strings.Join(spec.RelayURLs, ",")}}
+	}
+	return map[string]interface{}{
+		"placements": []interface{}{map[string]interface{}{"name": "gateway", "locations": []interface{}{map[string]interface{}{"name": spec.LocationRef}}, "scaleSettings": map[string]interface{}{"minReplicas": int64(1), "maxReplicas": int64(1)}}},
+		"template": map[string]interface{}{"spec": map[string]interface{}{
+			"networkInterfaces": []interface{}{map[string]interface{}{"name": "eth0", "network": map[string]interface{}{"name": spec.NetworkRef}, "ipFamilies": []interface{}{"IPv6"}}},
+			"runtime": map[string]interface{}{"class": "general-purpose", "resources": map[string]interface{}{"instanceType": instanceType}, "sandbox": map[string]interface{}{
+				"sysctls":    []interface{}{map[string]interface{}{"name": "net.ipv6.conf.all.forwarding", "value": "1"}, map[string]interface{}{"name": "net.ipv6.conf.default.forwarding", "value": "1"}},
+				"containers": []interface{}{container},
+			}},
+			"volumes": []interface{}{map[string]interface{}{"name": "connect-config", "configMap": map[string]interface{}{"name": configName}}, map[string]interface{}{"name": "connect-key", "secret": map[string]interface{}{"secretName": secretName, "defaultMode": int64(256)}}},
+		}},
+	}
+}
+
+func gatewayChildName(parent, suffix string) string {
+	name := strings.Trim(strings.ToLower(parent), "-")
+	if len(name) > 37 {
+		name = name[:37]
+	}
+	hash := sha256.Sum256([]byte(parent + "/" + suffix))
+	return fmt.Sprintf("connect-%s-%s-%x", name, suffix, hash[:4])
+}
+
+func gatewayPeerAddresses(project, network, clientKey, gatewayKey string) (string, string, string) {
+	a, b := clientKey, gatewayKey
+	if b < a {
+		a, b = b, a
+	}
+	address := func(key string) string {
+		digest := gatewayDigest(project, network, a, b, key)
+		var address [16]byte
+		copy(address[:], digest[:16])
+		address[0] = 0xfd
+		return netip.AddrFrom16(address).String()
+	}
+	label := gatewayDigest(project, network, gatewayKey)
+	return address(clientKey), address(gatewayKey), fmt.Sprintf("dc%x", label[:5])
+}
+
+func gatewayDigest(parts ...string) [32]byte {
+	hash := sha256.New()
+	hash.Write([]byte("datum-connect/peer-host/v1\x00"))
+	var length [8]byte
+	for _, part := range parts {
+		binary.BigEndian.PutUint64(length[:], uint64(len(part)))
+		hash.Write(length[:])
+		hash.Write([]byte(part))
+	}
+	var out [32]byte
+	copy(out[:], hash.Sum(nil))
+	return out
+}
+
+func schemeForGateway() *runtime.Scheme {
+	s := runtime.NewScheme()
+	_ = corev1.AddToScheme(s)
+	_ = connectv1alpha1.AddToScheme(s)
+	return s
 }
 
 func contains(values []string, value string) bool {
