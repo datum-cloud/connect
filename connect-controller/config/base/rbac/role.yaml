@@ -1,0 +1,39 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: connect-manager
+rules:
+- apiGroups:
+  - connect.datumapis.com
+  resources:
+  - connectgateways
+  - connectoradvertisements
+  - connectorclasses
+  - connectors
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - connect.datumapis.com
+  resources:
+  - connectgateways/status
+  - connectoradvertisements/status
+  - connectorclasses/status
+  - connectors/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch

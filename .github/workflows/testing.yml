@@ -6,6 +6,7 @@ on:
       - 'connect-plugin/**/*.go'
       - 'connect-plugin/go.mod'
       - 'connect-plugin/go.sum'
+      - 'connect-controller/**'
       - 'connect-lib/**/*.rs'
       - 'connect-lib/**/Cargo.toml'
       - 'connect-lib/Cargo.lock'
@@ -21,6 +22,7 @@ on:
       - 'connect-plugin/**/*.go'
       - 'connect-plugin/go.mod'
       - 'connect-plugin/go.sum'
+      - 'connect-controller/**'
       - 'connect-lib/**/*.rs'
       - 'connect-lib/**/Cargo.toml'
       - 'connect-lib/Cargo.lock'
@@ -36,6 +38,24 @@ permissions:
   contents: read
 
 jobs:
+  connect-controller:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: connect-controller
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: connect-controller/go.mod
+          cache-dependency-path: connect-controller/go.sum
+      - name: Test
+        run: go test -timeout 5m ./...
+      - name: Build
+        run: go build ./cmd/controller
+      - name: Render deployment
+        run: kubectl kustomize config/default >/dev/null
+
   windows-gnu-link:
     runs-on: ubuntu-latest
     steps:
