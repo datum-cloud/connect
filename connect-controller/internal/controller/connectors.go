@@ -406,6 +406,10 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	workload.SetName(gatewayChildName(gateway.Name, "workload"))
 	workload.SetNamespace(gateway.Namespace)
 	desired := gatewayWorkloadSpec(gateway.Spec, configMap.Name, secretName)
+	template := desired["template"].(map[string]interface{})
+	template["metadata"] = map[string]interface{}{"annotations": map[string]interface{}{
+		"connect.datumapis.com/config-hash": fmt.Sprintf("%x", sha256.Sum256([]byte(gatewayYAML+"\x00"+string(grantJSON)))),
+	}}
 	_, err = controllerutil.CreateOrUpdate(ctx, c, workload, func() error {
 		if err := controllerutil.SetControllerReference(gateway, workload, scheme); err != nil {
 			return err

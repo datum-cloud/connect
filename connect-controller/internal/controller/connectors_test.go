@@ -92,6 +92,10 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: "project"}, workload); err != nil {
 		t.Fatal(err)
 	}
+	initialConfigHash, found, err := unstructured.NestedString(workload.Object, "spec", "template", "metadata", "annotations", "connect.datumapis.com/config-hash")
+	if err != nil || !found || initialConfigHash == "" {
+		t.Fatalf("initial config hash=%q found=%t err=%v", initialConfigHash, found, err)
+	}
 	placements, found, err := unstructured.NestedSlice(workload.Object, "spec", "placements")
 	if err != nil || !found || len(placements) != 1 {
 		t.Fatalf("placements=%v found=%t err=%v, want one", placements, found, err)
@@ -132,6 +136,13 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	}
 	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: "project"}, workload); err != nil {
+		t.Fatal(err)
+	}
+	updatedConfigHash, found, err := unstructured.NestedString(workload.Object, "spec", "template", "metadata", "annotations", "connect.datumapis.com/config-hash")
+	if err != nil || !found || updatedConfigHash == initialConfigHash {
+		t.Fatalf("updated config hash=%q initial=%q found=%t err=%v; expected grant changes to roll the Workload", updatedConfigHash, initialConfigHash, found, err)
 	}
 	configMap := &corev1.ConfigMap{}
 	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: "project"}, configMap); err != nil {
