@@ -92,6 +92,10 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: "project"}, workload); err != nil {
 		t.Fatal(err)
 	}
+	deploymentLabel := workload.GetName() + "-gateway-us-central-1"
+	if len(deploymentLabel) > 63 {
+		t.Fatalf("generated WorkloadDeployment name %q exceeds Kubernetes label limit", deploymentLabel)
+	}
 	initialConfigHash, found, err := unstructured.NestedString(workload.Object, "spec", "template", "metadata", "annotations", "connect.datumapis.com/config-hash")
 	if err != nil || !found || initialConfigHash == "" {
 		t.Fatalf("initial config hash=%q found=%t err=%v", initialConfigHash, found, err)

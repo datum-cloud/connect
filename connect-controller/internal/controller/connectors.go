@@ -420,6 +420,22 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	if err != nil {
 		return fmt.Errorf("reconcile Compute gateway Workload: %w", err)
 	}
+	legacyWorkloadName := legacyGatewayWorkloadName(gateway.Name)
+	if legacyWorkloadName != workload.GetName() {
+		legacy := &unstructured.Unstructured{}
+		legacy.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
+		legacy.SetName(legacyWorkloadName)
+		legacy.SetNamespace(gateway.Namespace)
+		if err := c.Get(ctx, types.NamespacedName{Name: legacyWorkloadName, Namespace: gateway.Namespace}, legacy); err == nil {
+			if metav1.IsControlledBy(legacy, gateway) {
+				if err := c.Delete(ctx, legacy); err != nil && !apierrors.IsNotFound(err) {
+					return fmt.Errorf("remove legacy Compute gateway Workload: %w", err)
+				}
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("get legacy Compute gateway Workload: %w", err)
+		}
+	}
 	gateway.Status.WorkloadRef = workload.GetName()
 	gateway.Status.EndpointID = endpointID
 	return nil
@@ -489,12 +505,24 @@ func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, se
 }
 
 func gatewayChildName(parent, suffix string) string {
+	hash := sha256.Sum256([]byte(parent + "/" + suffix))
+	if suffix == "workload" {
+		return fmt.Sprintf("connect-gw-%x", hash[:4])
+	}
 	name := strings.Trim(strings.ToLower(parent), "-")
 	if len(name) > 37 {
 		name = name[:37]
 	}
-	hash := sha256.Sum256([]byte(parent + "/" + suffix))
 	return fmt.Sprintf("connect-%s-%s-%x", name, suffix, hash[:4])
+}
+
+func legacyGatewayWorkloadName(parent string) string {
+	name := strings.Trim(strings.ToLower(parent), "-")
+	if len(name) > 37 {
+		name = name[:37]
+	}
+	hash := sha256.Sum256([]byte(parent + "/workload"))
+	return fmt.Sprintf("connect-%s-workload-%x", name, hash[:4])
 }
 
 func gatewayPeerAddresses(project, network, clientKey, gatewayKey string) (string, string, string) {
