@@ -1,0 +1,25 @@
+apiVersion: iam.miloapis.com/v1alpha1
+kind: Role
+metadata:
+  name: connect.datumapis.com-viewer
+  annotations:
+    kubernetes.io/display-name: Connect Viewer
+    kubernetes.io/description: "View Connectors, advertisements, classes, gateways, and network bindings"
+spec:
+  launchStage: Beta
+  includedPermissions:
+    - connect.datumapis.com/connectors.list
+    - connect.datumapis.com/connectors.get
+    - connect.datumapis.com/connectors.watch
+    - connect.datumapis.com/connectoradvertisements.list
+    - connect.datumapis.com/connectoradvertisements.get
+    - connect.datumapis.com/connectoradvertisements.watch
+    - connect.datumapis.com/connectorclasses.list
+    - connect.datumapis.com/connectorclasses.get
+    - connect.datumapis.com/connectorclasses.watch
+    - connect.datumapis.com/connectgateways.list
+    - connect.datumapis.com/connectgateways.get
+    - connect.datumapis.com/connectgateways.watch
+    - connect.datumapis.com/connectnetworkbindings.list
+    - connect.datumapis.com/connectnetworkbindings.get
+    - connect.datumapis.com/connectnetworkbindings.watch
