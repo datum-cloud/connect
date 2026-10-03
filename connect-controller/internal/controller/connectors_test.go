@@ -127,6 +127,30 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if len(attachments) != 1 {
 		t.Fatalf("gateway containers=%v, want one", attachments)
 	}
+	container, ok := attachments[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("gateway container=%T, want map", attachments[0])
+	}
+	command, _, _ := unstructured.NestedStringSlice(container, "command")
+	if len(command) != 2 || command[0] != "/bin/sh" {
+		t.Fatalf("gateway command=%v, want TUN setup wrapper", command)
+	}
+	args, _, _ := unstructured.NestedStringSlice(container, "args")
+	if len(args) != 1 || !strings.Contains(args[0], "mknod /dev/net/tun c 10 200") {
+		t.Fatalf("gateway args=%v, want TUN device setup", args)
+	}
+	securityContext, ok := container["securityContext"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("gateway securityContext=%T, want map", container["securityContext"])
+	}
+	capabilities, ok := securityContext["capabilities"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("gateway capabilities=%T, want map", securityContext["capabilities"])
+	}
+	added, ok := capabilities["add"].([]interface{})
+	if !ok || len(added) != 2 || added[0] != "NET_ADMIN" || added[1] != "MKNOD" {
+		t.Fatalf("gateway capabilities=%v, want NET_ADMIN and MKNOD", capabilities["add"])
+	}
 
 	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
 	if err := c.Create(ctx, binding); err != nil {

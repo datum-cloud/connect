@@ -487,7 +487,7 @@ func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, se
 	if instanceType == "" {
 		instanceType = "datumcloud/d1-standard-2"
 	}
-	container := map[string]interface{}{"name": "connect-gateway", "image": spec.Image, "args": []interface{}{"--config-file=/etc/connect/gateway/gateway.yaml", "--key-file=/etc/connect/key/key"}, "securityContext": map[string]interface{}{"capabilities": map[string]interface{}{"add": []interface{}{"NET_ADMIN"}}}, "volumeAttachments": []interface{}{map[string]interface{}{"name": "connect-config", "mountPath": "/etc/connect/gateway"}, map[string]interface{}{"name": "connect-key", "mountPath": "/etc/connect/key"}}}
+	container := map[string]interface{}{"name": "connect-gateway", "image": spec.Image, "command": []interface{}{"/bin/sh", "-ec"}, "args": []interface{}{"mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && exec /usr/local/bin/iroh-gateway --config-file=/etc/connect/gateway/gateway.yaml --key-file=/etc/connect/key/key"}, "securityContext": map[string]interface{}{"capabilities": map[string]interface{}{"add": []interface{}{"NET_ADMIN", "MKNOD"}}}, "volumeAttachments": []interface{}{map[string]interface{}{"name": "connect-config", "mountPath": "/etc/connect/gateway"}, map[string]interface{}{"name": "connect-key", "mountPath": "/etc/connect/key"}}}
 	if len(spec.RelayURLs) > 0 {
 		container["env"] = []interface{}{map[string]interface{}{"name": "IROH_GATEWAY_RELAY_URLS", "value": strings.Join(spec.RelayURLs, ",")}}
 	}
