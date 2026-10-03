@@ -51,25 +51,33 @@ class Platform(http.server.BaseHTTPRequestHandler):
         self.observed_tokens.add(bearer)
         parts = self.path.strip('/').split('/')
         if 'connectorclasses' in parts:
-            item = {'metadata': {'name': 'local-masque', 'annotations': {'connect.datum.net/transport': 'masque-v1'}}}
+            item = {
+                'metadata': {'name': 'local-masque', 'annotations': {'connect.datum.net/transport': 'masque-v1'}},
+                'spec': {'transports': ['masque-v1']},
+                'status': {'conditions': [{'type': 'Ready', 'status': 'True'}]},
+            }
             if self.gateway_connectors:
                 item['metadata']['annotations']['connect.datum.net/gateway-connectors'] = json.dumps(self.gateway_connectors)
             return self.reply(200, {'items': [item]} if parts[-1] == 'connectorclasses' else item)
         plural_index = next((i for i, x in enumerate(parts) if x in ('connectors', 'connectoradvertisements', 'httpproxies')), None)
         if plural_index is None:
             return self.reply(404, {})
+        # NSO and Connect both expose a `connectors` resource, but they live in
+        # different API groups and each Connector is independently owned.
+        api_indices = [i for i, part in enumerate(parts) if part == 'apis']
+        group = parts[api_indices[-1] + 1] if api_indices and api_indices[-1] + 1 < len(parts) else ''
         plural = parts[plural_index]
         name = parts[plural_index+1] if len(parts) > plural_index+1 else ''
-        key = (plural, name)
+        key = (group, plural, name)
         with self.lock:
             if self.command == 'GET':
                 if not name:
-                    return self.reply(200, {'items': [v for (p, _), v in self.objects.items() if p == plural]})
+                    return self.reply(200, {'items': [v for (g, p, _), v in self.objects.items() if g == group and p == plural]})
                 return self.reply(200 if key in self.objects else 404, self.objects.get(key, {}))
             value = json.loads(body or b'{}')
             self.writes.append((self.command, plural))
             if self.command == 'POST':
-                key = (plural, value['metadata']['name'])
+                key = (group, plural, value['metadata']['name'])
                 if key in self.objects:
                     return self.reply(409, {})
                 value['metadata'].update(uid='uid-' + key[1], resourceVersion='1', generation=1)
@@ -195,7 +203,7 @@ def main():
         result = subprocess.run([*prefix, *command, '--project', project, '--daemon-url', f'http://127.0.0.1:{ports[name]}', '--output', 'json'], cwd=root, env={**os.environ, 'DATUM_CONNECT_TOKEN': bearer or token(name)}, text=True, capture_output=True, timeout=45)
         with (root/'cli.log').open('a') as log:
             log.write(f'{name} {command}\nexit={result.returncode}\n{result.stdout}{result.stderr}\n')
-        assert (result.returncode == 0) == (expect == 0), f'{name} {command}: {result.stdout}{result.stderr}'
+        assert (result.returncode == 0) == (expect == 0), f'{name} {command}: {result.stdout}{result.stderr}; writes={Platform.writes}; resources={list(Platform.objects)}'
         return json.loads(result.stdout) if result.returncode == 0 else result.stderr
 
     def api(name, method, path, body=None, bearer=None):
@@ -310,7 +318,7 @@ def main():
         public_service = cli('alice', 'serve', f'127.0.0.1:{denied_origin.server_port}', '--public', '--hostname', 'preview.example.test')
         assert public_service['public'] and not public_service['ready'], 'hostname alone must not imply public readiness'
         with Platform.lock:
-            proxy = Platform.objects[('httpproxies', public_service['id'])]
+            proxy = Platform.objects[('networking.datumapis.com', 'httpproxies', public_service['id'])]
             proxy['status'] = {'hostnames': ['preview.example.test'], 'conditions': [
                 {'type': kind, 'status': 'True', 'observedGeneration': 1}
                 for kind in ('Accepted', 'Programmed', 'CertificatesReady')
