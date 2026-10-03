@@ -465,7 +465,7 @@ func gatewayInterfaceName(project, network, gatewayKey string) string {
 func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, secretName string) map[string]interface{} {
 	instanceType := spec.InstanceType
 	if instanceType == "" {
-		instanceType = "datumcloud-d1-standard-2"
+		instanceType = "datumcloud/d1-standard-2"
 	}
 	container := map[string]interface{}{"name": "connect-gateway", "image": spec.Image, "args": []interface{}{"--config-file=/etc/connect/gateway/gateway.yaml", "--key-file=/etc/connect/key/key"}, "securityContext": map[string]interface{}{"capabilities": map[string]interface{}{"add": []interface{}{"NET_ADMIN"}}}, "volumeAttachments": []interface{}{map[string]interface{}{"name": "connect-config", "mountPath": "/etc/connect/gateway"}, map[string]interface{}{"name": "connect-key", "mountPath": "/etc/connect/key"}}}
 	if len(spec.RelayURLs) > 0 {
