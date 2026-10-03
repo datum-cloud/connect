@@ -27,7 +27,11 @@ async fn joined_grants_share_one_endpoint_with_tcp_udp_and_revoke_independently(
             CancellationToken::new()
         )
         .await,
-        Err(Error::Rejected(StatusCode::FORBIDDEN))
+        Err(Error::RejectedWithReason {
+            status: StatusCode::FORBIDDEN,
+            reason: RejectionReason::PeerNetworkNotApproved,
+            ..
+        })
     ));
     let config = config();
     let grant = Grant {
@@ -133,7 +137,11 @@ async fn joined_grants_share_one_endpoint_with_tcp_udp_and_revoke_independently(
                     CancellationToken::new()
                 )
                 .await,
-                Err(Error::Rejected(StatusCode::FORBIDDEN))
+                Err(Error::RejectedWithReason {
+                    status: StatusCode::FORBIDDEN,
+                    reason: RejectionReason::PeerNetworkNotApproved,
+                    ..
+                })
             ));
         }
         tcp_session.write_all(label).await.unwrap();
@@ -660,7 +668,11 @@ async fn unauthorized_peer_and_failed_readiness_never_join() {
             CancellationToken::new()
         )
         .await,
-        Err(Error::Rejected(StatusCode::FORBIDDEN))
+        Err(Error::RejectedWithReason {
+            status: StatusCode::FORBIDDEN,
+            reason: RejectionReason::PeerNetworkNotApproved,
+            ..
+        })
     ));
     assert!(matches!(
         connect(
@@ -670,7 +682,11 @@ async fn unauthorized_peer_and_failed_readiness_never_join() {
             CancellationToken::new()
         )
         .await,
-        Err(Error::Rejected(StatusCode::FORBIDDEN))
+        Err(Error::RejectedWithReason {
+            status: StatusCode::FORBIDDEN,
+            reason: RejectionReason::PeerNetworkNotApproved,
+            ..
+        })
     ));
     assert!(accepted.try_recv().is_err());
     let connecting = tokio::spawn(connect(
@@ -752,6 +768,8 @@ async fn invalid_wire_packets_drop_and_full_receiver_does_not_block_cancel() {
         },
         config.clone(),
         Role::Gateway,
+        "test-network".into(),
+        "test-session".into(),
         outgoing,
         packets,
         cancel.clone(),
@@ -990,6 +1008,8 @@ async fn path_capacity_failure_records_reason_before_close() {
         },
         config,
         Role::Gateway,
+        "test-network".into(),
+        "test-session".into(),
         outgoing,
         packets,
         cancel,
@@ -1038,6 +1058,8 @@ async fn reliable_packet_fallback_is_rejected_and_remote_mtu_reason_is_safe() {
             },
             config,
             Role::Gateway,
+            "test-network".into(),
+            "test-session".into(),
             outgoing,
             packets,
             cancel,

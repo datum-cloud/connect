@@ -1,9 +1,12 @@
 package commands
 
 import (
+	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -20,9 +23,10 @@ import (
 var ensureNetworking = daemonservice.EnsureNetworking
 
 type networkPlan struct {
-	Network      string                        `json:"network"`
-	HelperConfig daemonservice.HelperApprovals `json:"helper_config"`
-	Binding      struct {
+	Network        string                        `json:"network"`
+	ManagedGateway bool                          `json:"managed_gateway"`
+	HelperConfig   daemonservice.HelperApprovals `json:"helper_config"`
+	Binding        struct {
 		Peer            string        `json:"peer"`
 		Address         string        `json:"assigned_address"`
 		PeerAddress     string        `json:"peer_address"`
@@ -55,7 +59,88 @@ func formatNetworkRules(rules []networkRule) string {
 	if len(text) == 0 {
 		return "deny all"
 	}
-	return strings.Join(text, "; ")
+	return strings.Join(text, ", ")
+}
+
+func displayPeer(peer string) string {
+	peer = strings.TrimSpace(peer)
+	if peer == "" {
+		return ""
+	}
+	if len(peer) > 24 && len(peer)%2 == 0 {
+		if _, err := hex.DecodeString(peer); err == nil {
+			return peer[:12] + "…" + peer[len(peer)-6:]
+		}
+	}
+	return peer
+}
+
+func writeNetworkApproval(out io.Writer, plan networkPlan, peer string) {
+	fmt.Fprintf(out, "Connect IP: %s\n", plan.Network)
+	peerLabel := displayPeer(peer)
+	if peerLabel == "" {
+		peerLabel = displayPeer(plan.Binding.Peer)
+	}
+	if peerLabel != "" {
+		fmt.Fprintf(out, "Peer: %s\n", peerLabel)
+	}
+	if plan.ManagedGateway {
+		if len(plan.Binding.Routes) > 0 {
+			fmt.Fprintf(out, "Routes through VPC gateway: %s\n", strings.Join(plan.Binding.Routes, ", "))
+		}
+		fmt.Fprintln(out, "This approves the local interface and these routes. VPC firewall rules still control access to workloads.")
+		return
+	}
+	if len(plan.Binding.Routes) > 0 {
+		fmt.Fprintf(out, "Route via peer: %s\n", strings.Join(plan.Binding.Routes, ", "))
+		fmt.Fprintf(out, "Traffic to peer: %s\n", formatNetworkRules(plan.Binding.Outbound))
+	}
+	if len(plan.Binding.AdvertiseRoutes) > 0 {
+		fmt.Fprintf(out, "Route shared with peer: %s\n", strings.Join(plan.Binding.AdvertiseRoutes, ", "))
+		fmt.Fprintf(out, "Traffic from peer: %s\n", formatNetworkRules(plan.Binding.Inbound))
+		fmt.Fprintln(out, "Forwarding must already be configured on this device.")
+	}
+	if len(plan.Binding.Routes) == 0 && len(plan.Binding.AdvertiseRoutes) == 0 {
+		fmt.Fprintf(out, "Traffic to peer: %s\n", formatNetworkRules(plan.Binding.Outbound))
+	}
+}
+
+func waitForPeer(ctx context.Context, client *connectapi.Client, project, network string, timeout time.Duration) (json.RawMessage, bool, error) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		data, err := client.Request(ctx, http.MethodGet, "/v1/status", project, nil)
+		if err != nil {
+			return nil, false, err
+		}
+		var status struct {
+			Networks []json.RawMessage `json:"networks"`
+		}
+		if err := json.Unmarshal(data, &status); err != nil {
+			return nil, false, err
+		}
+		for _, attachment := range status.Networks {
+			var value networkDisplay
+			if err := json.Unmarshal(attachment, &value); err != nil {
+				return nil, false, err
+			}
+			if value.Network == network {
+				if value.Connected {
+					return attachment, true, nil
+				}
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case <-deadline.C:
+			return nil, false, nil
+		case <-ticker.C:
+		}
+	}
 }
 
 func validateNetworkPlan(plan networkPlan, network string) error {
@@ -69,12 +154,34 @@ func validateNetworkPlan(plan networkPlan, network string) error {
 	return nil
 }
 
+func shouldWaitForJoin(wait, noWait bool, network networkDisplay) bool {
+	if noWait {
+		return false
+	}
+	// Routed attachments are useful only after their peer session is live. Wait
+	// by default so a following curl does not race the tunnel handshake.
+	return wait || (network.Mode == "peer" && hasSubnetRoutes(network))
+}
+
+func hasSubnetRoutes(network networkDisplay) bool {
+	for _, route := range network.Routes {
+		if route != network.PeerAddress {
+			return true
+		}
+	}
+	return false
+}
+
 func newJoin(opts *options) *cobra.Command {
 	var peer, executable string
 	var tcp, udp []string
 	var routes, advertise []string
-	var ping, upgrade bool
-	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join an IP attachment; guide peer or subnet setup on first use", Long: "Join a saved IP attachment. For first-time peer setup, pass --peer\nand explicit traffic permissions. Both devices use the same network name\nand approve each other. Connect generates matching IPv6 host addresses.\nAdministrator approval enables only the displayed routes; your daemon keeps\nyour ordinary login. No cloud VPC membership is created.\n\nFor IPv6 subnet access, the client uses --routes and the router uses\n--advertise-routes with exactly matching prefixes. Traffic flags allow only\nclient-initiated traffic to those destinations, plus tracked replies.\nThe router operator separately configures forwarding, firewall, and source NAT\nor return routes. Connect does not change global forwarding or NAT settings.\nWithout route flags, permissions apply in both directions between peer hosts.\nSaved configuration survives restart; active attachments require explicit rejoin.\nScripts never prompt or elevate. Existing operator-managed IP configurations still work.", Example: "  datumctl connect join friend --peer susquehanna --allow-tcp 8080 --allow-ping\n  datumctl connect join vpc --peer router --routes fd20:1::/64 --allow-tcp 22\n  datumctl connect join vpc --peer laptop --advertise-routes fd20:1::/64 --allow-tcp 22\n  datumctl connect join friend", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	var ping, upgrade, wait, noWait bool
+	var waitTimeout time.Duration
+	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC gateway or direct Connector", Long: "Join the ready ConnectGateway configured for NETWORK. Connect creates or reuses this device's ConnectNetworkBinding, then asks for Administrator approval before installing the local interface and approved routes.\n\nIf no managed gateway exists, pass --peer and explicit traffic permissions\nfor direct Connector setup. Both peers use the same network name and approve\neach other. Routed direct attachments wait for the peer by default.\n\nLocal attachments disappear on daemon restart; run an explicit rejoin to\nreattach. The project binding remains. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if wait && noWait {
+			return fmt.Errorf("choose either --wait or --no-wait")
+		}
 		if peer == "" && (len(tcp) > 0 || len(udp) > 0 || ping || len(routes) > 0 || len(advertise) > 0) {
 			return fmt.Errorf("traffic flags require --peer on first-time setup; saved permissions are not silently changed")
 		}
@@ -155,7 +262,7 @@ func newJoin(opts *options) *cobra.Command {
 			if !guidedSetupEnabled(cmd, opts) {
 				return fmt.Errorf("networking needs local administrator approval. Run this join interactively on the daemon's device; scripts and remote API clients never elevate")
 			}
-			data, planErr := client.Request(cmd.Context(), http.MethodGet, "/v1/networks/"+url.PathEscape(args[0])+"/setup", project, nil)
+			data, planErr := client.Request(cmd.Context(), http.MethodPost, "/v1/networks/"+url.PathEscape(args[0])+"/setup", project, nil)
 			if planErr != nil {
 				return friendlyError(cmd, opts, project, planErr)
 			}
@@ -166,17 +273,10 @@ func newJoin(opts *options) *cobra.Command {
 			if err := validateNetworkPlan(plan, args[0]); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "IP attachment %q\n  Peer key: %s\n  This device: %s\n  Peer: %s\n", plan.Network, plan.Binding.Peer, plan.Binding.Address, plan.Binding.PeerAddress)
-			fmt.Fprintf(cmd.ErrOrStderr(), "  Inbound: %s\n  Outbound: %s\n", formatNetworkRules(plan.Binding.Inbound), formatNetworkRules(plan.Binding.Outbound))
-			if len(plan.Binding.Routes) > 0 {
-				fmt.Fprintf(cmd.ErrOrStderr(), "  Routes through peer: %s\n", strings.Join(plan.Binding.Routes, ", "))
-			}
-			if len(plan.Binding.AdvertiseRoutes) > 0 {
-				fmt.Fprintf(cmd.ErrOrStderr(), "  Forward for peer: %s\n  Configure forwarding, firewall, and a return path on this router separately.\n", strings.Join(plan.Binding.AdvertiseRoutes, ", "))
-			}
-			question := "Approve a privileged networking helper for these exact routes? Your daemon and login stay unprivileged."
+			writeNetworkApproval(cmd.ErrOrStderr(), plan, peer)
+			question := "Install the privileged helper and approve this access?"
 			if upgrade {
-				question = "Upgrade the networking helper? Active IP attachments will disconnect and need rejoining; TCP/UDP serve and dial stay running."
+				question = "Upgrade the helper? Active IP attachments will disconnect; services and local ports stay running."
 			}
 			if err := confirmSetup(cmd, question); err != nil {
 				return err
@@ -200,6 +300,25 @@ func newJoin(opts *options) *cobra.Command {
 		if err != nil {
 			return friendlyError(cmd, opts, project, err)
 		}
+		if waitTimeout > 0 {
+			var joined networkDisplay
+			if json.Unmarshal(result, &joined) == nil && shouldWaitForJoin(wait, noWait, joined) && joined.Mode == "peer" && !joined.Connected {
+				if hasSubnetRoutes(joined) {
+					fmt.Fprintf(cmd.ErrOrStderr(), "Waiting for the VPC connection to become ready (up to %s; Ctrl+C stops waiting, not the attachment)…\n", waitTimeout)
+				} else {
+					fmt.Fprintf(cmd.ErrOrStderr(), "Waiting for the peer to connect (up to %s; Ctrl+C stops waiting, not the attachment)…\n", waitTimeout)
+				}
+				connected, ok, waitErr := waitForPeer(cmd.Context(), client, project, args[0], waitTimeout)
+				if waitErr != nil {
+					return waitErr
+				}
+				if ok {
+					result = connected
+				} else {
+					return fmt.Errorf("network %q is still waiting for its peer after %s; the attachment remains active. Retry `datumctl connect join %s` when the peer is available, or use `datumctl connect status` to inspect it", args[0], waitTimeout, args[0])
+				}
+			}
+		}
 		return writeJSON(cmd, result)
 	}}
 	cmd.Flags().StringVar(&peer, "peer", "", "Connector name or public key for first-time direct IP setup")
@@ -210,6 +329,9 @@ func newJoin(opts *options) *cobra.Command {
 	cmd.Flags().BoolVar(&ping, "allow-ping", false, "Permit ping (subnet mode: client to subnet; host mode: both directions)")
 	cmd.Flags().StringVar(&executable, "helper-executable", "", "Explicit local helper build instead of downloading this plugin's release")
 	cmd.Flags().BoolVar(&upgrade, "upgrade-helper", false, "Approve matching-helper upgrade; active IP attachments disconnect")
+	cmd.Flags().BoolVar(&wait, "wait", false, "Wait for the peer to connect after joining")
+	cmd.Flags().BoolVar(&noWait, "no-wait", false, "Return immediately even if a routed peer is not connected yet")
+	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", 5*time.Minute, "Maximum time to wait with --wait (for example 30s or 5m)")
 	return cmd
 }
 

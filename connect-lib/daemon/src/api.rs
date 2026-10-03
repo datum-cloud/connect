@@ -47,7 +47,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/dials/{port}", delete(delete_dial))
         .route("/v1/networks", post(join_network))
         .route("/v1/networks/prepare", post(prepare_network))
-        .route("/v1/networks/{network}/setup", get(network_setup))
+        .route("/v1/networks/{network}/setup", post(network_setup))
         .route("/v1/networks/{network}", delete(leave_network))
         .route("/v1/ping", post(ping))
         .route("/v1/tokens", post(mint_token).get(list_tokens))
@@ -1066,6 +1066,13 @@ async fn network_setup(
     authorized(&state, &headers, &query.project)
         .await?
         .require_setup()?;
+    if let Some(plan) = state
+        .control
+        .managed_network_setup(&query.project, &network)
+        .await?
+    {
+        return Ok(Json(plan));
+    }
     setup_plan(&state.store.snapshot().await, &query.project, &network).map(Json)
 }
 
@@ -1196,6 +1203,28 @@ async fn join_network(
         };
         if !helper.is_ok_and(|helper| helper.approvals.contains(&approval)) {
             return Err(ApiError::new(StatusCode::CONFLICT, "Administrator approval is required for this IP attachment. Run connect join interactively on this device to set up networking.").with_code("network_setup_required"));
+        }
+    } else if let Some(plan) = state
+        .control
+        .managed_network_setup(&query.project, &request.network)
+        .await?
+    {
+        let expected: connect_ip_adapter::helper::Config =
+            serde_json::from_value(plan.get("helper_config").cloned().ok_or_else(|| {
+                ApiError::internal("Managed network setup plan lacks helper_config")
+            })?)
+            .map_err(|_| {
+                ApiError::internal("Managed network setup plan has invalid helper_config")
+            })?;
+        let helper =
+            connect_ip_adapter::helper::inspect(&crate::networking::helper_socket()?).await;
+        if !helper.is_ok_and(|helper| {
+            expected
+                .approvals
+                .iter()
+                .all(|approval| helper.approvals.contains(approval))
+        }) {
+            return Err(ApiError::new(StatusCode::CONFLICT, "Administrator approval is required for this VPC attachment. Run connect join interactively on this device to approve the exact address and routes.").with_code("network_setup_required"));
         }
     }
     let result = state

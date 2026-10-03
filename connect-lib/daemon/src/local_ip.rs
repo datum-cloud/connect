@@ -39,6 +39,10 @@ pub struct Binding {
     pub network: String,
     pub gateway: String,
     pub addresses: Vec<SocketAddr>,
+    /// Relay-only ConnectGateway endpoints are valid when the VPC gateway has
+    /// no public underlay address. Existing static approvals leave this empty.
+    #[serde(default)]
+    pub relay_urls: Vec<String>,
     pub assigned_address: String,
     pub routes: Vec<String>,
     pub interface_name: String,
@@ -146,8 +150,9 @@ impl LocalIpConfig {
             let discovered = self.peer_bindings.iter().any(|p| {
                 p.project == binding.project && p.network == binding.network && p.discover
             });
-            if (binding.addresses.is_empty() && !discovered)
+            if (binding.addresses.is_empty() && !discovered && binding.relay_urls.is_empty())
                 || binding.addresses.len() > 16
+                || binding.relay_urls.len() > 8
                 || binding
                     .addresses
                     .iter()
@@ -375,12 +380,12 @@ fn read_config(path: &Path) -> Result<Vec<u8>, ApiError> {
 }
 
 impl Binding {
-    fn address(&self) -> Result<IpNet, ApiError> {
+    pub(crate) fn address(&self) -> Result<IpNet, ApiError> {
         self.assigned_address.parse().map_err(|_| {
             ApiError::bad_request("Assigned address must be an IPv4 /32 or IPv6 /128 CIDR")
         })
     }
-    fn parsed_routes(&self) -> Result<Vec<IpNet>, ApiError> {
+    pub(crate) fn parsed_routes(&self) -> Result<Vec<IpNet>, ApiError> {
         if self.routes.is_empty() || self.routes.len() > 32 {
             return Err(ApiError::bad_request(
                 "Local IP bindings require 1 to 32 explicit IPv4 or IPv6 routes",
@@ -451,13 +456,30 @@ pub async fn join(
     for address in &binding.addresses {
         peer = peer.with_ip_addr(*address);
     }
+    if !binding.relay_urls.is_empty() {
+        let relays = crate::relays::parse(&binding.relay_urls.join(","))?;
+        for relay in relays {
+            peer = peer.with_relay_url(relay);
+        }
+    }
     let session = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         ip::connect(endpoint, peer, &binding.network, cancel.clone()),
     )
     .await
     .map_err(|_| ApiError::internal("CONNECT-IP gateway setup timed out"))?
-    .map_err(|error| handshake_error(&binding.network, &connector, error))?;
+    .map_err(|error| {
+        tracing::warn!(
+            project=%binding.project,
+            network=%binding.network,
+            connector=%connector,
+            peer=%binding.gateway,
+            %error,
+            stage="connect_ip_setup_failed",
+            "local CONNECT-IP setup failed"
+        );
+        handshake_error(&binding.network, &connector, error)
+    })?;
     let actual_routes: HashSet<_> = session
         .config
         .routes
@@ -570,6 +592,30 @@ fn handshake_error(network: &str, connector: &str, error: ip::Error) -> ApiError
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             format!("Cannot join network {network:?}: the approved IP MTU is {required} bytes, but this path can carry only {available} IP bytes per QUIC datagram. Check the direct or relay path MTU with the gateway operator, or configure matching supported MTUs on both endpoints (minimum 1280). No local interface was created"),
         ).with_code("local_ip_datagram_mtu_insufficient"),
+        ip::Error::RejectedWithReason {
+            status: axum::http::StatusCode::FORBIDDEN,
+            reason: ip::RejectionReason::PeerNetworkNotApproved,
+            session_id,
+        } => ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            format!("The peer rejected CONNECT-IP because it has no matching approval for network {network:?} and Connector {connector}. Confirm that both sides use the same network name and approve each other's Connector keys. Diagnostic session_id: {session_id}"),
+        ).with_code("local_ip_peer_network_not_approved"),
+        ip::Error::RejectedWithReason {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            reason: ip::RejectionReason::InvalidRequest,
+            session_id,
+        } => ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("The peer rejected the CONNECT-IP request as invalid for network {network:?}. Verify that both sides run compatible Connect versions. Diagnostic session_id: {session_id}"),
+        ).with_code("local_ip_invalid_peer_request"),
+        ip::Error::RejectedWithReason {
+            status,
+            reason,
+            session_id,
+        } => ApiError::new(
+            status,
+            format!("The peer rejected CONNECT-IP for network {network:?} (reason: {reason}). Diagnostic session_id: {session_id}"),
+        ).with_code("local_ip_peer_rejected"),
         ip::Error::Rejected(axum::http::StatusCode::FORBIDDEN) => ApiError::new(
             axum::http::StatusCode::FORBIDDEN,
             format!("The gateway has not approved network {network:?} for Connector {connector}. Ask the gateway operator to approve this Connector key and network in its IP grant"),
@@ -648,6 +694,33 @@ mod tests {
     }
     #[test]
     fn gateway_errors_identify_operator_action_and_preserve_status() {
+        let peer_denied = handshake_error(
+            "staging-vpc-mac",
+            "connector-key",
+            ip::Error::RejectedWithReason {
+                status: axum::http::StatusCode::FORBIDDEN,
+                reason: ip::RejectionReason::PeerNetworkNotApproved,
+                session_id: "0123456789abcdef-00000001".into(),
+            },
+        );
+        assert_eq!(peer_denied.status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            peer_denied.code.as_deref(),
+            Some("local_ip_peer_network_not_approved")
+        );
+        for expected in [
+            "staging-vpc-mac",
+            "connector-key",
+            "both sides",
+            "0123456789abcdef-00000001",
+        ] {
+            assert!(
+                peer_denied.message.contains(expected),
+                "missing {expected}: {}",
+                peer_denied.message
+            );
+        }
+
         let denied = handshake_error(
             "vpc",
             "connector-key",

@@ -134,12 +134,14 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 		if value.Connector != nil {
 			fmt.Fprintf(&out, "Connector: %s\n", value.Connector.Name)
 		}
+		shownNetworks := make(map[string]bool)
 		if value.Networking != nil && value.Networking.State != "not_required" {
 			fmt.Fprintf(&out, "IP networking helper: %s\n", strings.ReplaceAll(value.Networking.State, "_", " "))
 			if value.Networking.LastError != "" {
 				fmt.Fprintf(&out, "  %s\n", value.Networking.LastError)
 			}
 			for _, saved := range value.Networking.Saved {
+				shownNetworks[saved.Network] = true
 				active := false
 				for _, network := range value.Networks {
 					if network.Network == saved.Network && network.Running {
@@ -148,6 +150,14 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 				}
 				if !active {
 					fmt.Fprintf(&out, "  Saved attachment %s: inactive. Join: datumctl connect join %s%s\n", saved.Network, shellArg(saved.Network), displayProjectFlag(cmd))
+				}
+			}
+		}
+		for _, network := range value.Networks {
+			if network.Mode == "gateway" && !network.Running && network.Network != "" && !shownNetworks[network.Network] {
+				fmt.Fprintf(&out, "Saved VPC attachment %s: inactive. Join: datumctl connect join %s%s\n", network.Network, shellArg(network.Network), displayProjectFlag(cmd))
+				if network.LastError != "" {
+					writeFailure(&out, "network", network.LastError)
 				}
 			}
 		}
@@ -346,20 +356,25 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			return fmt.Errorf("network attachment is not running; inspect datumctl connect status%s", displayProjectFlag(cmd))
 		}
 		if network.Mode == "peer" && !network.Connected {
-			fmt.Fprintf(&out, "Prepared %s: %s on %s; waiting for peer %s (%s).\nPeer traffic is not connected yet. Run datumctl connect join %s on the other device using its configured project. Both devices need matching peer approvals.\nCheck: datumctl connect status%s\n", network.Network, network.Address, network.Interface, network.Peer, network.PeerAddress, network.Network, displayProjectFlag(cmd))
+			if hasSubnetRoutes(network) {
+				fmt.Fprintf(&out, "Waiting for the VPC connection to become ready for %s.\n", network.Network)
+			} else {
+				fmt.Fprintf(&out, "Waiting for the other device to join %s.\n", network.Network)
+				fmt.Fprintf(&out, "On the other device: datumctl connect join %s%s\n", shellArg(network.Network), displayProjectFlag(cmd))
+			}
 			if network.LastConnectError != "" {
-				fmt.Fprintf(&out, "Last connection attempt: %s\n", network.LastConnectError)
+				fmt.Fprintf(&out, "Connection issue: %s\n", network.LastConnectError)
 			}
 		} else {
-			fmt.Fprintf(&out, "Joined %s: %s on %s.\n", network.Network, network.Address, network.Interface)
-			if network.Mode == "peer" {
-				fmt.Fprintf(&out, "Peer: %s (%s). Only explicitly approved traffic is allowed.\n", network.Peer, network.PeerAddress)
-			}
+			fmt.Fprintf(&out, "Connected to %s.\n", network.Network)
 		}
-		fmt.Fprintf(&out, "Routes: %s\nEphemeral native preview: down or daemon restart removes this attachment.\nLeave: datumctl connect leave %s%s\n", strings.Join(network.Routes, ", "), network.Network, displayProjectFlag(cmd))
+		if len(network.Routes) > 0 {
+			fmt.Fprintf(&out, "Route: %s\n", strings.Join(network.Routes, ", "))
+		}
 		if len(network.AdvertiseRoutes) > 0 {
-			fmt.Fprintf(&out, "Approved subnet access for peer: %s\nForwarding, firewall, and return routing are managed separately on this device.\n", strings.Join(network.AdvertiseRoutes, ", "))
+			fmt.Fprintf(&out, "Shared with peer: %s\n", strings.Join(network.AdvertiseRoutes, ", "))
 		}
+		fmt.Fprintf(&out, "Leave: datumctl connect leave %s%s\n", shellArg(network.Network), displayProjectFlag(cmd))
 	case "leave":
 		var value struct {
 			Network string `json:"network"`

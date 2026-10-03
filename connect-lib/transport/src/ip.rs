@@ -39,7 +39,44 @@ const MAX_CAPSULE: usize = 16 * 1024;
 const MAX_ROUTES: usize = 32;
 const MAX_SESSIONS: usize = 128;
 const PATH: &str = "/.well-known/masque/ip/*/*/";
+const IP_ERROR_HEADER: &str = "x-datum-ip-error";
 const MTU_CLOSE_CODE: u32 = 0x4443_4950;
+static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn session_id() -> String {
+    format!(
+        "{:016x}-{:08x}",
+        rand::random::<u64>(),
+        SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// A bounded, non-sensitive reason returned when a peer rejects CONNECT-IP.
+/// Keep these wire values stable so the client and server logs can be joined.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RejectionReason {
+    InvalidRequest,
+    PeerNetworkNotApproved,
+}
+
+impl RejectionReason {
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "invalid_request" => Some(Self::InvalidRequest),
+            "peer_network_not_approved" => Some(Self::PeerNetworkNotApproved),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::PeerNetworkNotApproved => "peer_network_not_approved",
+        })
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -49,6 +86,12 @@ pub enum Error {
     Protocol(&'static str),
     #[error("CONNECT-IP rejected (HTTP {0})")]
     Rejected(StatusCode),
+    #[error("CONNECT-IP rejected (HTTP {status}; reason={reason}; session_id={session_id})")]
+    RejectedWithReason {
+        status: StatusCode,
+        reason: RejectionReason,
+        session_id: String,
+    },
     #[error("CONNECT-IP session is closed")]
     Closed,
     #[error("CONNECT-IP operation timed out")]
@@ -252,7 +295,7 @@ struct Counters {
     dropped: AtomicU64,
     errors: AtomicU64,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Role {
     Client,
     Gateway,
@@ -465,30 +508,57 @@ pub async fn connect(
     valid_network(network)?;
     let local = cancel.child_token();
     let guard = local.clone().drop_guard();
+    let session_id = session_id();
+    tracing::info!(peer=%peer.id, %network, %session_id, stage="ip_setup", "CONNECT-IP setup started");
     let result = tokio::select! {
         _ = local.cancelled() => Err(Error::Closed),
         result = tokio::time::timeout(SETUP_TIMEOUT, async {
             let conn = endpoint.connect(peer.clone(), ALPN).await.map_err(|error| {
-                tracing::warn!(peer=%peer.id, %network, %error, stage="ip_connect", "CONNECT-IP peer connection failed");
+                tracing::warn!(peer=%peer.id, %network, %session_id, %error, stage="quic_connect", "CONNECT-IP QUIC connection failed");
                 Error::Transport
             })?;
-            observe_connection(&conn, "initiator");
-            if conn.max_datagram_size().is_none() { return Err(Error::DatagramsUnsupported); }
-            let (mut driver, mut sender) = h3::client::builder().enable_datagram(true).enable_extended_connect(true).build(crate::h3_iroh::Connection::new(conn.clone())).await.map_err(|_| Error::Transport)?;
-            let mut request = Request::builder().method(Method::CONNECT).uri(format!("https://{}{PATH}", peer.id)).header("capsule-protocol", "?1").header("x-datum-network", network).body(()).map_err(|_| Error::Configuration("invalid network request"))?;
+            observe_connection(&conn, "initiator", network, &session_id);
+            if conn.max_datagram_size().is_none() {
+                tracing::warn!(peer=%peer.id, %network, %session_id, stage="quic_datagram_capability", "CONNECT-IP peer does not support QUIC DATAGRAM");
+                return Err(Error::DatagramsUnsupported);
+            }
+            let (mut driver, mut sender) = h3::client::builder().enable_datagram(true).enable_extended_connect(true).build(crate::h3_iroh::Connection::new(conn.clone())).await.map_err(|error| {
+                tracing::warn!(peer=%peer.id, %network, %session_id, %error, stage="http3_client", "CONNECT-IP HTTP/3 client setup failed");
+                Error::Transport
+            })?;
+            let mut request = Request::builder().method(Method::CONNECT).uri(format!("https://{}{PATH}", peer.id)).header("capsule-protocol", "?1").header("x-datum-network", network).header("x-datum-connect-session", &session_id).body(()).map_err(|_| Error::Configuration("invalid network request"))?;
             request.extensions_mut().insert(Protocol::CONNECT_IP);
-            let mut stream = sender.send_request(request).await.map_err(|_| Error::Transport)?;
+            let mut stream = sender.send_request(request).await.map_err(|error| {
+                tracing::warn!(peer=%peer.id, %network, %session_id, %error, stage="connect_request", "CONNECT-IP request send failed");
+                Error::Transport
+            })?;
             let stream_id = stream.id().into_inner();
             let driver_guard = crate::AbortTask::new(tokio::spawn(async move { let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await; }));
-            let response = stream.recv_response().await.map_err(|_| Error::Transport)?;
+            let response = stream.recv_response().await.map_err(|error| {
+                tracing::warn!(peer=%peer.id, %network, %session_id, %error, stage="connect_response", "CONNECT-IP response receive failed");
+                Error::Transport
+            })?;
             if !response.status().is_success() {
-                return Err(match one_header(response.headers(), "x-datum-ip-error") {
+                let status = response.status();
+                let wire_reason = one_header(response.headers(), IP_ERROR_HEADER);
+                let reason = wire_reason.and_then(RejectionReason::from_wire);
+                tracing::warn!(peer=%peer.id, %network, %session_id, %status,
+                    remote_reason=reason.map(|reason| reason.to_string()).as_deref().unwrap_or("unreported_or_unknown"),
+                    stage="connect_rejected", "CONNECT-IP peer rejected session");
+                return Err(match wire_reason {
                     Some("datagrams_unsupported") => Error::DatagramsUnsupported,
                     Some("insufficient_datagram_mtu") => Error::InsufficientDatagramMtu {
                         required: one_header(response.headers(), "x-datum-ip-mtu").and_then(|value|value.parse().ok()).unwrap_or(1280),
                         available: one_header(response.headers(), "x-datum-ip-capacity").and_then(|value|value.parse().ok()).unwrap_or(0),
                     },
-                    _ => Error::Rejected(response.status()),
+                    _ => match reason {
+                        Some(reason) => Error::RejectedWithReason {
+                            status,
+                            reason,
+                            session_id: session_id.clone(),
+                        },
+                        None => Error::Rejected(status),
+                    },
                 });
             }
             wait_h3_datagrams(&mut sender).await?;
@@ -508,12 +578,18 @@ pub async fn connect(
             let (kind, routes) = read_capsule(&mut io).await?;
             if kind != 3 { return Err(Error::Protocol("expected ROUTE_ADVERTISEMENT")); }
             let config = SessionConfig { address, routes: decode_routes(&routes)?, mtu }; config.validate()?;
+            tracing::info!(peer=%peer.id, %network, %session_id, assigned_address=%config.address, routes=?config.routes, mtu=config.mtu, datagram_capacity=capacity, stage="ip_ready", "CONNECT-IP session negotiated");
             let (session, outgoing, incoming) = session_parts(config.clone(), Role::Client, local.clone());
             session.counters.capacity.store(capacity, Ordering::Relaxed);
             let counters = session.counters.clone(); let task_cancel = local.clone();
-            tokio::spawn(async move { let _bridge = bridge_guard; run_session(io, DatagramPath { connection: conn, stream_id, low_capacity_since: None }, config, Role::Client, outgoing, incoming, task_cancel, counters).await; });
+            let session_network = network.to_owned();
+            let session_id = session_id.clone();
+            tokio::spawn(async move { let _bridge = bridge_guard; run_session(io, DatagramPath { connection: conn, stream_id, low_capacity_since: None }, config, Role::Client, session_network, session_id, outgoing, incoming, task_cancel, counters).await; });
             Ok(session)
-        }) => result.map_err(|_| Error::Timeout)?,
+        }) => result.map_err(|_| {
+            tracing::warn!(peer=%peer.id, %network, %session_id, stage="ip_setup_timeout", timeout_seconds=SETUP_TIMEOUT.as_secs(), "CONNECT-IP setup timed out");
+            Error::Timeout
+        })?,
     };
     if result.is_ok() {
         guard.disarm();
@@ -550,10 +626,19 @@ pub async fn serve(
                 tasks.spawn(async move {
                     let _guard = child.clone().drop_guard();
                     let result = async {
-                        let conn = tokio::time::timeout(SETUP_TIMEOUT, async { request.accept().map_err(|_|Error::Transport)?.await.map_err(|_|Error::Transport) }).await.map_err(|_|Error::Timeout)??;
+                        let conn = tokio::time::timeout(SETUP_TIMEOUT, async { request.accept().map_err(|error| {
+                            tracing::warn!(%error, stage="quic_accept", "CONNECT-IP QUIC accept failed");
+                            Error::Transport
+                        })?.await.map_err(|error| {
+                            tracing::warn!(%error, stage="quic_handshake", "CONNECT-IP QUIC handshake failed");
+                            Error::Transport
+                        }) }).await.map_err(|_| {
+                            tracing::warn!(stage="quic_handshake", timeout_seconds=SETUP_TIMEOUT.as_secs(), "CONNECT-IP QUIC handshake timed out");
+                            Error::Timeout
+                        })??;
                         serve_connection(conn, policies, child).await
                     }.await;
-                    if let Err(error) = result { tracing::debug!(stage="connect_ip", %error, "CONNECT-IP session ended"); }
+                    if let Err(error) = result { tracing::warn!(stage="connect_ip", %error, "CONNECT-IP incoming session ended"); }
                 });
             }
         }
@@ -570,29 +655,50 @@ pub(crate) async fn serve_connection(
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut _session_lifetime = None;
+    let peer = conn.remote_id();
+    let mut session_id = String::from("unidentified");
+    let mut network_name = String::from("unknown");
     let setup = async {
         if conn.alpn() != ALPN {
             return Err(Error::Protocol("wrong ALPN"));
         }
-        let peer = conn.remote_id();
-        observe_connection(&conn, "acceptor");
         let mut h3 = h3::server::builder()
             .enable_datagram(true)
             .enable_extended_connect(true)
             .build::<_, Bytes>(crate::h3_iroh::Connection::new(conn.clone()))
             .await
-            .map_err(|_| Error::Transport)?;
+            .map_err(|error| {
+                tracing::warn!(peer=%peer, %error, stage="http3_server", "CONNECT-IP HTTP/3 server setup failed");
+                Error::Transport
+            })?;
         let resolver = h3
             .accept()
             .await
-            .map_err(|_| Error::Transport)?
+            .map_err(|error| {
+                tracing::warn!(peer=%peer, %error, stage="http3_accept", "CONNECT-IP HTTP/3 request acceptance failed");
+                Error::Transport
+            })?
             .ok_or(Error::Closed)?;
         let (request, mut stream) = resolver
             .resolve_request()
             .await
-            .map_err(|_| Error::Transport)?;
+            .map_err(|error| {
+                tracing::warn!(peer=%peer, %error, stage="connect_request", "CONNECT-IP request decoding failed");
+                Error::Transport
+            })?;
+        session_id = one_header(request.headers(), "x-datum-connect-session")
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 64
+                    && value.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            })
+            .unwrap_or("unidentified")
+            .to_owned();
         let network = one_header(request.headers(), "x-datum-network")
             .filter(|name| valid_network(name).is_ok());
+        network_name = network.unwrap_or("unknown").to_owned();
+        observe_connection(&conn, "acceptor", network.unwrap_or("unknown"), &session_id);
+        tracing::info!(peer=%peer, network=network.unwrap_or("unknown"), %session_id, stage="connect_request", "CONNECT-IP request received");
         let valid = request.method() == Method::CONNECT
             && request.extensions().get::<Protocol>() == Some(&Protocol::CONNECT_IP)
             && request.uri().scheme_str() == Some("https")
@@ -605,23 +711,51 @@ pub(crate) async fn serve_connection(
             None
         };
         let Some(admission) = admission else {
+            let reason = if !valid {
+                "invalid_request"
+            } else if network.is_none() {
+                "invalid_network"
+            } else {
+                "no_matching_peer_network_approval"
+            };
+            let status = if valid {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            let wire_reason = if valid {
+                "peer_network_not_approved"
+            } else {
+                "invalid_request"
+            };
+            tracing::warn!(peer=%peer, network=network.unwrap_or("unknown"), %session_id,
+                request_valid=valid, %status, rejection_reason=reason, stage="connect_admission",
+                "CONNECT-IP request denied");
             stream
                 .send_response(
                     Response::builder()
-                        .status(if valid { 403 } else { 400 })
+                        .status(status)
+                        .header(IP_ERROR_HEADER, wire_reason)
                         .body(())
                         .unwrap(),
                 )
                 .await
-                .map_err(|_| Error::Transport)?;
-            stream.finish().await.map_err(|_| Error::Transport)?;
+                .map_err(|error| {
+                    tracing::warn!(peer=%peer, network=network.unwrap_or("unknown"), %session_id, %error, stage="connect_rejection_response", "failed to send CONNECT-IP rejection");
+                    Error::Transport
+                })?;
+            stream.finish().await.map_err(|error| {
+                tracing::warn!(peer=%peer, network=network.unwrap_or("unknown"), %session_id, %error, stage="connect_rejection_response_finish", "failed to finish CONNECT-IP rejection response");
+                Error::Transport
+            })?;
             // Let the peer receive the response before the connection closes.
             tokio::time::sleep(Duration::from_millis(100)).await;
-            return Err(Error::Rejected(if valid {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::BAD_REQUEST
-            }));
+            return Err(Error::RejectedWithReason {
+                status,
+                reason: RejectionReason::from_wire(wire_reason)
+                    .expect("server rejection reasons must be declared"),
+                session_id: session_id.clone(),
+            });
         };
         let Admission {
             config,
@@ -629,6 +763,7 @@ pub(crate) async fn serve_connection(
             cancel: membership,
             ..
         } = admission;
+        tracing::info!(peer=%peer, network=%network.unwrap(), %session_id, assigned_address=%config.address, routes=?config.routes, mtu=config.mtu, stage="connect_admission", "CONNECT-IP peer and network approved");
         let membership_lifetime = membership.clone();
         let connection_cancel = cancel.clone();
         let membership_guard = crate::AbortTask::new(tokio::spawn(async move {
@@ -732,7 +867,22 @@ pub(crate) async fn serve_connection(
             },
         ))
     };
-    let (mut io, config, outgoing, packets, counters, _bridge, session_cancel, _membership, path) = tokio::select! { _ = cancel.cancelled() => return Err(Error::Closed), result = tokio::time::timeout(SETUP_TIMEOUT, setup) => result.map_err(|_| Error::Timeout)?? };
+    let setup_result = tokio::select! {
+        _ = cancel.cancelled() => return Err(Error::Closed),
+        result = tokio::time::timeout(SETUP_TIMEOUT, setup) => result,
+    };
+    let (mut io, config, outgoing, packets, counters, _bridge, session_cancel, _membership, path) =
+        match setup_result {
+            Err(_) => {
+                tracing::warn!(peer=%peer, network=%network_name, %session_id, stage="connect_setup_timeout", timeout_seconds=SETUP_TIMEOUT.as_secs(), "CONNECT-IP session setup timed out");
+                return Err(Error::Timeout);
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(peer=%peer, network=%network_name, %session_id, %error, stage="connect_setup_failed", "CONNECT-IP session setup failed");
+                return Err(error);
+            }
+            Ok(Ok(value)) => value,
+        };
     tokio::select! {
         _ = cancel.cancelled() => return Err(Error::Closed),
         result = tokio::time::timeout(SETUP_TIMEOUT, async {
@@ -748,6 +898,8 @@ pub(crate) async fn serve_connection(
         path,
         config,
         Role::Gateway,
+        network_name,
+        session_id,
         outgoing,
         packets,
         session_cancel,
@@ -763,6 +915,8 @@ async fn run_session(
     mut path: DatagramPath,
     config: SessionConfig,
     role: Role,
+    network: String,
+    session_id: String,
     mut outgoing: mpsc::Receiver<Bytes>,
     packets: mpsc::Sender<Bytes>,
     cancel: CancellationToken,
@@ -810,8 +964,11 @@ async fn run_session(
                         Err(_) => return Err(Error::Transport),
                     }
                 },
-                incoming = path.connection.read_datagram() => {
-                    let wire = incoming.map_err(|_| Error::Transport)?;
+                    incoming = path.connection.read_datagram() => {
+                    let wire = incoming.map_err(|error| {
+                        tracing::warn!(peer=%path.connection.remote_id(), %network, %session_id, role=?role, %error, stage="quic_datagram_receive", "CONNECT-IP QUIC datagram receive failed");
+                        Error::Transport
+                    })?;
                     counters.datagrams_received.fetch_add(1, Ordering::Relaxed);
                     let Some(packet) = decode_datagram(wire, path.stream_id)? else { counters.dropped.fetch_add(1, Ordering::Relaxed); continue; };
                     if validate_packet(&packet, &config, matches!(role, Role::Gateway)).is_err() { counters.dropped.fetch_add(1, Ordering::Relaxed); continue; }
@@ -855,7 +1012,19 @@ async fn run_session(
                 b"connect-ip-path-mtu",
             );
         }
-        tracing::warn!(stage="ip_datagrams", %error, "CONNECT-IP session closed");
+        tracing::warn!(peer=%path.connection.remote_id(), %network, %session_id, role=?role,
+            %error, quic_close_reason=?path.connection.close_reason(),
+            packets_sent=counters.sent.load(Ordering::Relaxed), packets_received=counters.received.load(Ordering::Relaxed),
+            datagrams_sent=counters.datagrams_sent.load(Ordering::Relaxed), datagrams_received=counters.datagrams_received.load(Ordering::Relaxed),
+            packets_dropped=counters.dropped.load(Ordering::Relaxed), mtu_errors=counters.mtu_errors.load(Ordering::Relaxed),
+            stage="ip_datagrams", "CONNECT-IP session closed with error");
+    } else {
+        tracing::info!(peer=%path.connection.remote_id(), %network, %session_id, role=?role,
+            quic_close_reason=?path.connection.close_reason(),
+            packets_sent=counters.sent.load(Ordering::Relaxed), packets_received=counters.received.load(Ordering::Relaxed),
+            datagrams_sent=counters.datagrams_sent.load(Ordering::Relaxed), datagrams_received=counters.datagrams_received.load(Ordering::Relaxed),
+            packets_dropped=counters.dropped.load(Ordering::Relaxed), mtu_errors=counters.mtu_errors.load(Ordering::Relaxed),
+            stage="ip_datagrams", "CONNECT-IP session closed cleanly");
     }
 }
 
@@ -995,7 +1164,12 @@ fn decode_datagram(wire: Bytes, stream_id: u64) -> Result<Option<Bytes>> {
     Ok(Some(wire.slice(offset + length..)))
 }
 
-fn observe_connection(connection: &iroh::endpoint::Connection, role: &str) {
+fn observe_connection(
+    connection: &iroh::endpoint::Connection,
+    role: &str,
+    network: &str,
+    session_id: &str,
+) {
     let paths = connection.paths();
     if let Some(path) = paths.iter().find(|path| path.is_selected()) {
         let transport = if path.is_ip() {
@@ -1005,10 +1179,10 @@ fn observe_connection(connection: &iroh::endpoint::Connection, role: &str) {
         } else {
             "unknown"
         };
-        tracing::info!(peer=%connection.remote_id(), role, path=transport, local=?path.local_addr(), remote=?path.remote_addr(),
+        tracing::info!(peer=%connection.remote_id(), role, %network, %session_id, path=transport, local=?path.local_addr(), remote=?path.remote_addr(),
             rtt_ms=path.rtt().as_millis() as u64, stage="ip_connected", "CONNECT-IP peer connected");
     } else {
-        tracing::info!(peer=%connection.remote_id(), role, path="unknown",
+        tracing::info!(peer=%connection.remote_id(), role, %network, %session_id, path="unknown",
             stage="ip_connected", "CONNECT-IP peer connected");
     }
 }

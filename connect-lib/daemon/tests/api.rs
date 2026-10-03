@@ -229,7 +229,7 @@ async fn managed_peer_plans_are_setup_scoped_durable_and_do_not_grant_privileges
     assert_eq!(control.network_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         client
-            .get(format!("{base}/v1/networks/friend/setup?project=alpha"))
+            .post(format!("{base}/v1/networks/friend/setup?project=alpha"))
             .bearer_auth(operator["bearer"].as_str().unwrap())
             .send()
             .await

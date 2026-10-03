@@ -118,6 +118,7 @@ impl Binding {
             network: self.network.clone(),
             gateway: self.peer.clone(),
             addresses: self.addresses.clone(),
+            relay_urls: vec![],
             assigned_address: self.assigned_address.clone(),
             routes: self.tun_routes(),
             interface_name: self.interface_name.clone(),
@@ -432,6 +433,21 @@ pub async fn join(
         binding.clone(),
     );
     let task_policy = policy.clone();
+    let task_interface = interface_name.clone();
+    tracing::info!(
+        project=%binding.project,
+        network=%binding.network,
+        %peer,
+        dialer,
+        interface=%interface_name,
+        assigned_address=%binding.assigned_address,
+        peer_address=%binding.peer_address,
+        routes=?binding.routes,
+        advertise_routes=?binding.advertise_routes,
+        mtu=binding.mtu,
+        stage="peer_ip_attachment_starting",
+        "CONNECT-IP attachment starting"
+    );
     let task = tokio::spawn(async move {
         let policy = task_policy;
         let outcome: Result<(), String> = tokio::select! {
@@ -449,7 +465,10 @@ pub async fn join(
                             Ok(session)=>break session,
                             Err(error)=>{
                                 task_state.lock().await.last_connect_error=Some(error.to_string());
-                                tracing::debug!(network=%task_binding.network,%error,stage="peer_ip_connect","peer_not_ready");
+                                let attempt=task_attempts.load(Ordering::Relaxed);
+                                if attempt == 1 || attempt % 10 == 0 {
+                                    tracing::warn!(project=%task_binding.project,network=%task_binding.network,%peer,attempt,%error,stage="peer_ip_connect","CONNECT-IP peer session attempt failed; retrying");
+                                }
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                             }
                         }
@@ -464,7 +483,7 @@ pub async fn join(
                 if session.config!=expected { session.cancel(); return Err("Peer IP assignment, routes, or MTU did not match local approval".into()); }
                 let session=Arc::new(session);
                 { let mut state=task_state.lock().await; state.phase="connected"; state.last_connect_error=None; state.session=Some(session.clone()); }
-                tracing::info!(network=%task_binding.network,%peer,stage="peer_ip", "peer_ip_connected");
+                tracing::info!(project=%task_binding.project,network=%task_binding.network,%peer,dialer,interface=%task_interface,assigned_address=%task_binding.assigned_address,peer_address=%task_binding.peer_address,routes=?task_binding.routes,advertise_routes=?task_binding.advertise_routes,mtu=task_binding.mtu,stage="peer_ip_connected", "CONNECT-IP peer session connected");
                 let mut buffer=vec![0u8;65536];
                 let mut authorization = tokio::time::interval(Duration::from_secs(30));
                 authorization.tick().await;
@@ -506,7 +525,9 @@ pub async fn join(
         };
         state.error = outcome.err();
         if let Some(error) = &state.error {
-            tracing::warn!(network=%task_binding.network,%error,stage="peer_ip","peer_attachment_closed");
+            tracing::warn!(project=%task_binding.project,network=%task_binding.network,%peer,dialer,interface=%task_interface,assigned_address=%task_binding.assigned_address,peer_address=%task_binding.peer_address,routes=?task_binding.routes,attempts=task_attempts.load(Ordering::Relaxed),packets_sent=task_sent.load(Ordering::Relaxed),packets_received=task_received.load(Ordering::Relaxed),acl_drops=task_denied.load(Ordering::Relaxed),%error,stage="peer_ip_attachment_closed","CONNECT-IP attachment failed or peer session ended");
+        } else {
+            tracing::info!(project=%task_binding.project,network=%task_binding.network,%peer,dialer,interface=%task_interface,attempts=task_attempts.load(Ordering::Relaxed),packets_sent=task_sent.load(Ordering::Relaxed),packets_received=task_received.load(Ordering::Relaxed),acl_drops=task_denied.load(Ordering::Relaxed),stage="peer_ip_attachment_closed","CONNECT-IP attachment stopped cleanly");
         }
     });
     let _ = guard.disarm();

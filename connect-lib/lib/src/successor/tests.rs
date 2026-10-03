@@ -87,6 +87,86 @@ fn connector() -> Value {
     json!({"metadata":{"name":format!("connect-{}",&public[..40]),"uid":"connector-uid","annotations":{"connect.datum.net/public-key":public}},"spec":{"connectorClassName":"masque"},"status":{"connectionDetails":{"publicKey":{"id":public}}}})
 }
 
+#[test]
+fn project_connect_resources_use_the_connect_api_group() {
+    let client = client("https://api.example");
+    assert!(client
+        .connect_resource("connectgateways", "vpc-gateway")
+        .ends_with("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectgateways/vpc-gateway"));
+    assert!(
+        client
+            .connect_resource("connectnetworkbindings", "binding")
+            .contains("/projects/demo/control-plane/apis/connect.datumapis.com/v1alpha1/")
+    );
+    assert!(
+        client.resource("connectors", "legacy").contains(
+            "/apis/networking.datumapis.com/v1alpha1/namespaces/default/connectors/legacy"
+        )
+    );
+}
+
+#[test]
+fn network_binding_name_is_deterministic_and_scoped_to_connector_and_network() {
+    let first = network_binding_name("staging-vpc", "macbook");
+    assert_eq!(first, network_binding_name("staging-vpc", "macbook"));
+    assert_ne!(first, network_binding_name("other-vpc", "macbook"));
+    assert_ne!(first, network_binding_name("staging-vpc", "router"));
+    assert!(first.len() <= 63);
+}
+
+#[tokio::test]
+async fn joining_managed_network_creates_connector_owned_binding_and_renews_lease() {
+    let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let connect_connector = json!({
+        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
+        "spec":{"publicKey":peer},
+        "status":{"leaseRef":"connect-lease","conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let gateway = json!({
+        "metadata":{"name":"vpc-gateway","generation":2},
+        "spec":{"networkRef":"staging-vpc"},
+        "status":{"endpointID":iroh::SecretKey::from_bytes(&[9; 32]).public().to_string(),"conditions":[{"type":"Ready","status":"True","observedGeneration":2}]}
+    });
+    let binding_name = network_binding_name("staging-vpc", &format!("connect-{}", &peer[..40]));
+    let created_binding = json!({
+        "metadata":{"name":binding_name,"uid":"binding-uid","resourceVersion":"1","generation":1},
+        "spec":{"gatewayRef":"vpc-gateway","connectorRef":format!("connect-{}", &peer[..40])},
+        "status":{"endpointID":gateway["status"]["endpointID"],"assignedAddress":"fd79::1/128","peerAddress":"fd79::2/128","routes":["fd20:0:27::/48"],"relayURLs":["https://relay.example/"],"conditions":[{"type":"Accepted","status":"True","observedGeneration":1}]}
+    });
+    let lease = json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"connect-lease","resourceVersion":"4"},"spec":{"leaseDurationSeconds":30}});
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, json!({"items":[gateway]})),
+        Reply::Json(200, connect_connector),
+        Reply::Json(200, lease),
+        Reply::EchoCreated,
+        Reply::Json(404, json!({})),
+        Reply::Json(201, created_binding.clone()),
+    ])
+    .await;
+    let cloud = client(&base);
+    let result = cloud
+        .join_gateway_network("staging-vpc", &ConnectionDetails::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["assignedAddress"], "fd79::1/128");
+    assert_eq!(result["routes"], json!(["fd20:0:27::/48"]));
+    assert_eq!(result["bindingName"], binding_name);
+    let requests = task.await.unwrap();
+    assert!(requests.iter().any(|(line, body)| {
+        line.starts_with("POST ")
+            && line.contains("connectnetworkbindings")
+            && body["spec"]["gatewayRef"] == "vpc-gateway"
+            && body["spec"]["connectorRef"] == cloud.name()
+    }));
+    assert!(requests.iter().any(|(line, body)| {
+        line.starts_with("PUT ")
+            && line.contains("/leases/connect-lease")
+            && body["metadata"]["resourceVersion"] == "4"
+    }));
+}
+
 #[tokio::test]
 async fn lease_renewal_uses_kubernetes_microtime_precision() {
     let mut value = connector();
@@ -98,6 +178,7 @@ async fn lease_renewal_uses_kubernetes_microtime_precision() {
         Reply::Json(200, value),
         Reply::Json(200, lease),
         Reply::EchoCreated,
+        Reply::Json(404, json!({})),
     ])
     .await;
     client(&base)
@@ -131,6 +212,7 @@ async fn renewal_retries_conflicts_with_fresh_resource_version_and_preserves_con
         Reply::Json(409, json!({})),
         Reply::Json(200, fresh),
         Reply::EchoCreated,
+        Reply::Json(404, json!({})),
     ])
     .await;
     client(&base)

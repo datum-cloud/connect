@@ -13,6 +13,7 @@ use std::{collections::HashSet, net::SocketAddr, time::Duration};
 
 pub type Result<T> = std::result::Result<T, Error>;
 const GROUP: &str = "networking.datumapis.com/v1alpha1";
+const CONNECT_GROUP: &str = "connect.datumapis.com/v1alpha1";
 const OWNER: &str = "connect.datum.net/connector";
 const PROTOCOL: &str = "connect.datum.net/transport";
 const GATEWAYS: &str = "connect.datum.net/gateway-connectors";
@@ -175,6 +176,345 @@ impl CloudConnector {
             "{}/apis/{group}/namespaces/default/{plural}/{name}",
             self.base.trim_end_matches('/')
         )
+    }
+
+    fn connect_resource(&self, plural: &str, name: &str) -> String {
+        format!(
+            "{}/apis/{CONNECT_GROUP}/namespaces/default/{plural}/{name}",
+            self.base.trim_end_matches('/')
+        )
+    }
+
+    async fn connect_get(&self, plural: &str, name: &str) -> Result<Option<Value>> {
+        self.request(Method::GET, &self.connect_resource(plural, name), None)
+            .await
+    }
+
+    async fn connect_create(&self, plural: &str, object: &Value) -> Result<Value> {
+        let name = object["metadata"]["name"]
+            .as_str()
+            .ok_or_else(|| Error::Invalid("resource name missing".into()))?;
+        match self
+            .request(
+                Method::POST,
+                &self.connect_resource(plural, ""),
+                Some(object),
+            )
+            .await
+        {
+            Ok(Some(value)) => Ok(value),
+            Err(Error::Api(409)) => self.connect_get(plural, name).await?.ok_or(Error::Api(404)),
+            Ok(None) => Err(Error::Api(500)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Register the same live iroh identity with the Connect service. The legacy
+    /// NSO Connector remains in place for existing HTTPProxy/advertisement APIs.
+    async fn ensure_connect_connector(&self, details: &ConnectionDetails) -> Result<()> {
+        let existing = self.connect_get("connectors", &self.name).await?;
+        let connector = if let Some(value) = existing {
+            if value.pointer("/spec/publicKey").and_then(Value::as_str)
+                != Some(self.public_key.as_str())
+            {
+                return Err(Error::Ownership(self.name.clone()));
+            }
+            value
+        } else {
+            let classes_url = format!("{}/apis/{CONNECT_GROUP}/connectorclasses", self.base);
+            let classes = self
+                .request(Method::GET, &classes_url, None)
+                .await?
+                .ok_or(Error::Api(404))?;
+            let ready = classes["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|class| {
+                    class["spec"]["transports"]
+                        .as_array()
+                        .is_some_and(|transports| {
+                            transports.iter().any(|transport| transport == "masque-v1")
+                        })
+                        && current_condition(class, "Ready")
+                })
+                .collect::<Vec<_>>();
+            if ready.len() != 1 {
+                return Err(Error::Unsupported(format!(
+                    "expected one Ready Connect ConnectorClass advertising masque-v1; found {}",
+                    ready.len()
+                )));
+            }
+            let class = string(ready[0], "/metadata/name")?;
+            let relays = if details.relay_url.is_empty() {
+                Vec::new()
+            } else {
+                vec![details.relay_url.clone()]
+            };
+            let desired = json!({
+                "apiVersion": CONNECT_GROUP,
+                "kind": "Connector",
+                "metadata": {"name": self.name},
+                "spec": {"classRef": class, "publicKey": self.public_key, "relayURLs": relays}
+            });
+            self.connect_create("connectors", &desired).await?
+        };
+        if connector.pointer("/spec/publicKey").and_then(Value::as_str)
+            != Some(self.public_key.as_str())
+        {
+            return Err(Error::Ownership(self.name.clone()));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut connector = connector;
+        loop {
+            self.renew_connect_connector_lease(&connector).await?;
+            if current_condition(&connector, "Ready") {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let reason = connector
+                    .pointer("/status/conditions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|condition| condition["type"] == "Ready")
+                    .and_then(|condition| condition["reason"].as_str())
+                    .unwrap_or("waiting for controller");
+                return Err(Error::Unsupported(format!(
+                    "Connect Connector {} is not Ready ({reason}); check ConnectorClass and Lease reconciliation",
+                    self.name
+                )));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            connector = self
+                .connect_get("connectors", &self.name)
+                .await?
+                .ok_or(Error::Api(404))?;
+            if connector.pointer("/spec/publicKey").and_then(Value::as_str)
+                != Some(self.public_key.as_str())
+            {
+                return Err(Error::Ownership(self.name.clone()));
+            }
+        }
+    }
+
+    async fn renew_connect_connector_lease(&self, connector: &Value) -> Result<()> {
+        let Some(name) = connector
+            .pointer("/status/leaseRef")
+            .and_then(Value::as_str)
+        else {
+            // The controller creates the Lease after observing the Connector.
+            return Ok(());
+        };
+        validate_name(name)?;
+        let url = format!(
+            "{}/apis/coordination.k8s.io/v1/namespaces/default/leases/{name}",
+            self.base
+        );
+        if let Some(mut lease) = self.request(Method::GET, &url, None).await? {
+            lease["spec"]["renewTime"] =
+                json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
+            self.request(Method::PUT, &url, Some(&lease)).await?;
+        }
+        Ok(())
+    }
+
+    /// Create or reuse this Connector's project binding to the only Ready
+    /// gateway for `network`. `None` means the project has no managed gateway
+    /// for that network, allowing the legacy local approval flow to continue.
+    pub async fn join_gateway_network(
+        &self,
+        network: &str,
+        details: &ConnectionDetails,
+    ) -> Result<Option<Value>> {
+        validate_name(network)?;
+        let Some(gateways) = self
+            .request(
+                Method::GET,
+                &self.connect_resource("connectgateways", ""),
+                None,
+            )
+            .await?
+        else {
+            // The controller CRD is optional during staged rollout; preserve
+            // legacy direct-peer behavior until ConnectGateway is installed.
+            return Ok(None);
+        };
+        let matches = gateways["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|gateway| gateway["spec"]["networkRef"] == network)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        let ready = matches
+            .iter()
+            .copied()
+            .filter(|gateway| current_condition(gateway, "Ready"))
+            .collect::<Vec<_>>();
+        if ready.len() != 1 {
+            let names = matches
+                .iter()
+                .filter_map(|item| item["metadata"]["name"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Unsupported(format!(
+                "ConnectGateway for network {network:?} is not uniquely ready (matching gateways: {names}); inspect `datumctl get connectgateways`"
+            )));
+        }
+        let gateway = ready[0];
+        let gateway_name = string(gateway, "/metadata/name")?;
+        let gateway_key = string(gateway, "/status/endpointID")?;
+        self.ensure_connect_connector(details).await?;
+        let binding_name = network_binding_name(network, &self.name);
+        let binding = match self
+            .connect_get("connectnetworkbindings", &binding_name)
+            .await?
+        {
+            Some(value) => {
+                if value["spec"]["connectorRef"] != self.name
+                    || value["spec"]["gatewayRef"] != gateway_name
+                {
+                    return Err(Error::Ownership(format!(
+                        "network binding {binding_name} already targets another Connector or gateway; remove it with `datumctl connect leave {network}` first"
+                    )));
+                }
+                value
+            }
+            None => {
+                self.connect_create(
+                    "connectnetworkbindings",
+                    &json!({
+                        "apiVersion": CONNECT_GROUP,
+                        "kind": "ConnectNetworkBinding",
+                        "metadata": {"name": binding_name},
+                        "spec": {"gatewayRef": gateway_name, "connectorRef": self.name}
+                    }),
+                )
+                .await?
+            }
+        };
+        // The controller publishes approval and addresses asynchronously. Wait
+        // for that status so `join` never reports a half-created attachment.
+        let until = tokio::time::Instant::now() + Duration::from_secs(90);
+        let mut binding = binding;
+        loop {
+            if current_condition(&binding, "Accepted") {
+                let mut result = binding["status"].clone();
+                result["network"] = json!(network);
+                result["gateway"] = json!(gateway_name);
+                result["gatewayEndpointID"] = json!(gateway_key);
+                result["bindingName"] = json!(binding_name);
+                result["connectorName"] = json!(self.name);
+                return Ok(Some(result));
+            }
+            if let Some(condition) = binding
+                .pointer("/status/conditions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|condition| condition["type"] == "Accepted" && condition["status"] == "False")
+            {
+                return Err(Error::Unsupported(format!(
+                    "ConnectNetworkBinding was rejected ({})",
+                    condition["reason"].as_str().unwrap_or("unknown reason")
+                )));
+            }
+            if tokio::time::Instant::now() >= until {
+                return Err(Error::Unsupported(format!(
+                    "timed out waiting for ConnectNetworkBinding {binding_name} approval; inspect `datumctl get connectnetworkbindings {binding_name}`"
+                )));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            binding = self
+                .connect_get("connectnetworkbindings", &binding_name)
+                .await?
+                .ok_or(Error::Api(404))?;
+        }
+    }
+
+    pub async fn leave_gateway_network(&self, network: &str) -> Result<bool> {
+        validate_name(network)?;
+        let name = network_binding_name(network, &self.name);
+        let Some(binding) = self.connect_get("connectnetworkbindings", &name).await? else {
+            return Ok(false);
+        };
+        if binding["spec"]["connectorRef"] != self.name {
+            return Err(Error::Ownership(name));
+        }
+        let uid = string(&binding, "/metadata/uid")?;
+        let resource_version = string(&binding, "/metadata/resourceVersion")?;
+        let options = json!({"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":uid,"resourceVersion":resource_version}});
+        match self
+            .request(
+                Method::DELETE,
+                &self.connect_resource("connectnetworkbindings", &name),
+                Some(&options),
+            )
+            .await
+        {
+            Ok(_) | Err(Error::Api(404)) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Project-scoped bindings owned by this Connector for `status` output.
+    /// Bindings survive a daemon restart; this inventory distinguishes that
+    /// control-plane intent from the ephemeral local TUN attachment.
+    pub async fn managed_network_bindings(&self) -> Result<Vec<Value>> {
+        let Some(list) = self
+            .request(
+                Method::GET,
+                &self.connect_resource("connectnetworkbindings", ""),
+                None,
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        if list
+            .pointer("/metadata/continue")
+            .and_then(Value::as_str)
+            .is_some_and(|token| !token.is_empty())
+        {
+            return Err(Error::Unsupported(
+                "paginated ConnectNetworkBinding list prevents safe status inventory".into(),
+            ));
+        }
+        let mut result = Vec::new();
+        for binding in list["items"].as_array().into_iter().flatten() {
+            if binding["spec"]["connectorRef"] != self.name {
+                continue;
+            }
+            let name = string(binding, "/metadata/name")?;
+            let gateway_ref = string(binding, "/spec/gatewayRef")?;
+            let gateway = self
+                .connect_get("connectgateways", &gateway_ref)
+                .await?
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "ConnectNetworkBinding {name} references a missing gateway"
+                    ))
+                })?;
+            let network = string(&gateway, "/spec/networkRef")?;
+            let status = &binding["status"];
+            result.push(json!({
+                "network": network,
+                "mode": "gateway",
+                "binding_name": name,
+                "gateway": gateway_ref,
+                "assigned_address": status["assignedAddress"],
+                "peer_address": status["peerAddress"],
+                "routes": status["routes"],
+                "running": false,
+                "connected": false,
+                "state": "inactive",
+                "last_error": "Local attachment is ephemeral; run datumctl connect join to attach again"
+            }));
+        }
+        Ok(result)
     }
 
     #[tracing::instrument(name = "control_plane.request", skip_all, fields(method = %method, connector = %self.name))]
@@ -418,6 +758,14 @@ impl CloudConnector {
                 self.request(Method::PUT, &lease_url, Some(&resource))
                     .await?;
             }
+        }
+        if let Some(connector) = self.connect_get("connectors", &self.name).await? {
+            if connector.pointer("/spec/publicKey").and_then(Value::as_str)
+                != Some(self.public_key.as_str())
+            {
+                return Err(Error::Ownership(self.name.clone()));
+            }
+            self.renew_connect_connector_lease(&connector).await?;
         }
         self.identity(&updated)
     }
@@ -736,6 +1084,22 @@ fn current_condition(resource: &Value, kind: &str) -> bool {
                     && condition["observedGeneration"].as_u64() == Some(generation)
             })
         })
+}
+
+fn network_binding_name(network: &str, connector: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(network.as_bytes());
+    digest.update([0]);
+    digest.update(connector.as_bytes());
+    let hash = digest.finalize();
+    format!(
+        "binding-{}",
+        hash[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 // Admission may insert defaults. Compare every field we own, without treating

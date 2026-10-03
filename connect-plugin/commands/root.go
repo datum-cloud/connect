@@ -377,7 +377,7 @@ func newHangup(opts *options) *cobra.Command {
 func newLeave(opts *options) *cobra.Command { return networkCommand(opts, "leave", http.MethodDelete) }
 
 func networkCommand(opts *options, name, method string) *cobra.Command {
-	return &cobra.Command{Use: name + " NETWORK", Short: strings.Title(name) + " an approved local IP network (native preview)", Long: "Attach or detach an explicitly approved local CONNECT-IP network.\nRequires an enrolled project and a supported native daemon started with --local-ip-config.\nAttachments are ephemeral and disappear on down or daemon restart; this does not create a production NetworkBinding.\nUse serve and dial for individual TCP or UDP services when CONNECT-IP is unavailable.", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	return &cobra.Command{Use: name + " NETWORK", Short: strings.Title(name) + " a project VPC network", Long: "Join selects the ready ConnectGateway for NETWORK and creates this Connector's ConnectNetworkBinding. The daemon asks before installing the local interface and approved routes. Leave deletes this Connector's binding; the local interface is ephemeral and disappears on daemon restart.\n\nWhen no managed gateway exists, join can use the direct Connector preview with\n--peer. Legacy --local-ip-config setups remain supported. Use serve and dial\nfor individual TCP or UDP services.", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		p, err := project(cmd)
 		if err != nil {
 			return err

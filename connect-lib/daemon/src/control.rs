@@ -85,6 +85,16 @@ pub trait Control: Send + Sync + 'static {
             "Local CONNECT-IP is not configured on this daemon",
         ))
     }
+    /// Return the exact local privileged-helper approval for a controller-
+    /// managed VPC attachment, creating its Connector-owned API binding first.
+    /// `None` means the named network is not managed by a ConnectGateway.
+    async fn managed_network_setup(
+        &self,
+        _project: &str,
+        _network: &str,
+    ) -> Result<Option<serde_json::Value>, ApiError> {
+        Ok(None)
+    }
     async fn networks(&self, _project: &str) -> serde_json::Value {
         serde_json::json!([])
     }
