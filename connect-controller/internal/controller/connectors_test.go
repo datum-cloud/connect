@@ -92,6 +92,21 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: "project"}, workload); err != nil {
 		t.Fatal(err)
 	}
+	placements, found, err := unstructured.NestedSlice(workload.Object, "spec", "placements")
+	if err != nil || !found || len(placements) != 1 {
+		t.Fatalf("placements=%v found=%t err=%v, want one", placements, found, err)
+	}
+	placement, ok := placements[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("placement=%T, want map", placements[0])
+	}
+	selector, ok := placement["locationSelector"].(map[string]interface{})
+	if !ok || selector["matchLabels"].(map[string]interface{})["topology.datum.net/city-code"] != "DFW" {
+		t.Fatalf("locationSelector=%v, want DFW city-code selector", placement["locationSelector"])
+	}
+	if scale, ok := placement["scaleSettings"].(map[string]interface{}); !ok || scale["minReplicas"] != int64(1) || scale["maxReplicas"] != nil {
+		t.Fatalf("scaleSettings=%v, want minReplicas=1 without maxReplicas", placement["scaleSettings"])
+	}
 	interfaces, _, _ := unstructured.NestedSlice(workload.Object, "spec", "template", "spec", "networkInterfaces")
 	if len(interfaces) != 1 {
 		t.Fatalf("network interfaces=%v, want one VPC interface", interfaces)
