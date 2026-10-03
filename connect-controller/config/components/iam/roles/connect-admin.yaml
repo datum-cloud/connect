@@ -22,6 +22,9 @@ spec:
     - connect.datumapis.com/connectorclasses.update
     - connect.datumapis.com/connectorclasses.patch
     - connect.datumapis.com/connectorclasses.delete
+    - connect.datumapis.com/connectorclasses/status.get
+    - connect.datumapis.com/connectorclasses/status.update
+    - connect.datumapis.com/connectorclasses/status.patch
     - connect.datumapis.com/connectgateways.create
     - connect.datumapis.com/connectgateways.update
     - connect.datumapis.com/connectgateways.patch
