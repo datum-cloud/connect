@@ -286,18 +286,10 @@ func reconcileGateway(ctx context.Context, c client.Client, project string, obj 
 		if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(obj.Name, "workload"), Namespace: obj.Namespace}, workload); err != nil {
 			return err
 		}
-		workloadAvailable := false
-		conditions, _, _ := unstructured.NestedSlice(workload.Object, "status", "conditions")
-		for _, raw := range conditions {
-			condition, ok := raw.(map[string]interface{})
-			if ok && condition["type"] == "Available" && condition["status"] == "True" {
-				workloadAvailable = true
-			}
-		}
-		if workloadAvailable {
+		if gatewayWorkloadReady(workload) && gatewayWorkloadConfigApplied(ctx, c, obj, workload) {
 			status, reason, message = metav1.ConditionTrue, "GatewayAvailable", "gateway Workload is available in the requested VPC"
 		} else {
-			status, reason, message = metav1.ConditionUnknown, "WorkloadProvisioning", "waiting for the Compute gateway Workload to become available"
+			status, reason, message = metav1.ConditionUnknown, "WorkloadProvisioning", "waiting for the Compute gateway Workload to apply its current configuration and become available"
 		}
 	}
 	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Ready", Status: status, Reason: reason, Message: message, ObservedGeneration: obj.Generation})
@@ -378,14 +370,18 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	grants := make([]interface{}, 0, len(bindings.Items))
 	for i := range bindings.Items {
 		binding := &bindings.Items[i]
-		if binding.Spec.GatewayRef != gateway.Name || !meta.IsStatusConditionTrue(binding.Status.Conditions, "Accepted") {
+		if binding.Spec.GatewayRef != gateway.Name || binding.DeletionTimestamp != nil {
 			continue
 		}
 		var connector connectv1alpha1.Connector
 		if err := c.Get(ctx, types.NamespacedName{Name: binding.Spec.ConnectorRef, Namespace: binding.Namespace}, &connector); err != nil {
 			continue
 		}
-		grant := map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": strings.ToLower(connector.Spec.PublicKey), "client_address": binding.Status.AssignedAddress, "gateway_address": binding.Status.PeerAddress, "routes": gateway.Spec.Routes, "interface_name": gatewayInterfaceName(project, gateway.Spec.NetworkRef, endpointID), "mtu": 1280}
+		if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
+			continue
+		}
+		clientAddress, peerAddress, _ := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, strings.ToLower(connector.Spec.PublicKey), strings.ToLower(endpointID))
+		grant := map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": strings.ToLower(connector.Spec.PublicKey), "client_address": clientAddress + "/128", "gateway_address": peerAddress + "/128", "routes": gateway.Spec.Routes, "interface_name": gatewayInterfaceName(project, gateway.Spec.NetworkRef, endpointID), "mtu": 1280}
 		grants = append(grants, grant)
 	}
 	grantJSON, err := json.Marshal(map[string]interface{}{"grants": grants})
@@ -464,7 +460,20 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 			binding.Status.PeerAddress = peerAddress + "/128"
 			binding.Status.Routes = append([]string(nil), gateway.Spec.Routes...)
 			binding.Status.RelayURLs = append([]string(nil), gateway.Spec.RelayURLs...)
-			status, reason, message = metav1.ConditionTrue, "Approved", "project ConnectGateway automatically approves this Connector for its configured routes"
+			workload := &unstructured.Unstructured{}
+			workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
+			if gateway.Status.WorkloadRef == "" {
+				status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
+			} else if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: gateway.Namespace}, workload); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
+			} else if !gatewayWorkloadReady(workload) || !gatewayWorkloadConfigApplied(ctx, c, &gateway, workload) || !gatewayConfigIncludesConnector(ctx, c, &gateway, strings.ToLower(connector.Spec.PublicKey)) {
+				status, reason, message = metav1.ConditionUnknown, "GatewayApplyingGrant", "waiting for the gateway Workload to apply this Connector grant and become available"
+			} else {
+				status, reason, message = metav1.ConditionTrue, "Approved", "gateway Workload is available with this Connector approved for its configured routes"
+			}
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return err
@@ -475,6 +484,54 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 		return nil
 	}
 	return c.Status().Update(ctx, binding)
+}
+
+func gatewayWorkloadReady(workload *unstructured.Unstructured) bool {
+	available := false
+	conditions, _, _ := unstructured.NestedSlice(workload.Object, "status", "conditions")
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]interface{})
+		if ok && condition["type"] == "Available" && condition["status"] == "True" {
+			available = true
+		}
+	}
+	generation := workload.GetGeneration()
+	observedGeneration, _, _ := unstructured.NestedInt64(workload.Object, "status", "observedGeneration")
+	desiredReplicas, _, _ := unstructured.NestedInt64(workload.Object, "status", "desiredReplicas")
+	readyReplicas, _, _ := unstructured.NestedInt64(workload.Object, "status", "readyReplicas")
+	updatedReplicas, _, _ := unstructured.NestedInt64(workload.Object, "status", "updatedReplicas")
+	return available && observedGeneration >= generation && desiredReplicas > 0 && readyReplicas >= desiredReplicas && updatedReplicas >= desiredReplicas
+}
+
+func gatewayWorkloadConfigApplied(ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway, workload *unstructured.Unstructured) bool {
+	config := &corev1.ConfigMap{}
+	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: gateway.Namespace}, config); err != nil {
+		return false
+	}
+	expectedHash := fmt.Sprintf("%x", sha256.Sum256([]byte(config.Data["gateway.yaml"]+"\x00"+config.Data["grants.json"])))
+	workloadHash, found, err := unstructured.NestedString(workload.Object, "spec", "template", "metadata", "annotations", "connect.datumapis.com/config-hash")
+	return err == nil && found && workloadHash == expectedHash
+}
+
+func gatewayConfigIncludesConnector(ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway, publicKey string) bool {
+	config := &corev1.ConfigMap{}
+	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: gateway.Namespace}, config); err != nil {
+		return false
+	}
+	var grants struct {
+		Grants []struct {
+			Peer string `json:"peer"`
+		} `json:"grants"`
+	}
+	if err := json.Unmarshal([]byte(config.Data["grants.json"]), &grants); err != nil {
+		return false
+	}
+	for _, grant := range grants.Grants {
+		if strings.EqualFold(grant.Peer, publicKey) {
+			return true
+		}
+	}
+	return false
 }
 
 func gatewayInterfaceName(project, network, gatewayKey string) string {

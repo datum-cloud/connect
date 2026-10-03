@@ -159,8 +159,8 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if err := reconcileNetworkBinding(ctx, c, "project-id", binding); err != nil {
 		t.Fatal(err)
 	}
-	if !meta.IsStatusConditionTrue(binding.Status.Conditions, "Accepted") || binding.Status.AssignedAddress == "" || binding.Status.PeerAddress == "" {
-		t.Fatalf("binding not accepted or addresses missing: %#v", binding.Status)
+	if condition := meta.FindStatusCondition(binding.Status.Conditions, "Accepted"); condition == nil || condition.Status != metav1.ConditionUnknown || condition.Reason != "GatewayApplyingGrant" || binding.Status.AssignedAddress == "" || binding.Status.PeerAddress == "" {
+		t.Fatalf("binding should wait for the grant rollout and have addresses: %#v", binding.Status)
 	}
 	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
@@ -188,8 +188,24 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if err := unstructured.SetNestedSlice(workload.Object, []interface{}{map[string]interface{}{"type": "Available", "status": "True"}}, "status", "conditions"); err != nil {
 		t.Fatal(err)
 	}
+	for path, value := range map[string]interface{}{
+		"observedGeneration": workload.GetGeneration(),
+		"desiredReplicas":    int64(1),
+		"readyReplicas":      int64(1),
+		"updatedReplicas":    int64(1),
+	} {
+		if err := unstructured.SetNestedField(workload.Object, value, "status", path); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := c.Update(ctx, workload); err != nil {
 		t.Fatal(err)
+	}
+	if err := reconcileNetworkBinding(ctx, c, "project-id", binding); err != nil {
+		t.Fatal(err)
+	}
+	if !meta.IsStatusConditionTrue(binding.Status.Conditions, "Accepted") {
+		t.Fatalf("binding should be accepted only after the gateway applies its grant: %#v", binding.Status.Conditions)
 	}
 	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
