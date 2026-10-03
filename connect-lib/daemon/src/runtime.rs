@@ -903,104 +903,98 @@ impl Control for RealControl {
         // Prefer the project-scoped Connect API. The resource controller owns
         // gateway selection and address assignment; the daemon only applies
         // the returned, approved configuration to the local CONNECT-IP stack.
-        match runtime
+        if let Some(status) = runtime
             .cloud
             .join_gateway_network(network, &cloud_details(&runtime.transport))
             .await
             .map_err(cloud_error)?
         {
-            Some(status) => {
-                let endpoint_id = json_string(&status, "gatewayEndpointID")?;
-                let assigned_address = json_string(&status, "assignedAddress")?;
-                let peer_address = json_string(&status, "peerAddress")?;
-                let routes = status["routes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|route| {
-                        route.as_str().map(str::to_owned).ok_or_else(|| {
-                            ApiError::bad_request("ConnectNetworkBinding returned an invalid route")
-                        })
+            let endpoint_id = json_string(&status, "gatewayEndpointID")?;
+            let assigned_address = json_string(&status, "assignedAddress")?;
+            let peer_address = json_string(&status, "peerAddress")?;
+            let routes = status["routes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|route| {
+                    route.as_str().map(str::to_owned).ok_or_else(|| {
+                        ApiError::bad_request("ConnectNetworkBinding returned an invalid route")
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let relay_urls = status["relayURLs"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|relay| {
-                        relay.as_str().map(str::to_owned).ok_or_else(|| {
-                            ApiError::bad_request(
-                                "ConnectNetworkBinding returned an invalid relay URL",
-                            )
-                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let relay_urls = status["relayURLs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|relay| {
+                    relay.as_str().map(str::to_owned).ok_or_else(|| {
+                        ApiError::bad_request("ConnectNetworkBinding returned an invalid relay URL")
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut digest = Sha256::new();
-                digest.update(project.as_bytes());
-                digest.update([0]);
-                digest.update(network.as_bytes());
-                let hash = digest.finalize();
-                let interface_name = format!(
-                    "dc{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    hash[0], hash[1], hash[2], hash[3], hash[4]
-                );
-                let binding = crate::local_ip::Binding {
-                    project: project.to_owned(),
-                    network: network.to_owned(),
-                    gateway: endpoint_id.clone(),
-                    addresses: vec![],
-                    relay_urls,
-                    assigned_address,
-                    routes: routes.clone(),
-                    interface_name,
-                    mtu: 1280,
-                };
-                let assigned = binding.address()?;
-                let peer: connect_ip_adapter::IpNet = peer_address.parse().map_err(|_| {
-                    ApiError::bad_request("ConnectNetworkBinding peerAddress is invalid")
-                })?;
-                if assigned.addr().is_ipv4()
-                    || assigned.prefix_len() != 128
-                    || peer.addr().is_ipv4()
-                    || peer.prefix_len() != 128
-                {
-                    return Err(ApiError::bad_request(
-                        "ConnectNetworkBinding must assign IPv6 /128 host addresses",
-                    ));
-                }
-                binding.parsed_routes()?;
-                let mut networks = runtime.networks.lock().await;
-                require_network_authorization(&runtime.authorized, &runtime.cancel)?;
-                if let Some(existing) = networks
-                    .get(network)
-                    .filter(|attachment| !attachment.is_finished())
-                {
-                    return Ok(existing.status().await);
-                }
-                if let Some(previous) = networks.remove(network) {
-                    previous.stop().await;
-                }
-                let attachment = crate::local_ip::NetworkAttachment::Gateway(
-                    crate::local_ip::join(
-                        binding,
-                        runtime.transport.endpoint(),
-                        runtime.cancel.child_token(),
-                    )
-                    .await?,
-                );
-                if let Err(error) =
-                    require_network_authorization(&runtime.authorized, &runtime.cancel)
-                {
-                    attachment.stop().await;
-                    return Err(error);
-                }
-                let mut result = attachment.status().await;
-                result["gateway"] = serde_json::json!(endpoint_id);
-                result["routes"] = serde_json::json!(routes);
-                networks.insert(network.to_owned(), attachment);
-                return Ok(result);
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut digest = Sha256::new();
+            digest.update(project.as_bytes());
+            digest.update([0]);
+            digest.update(network.as_bytes());
+            let hash = digest.finalize();
+            let interface_name = format!(
+                "dc{:02x}{:02x}{:02x}{:02x}{:02x}",
+                hash[0], hash[1], hash[2], hash[3], hash[4]
+            );
+            let binding = crate::local_ip::Binding {
+                project: project.to_owned(),
+                network: network.to_owned(),
+                gateway: endpoint_id.clone(),
+                addresses: vec![],
+                relay_urls,
+                assigned_address,
+                routes: routes.clone(),
+                interface_name,
+                mtu: 1280,
+            };
+            let assigned = binding.address()?;
+            let peer: connect_ip_adapter::IpNet = peer_address.parse().map_err(|_| {
+                ApiError::bad_request("ConnectNetworkBinding peerAddress is invalid")
+            })?;
+            if assigned.addr().is_ipv4()
+                || assigned.prefix_len() != 128
+                || peer.addr().is_ipv4()
+                || peer.prefix_len() != 128
+            {
+                return Err(ApiError::bad_request(
+                    "ConnectNetworkBinding must assign IPv6 /128 host addresses",
+                ));
             }
-            None => {}
+            binding.parsed_routes()?;
+            let mut networks = runtime.networks.lock().await;
+            require_network_authorization(&runtime.authorized, &runtime.cancel)?;
+            if let Some(existing) = networks
+                .get(network)
+                .filter(|attachment| !attachment.is_finished())
+            {
+                return Ok(existing.status().await);
+            }
+            if let Some(previous) = networks.remove(network) {
+                previous.stop().await;
+            }
+            let attachment = crate::local_ip::NetworkAttachment::Gateway(
+                crate::local_ip::join(
+                    binding,
+                    runtime.transport.endpoint(),
+                    runtime.cancel.child_token(),
+                )
+                .await?,
+            );
+            if let Err(error) = require_network_authorization(&runtime.authorized, &runtime.cancel)
+            {
+                attachment.stop().await;
+                return Err(error);
+            }
+            let mut result = attachment.status().await;
+            result["gateway"] = serde_json::json!(endpoint_id);
+            result["routes"] = serde_json::json!(routes);
+            networks.insert(network.to_owned(), attachment);
+            return Ok(result);
         }
         let config = self.ip_config(&runtime).await?.ok_or_else(|| ApiError::new(axum::http::StatusCode::NOT_IMPLEMENTED, "No saved IP attachment. For a direct peer, run connect join NETWORK --peer CONNECTOR with explicit traffic permissions. VPC membership is not implemented.").with_code("network_not_configured"))?;
         let binding = config.approval(project, network)?;
@@ -1075,12 +1069,11 @@ impl Control for RealControl {
             .projects
             .get(project)
             .is_some_and(|p| p.peer_networks.contains_key(network))
+            && !gateway_left
         {
-            if !gateway_left {
-                return Err(ApiError::not_found(
-                    "No saved peer attachment with this name",
-                ));
-            }
+            return Err(ApiError::not_found(
+                "No saved peer attachment with this name",
+            ));
         }
         if let Some(runtime) = self.projects.lock().await.get(project).cloned()
             && let Some(attachment) = runtime.networks.lock().await.remove(network)
