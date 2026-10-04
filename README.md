@@ -31,6 +31,13 @@ approved by your Connector's class and aliases of those keys. Use `--allow` to
 select specific Connectors. Explicitly allowing a gateway can expose your
 service through that gateway's ingress.
 Use `--protocol udp` with `serve` and `dial` for UDP; TCP is the default.
+Dial ports carry transparent application traffic and cannot authenticate local
+clients. Per-user daemons retain them for single-user workstations, but loopback
+does not enforce an account boundary: another local account may also reach them.
+System daemons disable dial listeners by default so local accounts cannot borrow
+the daemon's private-service access. Administrators of a trusted single-user
+host can opt in during installation with `--allow-unsafe-local-dials`. Install a
+per-user daemon with `--disable-local-dials` on a shared workstation.
 Use `--project PROJECT` to select a project or use your `datumctl` context.
 Use `datumctl get` and `datumctl edit` to inspect and edit cloud resources.
 Connect does not provide another general-purpose resource-management CLI.

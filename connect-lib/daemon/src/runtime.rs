@@ -43,6 +43,7 @@ pub struct RealControl {
     mutation_lock: Arc<Mutex<()>>,
     local_ip: Option<Arc<crate::local_ip::LocalIpConfig>>,
     relay_urls: Option<Vec<iroh::RelayUrl>>,
+    local_dials_enabled: bool,
 }
 
 struct ProjectRuntime {
@@ -139,6 +140,7 @@ impl RealControl {
             mutation_lock,
             local_ip: None,
             relay_urls: None,
+            local_dials_enabled: true,
         }
     }
 
@@ -149,6 +151,11 @@ impl RealControl {
 
     pub fn with_relay_urls(mut self, relays: Option<Vec<iroh::RelayUrl>>) -> Self {
         self.relay_urls = relays;
+        self
+    }
+
+    pub fn with_local_dials_enabled(mut self, enabled: bool) -> Self {
+        self.local_dials_enabled = enabled;
         self
     }
 
@@ -788,6 +795,13 @@ impl Control for RealControl {
     }
 
     async fn reconcile_dial(&self, project: &str, dial: &DialState) -> Result<u16, ApiError> {
+        if !self.local_dials_enabled {
+            return Err(ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "Local dials are disabled for this daemon because raw loopback ports cannot authenticate local clients",
+            )
+            .with_code("local_dials_disabled"));
+        }
         let runtime = self.project(project).await?;
         let peer = runtime
             .cloud

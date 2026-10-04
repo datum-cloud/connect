@@ -55,7 +55,7 @@ func TestServiceConfigIsExplicitAndScoped(t *testing.T) {
 	if err := os.WriteFile(exe, []byte("binary"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	_, cfg, err := makeService(false, exe, 47781, "/private/credentials.json", "/private/ip.json")
+	_, cfg, err := makeService(false, true, exe, 47781, "/private/credentials.json", "/private/ip.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,8 @@ func TestServiceConfigIsExplicitAndScoped(t *testing.T) {
 		t.Fatalf("UserService = %#v", got)
 	}
 	if !argumentPair(cfg.Arguments, "--credentials-file", "/private/credentials.json") ||
-		!argumentPair(cfg.Arguments, "--local-ip-config", "/private/ip.json") {
+		!argumentPair(cfg.Arguments, "--local-ip-config", "/private/ip.json") ||
+		!argumentPair(cfg.Arguments, "--local-dial-access", "unrestricted-loopback") {
 		t.Fatalf("args = %#v", cfg.Arguments)
 	}
 	if runtime.GOOS == "windows" && cfg.Arguments[len(cfg.Arguments)-1] != "--windows-service" {
@@ -78,6 +79,50 @@ func TestServiceConfigIsExplicitAndScoped(t *testing.T) {
 	if runtime.GOOS == "linux" && len(cfg.Dependencies) == 0 {
 		t.Fatal("systemd config lacks network dependency")
 	}
+}
+
+func TestSystemServiceDisablesLocalDialsUnlessExplicitlyEnabled(t *testing.T) {
+	exe := filepath.Join(t.TempDir(), "datum-connect-daemon")
+	if err := os.WriteFile(exe, []byte("binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	_, disabled, err := makeService(true, false, exe, 47780, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !argumentPair(disabled.Arguments, "--local-dial-access", "disabled") || !hasArgument(disabled.Arguments, "--system-service") {
+		t.Fatalf("system args = %#v", disabled.Arguments)
+	}
+	_, enabled, err := makeService(true, true, exe, 47780, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !argumentPair(enabled.Arguments, "--local-dial-access", "unrestricted-loopback") {
+		t.Fatalf("opt-in system args = %#v", enabled.Arguments)
+	}
+}
+
+func TestPerUserServiceCanDisableLocalDials(t *testing.T) {
+	exe := filepath.Join(t.TempDir(), "datum-connect-daemon")
+	if err := os.WriteFile(exe, []byte("binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	_, cfg, err := makeService(false, false, exe, 47780, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !argumentPair(cfg.Arguments, "--local-dial-access", "disabled") {
+		t.Fatalf("shared-host user args = %#v", cfg.Arguments)
+	}
+}
+
+func hasArgument(arguments []string, name string) bool {
+	for _, argument := range arguments {
+		if argument == name {
+			return true
+		}
+	}
+	return false
 }
 
 func argumentPair(arguments []string, name, value string) bool {

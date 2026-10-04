@@ -37,7 +37,7 @@ func bootstrapUser(ctx context.Context, version, executable string, timeout time
 		return err
 	}
 	defer unlock()
-	svc, _, err := makeService(false, "", 47780, "", "")
+	svc, _, err := makeService(false, true, "", 47780, "", "")
 	if err != nil {
 		return err
 	}

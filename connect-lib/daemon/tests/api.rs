@@ -24,6 +24,7 @@ struct MockControl {
     service_calls: AtomicUsize,
     fail_service: AtomicBool,
     fail_dial: AtomicBool,
+    dial_calls: AtomicUsize,
     network_calls: AtomicUsize,
 }
 
@@ -95,6 +96,7 @@ impl Control for MockControl {
         Ok(())
     }
     async fn reconcile_dial(&self, _project: &str, dial: &DialState) -> Result<u16, ApiError> {
+        self.dial_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_dial.load(Ordering::SeqCst) {
             return Err(ApiError::internal("simulated dial failure"));
         }
@@ -378,6 +380,14 @@ async fn setup(
     repo: &Path,
     control: Arc<MockControl>,
 ) -> (String, reqwest::Client, tokio::task::JoinHandle<()>) {
+    setup_with_dial_access(repo, control, api::LocalDialAccess::UnrestrictedLoopback).await
+}
+
+async fn setup_with_dial_access(
+    repo: &Path,
+    control: Arc<MockControl>,
+    local_dial_access: api::LocalDialAccess,
+) -> (String, reqwest::Client, tokio::task::JoinHandle<()>) {
     let store = Store::open(repo).await.unwrap();
     auth::initialize_setup_token(&store, repo).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -387,6 +397,7 @@ async fn setup(
         control,
         default_credentials_file: None,
         mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        local_dial_access,
     };
     let task = tokio::spawn(async move {
         axum::serve(listener, api::router(state)).await.unwrap();
@@ -919,6 +930,38 @@ async fn failed_dial_can_be_retried_without_duplicate_intent() {
 }
 
 #[tokio::test]
+async fn disabled_local_dials_are_rejected_without_saving_intent() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) =
+        setup_with_dial_access(repo.path(), control.clone(), api::LocalDialAccess::Disabled).await;
+    let token = enroll_test_project(&base, &client, repo.path()).await;
+    let response = client
+        .post(format!("{base}/v1/dials?project=alpha"))
+        .bearer_auth(&token)
+        .json(&json!({"connector":"peer", "port":22, "bind":2222}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["code"], "local_dials_disabled");
+    assert_eq!(control.dial_calls.load(Ordering::SeqCst), 0);
+    let status: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["local_dial_access"], "disabled");
+    assert!(status["dials"].as_array().unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
 async fn setup_errors_have_stable_codes_and_failed_ephemeral_dial_can_be_removed() {
     let repo = tempfile::tempdir().unwrap();
     let control = Arc::new(MockControl::default());
@@ -1122,6 +1165,7 @@ async fn restart_reconciles_only_desired_active_intent() {
         control: control.clone(),
         default_credentials_file: None,
         mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        local_dial_access: api::LocalDialAccess::UnrestrictedLoopback,
     };
     store
         .transact(|root| {
@@ -1183,6 +1227,7 @@ async fn restart_reconciles_only_desired_active_intent() {
         control: control.clone(),
         default_credentials_file: None,
         mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        local_dial_access: api::LocalDialAccess::UnrestrictedLoopback,
     };
     api::reconcile_all(&restarted).await;
     assert_eq!(control.up_calls.load(Ordering::SeqCst), 1);

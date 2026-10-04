@@ -32,11 +32,13 @@ func SystemSetupTokenPath() string {
 }
 
 type installOptions struct {
-	system          bool
-	credentialsFile string
-	localIPConfig   string
-	port            uint16
-	executable      string
+	system           bool
+	allowUnsafeDials bool
+	disableDials     bool
+	credentialsFile  string
+	localIPConfig    string
+	port             uint16
+	executable       string
 }
 
 func InstallCommand() *cobra.Command {
@@ -45,6 +47,8 @@ func InstallCommand() *cobra.Command {
 		return install(cmd, *o)
 	}}
 	addScopeFlag(cmd, &o.system)
+	cmd.Flags().BoolVar(&o.allowUnsafeDials, "allow-unsafe-local-dials", false, "Allow every local process to use raw TCP/UDP dial ports from a system service")
+	cmd.Flags().BoolVar(&o.disableDials, "disable-local-dials", false, "Disable raw TCP/UDP dial listeners (recommended on shared hosts)")
 	cmd.Flags().StringVar(&o.credentialsFile, "credentials-file", "", "Credential JSON to copy into service-owned state")
 	cmd.Flags().StringVar(&o.localIPConfig, "local-ip-config", "", "Absolute path to CONNECT-IP approvals (system daemon or approved networking helper)")
 	cmd.Flags().Uint16Var(&o.port, "port", 47780, "Loopback HTTP port")
@@ -73,7 +77,7 @@ func StatusCommand() *cobra.Command {
 				return err
 			}
 		}
-		svc, _, err := makeService(system, "", 47780, "", "")
+		svc, _, err := makeService(system, false, "", 47780, "", "")
 		if err != nil {
 			return err
 		}
@@ -111,7 +115,7 @@ func lifecycleCommand(use, short string, action func(service.Service) error) *co
 				return err
 			}
 		}
-		svc, _, err := makeService(system, "", 47780, "", "")
+		svc, _, err := makeService(system, false, "", 47780, "", "")
 		if err != nil {
 			return err
 		}
@@ -179,6 +183,12 @@ func install(cmd *cobra.Command, o installOptions) error {
 			return err
 		}
 	}
+	if o.allowUnsafeDials && !o.system {
+		return fmt.Errorf("--allow-unsafe-local-dials applies only to --system; per-user services already enable unrestricted loopback dials for single-user workstation compatibility")
+	}
+	if o.allowUnsafeDials && o.disableDials {
+		return fmt.Errorf("--allow-unsafe-local-dials and --disable-local-dials cannot be used together")
+	}
 	if runtime.GOOS == "windows" && o.credentialsFile == "" {
 		return fmt.Errorf("the Windows system service cannot use the interactive datumctl login helper; pass --credentials-file with renewable Connector or service-account credentials")
 	}
@@ -204,7 +214,8 @@ func install(cmd *cobra.Command, o installOptions) error {
 	if localIPConfig != "" {
 		serviceLocalIPConfig = filepath.Join(stateDir, "local-ip.json")
 	}
-	svc, cfg, err := makeService(o.system, executable, o.port, credentialCopy, serviceLocalIPConfig)
+	localDialsEnabled := (!o.system && !o.disableDials) || o.allowUnsafeDials
+	svc, cfg, err := makeService(o.system, localDialsEnabled, executable, o.port, credentialCopy, serviceLocalIPConfig)
 	if err != nil {
 		return err
 	}
@@ -239,7 +250,16 @@ func install(cmd *cobra.Command, o installOptions) error {
 		start += fmt.Sprintf(" --daemon-url http://127.0.0.1:%d", o.port)
 	}
 	human := fmt.Sprintf("Installed Connect daemon service (%s).\nState and logs: %s\nNext: %s\n", scopeLabel(o.system), stateDir, start)
-	return output.Write(cmd, map[string]any{"service": serviceName, "action": "installed", "system": o.system, "state_dir": stateDir, "local_ip_config": serviceLocalIPConfig}, human)
+	if o.system && o.allowUnsafeDials {
+		human += "Warning: raw dial ports accept traffic from every local process on this host.\n"
+	} else if !localDialsEnabled {
+		human += "Raw TCP/UDP dial listeners are disabled for this service.\n"
+	}
+	localDialAccess := "disabled"
+	if localDialsEnabled {
+		localDialAccess = "unrestricted_loopback"
+	}
+	return output.Write(cmd, map[string]any{"service": serviceName, "action": "installed", "system": o.system, "state_dir": stateDir, "local_ip_config": serviceLocalIPConfig, "local_dial_access": localDialAccess}, human)
 }
 
 func validateLocalIPConfig(value string, system, hasCredentials bool) (string, error) {
@@ -508,7 +528,7 @@ func copyPrivateFile(source, destination string, limit int64) error {
 
 // makeService builds a native kardianos service. An empty executable is used
 // for lifecycle commands, where the installed service definition is authoritative.
-func makeService(system bool, executable string, port uint16, credentials, localIPConfig string) (service.Service, *service.Config, error) {
+func makeService(system, localDialsEnabled bool, executable string, port uint16, credentials, localIPConfig string) (service.Service, *service.Config, error) {
 	if executable == "" {
 		executable = serviceName
 	}
@@ -517,6 +537,14 @@ func makeService(system bool, executable string, port uint16, credentials, local
 		"--repo", stateDir,
 		"--port", fmt.Sprint(port),
 		"--log-file", filepath.Join(stateDir, "daemon.log"),
+	}
+	if system {
+		args = append(args, "--system-service")
+	}
+	if localDialsEnabled {
+		args = append(args, "--local-dial-access", "unrestricted-loopback")
+	} else {
+		args = append(args, "--local-dial-access", "disabled")
 	}
 	if credentials != "" {
 		args = append(args, "--credentials-file", credentials)

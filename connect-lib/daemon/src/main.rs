@@ -1,8 +1,8 @@
 use std::{future::IntoFuture, path::PathBuf, sync::Arc};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use datum_connect_daemon::{
-    api::{self, AppState},
+    api::{self, AppState, LocalDialAccess},
     auth,
     control::Control,
     error::ApiError,
@@ -15,6 +15,14 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 #[cfg(windows)]
 #[path = "main/windows_service.rs"]
 mod windows_service;
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum LocalDialAccessArg {
+    #[default]
+    Auto,
+    Disabled,
+    UnrestrictedLoopback,
+}
 
 #[derive(Clone, Debug, Parser)]
 #[command(name = "datum-connect-daemon", version)]
@@ -46,6 +54,19 @@ struct Args {
     /// Comma-separated HTTPS relay origins. Staging sessions default to Datum staging relays.
     #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
     relay_urls: Option<String>,
+
+    /// Access policy for raw local TCP/UDP dial listeners. Loopback does not authenticate clients.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        env = "DATUM_CONNECT_LOCAL_DIAL_ACCESS"
+    )]
+    local_dial_access: LocalDialAccessArg,
+
+    /// Mark an OS-wide service so automatic local-dial policy fails closed.
+    #[arg(long, hide = true)]
+    system_service: bool,
 
     /// Run under the Windows Service Control Manager.
     #[cfg(windows)]
@@ -92,6 +113,19 @@ async fn run(
     external_shutdown: Option<CancellationToken>,
     on_ready: Option<fn()>,
 ) -> Result<(), ApiError> {
+    let local_dial_access = effective_local_dial_access(&args);
+    match local_dial_access {
+        LocalDialAccess::Disabled => tracing::info!(
+            stage = "startup",
+            local_dial_access = "disabled",
+            "raw local dial listeners are disabled"
+        ),
+        LocalDialAccess::UnrestrictedLoopback => tracing::warn!(
+            stage = "startup",
+            local_dial_access = "unrestricted_loopback",
+            "local dial listeners accept traffic from every process that can reach host loopback"
+        ),
+    }
     let store = Store::open(&args.repo).await?;
     auth::initialize_setup_token(&store, &args.repo).await?;
 
@@ -102,6 +136,7 @@ async fn run(
     };
     let control: Arc<dyn Control> = Arc::new(
         RealControl::new(args.repo.clone(), store.clone(), mutation_lock.clone())
+            .with_local_dials_enabled(local_dial_access == LocalDialAccess::UnrestrictedLoopback)
             .with_local_ip_config(local_ip)
             .with_relay_urls(
                 args.relay_urls
@@ -123,6 +158,7 @@ async fn run(
             .credentials_file
             .map(|path| path.to_string_lossy().into_owned()),
         mutation_lock,
+        local_dial_access,
     };
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.port))
         .await
@@ -183,6 +219,69 @@ async fn run(
     }
     tracing::info!(stage = "shutdown", "daemon_stopped");
     serve_error.map_or(Ok(()), Err)
+}
+
+fn effective_local_dial_access(args: &Args) -> LocalDialAccess {
+    match args.local_dial_access {
+        LocalDialAccessArg::Disabled => LocalDialAccess::Disabled,
+        LocalDialAccessArg::UnrestrictedLoopback => LocalDialAccess::UnrestrictedLoopback,
+        LocalDialAccessArg::Auto => {
+            #[cfg(unix)]
+            let elevated = unsafe { libc::geteuid() } == 0;
+            #[cfg(not(unix))]
+            let elevated = false;
+            #[cfg(windows)]
+            let system_service = args.system_service || args.windows_service;
+            #[cfg(not(windows))]
+            let system_service = args.system_service;
+            if elevated || system_service {
+                LocalDialAccess::Disabled
+            } else {
+                LocalDialAccess::UnrestrictedLoopback
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(access: LocalDialAccessArg, system_service: bool) -> Args {
+        Args {
+            repo: PathBuf::from("repo"),
+            port: 47_780,
+            log_file: None,
+            credentials_file: None,
+            offline: false,
+            local_ip_config: None,
+            relay_urls: None,
+            local_dial_access: access,
+            system_service,
+            #[cfg(windows)]
+            windows_service: false,
+        }
+    }
+
+    #[test]
+    fn explicit_local_dial_policy_is_honored() {
+        assert_eq!(
+            effective_local_dial_access(&args(LocalDialAccessArg::Disabled, false)),
+            LocalDialAccess::Disabled
+        );
+        assert_eq!(
+            effective_local_dial_access(&args(LocalDialAccessArg::UnrestrictedLoopback, true)),
+            LocalDialAccess::UnrestrictedLoopback
+        );
+    }
+
+    #[test]
+    fn automatic_system_service_policy_is_disabled() {
+        assert_eq!(
+            effective_local_dial_access(&args(LocalDialAccessArg::Auto, true)),
+            LocalDialAccess::Disabled
+        );
+    }
 }
 
 async fn wait_for_shutdown_signal() {

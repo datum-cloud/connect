@@ -25,12 +25,33 @@ use crate::{
     store::Store,
 };
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalDialAccess {
+    Disabled,
+    UnrestrictedLoopback,
+}
+
+impl LocalDialAccess {
+    fn require_enabled(self) -> Result<(), ApiError> {
+        match self {
+            Self::UnrestrictedLoopback => Ok(()),
+            Self::Disabled => Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "Local dials are disabled for this daemon. Raw TCP and UDP loopback ports cannot authenticate local clients; use a per-user daemon, or explicitly opt a trusted single-user host into unrestricted loopback dials.",
+            )
+            .with_code("local_dials_disabled")),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
     pub control: Arc<dyn Control>,
     pub default_credentials_file: Option<String>,
     pub mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    pub local_dial_access: LocalDialAccess,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -148,7 +169,7 @@ async fn status(
         } else {
             json!([])
         };
-    let mut result = ProjectStatus::from_state(query.project, project);
+    let mut result = ProjectStatus::from_state(query.project, project, state.local_dial_access);
     result.transport = diagnostics;
     result.networks = networks;
     if actor.role != Role::Operate || actor.scopes.iter().any(|scope| scope == "project") {
@@ -159,6 +180,7 @@ async fn status(
 
 #[derive(Debug, Serialize)]
 struct ProjectStatus {
+    local_dial_access: LocalDialAccess,
     networking: Value,
     transport: Value,
     project: String,
@@ -176,8 +198,13 @@ struct ProjectStatus {
 }
 
 impl ProjectStatus {
-    fn from_state(project: String, state: ProjectState) -> Self {
+    fn from_state(
+        project: String,
+        state: ProjectState,
+        local_dial_access: LocalDialAccess,
+    ) -> Self {
         Self {
+            local_dial_access,
             networking: Value::Null,
             transport: Value::Null,
             project,
@@ -830,6 +857,7 @@ async fn create_dial(
 ) -> Result<(StatusCode, Json<DialState>), ApiError> {
     let actor = authorized(&state, &headers, &query.project).await?;
     actor.require_operate(&query.project, "project")?;
+    state.local_dial_access.require_enabled()?;
     let _mutation_guard = state.mutation_lock.lock().await;
     if request.port == 0 || request.connector.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -1520,6 +1548,20 @@ async fn reconcile_project(state: &AppState, project: &str) {
                 .await;
             }
         }
+    }
+    if state.local_dial_access == LocalDialAccess::Disabled {
+        for dial in desired.dials.values().filter(|dial| dial.desired_active) {
+            let key = dial.local_port.unwrap_or(dial.bind);
+            let _ = record_dial_error(
+                state,
+                project,
+                key,
+                "restart_dial",
+                "Local dials are disabled for this daemon because raw loopback ports cannot authenticate local clients",
+            )
+            .await;
+        }
+        return;
     }
     for dial in desired.dials.values().filter(|dial| dial.desired_active) {
         match state.control.reconcile_dial(project, dial).await {

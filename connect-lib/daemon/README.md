@@ -151,7 +151,15 @@ sudo datumctl connect daemon start --system
 
 Do not run a user daemon and a system daemon on the same API port. The installer
 copies credentials and IP policy into protected service state. It does not enroll
-a project. Set the explicit project and system setup token when operating it:
+a project. Raw TCP and UDP `dial` listeners are disabled because loopback cannot
+authenticate which local account opened a connection or sent a datagram. Use a
+per-user daemon for transparent local forwarding only on a single-user host or
+with separate OS network isolation. Install a per-user service with
+`--disable-local-dials` on a shared host. On a trusted single-user host, an
+administrator may explicitly accept host-wide access with
+`daemon install --system --allow-unsafe-local-dials`; every local process can
+then use those forwards. Set the explicit project and system setup token when
+operating it:
 
 ```sh
 sudo datumctl connect up --project PROJECT \
