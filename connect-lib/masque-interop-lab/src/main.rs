@@ -1,8 +1,8 @@
-//! Local independent-client lab: standard H3 CONNECT-UDP -> Connect transport -> UDP origin.
+//! Local independent-client lab for standard H3 CONNECT-UDP and CONNECT-IP.
 
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
 };
@@ -10,12 +10,13 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, Bytes, BytesMut};
 use connect_transport::{
-    Access, DestinationId, DestinationPolicy, Policy, Target, Transport, TransportConfig,
+    Access, DestinationId, DestinationPolicy, Policy, Target, Transport, TransportConfig, ip,
     standard_connect_udp_target,
 };
 use h3::error::Code;
+use h3::ext::Protocol;
 use h3_datagram::datagram_handler::{HandleDatagramsExt, SendDatagramError};
-use http::{Response, StatusCode};
+use http::{Method, Response, StatusCode};
 use iroh::{EndpointAddr, SecretKey};
 use quinn::crypto::rustls::QuicServerConfig;
 use rcgen::generate_simple_self_signed;
@@ -26,6 +27,10 @@ use tokio_util::sync::CancellationToken;
 const CAPSULE_PROTOCOL: &str = "capsule-protocol";
 const DATAGRAM_CAPSULE: u64 = 0;
 const MAX_CAPSULE: usize = 64 * 1024;
+const IP_PATH: &str = "/.well-known/masque/ip/*/*/";
+const IP_NETWORK: &str = "masque-interop";
+const IP_ASSIGNED: Ipv4Addr = Ipv4Addr::new(10, 20, 0, 2);
+const IP_REMOTE: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 9);
 
 struct Options {
     listen: SocketAddr,
@@ -92,6 +97,33 @@ async fn main() -> Result<()> {
         EndpointAddr::new(details.endpoint_id),
         EndpointAddr::with_ip_addr,
     );
+    let mut ip_registration = backend
+        .register_ip_grant(ip::Grant {
+            peer: edge.endpoint_id(),
+            network: IP_NETWORK.into(),
+            address: IpAddr::V4(IP_ASSIGNED),
+            routes: vec!["10.30.0.9/32".parse()?],
+            mtu: 1280,
+        })
+        .await
+        .context("install test CONNECT-IP grant")?;
+    tokio::spawn(async move {
+        while let Some(incoming) = ip_registration.recv().await {
+            if incoming.ready.send(true).is_err() {
+                continue;
+            }
+            tokio::spawn(async move {
+                while let Some(packet) = incoming.session.recv().await {
+                    let Some(reply) = reverse_ipv4_packet(packet) else {
+                        continue;
+                    };
+                    if incoming.session.send(reply).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
 
     let certified = generate_simple_self_signed(vec!["localhost".into()])?;
     std::fs::write(&options.cert_out, certified.cert.pem()).context("write test CA certificate")?;
@@ -121,6 +153,9 @@ async fn main() -> Result<()> {
                 public_addr.port()
             ),
             "allowed_target": options.origin.to_string(),
+            "ip_uri": format!("https://localhost:{}{IP_PATH}", public_addr.port()),
+            "ip_assigned": IP_ASSIGNED.to_string(),
+            "ip_remote": IP_REMOTE.to_string(),
             "service_endpoint": details.endpoint_id.to_string(),
         }))?,
     )
@@ -153,6 +188,29 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn reverse_ipv4_packet(packet: Bytes) -> Option<Bytes> {
+    if packet.len() < 20 || packet[0] != 0x45 {
+        return None;
+    }
+    let mut bytes = packet.to_vec();
+    let source = <[u8; 4]>::try_from(&bytes[12..16]).ok()?;
+    let destination = <[u8; 4]>::try_from(&bytes[16..20]).ok()?;
+    bytes[12..16].copy_from_slice(&destination);
+    bytes[16..20].copy_from_slice(&source);
+    bytes[10..12].fill(0);
+    let mut sum: u32 = bytes[..20]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u32::from(u16::from_be_bytes(*pair)))
+        .sum();
+    while sum > u32::from(u16::MAX) {
+        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    }
+    bytes[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    Some(Bytes::from(bytes))
+}
+
 async fn serve_connection(
     incoming: quinn::Incoming,
     edge: Transport,
@@ -180,6 +238,114 @@ async fn serve_connection(
             accepted = h3.accept() => {
                 let Some(resolver) = accepted.context("accept request")? else { break };
                 let (request, mut stream) = resolver.resolve_request().await.context("decode request")?;
+                let is_connect_ip = request.method() == Method::CONNECT
+                    && request.extensions().get::<Protocol>() == Some(&Protocol::CONNECT_IP);
+                if is_connect_ip {
+                    let common_valid = request.uri().scheme_str() == Some("https")
+                        && request.uri().query().is_none()
+                        && request.headers().get(CAPSULE_PROTOCOL).and_then(|value| value.to_str().ok()) == Some("?1");
+                    let target = connect_ip_target(request.uri().path());
+                    if !common_valid || target.is_none() {
+                        stream.send_response(
+                            Response::builder().status(StatusCode::BAD_REQUEST).body(())?
+                        ).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
+                    if target != Some(("*", "*")) {
+                        stream.send_response(
+                            Response::builder().status(StatusCode::FORBIDDEN).body(())?
+                        ).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
+                    if !datagrams_available {
+                        stream.send_response(
+                            Response::builder().status(StatusCode::SERVICE_UNAVAILABLE).body(())?
+                        ).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
+                    let session = match ip::connect(
+                        edge.endpoint(),
+                        backend.clone(),
+                        IP_NETWORK,
+                        cancel.child_token(),
+                    ).await {
+                        Ok(session) => session,
+                        Err(error) => {
+                            eprintln!("open Connect IP session: {error}");
+                            stream.send_response(
+                                Response::builder().status(StatusCode::BAD_GATEWAY).body(())?
+                            ).await?;
+                            stream.finish().await?;
+                            continue;
+                        }
+                    };
+                    let stream_id = stream.id();
+                    let association_id = stream_id.into_inner();
+                    let mut datagram_sender = h3.get_datagram_sender(stream_id);
+                    stream.send_response(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CAPSULE_PROTOCOL, "?1")
+                            .body(())?
+                    ).await.context("send CONNECT-IP response")?;
+
+                    let (incoming_tx, mut incoming_rx) = mpsc::channel::<Bytes>(64);
+                    associations.insert(association_id, incoming_tx);
+                    let closed_tx = closed_tx.clone();
+                    let association_cancel = cancel.child_token();
+                    tokio::spawn(async move {
+                        let result: Result<()> = async {
+                            let mut capsule_bytes = BytesMut::new();
+                            let request = loop {
+                                if let Some(capsule) = take_capsule(&mut capsule_bytes)? {
+                                    break capsule;
+                                }
+                                let Some(mut chunk) = stream.recv_data().await? else {
+                                    bail!("CONNECT-IP stream ended before ADDRESS_REQUEST");
+                                };
+                                let remaining = chunk.remaining();
+                                capsule_bytes.extend_from_slice(&chunk.copy_to_bytes(remaining));
+                            };
+                            let request_id = validate_ipv4_address_request(&request)?;
+                            stream.send_data(address_assignment_capsule(request_id)).await?;
+                            stream.send_data(route_advertisement_capsule(false)).await?;
+                            // RFC 9484 updates are complete snapshots. Exercise a withdrawal and
+                            // restoration before making the route usable for packet forwarding.
+                            stream.send_data(route_advertisement_capsule(true)).await?;
+                            stream.send_data(route_advertisement_capsule(false)).await?;
+                            loop {
+                                tokio::select! {
+                                    _ = association_cancel.cancelled() => break,
+                                    incoming = incoming_rx.recv() => {
+                                        let Some(packet) = incoming else { break };
+                                        session.send(packet).await.context("send internal IP packet")?;
+                                    }
+                                    incoming = session.recv() => {
+                                        let Some(packet) = incoming else { break };
+                                        let mut framed = Vec::with_capacity(packet.len() + 1);
+                                        framed.push(0);
+                                        framed.extend_from_slice(&packet);
+                                        match datagram_sender.send_datagram(Bytes::from(framed)) {
+                                            Ok(()) => {}
+                                            Err(SendDatagramError::TooLarge { .. }) => continue,
+                                            Err(error) => return Err(error.into()),
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }.await;
+                        if let Err(error) = result {
+                            eprintln!("CONNECT-IP association failed: {error:#}");
+                        }
+                        stream.stop_stream(Code::H3_REQUEST_CANCELLED);
+                        let _ = closed_tx.send(association_id).await;
+                    });
+                    continue;
+                }
                 let target = match standard_connect_udp_target(&request) {
                     Ok(target) => target,
                     Err(_) => {
@@ -323,6 +489,17 @@ async fn serve_connection(
     Ok(())
 }
 
+fn connect_ip_target(path: &str) -> Option<(&str, &str)> {
+    let suffix = path
+        .strip_prefix("/.well-known/masque/ip/")?
+        .strip_suffix('/')?;
+    let mut parts = suffix.split('/');
+    let target = parts.next()?;
+    let protocol = parts.next()?;
+    (!target.is_empty() && !protocol.is_empty() && parts.next().is_none())
+        .then_some((target, protocol))
+}
+
 fn encode_varint(value: u64, output: &mut Vec<u8>) {
     if value < 64 {
         output.push(value as u8);
@@ -355,6 +532,47 @@ fn datagram_capsule(payload: &[u8]) -> Bytes {
     encode_varint(0, &mut capsule);
     capsule.extend_from_slice(payload);
     Bytes::from(capsule)
+}
+
+fn capsule(kind: u64, payload: &[u8]) -> Bytes {
+    let mut capsule = Vec::with_capacity(payload.len() + 16);
+    encode_varint(kind, &mut capsule);
+    encode_varint(payload.len() as u64, &mut capsule);
+    capsule.extend_from_slice(payload);
+    Bytes::from(capsule)
+}
+
+fn validate_ipv4_address_request(request: &(u64, Bytes)) -> Result<u64> {
+    if request.0 != 2 {
+        bail!("expected RFC 9484 ADDRESS_REQUEST capsule");
+    }
+    let (request_id, width) =
+        decode_varint(&request.1).ok_or_else(|| anyhow!("invalid ADDRESS_REQUEST ID"))?;
+    if request_id == 0 || request.1[width..] != [4, 0, 0, 0, 0, 32] {
+        bail!("lab requires one wildcard IPv4 host ADDRESS_REQUEST");
+    }
+    Ok(request_id)
+}
+
+fn address_assignment_capsule(request_id: u64) -> Bytes {
+    let mut payload = Vec::with_capacity(14);
+    encode_varint(request_id, &mut payload);
+    payload.push(4);
+    payload.extend_from_slice(&IP_ASSIGNED.octets());
+    payload.push(32);
+    capsule(1, &payload)
+}
+
+fn route_advertisement_capsule(withdraw: bool) -> Bytes {
+    if withdraw {
+        return capsule(3, &[]);
+    }
+    let mut payload = Vec::with_capacity(10);
+    payload.push(4);
+    payload.extend_from_slice(&IP_REMOTE.octets());
+    payload.extend_from_slice(&IP_REMOTE.octets());
+    payload.push(0);
+    capsule(3, &payload)
 }
 
 fn take_capsule(buffer: &mut BytesMut) -> Result<Option<(u64, Bytes)>> {
@@ -403,5 +621,31 @@ mod tests {
         encode_varint(DATAGRAM_CAPSULE, &mut header);
         encode_varint((MAX_CAPSULE + 1) as u64, &mut header);
         assert!(take_capsule(&mut BytesMut::from(&header[..])).is_err());
+    }
+
+    #[test]
+    fn connect_ip_default_target_is_exact_and_other_targets_remain_policy_scoped() {
+        assert_eq!(connect_ip_target(IP_PATH), Some(("*", "*")));
+        assert_eq!(
+            connect_ip_target("/.well-known/masque/ip/10.30.0.9/17/"),
+            Some(("10.30.0.9", "17"))
+        );
+        assert_eq!(connect_ip_target("/.well-known/masque/ip/*/*"), None);
+        assert_eq!(connect_ip_target("/.well-known/masque/ip/*/*/extra/"), None);
+    }
+
+    #[test]
+    fn connect_ip_capsules_encode_assignment_update_withdrawal_and_restoration() {
+        let request = (2, Bytes::from_static(&[7, 4, 0, 0, 0, 0, 32]));
+        assert_eq!(validate_ipv4_address_request(&request).unwrap(), 7);
+        assert_eq!(
+            address_assignment_capsule(7).as_ref(),
+            &[1, 7, 7, 4, 10, 20, 0, 2, 32]
+        );
+        assert_eq!(route_advertisement_capsule(true).as_ref(), &[3, 0]);
+        assert_eq!(
+            route_advertisement_capsule(false).as_ref(),
+            &[3, 10, 4, 10, 30, 0, 9, 10, 30, 0, 9, 0]
+        );
     }
 }

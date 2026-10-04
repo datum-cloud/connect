@@ -35,7 +35,7 @@ This is deliberately policy lookup, not arbitrary target dialing.
 | CONNECT-UDP response | 2xx response with Capsule Protocol negotiation and correct stream errors | Success and policy-denied responses are independently tested; expand transport failure status and `Proxy-Status` coverage |
 | HTTP Datagrams | Quarter Stream ID association, context ID zero, unknown-context handling | Independent multi-stream coverage is present, including a patched Quarter Stream ID encoder; add negotiated size and unknown-context cases |
 | Capsule fallback | DATAGRAM capsules when QUIC/H3 datagrams are unavailable | Implemented and end-to-end tested in the standards-facing UDP edge with a bounded incremental decoder; extract the existing UDP/IP codecs into one production module |
-| CONNECT-IP | RFC 9484 request plus repeated address/route assignments and withdrawals | Prototype supports the default wildcard path and initial configuration only |
+| CONNECT-IP | RFC 9484 request plus repeated address/route assignments and withdrawals | The standards-facing lab accepts the exact default wildcard path, relays through an explicitly granted private CONNECT-IP session, and tests address assignment plus route withdrawal/restoration; production integration, arbitrary authorized templates, dual stack, and live policy-driven reconfiguration remain |
 | Multiplexing | Multiple concurrent CONNECT streams per HTTP/3 connection | Implemented in the standards-facing edge and tested with three tunnels plus an isolated denied stream; the private iroh listener still uses one stream per connection |
 | HTTP/2 and HTTP/1.1 | RFC 9297/9298 mappings; RFC 9931 optimistic-transition safety for HTTP/1.1 | Deferred until the HTTP/3 edge is conformant; advertise only implemented versions |
 
@@ -84,12 +84,12 @@ The task builds a small standards-facing HTTP/3 edge and a separately pinned
 Go client using `github.com/quic-go/masque-go`. The process topology is:
 
 ```text
-masque-go client
-  -> WebPKI-style TLS + h3 + RFC 9298 CONNECT-UDP
+independent Go client (masque-go for UDP, quic-go HTTP/3 primitives for IP)
+  -> WebPKI-style TLS + h3 + RFC 9298 CONNECT-UDP or RFC 9484 CONNECT-IP
   -> local interoperability edge
-  -> datum-connect/masque-v1 over iroh
-  -> Connect transport policy and UDP association
-  -> loopback UDP echo origin
+  -> datum-connect/masque-v1 or datum-connect/connect-ip-v1 over iroh
+  -> explicit Connect UDP policy or peer/network CONNECT-IP grant
+  -> loopback UDP echo origin or policy-valid IP packet responder
 ```
 
 The test opens three CONNECT-UDP streams on one HTTP/3 connection, rejects a
@@ -103,7 +103,18 @@ certificate that is trusted only by the spawned client. Test metadata, the
 certificate, and service logs are left in the printed temporary artifacts
 directory.
 
-This lab proves CONNECT-UDP interoperability at the HTTP/3 edge and exercises
-the real Connect UDP transport behind it. It does not yet prove production
-certificate provisioning, authentication, standards-facing CONNECT-IP, or
-deployed gateway configuration. Those remain explicit release gates above.
+The same run opens an RFC 9484 CONNECT-IP request on the default
+`/.well-known/masque/ip/*/*/` path without any private request headers. The
+edge returns an IPv4 ADDRESS_ASSIGN, advertises the one approved host route,
+withdraws the route with an empty full-snapshot advertisement, restores it,
+and completes a bidirectional IP-packet round trip through the real private
+CONNECT-IP transport. A second valid CONNECT-IP target receives HTTP 403 and
+never creates a private session. The update sequence verifies capsule wire
+semantics; it does not yet expose a production API for changing a live grant.
+
+This lab proves CONNECT-UDP and a constrained IPv4 CONNECT-IP profile at the
+HTTP/3 edge and exercises the corresponding real Connect transports behind it.
+It does not yet prove production certificate provisioning, authentication,
+dual-stack CONNECT-IP, live grant updates, a second independent CONNECT-IP
+implementation, or deployed gateway configuration. Those remain explicit
+release gates above.
