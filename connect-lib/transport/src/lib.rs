@@ -49,6 +49,7 @@ const MAX_INBOUND_HANDSHAKES: usize = 32;
 const MAX_INBOUND_SETUPS: usize = 64;
 const MAX_INBOUND_ACTIVE: usize = 128;
 const MAX_INBOUND_PER_PEER: usize = 8;
+const MAX_PEER_DIAGNOSTICS: usize = 256;
 
 /// Stable identifier advertised by the control plane for one destination.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -686,7 +687,6 @@ impl Transport {
                             result.map_err(|_| Error::Timeout)?.map_err(error_debug)?
                         }
                     };
-                    transport.observe_connection(&conn);
                     let peer = conn.remote_id();
                     let eligible = if conn.alpn() == ip::ALPN {
                         transport.inner.ip_registry.allows_peer(peer)
@@ -704,6 +704,7 @@ impl Transport {
                         return Err(Error::Rejected(StatusCode::TOO_MANY_REQUESTS));
                     };
                     drop(handshake);
+                    transport.observe_connection(&conn);
                     if conn.alpn() == ip::ALPN {
                         ip::serve_connection(
                             conn,
@@ -951,9 +952,23 @@ impl Transport {
                 latency: None,
             },
         };
-        if let Ok(mut peers) = self.inner.peer_diagnostics.write() {
-            peers.insert(conn.remote_id(), diagnostics);
+        record_peer_diagnostics(&self.inner.peer_diagnostics, conn.remote_id(), diagnostics);
+    }
+}
+
+fn record_peer_diagnostics(
+    peer_diagnostics: &RwLock<HashMap<EndpointId, PeerDiagnostics>>,
+    peer: EndpointId,
+    diagnostics: PeerDiagnostics,
+) {
+    if let Ok(mut peers) = peer_diagnostics.write() {
+        if !peers.contains_key(&peer)
+            && peers.len() >= MAX_PEER_DIAGNOSTICS
+            && let Some(oldest) = peers.keys().next().copied()
+        {
+            peers.remove(&oldest);
         }
+        peers.insert(peer, diagnostics);
     }
 }
 
@@ -1435,6 +1450,32 @@ mod tests {
         drop(same_peer_setup);
         drop(second_active);
         assert!(admission.try_setup(second).is_some());
+    }
+
+    #[test]
+    fn peer_diagnostics_cache_is_bounded() {
+        let diagnostics = RwLock::new(HashMap::new());
+        let latest = (0..=MAX_PEER_DIAGNOSTICS)
+            .map(|_| SecretKey::generate().public())
+            .last()
+            .unwrap();
+        for peer in (0..MAX_PEER_DIAGNOSTICS)
+            .map(|_| SecretKey::generate().public())
+            .chain(std::iter::once(latest))
+        {
+            record_peer_diagnostics(
+                &diagnostics,
+                peer,
+                PeerDiagnostics {
+                    path: ConnectionPath::Unknown,
+                    detail: None,
+                    latency: None,
+                },
+            );
+        }
+        let diagnostics = diagnostics.read().unwrap();
+        assert_eq!(diagnostics.len(), MAX_PEER_DIAGNOSTICS);
+        assert!(diagnostics.contains_key(&latest));
     }
 
     #[tokio::test]
