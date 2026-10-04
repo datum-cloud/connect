@@ -21,6 +21,7 @@ import (
 
 func main() {
 	proxy := flag.String("proxy", "", "RFC 9298 proxy URI template")
+	ipProxy := flag.String("ip-proxy", "", "RFC 9484 CONNECT-IP URI")
 	proxyAddr := flag.String("proxy-address", "", "UDP address used to reach the proxy")
 	target := flag.String("target", "", "UDP target as host:port")
 	deniedTarget := flag.String("denied-target", "", "optional target expected to receive HTTP 403 on the shared connection")
@@ -29,8 +30,9 @@ func main() {
 	expectStatus := flag.Int("expect-status", 200, "expected HTTP response status")
 	sessions := flag.Int("sessions", 1, "number of CONNECT-UDP sessions to multiplex on one HTTP/3 connection")
 	capsuleFallback := flag.Bool("capsule-fallback", false, "disable QUIC DATAGRAM and test DATAGRAM capsules")
+	connectIP := flag.Bool("connect-ip", false, "run the RFC 9484 CONNECT-IP test")
 	flag.Parse()
-	if *proxy == "" || *proxyAddr == "" || *target == "" || *caFile == "" {
+	if *proxyAddr == "" || *caFile == "" || (!*connectIP && (*proxy == "" || *target == "")) || (*connectIP && *ipProxy == "") {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -46,6 +48,10 @@ func main() {
 		ServerName: "localhost",
 		NextProtos: []string{http3.NextProtoH3},
 		MinVersion: tls.VersionTLS13,
+	}
+	if *connectIP {
+		must(runConnectIP(*ipProxy, *proxyAddr, *expectStatus, tlsConfig))
+		return
 	}
 	if *capsuleFallback {
 		must(runCapsuleFallback(*proxy, *proxyAddr, *target, *payload, tlsConfig))
@@ -127,6 +133,133 @@ func main() {
 		fmt.Printf("round trip completed on session %d/%d\n", i+1, *sessions)
 	}
 	fmt.Printf("PASS %d independent masque-go sessions multiplexed on one HTTP/3 connection\n", *sessions)
+}
+
+func runConnectIP(proxyURL, proxyAddr string, expectStatus int, tlsConfig *tls.Config) error {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, proxyURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Proto = "connect-ip"
+	req.Host = req.URL.Host
+	req.Header.Set(http3.CapsuleProtocolHeader, "?1")
+	quicConn, err := quic.DialAddr(context.Background(), proxyAddr, tlsConfig, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		return err
+	}
+	defer quicConn.CloseWithError(0, "")
+	clientConn := (&http3.Transport{EnableDatagrams: true}).NewClientConn(quicConn)
+	stream, err := clientConn.OpenRequestStream(context.Background())
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+	if err := stream.SendRequestHeader(req); err != nil {
+		return err
+	}
+	response, err := stream.ReadResponse()
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != expectStatus {
+		return fmt.Errorf("CONNECT-IP rejected: status=%d headers=%v", response.StatusCode, response.Header)
+	}
+	if expectStatus != http.StatusOK {
+		fmt.Printf("PASS rejected unauthorized CONNECT-IP target with HTTP %d\n", response.StatusCode)
+		return nil
+	}
+	if response.Header.Get(http3.CapsuleProtocolHeader) != "?1" {
+		return fmt.Errorf("CONNECT-IP response omitted capsule negotiation: headers=%v", response.Header)
+	}
+	// Request ID 1, IPv4, wildcard address, host prefix.
+	if _, err := stream.Write([]byte{2, 7, 1, 4, 0, 0, 0, 0, 32}); err != nil {
+		return err
+	}
+	kind, assignment, err := readCapsule(stream)
+	if err != nil || kind != 1 || string(assignment) != string([]byte{1, 4, 10, 20, 0, 2, 32}) {
+		return fmt.Errorf("invalid ADDRESS_ASSIGN: type=%d payload=%x error=%v", kind, assignment, err)
+	}
+	kind, route, err := readCapsule(stream)
+	if err != nil || kind != 3 || string(route) != string([]byte{4, 10, 30, 0, 9, 10, 30, 0, 9, 0}) {
+		return fmt.Errorf("invalid initial ROUTE_ADVERTISEMENT: type=%d payload=%x error=%v", kind, route, err)
+	}
+	kind, withdrawal, err := readCapsule(stream)
+	if err != nil || kind != 3 || len(withdrawal) != 0 {
+		return fmt.Errorf("invalid route withdrawal: type=%d payload=%x error=%v", kind, withdrawal, err)
+	}
+	kind, restored, err := readCapsule(stream)
+	if err != nil || kind != 3 || string(restored) != string(route) {
+		return fmt.Errorf("invalid restored route: type=%d payload=%x error=%v", kind, restored, err)
+	}
+	packet := ipv4Packet([4]byte{10, 20, 0, 2}, [4]byte{10, 30, 0, 9})
+	if err := stream.SendDatagram(append([]byte{0}, packet...)); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	reply, err := stream.ReceiveDatagram(ctx)
+	if err != nil {
+		return err
+	}
+	want := ipv4Packet([4]byte{10, 30, 0, 9}, [4]byte{10, 20, 0, 2})
+	if len(reply) != len(want)+1 || reply[0] != 0 || string(reply[1:]) != string(want) {
+		return fmt.Errorf("unexpected CONNECT-IP reply: %x", reply)
+	}
+	fmt.Println("PASS RFC 9484 CONNECT-IP assignment, route withdrawal/restoration, and IP packet round trip")
+	return nil
+}
+
+func readCapsule(reader io.Reader) (uint64, []byte, error) {
+	kind, err := readVarint(reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	length, err := readVarint(reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	if length > 64*1024 {
+		return 0, nil, fmt.Errorf("capsule too large: %d", length)
+	}
+	payload := make([]byte, int(length))
+	_, err = io.ReadFull(reader, payload)
+	return kind, payload, err
+}
+
+func readVarint(reader io.Reader) (uint64, error) {
+	var encoded [8]byte
+	if _, err := io.ReadFull(reader, encoded[:1]); err != nil {
+		return 0, err
+	}
+	width := 1 << (encoded[0] >> 6)
+	if _, err := io.ReadFull(reader, encoded[1:width]); err != nil {
+		return 0, err
+	}
+	value := uint64(encoded[0] & 0x3f)
+	for _, b := range encoded[1:width] {
+		value = value<<8 | uint64(b)
+	}
+	return value, nil
+}
+
+func ipv4Packet(source, destination [4]byte) []byte {
+	packet := make([]byte, 64)
+	packet[0] = 0x45
+	packet[2], packet[3] = 0, byte(len(packet))
+	packet[8], packet[9] = 64, 17
+	copy(packet[12:16], source[:])
+	copy(packet[16:20], destination[:])
+	var sum uint32
+	for i := 0; i < 20; i += 2 {
+		sum += uint32(packet[i])<<8 | uint32(packet[i+1])
+	}
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	checksum := ^uint16(sum)
+	packet[10], packet[11] = byte(checksum>>8), byte(checksum)
+	copy(packet[20:], []byte("datum-connect-ip-e2e"))
+	return packet
 }
 
 func runCapsuleFallback(proxy, proxyAddr, target, payload string, tlsConfig *tls.Config) error {

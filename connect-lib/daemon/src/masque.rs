@@ -5,11 +5,11 @@
 //! authorize that public key for every configured destination.
 
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
-use connect_masque_edge::{Route, Server};
+use connect_masque_edge::{IpRoute, Ipv4RouteRange, Route, Server};
 use connect_transport::{DestinationId, Transport, TransportConfig};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde::Deserialize;
@@ -29,7 +29,10 @@ struct Config {
     max_connections: usize,
     #[serde(default = "default_max_associations")]
     max_associations_per_connection: usize,
+    #[serde(default)]
     routes: Vec<RouteConfig>,
+    #[serde(default)]
+    ip_routes: Vec<IpRouteConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +46,30 @@ struct RouteConfig {
     #[serde(default)]
     backend_relay_url: Option<String>,
     destination_port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpRouteConfig {
+    target: String,
+    protocol: String,
+    backend_endpoint_id: String,
+    #[serde(default)]
+    backend_addresses: Vec<SocketAddr>,
+    #[serde(default)]
+    backend_relay_url: Option<String>,
+    network: String,
+    assigned_address: Ipv4Addr,
+    route_updates: Vec<Vec<Ipv4RouteRangeConfig>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Ipv4RouteRangeConfig {
+    start: Ipv4Addr,
+    end: Ipv4Addr,
+    #[serde(default)]
+    protocol: u8,
 }
 
 pub struct Runtime {
@@ -69,6 +96,11 @@ impl Runtime {
             .into_iter()
             .map(RouteConfig::route)
             .collect::<Result<Vec<_>, _>>()?;
+        let ip_routes = config
+            .ip_routes
+            .into_iter()
+            .map(IpRouteConfig::route)
+            .collect::<Result<Vec<_>, _>>()?;
         let tls = connect_masque_edge::load_tls_pem(&certificate_chain, &private_key).map_err(
             |error| ApiError::bad_request(format!("Invalid MASQUE TLS configuration: {error:#}")),
         )?;
@@ -77,11 +109,12 @@ impl Runtime {
             .map_err(|error| {
                 ApiError::internal(format!("binding MASQUE Connect transport: {error}"))
             })?;
-        let server = match Server::bind_with_limits(
+        let server = match Server::bind_with_limits_and_ip_routes(
             config.listen,
             tls,
             transport.clone(),
             routes,
+            ip_routes,
             config.max_connections,
             config.max_associations_per_connection,
         ) {
@@ -134,9 +167,11 @@ impl Config {
                 "MASQUE connection limits are outside supported bounds",
             ));
         }
-        if self.routes.is_empty() || self.routes.len() > 1024 {
+        if self.routes.len() + self.ip_routes.len() == 0
+            || self.routes.len() + self.ip_routes.len() > 1024
+        {
             return Err(ApiError::bad_request(
-                "MASQUE configuration requires 1 to 1024 routes",
+                "MASQUE configuration requires 1 to 1024 UDP or IP routes",
             ));
         }
         for path in [
@@ -171,6 +206,35 @@ impl Config {
                 ));
             }
         }
+        for route in &self.ip_routes {
+            if route.target.is_empty()
+                || route.target.contains('/')
+                || route.protocol.is_empty()
+                || route.protocol.contains('/')
+                || route.network.is_empty()
+                || route.network.len() > 255
+                || route.assigned_address.is_unspecified()
+                || route.assigned_address.is_multicast()
+                || route.route_updates.is_empty()
+                || route.route_updates.len() > 128
+                || route.route_updates.iter().any(|update| update.len() > 256)
+                || (route.backend_addresses.is_empty() && route.backend_relay_url.is_none())
+                || route.backend_addresses.iter().any(|address| {
+                    address.port() == 0
+                        || address.ip().is_unspecified()
+                        || address.ip().is_multicast()
+                })
+                || route
+                    .route_updates
+                    .iter()
+                    .flatten()
+                    .any(|range| u32::from(range.start) > u32::from(range.end))
+            {
+                return Err(ApiError::bad_request(
+                    "Each MASQUE IP route needs an exact target/protocol, network, IPv4 assignment, route snapshots, and backend address or relay",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -184,28 +248,66 @@ const fn default_max_associations() -> usize {
 
 impl RouteConfig {
     fn route(self) -> Result<Route, ApiError> {
-        let endpoint = self
-            .backend_endpoint_id
-            .parse::<EndpointId>()
-            .map_err(|_| {
-                ApiError::bad_request("MASQUE backend_endpoint_id must be a Connector public key")
-            })?;
-        let mut backend = self
-            .backend_addresses
-            .into_iter()
-            .fold(EndpointAddr::new(endpoint), EndpointAddr::with_ip_addr);
-        if let Some(relay) = self.backend_relay_url {
-            backend = backend.with_relay_url(relay.parse().map_err(|_| {
-                ApiError::bad_request("MASQUE backend_relay_url must be a valid relay URL")
-            })?);
-        }
         Ok(Route {
             target_host: self.target_host.to_ascii_lowercase(),
             target_port: self.target_port,
-            backend,
+            backend: backend_addr(
+                &self.backend_endpoint_id,
+                self.backend_addresses,
+                self.backend_relay_url,
+            )?,
             destination: DestinationId::udp(self.destination_port),
         })
     }
+}
+
+impl IpRouteConfig {
+    fn route(self) -> Result<IpRoute, ApiError> {
+        Ok(IpRoute {
+            target: self.target,
+            protocol: self.protocol,
+            backend: backend_addr(
+                &self.backend_endpoint_id,
+                self.backend_addresses,
+                self.backend_relay_url,
+            )?,
+            network: self.network,
+            assigned_address: self.assigned_address,
+            route_updates: self
+                .route_updates
+                .into_iter()
+                .map(|update| {
+                    update
+                        .into_iter()
+                        .map(|range| Ipv4RouteRange {
+                            start: range.start,
+                            end: range.end,
+                            protocol: range.protocol,
+                        })
+                        .collect()
+                })
+                .collect(),
+        })
+    }
+}
+
+fn backend_addr(
+    endpoint_id: &str,
+    addresses: Vec<SocketAddr>,
+    relay_url: Option<String>,
+) -> Result<EndpointAddr, ApiError> {
+    let endpoint = endpoint_id.parse::<EndpointId>().map_err(|_| {
+        ApiError::bad_request("MASQUE backend_endpoint_id must be a Connector public key")
+    })?;
+    let mut backend = addresses
+        .into_iter()
+        .fold(EndpointAddr::new(endpoint), EndpointAddr::with_ip_addr);
+    if let Some(relay) = relay_url {
+        backend = backend.with_relay_url(relay.parse().map_err(|_| {
+            ApiError::bad_request("MASQUE backend_relay_url must be a valid relay URL")
+        })?);
+    }
+    Ok(backend)
 }
 
 async fn read_private(path: &Path, label: &str) -> Result<Vec<u8>, ApiError> {
@@ -275,6 +377,7 @@ mod tests {
             max_connections: default_max_connections(),
             max_associations_per_connection: default_max_associations(),
             routes: vec![],
+            ip_routes: vec![],
         };
         assert!(base.validate().is_err());
         let route = RouteConfig {

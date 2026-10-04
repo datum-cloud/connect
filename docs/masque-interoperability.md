@@ -36,7 +36,7 @@ This is deliberately policy lookup, not arbitrary target dialing.
 | CONNECT-UDP response | 2xx response with Capsule Protocol negotiation and correct stream errors | Success and policy-denied responses are independently tested; expand transport failure status and `Proxy-Status` coverage |
 | HTTP Datagrams | Quarter Stream ID association, context ID zero, unknown-context handling | Independent multi-stream coverage is present, including a patched Quarter Stream ID encoder; add negotiated size and unknown-context cases |
 | Capsule fallback | DATAGRAM capsules when QUIC/H3 datagrams are unavailable | Implemented in the shared production edge and end-to-end tested with a bounded incremental decoder; CONNECT-IP still needs the same fallback |
-| CONNECT-IP | RFC 9484 request plus repeated address/route assignments and withdrawals | Prototype supports the default wildcard path and initial configuration only |
+| CONNECT-IP | RFC 9484 request plus repeated address/route assignments and withdrawals | The shared edge and opt-in daemon listener accept exact configured targets, relay through explicitly granted private CONNECT-IP sessions, and publish configured IPv4 route snapshots including withdrawals; dual stack, capsule fallback, and live policy-driven reconfiguration remain |
 | Multiplexing | Multiple concurrent CONNECT streams per HTTP/3 connection | Implemented in the standards-facing edge and tested with three tunnels plus an isolated denied stream; the private iroh listener still uses one stream per connection |
 | HTTP/2 and HTTP/1.1 | RFC 9297/9298 mappings; RFC 9931 optimistic-transition safety for HTTP/1.1 | Deferred until the HTTP/3 edge is conformant; advertise only implemented versions |
 
@@ -85,12 +85,12 @@ The task builds a small standards-facing HTTP/3 edge and a separately pinned
 Go client using `github.com/quic-go/masque-go`. The process topology is:
 
 ```text
-masque-go client
-  -> WebPKI-style TLS + h3 + RFC 9298 CONNECT-UDP
+independent Go client (masque-go for UDP, quic-go HTTP/3 primitives for IP)
+  -> WebPKI-style TLS + h3 + RFC 9298 CONNECT-UDP or RFC 9484 CONNECT-IP
   -> local interoperability edge
-  -> datum-connect/masque-v1 over iroh
-  -> Connect transport policy and UDP association
-  -> loopback UDP echo origin
+  -> datum-connect/masque-v1 or datum-connect/connect-ip-v1 over iroh
+  -> explicit Connect UDP policy or peer/network CONNECT-IP grant
+  -> loopback UDP echo origin or policy-valid IP packet responder
 ```
 
 The test opens three CONNECT-UDP streams on one HTTP/3 connection, rejects a
@@ -104,10 +104,20 @@ certificate that is trusted only by the spawned client. Test metadata, the
 certificate, and service logs are left in the printed temporary artifacts
 directory.
 
-This lab proves CONNECT-UDP interoperability at the HTTP/3 edge and exercises
-the real Connect UDP transport behind it. It does not yet prove production
-certificate provisioning, authentication, standards-facing CONNECT-IP, or
-deployed gateway configuration. Those remain explicit release gates above.
+The same run opens an RFC 9484 CONNECT-IP request on the default
+`/.well-known/masque/ip/*/*/` path without any private request headers. The
+edge returns an IPv4 ADDRESS_ASSIGN, advertises the one approved host route,
+withdraws the route with an empty full-snapshot advertisement, restores it,
+and completes a bidirectional IP-packet round trip through the real private
+CONNECT-IP transport. A second valid CONNECT-IP target receives HTTP 403 and
+never creates a private session.
+
+This lab proves CONNECT-UDP and a constrained IPv4 CONNECT-IP profile at the
+HTTP/3 edge and exercises the corresponding real Connect transports behind it.
+It does not yet prove production certificate provisioning, authentication,
+dual-stack CONNECT-IP, live grant updates, a second independent CONNECT-IP
+implementation, or deployed gateway configuration. Those remain explicit
+release gates above.
 
 ## Run the production listener
 
@@ -132,6 +142,20 @@ targets, or provide a general UDP proxy.
     "backend_addresses": ["192.0.2.20:4433"],
     "backend_relay_url": "https://relay.example.net",
     "destination_port": 53
+  }],
+  "ip_routes": [{
+    "target": "*",
+    "protocol": "*",
+    "backend_endpoint_id": "BACKEND_CONNECTOR_PUBLIC_KEY",
+    "backend_addresses": ["192.0.2.20:4433"],
+    "backend_relay_url": "https://relay.example.net",
+    "network": "production-vpc",
+    "assigned_address": "10.20.0.2",
+    "route_updates": [[{
+      "start": "10.30.0.0",
+      "end": "10.30.0.255",
+      "protocol": 0
+    }]]
   }]
 }
 ```
@@ -147,8 +171,10 @@ the configured listener port.
 On startup, `masque_listener_ready` reports the listener address and the edge's
 Connector endpoint ID. The backend service policy must explicitly allow that
 identity for every `destination_port`; otherwise the edge returns 502. Requests
-for any tuple absent from `routes` return 403 before a Connect association is
-opened. Route or certificate changes currently require a daemon restart.
+for any tuple absent from `routes` or `ip_routes` return 403 before a Connect
+association is opened. Each IP backend must separately grant the edge identity,
+network, assigned address, routes, and MTU. Route or certificate changes
+currently require a daemon restart.
 
 The public listener intentionally performs no end-user authentication yet. It
 is suitable only for services whose ingress policy is public, with the exact

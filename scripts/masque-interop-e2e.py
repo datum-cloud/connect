@@ -98,6 +98,35 @@ def main():
         assert fallback.returncode == 0, fallback.stdout + fallback.stderr
         assert Echo.packets == [*expected_packets, b"datum-capsule-fallback"], Echo.packets
         print(fallback.stdout.strip(), flush=True)
+        connect_ip = subprocess.run(
+            [
+                str(client),
+                "-proxy-address", metadata["proxy_addr"],
+                "-ca", str(cert),
+                "-ip-proxy", metadata["ip_uri"],
+                "-connect-ip",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+        assert connect_ip.returncode == 0, connect_ip.stdout + connect_ip.stderr
+        print(connect_ip.stdout.strip(), flush=True)
+        denied_ip = subprocess.run(
+            [
+                str(client),
+                "-proxy-address", metadata["proxy_addr"],
+                "-ca", str(cert),
+                "-ip-proxy", metadata["ip_uri"].replace("/*/*/", "/10.30.0.10/17/"),
+                "-connect-ip",
+                "-expect-status", "403",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+        assert denied_ip.returncode == 0, denied_ip.stdout + denied_ip.stderr
+        print(denied_ip.stdout.strip(), flush=True)
         print("PASS standard H3 edge translated through the real Connect UDP transport", flush=True)
     finally:
         process.terminate()

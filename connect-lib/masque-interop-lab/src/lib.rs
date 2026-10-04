@@ -1,16 +1,22 @@
-//! Standards-facing HTTP/3 CONNECT-UDP edge for Datum Connect.
+//! Standards-facing HTTP/3 CONNECT-UDP and CONNECT-IP edge for Datum Connect.
 //!
 //! The edge deliberately has no resolver or arbitrary-dial API. Every public
 //! MASQUE target must be mapped to an already-authorized Connect destination.
 
-use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, SocketAddr},
+    path::Path,
+    sync::Arc,
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, Bytes, BytesMut};
-use connect_transport::{DestinationId, Transport, standard_connect_udp_target};
+use connect_transport::{DestinationId, Transport, ip, standard_connect_udp_target};
 use h3::error::Code;
+use h3::ext::Protocol;
 use h3_datagram::datagram_handler::{HandleDatagramsExt, SendDatagramError};
-use http::{Response, StatusCode};
+use http::{Method, Response, StatusCode};
 use iroh::EndpointAddr;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -30,12 +36,35 @@ pub struct Route {
     pub destination: DestinationId,
 }
 
+/// One IPv4 range record carried in an RFC 9484 ROUTE_ADVERTISEMENT capsule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ipv4RouteRange {
+    pub start: Ipv4Addr,
+    pub end: Ipv4Addr,
+    /// IP protocol number, or zero for all protocols.
+    pub protocol: u8,
+}
+
+/// An exact public CONNECT-IP target routed to an authorized Connect IP grant.
+/// Each inner vector is a complete route snapshot; an empty snapshot withdraws
+/// all routes, allowing callers to publish updates and withdrawals in order.
+#[derive(Clone, Debug)]
+pub struct IpRoute {
+    pub target: String,
+    pub protocol: String,
+    pub backend: EndpointAddr,
+    pub network: String,
+    pub assigned_address: Ipv4Addr,
+    pub route_updates: Vec<Vec<Ipv4RouteRange>>,
+}
+
 /// Bound edge listener. Binding is separate from serving so callers can publish
 /// readiness only after the UDP socket and TLS configuration are usable.
 pub struct Server {
     endpoint: quinn::Endpoint,
     transport: Transport,
     routes: Arc<HashMap<(String, u16), Route>>,
+    ip_routes: Arc<HashMap<(String, String), IpRoute>>,
     max_connections: usize,
     max_associations_per_connection: usize,
 }
@@ -47,7 +76,17 @@ impl Server {
         transport: Transport,
         routes: Vec<Route>,
     ) -> Result<Self> {
-        Self::bind_with_limits(listen, tls, transport, routes, 1024, 128)
+        Self::bind_with_limits_and_ip_routes(listen, tls, transport, routes, vec![], 1024, 128)
+    }
+
+    pub fn bind_with_ip_routes(
+        listen: SocketAddr,
+        tls: rustls::ServerConfig,
+        transport: Transport,
+        routes: Vec<Route>,
+        ip_routes: Vec<IpRoute>,
+    ) -> Result<Self> {
+        Self::bind_with_limits_and_ip_routes(listen, tls, transport, routes, ip_routes, 1024, 128)
     }
 
     pub fn bind_with_limits(
@@ -58,10 +97,31 @@ impl Server {
         max_connections: usize,
         max_associations_per_connection: usize,
     ) -> Result<Self> {
+        Self::bind_with_limits_and_ip_routes(
+            listen,
+            tls,
+            transport,
+            routes,
+            vec![],
+            max_connections,
+            max_associations_per_connection,
+        )
+    }
+
+    pub fn bind_with_limits_and_ip_routes(
+        listen: SocketAddr,
+        tls: rustls::ServerConfig,
+        transport: Transport,
+        routes: Vec<Route>,
+        ip_routes: Vec<IpRoute>,
+        max_connections: usize,
+        max_associations_per_connection: usize,
+    ) -> Result<Self> {
         if max_connections == 0 || max_associations_per_connection == 0 {
             bail!("MASQUE connection and association limits must be nonzero");
         }
-        let indexed = index_routes(routes)?;
+        let indexed = index_routes(routes, !ip_routes.is_empty())?;
+        let indexed_ip = index_ip_routes(ip_routes, !indexed.is_empty())?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(tls).context("build QUIC TLS configuration")?,
         ));
@@ -74,6 +134,7 @@ impl Server {
             endpoint,
             transport,
             routes: Arc::new(indexed),
+            ip_routes: Arc::new(indexed_ip),
             max_connections,
             max_associations_per_connection,
         })
@@ -98,12 +159,13 @@ impl Server {
                     let Some(incoming) = incoming else { break };
                     let transport = self.transport.clone();
                     let routes = self.routes.clone();
+                    let ip_routes = self.ip_routes.clone();
                     let connection_cancel = cancel.child_token();
                     let max_associations = self.max_associations_per_connection;
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(error) = serve_connection(
-                            incoming, transport, routes, max_associations, connection_cancel
+                            incoming, transport, routes, ip_routes, max_associations, connection_cancel
                         ).await {
                             tracing::warn!(error = %format!("{error:#}"), "masque_connection_failed");
                         }
@@ -116,8 +178,11 @@ impl Server {
     }
 }
 
-fn index_routes(routes: Vec<Route>) -> Result<HashMap<(String, u16), Route>> {
-    if routes.is_empty() {
+fn index_routes(
+    routes: Vec<Route>,
+    other_routes_present: bool,
+) -> Result<HashMap<(String, u16), Route>> {
+    if routes.is_empty() && !other_routes_present {
         bail!("MASQUE edge requires at least one exact route");
     }
     let mut indexed = HashMap::new();
@@ -125,6 +190,42 @@ fn index_routes(routes: Vec<Route>) -> Result<HashMap<(String, u16), Route>> {
         let key = (route.target_host.to_ascii_lowercase(), route.target_port);
         if indexed.insert(key.clone(), route).is_some() {
             bail!("duplicate MASQUE route for {}:{}", key.0, key.1);
+        }
+    }
+    Ok(indexed)
+}
+
+fn index_ip_routes(
+    routes: Vec<IpRoute>,
+    other_routes_present: bool,
+) -> Result<HashMap<(String, String), IpRoute>> {
+    if routes.is_empty() && !other_routes_present {
+        bail!("MASQUE edge requires at least one exact route");
+    }
+    let mut indexed = HashMap::new();
+    for route in routes {
+        if route.target.is_empty()
+            || route.target.contains('/')
+            || route.protocol.is_empty()
+            || route.protocol.contains('/')
+            || route.network.is_empty()
+            || route.network.len() > 255
+            || route.assigned_address.is_unspecified()
+            || route.assigned_address.is_multicast()
+            || route.route_updates.is_empty()
+            || route.route_updates.len() > 128
+            || route.route_updates.iter().any(|update| update.len() > 256)
+            || route
+                .route_updates
+                .iter()
+                .flatten()
+                .any(|range| u32::from(range.start) > u32::from(range.end))
+        {
+            bail!("CONNECT-IP routes require an exact target, protocol, network, and route update");
+        }
+        let key = (route.target.clone(), route.protocol.clone());
+        if indexed.insert(key.clone(), route).is_some() {
+            bail!("duplicate CONNECT-IP route for {}/{}", key.0, key.1);
         }
     }
     Ok(indexed)
@@ -170,6 +271,7 @@ async fn serve_connection(
     incoming: quinn::Incoming,
     transport: Transport,
     routes: Arc<HashMap<(String, u16), Route>>,
+    ip_routes: Arc<HashMap<(String, String), IpRoute>>,
     max_associations: usize,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -191,6 +293,107 @@ async fn serve_connection(
             accepted = h3.accept() => {
                 let Some(resolver) = accepted.context("accept request")? else { break };
                 let (request, mut stream) = resolver.resolve_request().await.context("decode request")?;
+                let is_connect_ip = request.method() == Method::CONNECT
+                    && request.extensions().get::<Protocol>() == Some(&Protocol::CONNECT_IP);
+                if is_connect_ip {
+                    let common_valid = request.uri().scheme_str() == Some("https")
+                        && request.uri().query().is_none()
+                        && request.headers().get(CAPSULE_PROTOCOL).and_then(|value| value.to_str().ok()) == Some("?1");
+                    let target = connect_ip_target(request.uri().path());
+                    if !common_valid || target.is_none() {
+                        stream.send_response(Response::builder().status(StatusCode::BAD_REQUEST).body(())?).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
+                    if associations.len() >= max_associations {
+                        stream.send_response(Response::builder().status(StatusCode::TOO_MANY_REQUESTS).body(())?).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
+                    let (target, protocol) = target.expect("checked CONNECT-IP target");
+                    let Some(route) = ip_routes.get(&(target.into(), protocol.into())).cloned() else {
+                        stream.send_response(Response::builder().status(StatusCode::FORBIDDEN).body(())?).await?;
+                        stream.finish().await?;
+                        continue;
+                    };
+                    if !datagrams_available {
+                        stream.send_response(Response::builder().status(StatusCode::SERVICE_UNAVAILABLE).body(())?).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
+                    let session = match ip::connect(
+                        transport.endpoint(),
+                        route.backend,
+                        &route.network,
+                        cancel.child_token(),
+                    ).await {
+                        Ok(session) => session,
+                        Err(error) => {
+                            tracing::warn!(target, protocol, error = %error, "masque_ip_backend_connect_failed");
+                            stream.send_response(Response::builder().status(StatusCode::BAD_GATEWAY).body(())?).await?;
+                            stream.finish().await?;
+                            continue;
+                        }
+                    };
+                    let stream_id = stream.id();
+                    let association_id = stream_id.into_inner();
+                    let mut datagram_sender = h3.get_datagram_sender(stream_id);
+                    stream.send_response(
+                        Response::builder().status(StatusCode::OK).header(CAPSULE_PROTOCOL, "?1").body(())?
+                    ).await.context("send CONNECT-IP response")?;
+
+                    let (incoming_tx, mut incoming_rx) = mpsc::channel::<Bytes>(64);
+                    associations.insert(association_id, incoming_tx);
+                    let closed_tx = closed_tx.clone();
+                    let association_cancel = cancel.child_token();
+                    tokio::spawn(async move {
+                        let result: Result<()> = async {
+                            let mut capsule_bytes = BytesMut::new();
+                            let request = loop {
+                                if let Some(capsule) = take_capsule(&mut capsule_bytes)? {
+                                    break capsule;
+                                }
+                                let Some(mut chunk) = stream.recv_data().await? else {
+                                    bail!("CONNECT-IP stream ended before ADDRESS_REQUEST");
+                                };
+                                let remaining = chunk.remaining();
+                                capsule_bytes.extend_from_slice(&chunk.copy_to_bytes(remaining));
+                            };
+                            let request_id = validate_ipv4_address_request(&request)?;
+                            stream.send_data(address_assignment_capsule(request_id, route.assigned_address)).await?;
+                            for update in &route.route_updates {
+                                stream.send_data(route_advertisement_capsule(update)).await?;
+                            }
+                            loop {
+                                tokio::select! {
+                                    _ = association_cancel.cancelled() => break,
+                                    incoming = incoming_rx.recv() => {
+                                        let Some(packet) = incoming else { break };
+                                        session.send(packet).await.context("send internal IP packet")?;
+                                    }
+                                    incoming = session.recv() => {
+                                        let Some(packet) = incoming else { break };
+                                        let mut framed = Vec::with_capacity(packet.len() + 1);
+                                        framed.push(0);
+                                        framed.extend_from_slice(&packet);
+                                        match datagram_sender.send_datagram(Bytes::from(framed)) {
+                                            Ok(()) => {}
+                                            Err(SendDatagramError::TooLarge { .. }) => continue,
+                                            Err(error) => return Err(error.into()),
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }.await;
+                        if let Err(error) = result {
+                            tracing::warn!(error = %format!("{error:#}"), "masque_ip_association_failed");
+                        }
+                        stream.stop_stream(Code::H3_REQUEST_CANCELLED);
+                        let _ = closed_tx.send(association_id).await;
+                    });
+                    continue;
+                }
                 let target = match standard_connect_udp_target(&request) {
                     Ok(target) => target,
                     Err(_) => {
@@ -344,6 +547,57 @@ fn datagram_capsule(payload: &[u8]) -> Bytes {
     Bytes::from(capsule)
 }
 
+fn connect_ip_target(path: &str) -> Option<(&str, &str)> {
+    let suffix = path
+        .strip_prefix("/.well-known/masque/ip/")?
+        .strip_suffix('/')?;
+    let mut parts = suffix.split('/');
+    let target = parts.next()?;
+    let protocol = parts.next()?;
+    (!target.is_empty() && !protocol.is_empty() && parts.next().is_none())
+        .then_some((target, protocol))
+}
+
+fn capsule(kind: u64, payload: &[u8]) -> Bytes {
+    let mut capsule = Vec::with_capacity(payload.len() + 16);
+    encode_varint(kind, &mut capsule);
+    encode_varint(payload.len() as u64, &mut capsule);
+    capsule.extend_from_slice(payload);
+    Bytes::from(capsule)
+}
+
+fn validate_ipv4_address_request(request: &(u64, Bytes)) -> Result<u64> {
+    if request.0 != 2 {
+        bail!("expected RFC 9484 ADDRESS_REQUEST capsule");
+    }
+    let (request_id, width) =
+        decode_varint(&request.1).ok_or_else(|| anyhow!("invalid ADDRESS_REQUEST ID"))?;
+    if request_id == 0 || request.1[width..] != [4, 0, 0, 0, 0, 32] {
+        bail!("edge requires one wildcard IPv4 host ADDRESS_REQUEST");
+    }
+    Ok(request_id)
+}
+
+fn address_assignment_capsule(request_id: u64, assigned: Ipv4Addr) -> Bytes {
+    let mut payload = Vec::with_capacity(14);
+    encode_varint(request_id, &mut payload);
+    payload.push(4);
+    payload.extend_from_slice(&assigned.octets());
+    payload.push(32);
+    capsule(1, &payload)
+}
+
+fn route_advertisement_capsule(routes: &[Ipv4RouteRange]) -> Bytes {
+    let mut payload = Vec::with_capacity(routes.len() * 10);
+    for route in routes {
+        payload.push(4);
+        payload.extend_from_slice(&route.start.octets());
+        payload.extend_from_slice(&route.end.octets());
+        payload.push(route.protocol);
+    }
+    capsule(3, &payload)
+}
+
 fn take_capsule(buffer: &mut BytesMut) -> Result<Option<(u64, Bytes)>> {
     let Some((kind, kind_width)) = decode_varint(buffer) else {
         return Ok(None);
@@ -376,19 +630,22 @@ mod tests {
             backend: EndpointAddr::new(SecretKey::generate().public()),
             destination: DestinationId::udp(53),
         };
-        assert!(index_routes(vec![]).is_err());
-        assert!(index_routes(vec![route.clone(), route]).is_err());
+        assert!(index_routes(vec![], false).is_err());
+        assert!(index_routes(vec![route.clone(), route], false).is_err());
     }
 
     #[test]
     fn route_keys_are_case_insensitive() {
         let backend = EndpointAddr::new(SecretKey::generate().public());
-        let routes = index_routes(vec![Route {
-            target_host: "DNS.Example.NET".into(),
-            target_port: 53,
-            backend,
-            destination: DestinationId::udp(53),
-        }])
+        let routes = index_routes(
+            vec![Route {
+                target_host: "DNS.Example.NET".into(),
+                target_port: 53,
+                backend,
+                destination: DestinationId::udp(53),
+            }],
+            false,
+        )
         .unwrap();
         assert!(routes.contains_key(&("dns.example.net".into(), 53)));
     }
@@ -404,5 +661,39 @@ mod tests {
         encode_varint(0, &mut header);
         encode_varint((MAX_CAPSULE + 1) as u64, &mut header);
         assert!(take_capsule(&mut BytesMut::from(&header[..])).is_err());
+    }
+
+    #[test]
+    fn connect_ip_default_target_is_exact_and_other_targets_remain_policy_scoped() {
+        assert_eq!(
+            connect_ip_target("/.well-known/masque/ip/*/*/"),
+            Some(("*", "*"))
+        );
+        assert_eq!(
+            connect_ip_target("/.well-known/masque/ip/10.30.0.9/17/"),
+            Some(("10.30.0.9", "17"))
+        );
+        assert_eq!(connect_ip_target("/.well-known/masque/ip/*/*"), None);
+        assert_eq!(connect_ip_target("/.well-known/masque/ip/*/*/extra/"), None);
+    }
+
+    #[test]
+    fn connect_ip_capsules_encode_assignment_update_withdrawal_and_restoration() {
+        let request = (2, Bytes::from_static(&[7, 4, 0, 0, 0, 0, 32]));
+        assert_eq!(validate_ipv4_address_request(&request).unwrap(), 7);
+        assert_eq!(
+            address_assignment_capsule(7, Ipv4Addr::new(10, 20, 0, 2)).as_ref(),
+            &[1, 7, 7, 4, 10, 20, 0, 2, 32]
+        );
+        assert_eq!(route_advertisement_capsule(&[]).as_ref(), &[3, 0]);
+        let route = Ipv4RouteRange {
+            start: Ipv4Addr::new(10, 30, 0, 9),
+            end: Ipv4Addr::new(10, 30, 0, 9),
+            protocol: 0,
+        };
+        assert_eq!(
+            route_advertisement_capsule(&[route]).as_ref(),
+            &[3, 10, 4, 10, 30, 0, 9, 10, 30, 0, 9, 0]
+        );
     }
 }
