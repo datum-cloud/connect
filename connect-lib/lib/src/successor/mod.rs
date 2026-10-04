@@ -253,11 +253,27 @@ impl CloudConnector {
             } else {
                 vec![details.relay_url.clone()]
             };
+            let mut endpoint = iroh::EndpointAddr::new(
+                self.public_key
+                    .parse()
+                    .map_err(|_| Error::Invalid("invalid Connector public key".into()))?,
+            );
+            for address in &details.addresses {
+                endpoint = endpoint.with_ip_addr(*address);
+            }
+            if !details.relay_url.is_empty() {
+                endpoint = endpoint.with_relay_url(
+                    details
+                        .relay_url
+                        .parse()
+                        .map_err(|_| Error::Invalid("invalid relay URL".into()))?,
+                );
+            }
             let desired = json!({
                 "apiVersion": CONNECT_GROUP,
                 "kind": "Connector",
                 "metadata": {"name": self.name},
-                "spec": {"classRef": class, "publicKey": self.public_key, "relayURLs": relays}
+                "spec": {"classRef": class, "publicKey": self.public_key, "relayURLs": relays, "endpoint": serde_json::to_string(&endpoint)?}
             });
             self.connect_create("connectors", &desired).await?
         };
@@ -315,6 +331,42 @@ impl CloudConnector {
             public_key,
             relay_url: details.relay_url.clone(),
             addresses: details.addresses.clone(),
+        })
+    }
+
+    fn connect_peer_identity(&self, connector: &Value) -> Result<PeerIdentity> {
+        let name = string(connector, "/metadata/name")?;
+        let uid = string(connector, "/metadata/uid")?;
+        let public_key = string(connector, "/spec/publicKey")?;
+        let id: iroh::EndpointId = public_key.parse().map_err(|_| {
+            Error::Invalid("control plane returned an invalid Connector key".into())
+        })?;
+        let address = connector
+            .pointer("/spec/endpoint")
+            .and_then(Value::as_str)
+            .and_then(|value| serde_json::from_str::<iroh::EndpointAddr>(value).ok());
+        let address = address.filter(|address| address.id == id);
+        let relay_url = address
+            .as_ref()
+            .and_then(|address| address.relay_urls().next())
+            .map(ToString::to_string)
+            .or_else(|| {
+                connector
+                    .pointer("/spec/relayURLs/0")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        let addresses = address
+            .as_ref()
+            .map(|address| address.ip_addrs().copied().collect())
+            .unwrap_or_default();
+        Ok(PeerIdentity {
+            name,
+            uid,
+            public_key,
+            relay_url,
+            addresses,
         })
     }
 
@@ -828,49 +880,44 @@ impl CloudConnector {
         let Ok(key) = name_or_key.parse::<iroh::EndpointId>() else {
             validate_name(name_or_key)?;
             let value = self
-                .get("connectors", name_or_key)
+                .connect_get("connectors", name_or_key)
                 .await?
                 .ok_or(Error::Api(404))?;
-            return self.identity(&value);
+            return self.connect_peer_identity(&value);
         };
         let public_key = key.to_string();
-        let legacy_name = format!("connect-{}", &public_key[..40]);
-        if let Some(value) = self.get("connectors", &legacy_name).await? {
-            let identity = self.identity(&value)?;
-            if identity.public_key != public_key {
-                return Err(Error::Ownership(legacy_name));
-            }
-            return Ok(identity);
-        }
-        // Named devices no longer have a key-derived resource name. Resolve by
-        // exact key, never a hostname/address, and reject ambiguous/incomplete lists.
-        let list = self
-            .request(Method::GET, &self.resource("connectors", ""), None)
+        let connect_list_url = format!(
+            "{}/apis/{CONNECT_GROUP}/namespaces/default/connectors",
+            self.base
+        );
+        let connect_list = self
+            .request(Method::GET, &connect_list_url, None)
             .await?
             .ok_or(Error::Api(404))?;
-        if list
+        if connect_list
             .pointer("/metadata/continue")
             .and_then(Value::as_str)
-            .is_some_and(|v| !v.is_empty())
+            .is_some_and(|value| !value.is_empty())
         {
             return Err(Error::Invalid(
-                "Connector discovery is paginated; cannot safely resolve a public key".into(),
+                "Connect Connector discovery is paginated; cannot safely resolve a public key"
+                    .into(),
             ));
         }
-        let matches: Vec<_> = list["items"]
+        let connect_matches: Vec<_> = connect_list["items"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|v| {
-                v.pointer("/status/connectionDetails/publicKey/id")
-                    .and_then(Value::as_str)
+            .filter(|value| {
+                value.pointer("/spec/publicKey").and_then(Value::as_str)
                     == Some(public_key.as_str())
             })
             .collect();
+        let matches = connect_matches;
         match matches.as_slice() {
-            [value] => self.identity(value),
+            [value] => self.connect_peer_identity(value),
             [] => Err(Error::Api(404)),
-            _ => Err(Error::Invalid("multiple Connectors advertise this public key; resolve the duplicate identities before connecting".into())),
+            _ => Err(Error::Invalid("multiple Connect Connectors advertise this public key; resolve the duplicate identities before connecting".into())),
         }
     }
 
@@ -890,8 +937,12 @@ impl CloudConnector {
                     })?,
             );
         }
+        let list_url = format!(
+            "{}/apis/{CONNECT_GROUP}/namespaces/default/connectors",
+            self.base
+        );
         let list = self
-            .request(Method::GET, &self.resource("connectors", ""), None)
+            .request(Method::GET, &list_url, None)
             .await?
             .ok_or(Error::Api(404))?;
         if list
@@ -900,7 +951,7 @@ impl CloudConnector {
             .is_some_and(|s| !s.is_empty())
         {
             return Err(Error::Unsupported(
-                "paginated Connector discovery requires an explicit allowlist".into(),
+                "paginated Connect Connector discovery requires an explicit allowlist".into(),
             ));
         }
         let mut peers = Vec::new();
@@ -908,19 +959,17 @@ impl CloudConnector {
             .as_array()
             .ok_or_else(|| Error::Invalid("Connector list lacks items".into()))?
         {
-            if item["metadata"]["annotations"][PROTOCOL] != "masque-v1"
+            if item.pointer("/metadata/name").and_then(Value::as_str) == Some(self.name.as_str())
+                || !current_condition(item, "Ready")
                 || !item["metadata"]["deletionTimestamp"].is_null()
             {
                 continue;
             }
             // Pending enrollment has no usable identity yet.
-            if item
-                .pointer("/status/connectionDetails/publicKey/id")
-                .is_none()
-            {
+            if item.pointer("/spec/publicKey").is_none() {
                 continue;
             }
-            let identity = self.identity(item)?;
+            let identity = self.connect_peer_identity(item)?;
             let key = identity
                 .public_key
                 .parse::<iroh::EndpointId>()
@@ -952,10 +1001,13 @@ impl CloudConnector {
     /// Missing approval means no gateways. Malformed approval cannot silently
     /// become an empty set, which would broaden the default private policy.
     async fn gateway_names(&self) -> Result<Vec<String>> {
-        let connector = self.owned_connector().await?;
-        let class = string(&connector, "/spec/connectorClassName")?;
+        let connector = self.owned_connect_connector().await?;
+        let class = string(&connector, "/spec/classRef")?;
         validate_name(&class)?;
-        let url = format!("{}/apis/{GROUP}/connectorclasses/{class}", self.base);
+        let url = format!(
+            "{}/apis/{CONNECT_GROUP}/connectorclasses/{class}",
+            self.base
+        );
         let class = self
             .request(Method::GET, &url, None)
             .await?

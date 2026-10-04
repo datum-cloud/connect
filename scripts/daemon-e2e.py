@@ -245,7 +245,7 @@ def main():
         raise AssertionError('UDP datagram did not complete the iroh/H3 roundtrip')
 
     def delete_connector(name):
-        path = f'/apis/networking.datumapis.com/v1alpha1/namespaces/default/connectors/{name}'
+        path = f'/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectors/{name}'
         request = urllib.request.Request(
             f'http://127.0.0.1:{platform.server_port}{path}',
             method='DELETE',
@@ -394,7 +394,7 @@ def main():
             raise AssertionError('deleted Connector did not revoke the running enrollment')
         roundtrip_denied(revoke_local)
         with Platform.lock:
-            assert ('connectors', alice['connector']['name']) not in Platform.objects, 'deleted Connector was silently recreated'
+            assert ('connect.datumapis.com', 'connectors', alice['connector']['name']) not in Platform.objects, 'deleted Connector was silently recreated'
         assert not cli('alice', 'status')['services'][0]['running']
         print('PASS control-plane Connector deletion revokes enrollment without recreation', flush=True)
         stop('alice')
@@ -402,7 +402,7 @@ def main():
         assert not cli('alice', 'status')['running']
         cli('alice', 'up', expect=1)
         with Platform.lock:
-            assert ('connectors', alice['connector']['name']) not in Platform.objects
+            assert ('connect.datumapis.com', 'connectors', alice['connector']['name']) not in Platform.objects
         print('PASS restart and up cannot recreate a revoked enrollment', flush=True)
     finally:
         for proc in procs.values():

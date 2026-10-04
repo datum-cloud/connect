@@ -261,6 +261,37 @@ async fn connect_enrollment_uses_only_the_connect_api() {
 }
 
 #[tokio::test]
+async fn connect_peer_lookup_uses_connect_connector_identity_and_addresses() {
+    let peer: iroh::EndpointId = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let endpoint = iroh::EndpointAddr::new(peer)
+        .with_relay_url("https://relay.example/".parse().unwrap())
+        .with_ip_addr("192.0.2.10:1234".parse().unwrap());
+    let connector = json!({
+        "metadata":{"name":"bob-mac","uid":"bob-uid"},
+        "spec":{"publicKey":peer.to_string(),"relayURLs":["https://relay.example/"],"endpoint":serde_json::to_string(&endpoint).unwrap()}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, connector.clone()),
+        Reply::Json(200, json!({"items":[connector]})),
+    ])
+    .await;
+    let cloud = client(&base);
+    let by_name = cloud.resolve_peer("bob-mac").await.unwrap();
+    let by_key = cloud.resolve_peer(&peer.to_string()).await.unwrap();
+    assert_eq!(by_name.public_key, peer.to_string());
+    assert_eq!(by_key.name, "bob-mac");
+    assert_eq!(by_key.relay_url, "https://relay.example/");
+    assert_eq!(by_key.addresses, vec!["192.0.2.10:1234".parse().unwrap()]);
+    let requests = task.await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|(line, _)| !line.contains("networking.datumapis.com"))
+    );
+}
+
+#[tokio::test]
 async fn lease_renewal_uses_kubernetes_microtime_precision() {
     let mut value = connector();
     value["status"]["leaseRef"] = json!({"name":"connector-lease"});
@@ -378,16 +409,12 @@ async fn validation_error_exposes_field_not_rejected_values() {
 
 #[tokio::test]
 async fn named_connector_is_resolved_by_name_and_by_exact_public_key() {
-    let mut named = connector();
+    let mut named = connect_connector();
     named["metadata"]["name"] = json!("alice-mac");
-    let key = named["status"]["connectionDetails"]["publicKey"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let key = named["spec"]["publicKey"].as_str().unwrap().to_owned();
     let (base, task) = server(vec![
         token(),
         Reply::Json(200, named.clone()),
-        Reply::Json(404, json!({})),
         Reply::Json(200, json!({"items":[named]})),
     ])
     .await;
@@ -397,25 +424,16 @@ async fn named_connector_is_resolved_by_name_and_by_exact_public_key() {
         key
     );
     assert_eq!(client.resolve_peer(&key).await.unwrap().name, "alice-mac");
-    assert_eq!(task.await.unwrap().len(), 4);
+    assert_eq!(task.await.unwrap().len(), 3);
 }
 
 #[tokio::test]
 async fn reused_name_cannot_resolve_a_previously_pinned_key() {
-    let mut reused = connector();
+    let mut reused = connect_connector();
     reused["metadata"]["name"] = json!("alice-mac");
-    let old_key = reused["status"]["connectionDetails"]["publicKey"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    reused["status"]["connectionDetails"]["publicKey"]["id"] =
-        json!(iroh::SecretKey::from_bytes(&[8; 32]).public().to_string());
-    let (base, task) = server(vec![
-        token(),
-        Reply::Json(404, json!({})),
-        Reply::Json(200, json!({"items":[reused]})),
-    ])
-    .await;
+    let old_key = reused["spec"]["publicKey"].as_str().unwrap().to_owned();
+    reused["spec"]["publicKey"] = json!(iroh::SecretKey::from_bytes(&[8; 32]).public().to_string());
+    let (base, task) = server(vec![token(), Reply::Json(200, json!({"items":[reused]}))]).await;
     assert!(matches!(
         client(&base).resolve_peer(&old_key).await,
         Err(Error::Api(404))
@@ -450,14 +468,10 @@ async fn named_connector_collision_never_updates_foreign_identity() {
 
 #[tokio::test]
 async fn ambiguous_key_discovery_fails_closed() {
-    let value = connector();
-    let key = value["status"]["connectionDetails"]["publicKey"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let value = connect_connector();
+    let key = value["spec"]["publicKey"].as_str().unwrap().to_owned();
     let (base, task) = server(vec![
         token(),
-        Reply::Json(404, json!({})),
         Reply::Json(200, json!({"items":[value.clone(),value]})),
     ])
     .await;
@@ -621,7 +635,7 @@ async fn unauthorized_control_plane_response_refreshes_once() {
         token(),
         Reply::Json(401, json!({})),
         token(),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
     ])
     .await;
     let cloud = client(&base);
@@ -631,15 +645,18 @@ async fn unauthorized_control_plane_response_refreshes_once() {
 
 #[tokio::test]
 async fn private_discovery_ignores_legacy_and_terminating_connectors() {
-    let mut eligible = connector();
-    eligible["metadata"]["annotations"][PROTOCOL] = json!("masque-v1");
+    let mut eligible = connect_connector();
+    eligible["metadata"]["name"] = json!("other-device");
     let mut terminating = eligible.clone();
     terminating["metadata"]["deletionTimestamp"] = json!("2026-09-30T00:00:00Z");
     let (base, task) = server(vec![
         token(),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
         Reply::Json(200, json!({"metadata":{"annotations":{}}})),
-        Reply::Json(200, json!({"items":[connector(),eligible,terminating]})),
+        Reply::Json(
+            200,
+            json!({"items":[connect_connector(),eligible,terminating]}),
+        ),
     ])
     .await;
     assert_eq!(client(&base).private_peers().await.unwrap().len(), 1);
@@ -648,17 +665,17 @@ async fn private_discovery_ignores_legacy_and_terminating_connectors() {
 
 #[tokio::test]
 async fn default_private_scope_excludes_approved_gateway_key_and_aliases() {
-    let mut device = connector();
-    device["metadata"]["annotations"][PROTOCOL] = json!("masque-v1");
+    let mut device = connect_connector();
+    device["metadata"]["name"] = json!("other-device");
     let mut gateway = device.clone();
     gateway["metadata"]["name"] = json!("approved-gateway");
     let key = iroh::SecretKey::from_bytes(&[8; 32]).public().to_string();
-    gateway["status"]["connectionDetails"]["publicKey"]["id"] = json!(key);
+    gateway["spec"]["publicKey"] = json!(key);
     let mut alias = gateway.clone();
     alias["metadata"]["name"] = json!("gateway-alias");
     let (base, task) = server(vec![
         token(),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
         Reply::Json(
             200,
             json!({"metadata":{"annotations":{(GATEWAYS):"[\"approved-gateway\"]"}}}),
@@ -686,7 +703,7 @@ async fn malformed_gateway_approval_fails_closed_before_private_discovery() {
     ] {
         let (base, task) = server(vec![
             token(),
-            Reply::Json(200, connector()),
+            Reply::Json(200, connect_connector()),
             Reply::Json(
                 200,
                 json!({"metadata":{"annotations":{(GATEWAYS):annotation}}}),
@@ -702,7 +719,7 @@ async fn malformed_gateway_approval_fails_closed_before_private_discovery() {
 async fn unresolved_gateway_approval_fails_closed_before_private_discovery() {
     let (base, task) = server(vec![
         token(),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
         Reply::Json(
             200,
             json!({"metadata":{"annotations":{(GATEWAYS):"[\"missing-gateway\"]"}}}),
@@ -721,12 +738,12 @@ async fn unresolved_gateway_approval_fails_closed_before_private_discovery() {
 async fn public_scope_still_resolves_only_approved_gateway_identities() {
     let (base, task) = server(vec![
         token(),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
         Reply::Json(
             200,
             json!({"metadata":{"annotations":{(GATEWAYS):"[\"approved-gateway\"]"}}}),
         ),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
     ])
     .await;
     assert_eq!(client(&base).public_peers().await.unwrap().len(), 1);
@@ -737,7 +754,7 @@ async fn public_scope_still_resolves_only_approved_gateway_identities() {
 async fn absent_gateway_approval_does_not_enable_public_access() {
     let (base, task) = server(vec![
         token(),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
         Reply::Json(200, json!({"metadata":{"annotations":{}}})),
     ])
     .await;
