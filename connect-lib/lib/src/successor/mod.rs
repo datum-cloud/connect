@@ -9,7 +9,11 @@ use credentials::TokenProvider;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashSet, net::SocketAddr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    time::Duration,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 const GROUP: &str = "networking.datumapis.com/v1alpha1";
@@ -618,16 +622,43 @@ impl CloudConnector {
         }
     }
 
+    /// Read a legacy NSO Connector identity only when the mutable status agrees
+    /// with the enrollment-time key binding on the object. Connector status is
+    /// written by the device and is therefore addressing data, not an identity
+    /// authority on its own.
     fn identity(&self, object: &Value) -> Result<PeerIdentity> {
         if !object["metadata"]["deletionTimestamp"].is_null() {
             return Err(Error::Ownership("Connector is terminating".into()));
         }
         let name = string(object, "/metadata/name")?;
         let uid = string(object, "/metadata/uid")?;
+        if object
+            .pointer("/status/connectionDetails/type")
+            .and_then(Value::as_str)
+            != Some("PublicKey")
+        {
+            return Err(Error::Invalid(format!(
+                "Connector {name} does not have PublicKey connection details"
+            )));
+        }
         let public_key = string(object, "/status/connectionDetails/publicKey/id")?;
-        let _: iroh::EndpointId = public_key
+        let public_key: iroh::EndpointId = public_key
             .parse()
             .map_err(|_| Error::Invalid("control plane returned invalid public key".into()))?;
+        let enrolled_key = string(
+            object,
+            "/metadata/annotations/connect.datum.net~1public-key",
+        )?;
+        let enrolled_key: iroh::EndpointId = enrolled_key.parse().map_err(|_| {
+            Error::Invalid(format!(
+                "Connector {name} has an invalid enrolled public-key binding"
+            ))
+        })?;
+        if public_key != enrolled_key {
+            return Err(Error::Ownership(format!(
+                "Connector {name} status identity does not match its enrolled public-key binding"
+            )));
+        }
         let relay_url = object
             .pointer("/status/connectionDetails/publicKey/homeRelay")
             .and_then(Value::as_str)
@@ -656,10 +687,56 @@ impl CloudConnector {
         Ok(PeerIdentity {
             name,
             uid,
-            public_key,
+            public_key: public_key.to_string(),
             relay_url,
             addresses,
         })
+    }
+
+    /// If this legacy Connector has been enrolled in the newer Connect API,
+    /// require that controller-observed record to bind the same key and be
+    /// currently Ready. Absence is tolerated during the staged API migration;
+    /// disagreement or stale readiness is never ignored.
+    async fn verify_connect_identity(&self, identity: &PeerIdentity) -> Result<()> {
+        let Some(connector) = self.connect_get("connectors", &identity.name).await? else {
+            return Ok(());
+        };
+        if !connector["metadata"]["deletionTimestamp"].is_null() {
+            return Err(Error::Ownership(format!(
+                "Connect Connector {} is terminating",
+                identity.name
+            )));
+        }
+        let enrolled_key = string(&connector, "/spec/publicKey")?;
+        let enrolled_key: iroh::EndpointId = enrolled_key.parse().map_err(|_| {
+            Error::Invalid(format!(
+                "Connect Connector {} has an invalid spec.publicKey",
+                identity.name
+            ))
+        })?;
+        let identity_key: iroh::EndpointId = identity
+            .public_key
+            .parse()
+            .map_err(|_| Error::Invalid("control plane returned invalid public key".into()))?;
+        if enrolled_key != identity_key {
+            return Err(Error::Ownership(format!(
+                "Connector {} identity disagrees between the legacy and Connect APIs",
+                identity.name
+            )));
+        }
+        if !current_condition(&connector, "Ready") {
+            return Err(Error::Ownership(format!(
+                "Connect Connector {} is not currently Ready",
+                identity.name
+            )));
+        }
+        Ok(())
+    }
+
+    async fn trusted_identity(&self, object: &Value) -> Result<PeerIdentity> {
+        let identity = self.identity(object)?;
+        self.verify_connect_identity(&identity).await?;
+        Ok(identity)
     }
 
     async fn owned_connector(&self) -> Result<Value> {
@@ -777,12 +854,12 @@ impl CloudConnector {
                 .get("connectors", name_or_key)
                 .await?
                 .ok_or(Error::Api(404))?;
-            return self.identity(&value);
+            return self.trusted_identity(&value).await;
         };
         let public_key = key.to_string();
         let legacy_name = format!("connect-{}", &public_key[..40]);
         if let Some(value) = self.get("connectors", &legacy_name).await? {
-            let identity = self.identity(&value)?;
+            let identity = self.trusted_identity(&value).await?;
             if identity.public_key != public_key {
                 return Err(Error::Ownership(legacy_name));
             }
@@ -814,7 +891,7 @@ impl CloudConnector {
             })
             .collect();
         match matches.as_slice() {
-            [value] => self.identity(value),
+            [value] => self.trusted_identity(value).await,
             [] => Err(Error::Api(404)),
             _ => Err(Error::Invalid("multiple Connectors advertise this public key; resolve the duplicate identities before connecting".into())),
         }
@@ -850,6 +927,7 @@ impl CloudConnector {
             ));
         }
         let mut peers = Vec::new();
+        let mut claimed_keys = HashMap::<iroh::EndpointId, String>::new();
         for item in list["items"]
             .as_array()
             .ok_or_else(|| Error::Invalid("Connector list lacks items".into()))?
@@ -866,11 +944,17 @@ impl CloudConnector {
             {
                 continue;
             }
-            let identity = self.identity(item)?;
+            let identity = self.trusted_identity(item).await?;
             let key = identity
                 .public_key
                 .parse::<iroh::EndpointId>()
                 .map_err(|_| Error::Invalid("control plane returned invalid public key".into()))?;
+            if let Some(first) = claimed_keys.insert(key, identity.name.clone()) {
+                return Err(Error::Invalid(format!(
+                    "Connectors {first} and {} claim the same enrolled public key; resolve the duplicate identities before serving",
+                    identity.name
+                )));
+            }
             if !gateway_keys.contains(&key) {
                 peers.push(identity);
             }
@@ -889,8 +973,20 @@ impl CloudConnector {
             ));
         }
         let mut peers = Vec::new();
+        let mut claimed_keys = HashMap::<iroh::EndpointId, String>::new();
         for name in names {
-            peers.push(self.resolve_peer(&name).await?);
+            let identity = self.resolve_peer(&name).await?;
+            let key = identity
+                .public_key
+                .parse::<iroh::EndpointId>()
+                .map_err(|_| Error::Invalid("control plane returned invalid public key".into()))?;
+            if let Some(first) = claimed_keys.insert(key, identity.name.clone()) {
+                return Err(Error::Invalid(format!(
+                    "approved gateway Connectors {first} and {} claim the same enrolled public key",
+                    identity.name
+                )));
+            }
+            peers.push(identity);
         }
         Ok(peers)
     }

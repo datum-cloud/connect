@@ -202,6 +202,19 @@ This mode uses your user's permissions, not a restricted per-Connector token.
 Least-privilege per-Connector credential issuance remains future platform work;
 you do not need that feature to use host-session enrollment.
 
+Peer discovery treats NSO `status.connectionDetails` as mutable addressing data,
+not as an identity authority. The daemon requires its public key to match the
+Connector's enrollment-time `connect.datum.net/public-key` annotation and, when
+the corresponding Connect API Connector exists, also requires its
+enrollment-owned `spec.publicKey` to match and its controller-observed `Ready`
+condition to be current. Conflicting key claims fail closed instead of
+broadening a private or explicit allow policy. These checks contain credentials
+limited to the status subresource, but they are defense in depth rather than a
+complete trust root: the platform must make enrolled keys immutable, require
+proof of possession at enrollment, and issue credentials scoped to one
+Connector. A principal that can rewrite both the enrollment binding and status
+can still replace an identity.
+
 For unattended servers, use a service-account credential file:
 
 ```sh

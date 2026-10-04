@@ -84,7 +84,7 @@ fn client(base: &str) -> CloudConnector {
 
 fn connector() -> Value {
     let public = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
-    json!({"metadata":{"name":format!("connect-{}",&public[..40]),"uid":"connector-uid","annotations":{"connect.datum.net/public-key":public}},"spec":{"connectorClassName":"masque"},"status":{"connectionDetails":{"publicKey":{"id":public}}}})
+    json!({"metadata":{"name":format!("connect-{}",&public[..40]),"uid":"connector-uid","annotations":{"connect.datum.net/public-key":public}},"spec":{"connectorClassName":"masque"},"status":{"connectionDetails":{"type":"PublicKey","publicKey":{"id":public}}}})
 }
 
 #[test]
@@ -295,7 +295,9 @@ async fn named_connector_is_resolved_by_name_and_by_exact_public_key() {
         token(),
         Reply::Json(200, named.clone()),
         Reply::Json(404, json!({})),
+        Reply::Json(404, json!({})),
         Reply::Json(200, json!({"items":[named]})),
+        Reply::Json(404, json!({})),
     ])
     .await;
     let client = client(&base);
@@ -304,7 +306,7 @@ async fn named_connector_is_resolved_by_name_and_by_exact_public_key() {
         key
     );
     assert_eq!(client.resolve_peer(&key).await.unwrap().name, "alice-mac");
-    assert_eq!(task.await.unwrap().len(), 4);
+    assert_eq!(task.await.unwrap().len(), 6);
 }
 
 #[tokio::test]
@@ -372,6 +374,86 @@ async fn ambiguous_key_discovery_fails_closed() {
         client(&base).resolve_peer(&key).await,
         Err(Error::Invalid(_))
     ));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn status_identity_must_match_the_enrollment_binding() {
+    let mut forged = connector();
+    forged["metadata"]["name"] = json!("alice-mac");
+    forged["status"]["connectionDetails"]["publicKey"]["id"] =
+        json!(iroh::SecretKey::from_bytes(&[8; 32]).public().to_string());
+    let (base, task) = server(vec![token(), Reply::Json(200, forged)]).await;
+
+    assert!(matches!(
+        client(&base).resolve_peer("alice-mac").await,
+        Err(Error::Ownership(message)) if message.contains("enrolled public-key binding")
+    ));
+    assert_eq!(task.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn connect_api_identity_must_match_and_be_currently_ready() {
+    let mut legacy = connector();
+    legacy["metadata"]["name"] = json!("alice-mac");
+    let key = legacy["status"]["connectionDetails"]["publicKey"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mismatched = json!({
+        "metadata":{"name":"alice-mac","generation":1},
+        "spec":{"publicKey":iroh::SecretKey::from_bytes(&[8; 32]).public().to_string()},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, legacy.clone()),
+        Reply::Json(200, mismatched),
+    ])
+    .await;
+    assert!(matches!(
+        client(&base).resolve_peer("alice-mac").await,
+        Err(Error::Ownership(message)) if message.contains("disagrees between")
+    ));
+    task.await.unwrap();
+
+    let not_ready = json!({
+        "metadata":{"name":"alice-mac","generation":2},
+        "spec":{"publicKey":key},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, legacy.clone()),
+        Reply::Json(200, not_ready),
+    ])
+    .await;
+    assert!(matches!(
+        client(&base).resolve_peer("alice-mac").await,
+        Err(Error::Ownership(message)) if message.contains("not currently Ready")
+    ));
+    task.await.unwrap();
+
+    let ready = json!({
+        "metadata":{"name":"alice-mac","generation":2},
+        "spec":{"publicKey":key},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":2}]}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, legacy),
+        Reply::Json(200, ready),
+    ])
+    .await;
+    assert_eq!(
+        client(&base)
+            .resolve_peer("alice-mac")
+            .await
+            .unwrap()
+            .public_key,
+        key
+    );
     task.await.unwrap();
 }
 
@@ -527,11 +609,12 @@ async fn unauthorized_control_plane_response_refreshes_once() {
         Reply::Json(401, json!({})),
         token(),
         Reply::Json(200, connector()),
+        Reply::Json(404, json!({})),
     ])
     .await;
     let cloud = client(&base);
     cloud.resolve_peer(cloud.name()).await.unwrap();
-    assert_eq!(task.await.unwrap().len(), 4);
+    assert_eq!(task.await.unwrap().len(), 5);
 }
 
 #[tokio::test]
@@ -545,6 +628,7 @@ async fn private_discovery_ignores_legacy_and_terminating_connectors() {
         Reply::Json(200, connector()),
         Reply::Json(200, json!({"metadata":{"annotations":{}}})),
         Reply::Json(200, json!({"items":[connector(),eligible,terminating]})),
+        Reply::Json(404, json!({})),
     ])
     .await;
     assert_eq!(client(&base).private_peers().await.unwrap().len(), 1);
@@ -552,13 +636,14 @@ async fn private_discovery_ignores_legacy_and_terminating_connectors() {
 }
 
 #[tokio::test]
-async fn default_private_scope_excludes_approved_gateway_key_and_aliases() {
+async fn default_private_scope_rejects_duplicate_gateway_key_aliases() {
     let mut device = connector();
     device["metadata"]["annotations"][PROTOCOL] = json!("masque-v1");
     let mut gateway = device.clone();
     gateway["metadata"]["name"] = json!("approved-gateway");
     let key = iroh::SecretKey::from_bytes(&[8; 32]).public().to_string();
     gateway["status"]["connectionDetails"]["publicKey"]["id"] = json!(key);
+    gateway["metadata"]["annotations"]["connect.datum.net/public-key"] = json!(key);
     let mut alias = gateway.clone();
     alias["metadata"]["name"] = json!("gateway-alias");
     let (base, task) = server(vec![
@@ -569,12 +654,17 @@ async fn default_private_scope_excludes_approved_gateway_key_and_aliases() {
             json!({"metadata":{"annotations":{(GATEWAYS):"[\"approved-gateway\"]"}}}),
         ),
         Reply::Json(200, gateway.clone()),
+        Reply::Json(404, json!({})),
         Reply::Json(200, json!({"items":[device.clone(),gateway,alias]})),
+        Reply::Json(404, json!({})),
+        Reply::Json(404, json!({})),
+        Reply::Json(404, json!({})),
     ])
     .await;
-    let peers = client(&base).private_peers().await.unwrap();
-    assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0].name, device["metadata"]["name"]);
+    assert!(matches!(
+        client(&base).private_peers().await,
+        Err(Error::Invalid(message)) if message.contains("claim the same enrolled public key")
+    ));
     let requests = task.await.unwrap();
     assert!(requests[3].0.contains("connectors/approved-gateway"));
 }
@@ -632,10 +722,11 @@ async fn public_scope_still_resolves_only_approved_gateway_identities() {
             json!({"metadata":{"annotations":{(GATEWAYS):"[\"approved-gateway\"]"}}}),
         ),
         Reply::Json(200, connector()),
+        Reply::Json(404, json!({})),
     ])
     .await;
     assert_eq!(client(&base).public_peers().await.unwrap().len(), 1);
-    assert_eq!(task.await.unwrap().len(), 4);
+    assert_eq!(task.await.unwrap().len(), 5);
 }
 
 #[tokio::test]
