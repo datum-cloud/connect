@@ -594,6 +594,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "connect-masque-edge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "connect-transport",
+ "h3",
+ "h3-datagram",
+ "h3-quinn",
+ "http",
+ "iroh",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "connect-transport"
 version = "0.1.0"
 dependencies = [
@@ -938,6 +959,7 @@ dependencies = [
  "clap",
  "connect-ip-adapter",
  "connect-lib",
+ "connect-masque-edge",
  "connect-transport",
  "fs2",
  "iroh",
@@ -2706,26 +2728,6 @@ name = "mac-addr"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3d25b0e0b648a86960ac23b7ad4abb9717601dec6f66c165f5b037f3f03065f"
-
-[[package]]
-name = "masque-interop-lab"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "connect-transport",
- "h3",
- "h3-datagram",
- "h3-quinn",
- "http",
- "iroh",
- "quinn",
- "rcgen",
- "rustls",
- "serde_json",
- "tokio",
- "tokio-util",
-]
 
 [[package]]
 name = "matchers"

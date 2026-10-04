@@ -1,5 +1,9 @@
 # Run the local CONNECT-IP prototype
 
+For the opt-in production HTTP/3 CONNECT-UDP listener, certificate provisioning,
+static routing, and its fail-closed authorization boundary, see
+[`../../docs/masque-interoperability.md`](../../docs/masque-interoperability.md#run-the-production-listener).
+
 You can attach an enrolled Connector to an explicitly approved IPv4 or IPv6 network
 using native Linux, macOS, or Windows adapters. This does not create a production NetworkBinding
 or enable VPC attachment against an unmodified deployed gateway.

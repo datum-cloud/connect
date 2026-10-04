@@ -3,6 +3,7 @@ pub mod auth;
 pub mod control;
 pub mod error;
 pub mod local_ip;
+pub mod masque;
 pub mod model;
 pub mod networking;
 pub mod peer_ip;

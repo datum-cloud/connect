@@ -141,7 +141,7 @@ tasks:
       RUSTC_1_98:
         sh: rustup which --toolchain 1.98.0 rustc
     cmds:
-      - env RUSTC={{.RUSTC_1_98}} rustup run 1.98.0 cargo build --locked -p masque-interop-lab
+      - env RUSTC={{.RUSTC_1_98}} rustup run 1.98.0 cargo build --locked -p connect-masque-edge
       - env GOCACHE={{.CARGO_TARGET_DIR}}/go-build go -C {{.ROOT_DIR}}/scripts/masque-client build -trimpath -o {{.CARGO_TARGET_DIR}}/debug/masque-interop-client .
       - python3 {{.ROOT_DIR}}/scripts/masque-interop-e2e.py --lab {{.CARGO_TARGET_DIR}}/debug/masque-interop-lab --client {{.CARGO_TARGET_DIR}}/debug/masque-interop-client
     dir: '{{.ROOT_DIR}}/connect-lib'

@@ -13,11 +13,12 @@ release gate because their wire formats can still change.
 
 ## Current profile
 
-The transport already has extended CONNECT, HTTP/3 DATAGRAM framing with
+The private transport has extended CONNECT, HTTP/3 DATAGRAM framing with
 context ID zero, bounded queues, UDP forwarding, and a CONNECT-IP prototype.
-Its public contract is not yet generic MASQUE: it uses iroh identity and private
-ALPNs, private routing headers, one CONNECT stream per QUIC connection, and no
-DATAGRAM capsule fallback.
+The standards-facing edge now provides ordinary TLS HTTP/3, concurrent request
+streams, exact target routing, and DATAGRAM capsule fallback while translating
+to an explicitly authorized iroh backend. The private listener retains iroh
+identity, private ALPNs, and private routing headers behind that edge.
 
 CONNECT-UDP now emits the RFC 9298 default URI template for canonical Datum UDP
 destinations (`udp-<port>`), advertises `Capsule-Protocol: ?1`, and retains the
@@ -30,11 +31,11 @@ This is deliberately policy lookup, not arbitrary target dialing.
 
 | Area | Required behavior | State / next work |
 | --- | --- | --- |
-| HTTP/3 endpoint | WebPKI TLS, `h3` ALPN, extended CONNECT and H3 DATAGRAM settings, ordinary DNS authority | Deferred to the gateway/public listener; the shared codec must not depend on iroh identity |
+| HTTP/3 endpoint | WebPKI TLS, `h3` ALPN, extended CONNECT and H3 DATAGRAM settings, ordinary DNS authority | Reusable edge and opt-in daemon listener accept caller-provisioned certificate/key files; deployed DNS, certificate issuance, and rotation remain operator work |
 | CONNECT-UDP request | RFC 9298 URI-template expansion, `:protocol = connect-udp`, Capsule Protocol negotiation, host names and IP literals | Default-template parsing/generation and an explicit target-tuple API are present; configurable non-default URI templates remain |
 | CONNECT-UDP response | 2xx response with Capsule Protocol negotiation and correct stream errors | Success and policy-denied responses are independently tested; expand transport failure status and `Proxy-Status` coverage |
 | HTTP Datagrams | Quarter Stream ID association, context ID zero, unknown-context handling | Independent multi-stream coverage is present, including a patched Quarter Stream ID encoder; add negotiated size and unknown-context cases |
-| Capsule fallback | DATAGRAM capsules when QUIC/H3 datagrams are unavailable | Implemented and end-to-end tested in the standards-facing UDP edge with a bounded incremental decoder; extract the existing UDP/IP codecs into one production module |
+| Capsule fallback | DATAGRAM capsules when QUIC/H3 datagrams are unavailable | Implemented in the shared production edge and end-to-end tested with a bounded incremental decoder; CONNECT-IP still needs the same fallback |
 | CONNECT-IP | RFC 9484 request plus repeated address/route assignments and withdrawals | Prototype supports the default wildcard path and initial configuration only |
 | Multiplexing | Multiple concurrent CONNECT streams per HTTP/3 connection | Implemented in the standards-facing edge and tested with three tunnels plus an isolated denied stream; the private iroh listener still uses one stream per connection |
 | HTTP/2 and HTTP/1.1 | RFC 9297/9298 mappings; RFC 9931 optimistic-transition safety for HTTP/1.1 | Deferred until the HTTP/3 edge is conformant; advertise only implemented versions |
@@ -107,3 +108,50 @@ This lab proves CONNECT-UDP interoperability at the HTTP/3 edge and exercises
 the real Connect UDP transport behind it. It does not yet prove production
 certificate provisioning, authentication, standards-facing CONNECT-IP, or
 deployed gateway configuration. Those remain explicit release gates above.
+
+## Run the production listener
+
+The daemon has an opt-in standards-facing HTTP/3 listener. It is disabled unless
+`--masque-config` (or `DATUM_CONNECT_MASQUE_CONFIG`) names a private configuration
+file. The edge uses a separate 32-byte Connector key and exact static routes; it
+does not inherit project identities, inspect local services, resolve arbitrary
+targets, or provide a general UDP proxy.
+
+```json
+{
+  "listen": "0.0.0.0:443",
+  "certificate_chain": "/etc/datum-connect/masque/fullchain.pem",
+  "private_key": "/etc/datum-connect/masque/tls-key.pem",
+  "connector_key": "/etc/datum-connect/masque/connector.key",
+  "max_connections": 4096,
+  "max_associations_per_connection": 128,
+  "routes": [{
+    "target_host": "dns.example.net",
+    "target_port": 53,
+    "backend_endpoint_id": "BACKEND_CONNECTOR_PUBLIC_KEY",
+    "backend_addresses": ["192.0.2.20:4433"],
+    "backend_relay_url": "https://relay.example.net",
+    "destination_port": 53
+  }]
+}
+```
+
+Use an absolute path for every file. The configuration, TLS private key, and
+Connector key must be regular files owned by the daemon user or root with
+owner-only permissions (`chmod 600`), and the Connector key must contain exactly
+32 cryptographically random raw bytes. The certificate
+chain may be world-readable, but must be a regular file under 1 MiB. Provision
+the TLS certificate for the DNS authority clients use and allow inbound UDP on
+the configured listener port.
+
+On startup, `masque_listener_ready` reports the listener address and the edge's
+Connector endpoint ID. The backend service policy must explicitly allow that
+identity for every `destination_port`; otherwise the edge returns 502. Requests
+for any tuple absent from `routes` return 403 before a Connect association is
+opened. Route or certificate changes currently require a daemon restart.
+
+The public listener intentionally performs no end-user authentication yet. It
+is suitable only for services whose ingress policy is public, with the exact
+route table providing the no-open-proxy boundary. Do not use it for private
+services until the gateway has a configured client-authentication mechanism and
+maps authenticated callers to service policy.
