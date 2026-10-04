@@ -55,6 +55,9 @@ impl PacketDevice {
         routes: &[IpNet],
         helper: Option<&std::path::Path>,
     ) -> io::Result<Self> {
+        #[cfg(not(unix))]
+        let _ = peer_address;
+
         validate(name, address, mtu, routes)?;
         if let Some(socket) = helper {
             #[cfg(unix)]
