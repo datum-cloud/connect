@@ -135,6 +135,17 @@ tasks:
       - cmd: 'python3 {{.E2E_SCRIPT}} --daemon {{.CARGO_TARGET_DIR}}/debug/{{.DAEMON_BINARY}} --plugin {{.ROOT_DIR}}/{{.GO_PROJECT}}/{{.PLUGIN_BINARY}} --oidc'
         silent: false
 
+  test:masque-interop:
+    desc: "Run an independent masque-go client through standard H3 and the real Connect UDP transport"
+    vars:
+      RUSTC_1_98:
+        sh: rustup which --toolchain 1.98.0 rustc
+    cmds:
+      - env RUSTC={{.RUSTC_1_98}} rustup run 1.98.0 cargo build --locked -p masque-interop-lab
+      - env GOCACHE={{.CARGO_TARGET_DIR}}/go-build go -C {{.ROOT_DIR}}/scripts/masque-client build -trimpath -o {{.CARGO_TARGET_DIR}}/debug/masque-interop-client .
+      - python3 {{.ROOT_DIR}}/scripts/masque-interop-e2e.py --lab {{.CARGO_TARGET_DIR}}/debug/masque-interop-lab --client {{.CARGO_TARGET_DIR}}/debug/masque-interop-client
+    dir: '{{.ROOT_DIR}}/connect-lib'
+
   # ════════════════════════════════════════════════════════════════════════
   #  Clean
   # ════════════════════════════════════════════════════════════════════════

@@ -41,6 +41,8 @@ pub const ALPN: &[u8] = b"datum-connect/masque-v1";
 pub const MAX_DATAGRAM_PAYLOAD: usize = 1100;
 const DESTINATION_HEADER: &str = "x-datum-destination";
 const KIND_HEADER: &str = "x-datum-connect-kind";
+const CAPSULE_PROTOCOL_HEADER: &str = "capsule-protocol";
+const CONNECT_UDP_PATH_PREFIX: &str = "/.well-known/masque/udp/";
 const TUNNEL_BUFFER: usize = 64 * 1024;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -407,7 +409,7 @@ impl Transport {
         let adapter = h3_iroh::Connection::new(conn);
         let (mut driver, mut sender) =
             setup(&local_cancel, h3::client::builder().build(adapter)).await?;
-        let request = connect_request(peer.id, &destination, SessionKind::Tcp)?;
+        let request = connect_request(peer.id, &destination, SessionKind::Tcp, None)?;
         let mut stream = setup(&local_cancel, sender.send_request(request)).await?;
         let driver_task = AbortTask::new(tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -443,7 +445,35 @@ impl Transport {
         cancel: CancellationToken,
     ) -> Result<UdpTunnel, Error> {
         let result = self
-            .connect_udp_inner(peer.into(), destination, cancel)
+            .connect_udp_inner(peer.into(), destination, None, cancel)
+            .await;
+        if matches!(&result, Err(error) if !matches!(error, Error::Closed)) {
+            self.inner.metrics.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Opens standards-shaped CONNECT-UDP for an explicit target tuple.
+    ///
+    /// `destination` remains the authenticated Datum policy identifier, while
+    /// `target_host` and `target_port` are encoded into the RFC 9298 default
+    /// URI template. The accepting peer rejects the request unless that tuple
+    /// describes the authorized UDP target, so this cannot bypass policy.
+    pub async fn connect_udp_target(
+        &self,
+        peer: impl Into<EndpointAddr>,
+        destination: DestinationId,
+        target_host: impl Into<String>,
+        target_port: u16,
+        cancel: CancellationToken,
+    ) -> Result<UdpTunnel, Error> {
+        let result = self
+            .connect_udp_inner(
+                peer.into(),
+                destination,
+                Some((target_host.into(), target_port)),
+                cancel,
+            )
             .await;
         if matches!(&result, Err(error) if !matches!(error, Error::Closed)) {
             self.inner.metrics.errors.fetch_add(1, Ordering::Relaxed);
@@ -455,6 +485,7 @@ impl Transport {
         &self,
         peer: EndpointAddr,
         destination: DestinationId,
+        target: Option<(String, u16)>,
         cancel: CancellationToken,
     ) -> Result<UdpTunnel, Error> {
         let local_cancel = linked_cancel(cancel, self.inner.shutdown.clone());
@@ -474,7 +505,13 @@ impl Transport {
                 .build(adapter),
         )
         .await?;
-        let request = connect_request(peer.id, &destination, SessionKind::Udp)?;
+        let request = connect_request(
+            peer.id,
+            &destination,
+            SessionKind::Udp,
+            target.as_ref().map(|(host, port)| (host.as_str(), *port)),
+        )?;
+        let standard_request = request.uri().path() != "/";
         let mut stream = setup(&local_cancel, sender.send_request(request)).await?;
         let stream_id = stream.id();
         let mut datagram_sender = driver.get_datagram_sender(stream_id);
@@ -490,6 +527,11 @@ impl Transport {
         };
         if !response.status().is_success() {
             return Err(Error::Rejected(response.status()));
+        }
+        if standard_request && !capsule_protocol_enabled(response.headers()) {
+            return Err(Error::Protocol(
+                "CONNECT-UDP response did not negotiate Capsule Protocol".into(),
+            ));
         }
         let sender_guard = sender;
         let (send_tx, mut send_rx) = mpsc::channel::<Bytes>(64);
@@ -620,15 +662,9 @@ impl Transport {
             return Ok(());
         };
         let (request, mut stream) = setup(&self.inner.shutdown, resolver.resolve_request()).await?;
-        let destination: DestinationId = request
-            .headers()
-            .get(DESTINATION_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .ok_or(Error::MissingDestination)?
-            .parse()?;
         let kind = request_kind(&request)?;
-        let Some(destination_policy) =
-            authorized_policy(&self.inner.policy.load(), &destination, peer, kind)
+        let Some((destination, destination_policy)) =
+            authorized_request(&self.inner.policy.load(), &request, peer, kind)?
         else {
             stream
                 .send_response(response(StatusCode::FORBIDDEN))
@@ -697,7 +733,7 @@ impl Transport {
                 .await?;
                 socket.connect(target).await?;
                 stream
-                    .send_response(response(StatusCode::OK))
+                    .send_response(connect_udp_response(StatusCode::OK))
                     .await
                     .map_err(error_display)?;
                 let mut buffer = vec![0u8; 65_535];
@@ -977,10 +1013,10 @@ fn connect_request(
     peer: EndpointId,
     destination: &DestinationId,
     kind: SessionKind,
+    udp_target: Option<(&str, u16)>,
 ) -> Result<Request<()>, Error> {
-    let mut request = Request::builder()
+    let mut builder = Request::builder()
         .method(Method::CONNECT)
-        .uri(format!("https://{peer}/"))
         .header(DESTINATION_HEADER, destination.as_str())
         .header(
             KIND_HEADER,
@@ -988,13 +1024,46 @@ fn connect_request(
                 SessionKind::Tcp => "tcp",
                 SessionKind::Udp => "udp",
             },
-        )
-        .body(())
-        .map_err(error_display)?;
+        );
+    if kind == SessionKind::Udp {
+        let target = udp_target
+            .map(|(host, port)| (host.to_owned(), port))
+            .or_else(|| {
+                canonical_udp_port(destination).map(|port| (destination.to_string(), port))
+            });
+        if let Some((host, port)) = target {
+            validate_connect_udp_host(&host)?;
+            builder = builder
+                .uri(format!(
+                    "https://{peer}{CONNECT_UDP_PATH_PREFIX}{}/{port}/",
+                    encode_uri_template_value(&host)
+                ))
+                .header(CAPSULE_PROTOCOL_HEADER, "?1");
+        } else {
+            // Opaque destination IDs predate the RFC 9298 target tuple. Keep
+            // their private request shape until callers can supply a target.
+            builder = builder.uri(format!("https://{peer}/"));
+        }
+    } else {
+        builder = builder.uri(format!("https://{peer}/"));
+    }
+    let mut request = builder.body(()).map_err(error_display)?;
     if kind == SessionKind::Udp {
         request.extensions_mut().insert(Protocol::CONNECT_UDP);
     }
     Ok(request)
+}
+
+fn validate_connect_udp_host(host: &str) -> Result<(), Error> {
+    if host.is_empty()
+        || host.len() > 255
+        || host
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b'/')
+    {
+        return Err(Error::Protocol("invalid CONNECT-UDP target host".into()));
+    }
+    Ok(())
 }
 
 fn request_kind(request: &Request<()>) -> Result<SessionKind, Error> {
@@ -1009,9 +1078,231 @@ fn request_kind(request: &Request<()>) -> Result<SessionKind, Error> {
         request.extensions().get::<Protocol>(),
     ) {
         (Some("tcp"), None) => Ok(SessionKind::Tcp),
-        (Some("udp"), Some(protocol)) if *protocol == Protocol::CONNECT_UDP => Ok(SessionKind::Udp),
+        (Some("udp"), Some(protocol)) if *protocol == Protocol::CONNECT_UDP => {
+            validate_connect_udp_request(request)?;
+            Ok(SessionKind::Udp)
+        }
+        (None, Some(protocol)) if *protocol == Protocol::CONNECT_UDP => {
+            validate_connect_udp_request(request)?;
+            Ok(SessionKind::Udp)
+        }
         _ => Err(Error::Protocol("invalid CONNECT kind or :protocol".into())),
     }
+}
+
+fn validate_connect_udp_request(request: &Request<()>) -> Result<(), Error> {
+    if request.uri().scheme_str() != Some("https") || request.uri().authority().is_none() {
+        return Err(Error::Protocol(
+            "CONNECT-UDP requires an https URI with an authority".into(),
+        ));
+    }
+    if request.uri().path() == "/" {
+        if request.headers().contains_key(DESTINATION_HEADER) {
+            return Ok(());
+        }
+        return Err(Error::MissingDestination);
+    }
+    parse_connect_udp_target(request.uri())?;
+    if !capsule_protocol_enabled(request.headers()) {
+        return Err(Error::Protocol(
+            "CONNECT-UDP requires Capsule-Protocol: ?1".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates an RFC 9298 HTTP/3 CONNECT-UDP request using the default URI
+/// template and returns its decoded target tuple.
+///
+/// This intentionally accepts no Datum routing headers as a substitute for the
+/// standard URI. Standards-facing listeners can use it before applying their
+/// own authentication and target authorization policy.
+pub fn standard_connect_udp_target(request: &Request<()>) -> Result<(String, u16), Error> {
+    if request.method() != Method::CONNECT
+        || request.extensions().get::<Protocol>() != Some(&Protocol::CONNECT_UDP)
+    {
+        return Err(Error::Protocol(
+            "expected an extended CONNECT request with :protocol connect-udp".into(),
+        ));
+    }
+    if request.uri().scheme_str() != Some("https") || request.uri().authority().is_none() {
+        return Err(Error::Protocol(
+            "CONNECT-UDP requires an https URI with an authority".into(),
+        ));
+    }
+    if !capsule_protocol_enabled(request.headers()) {
+        return Err(Error::Protocol(
+            "CONNECT-UDP requires Capsule-Protocol: ?1".into(),
+        ));
+    }
+    parse_connect_udp_target(request.uri())
+}
+
+fn authorized_request(
+    policy: &Policy,
+    request: &Request<()>,
+    peer: EndpointId,
+    kind: SessionKind,
+) -> Result<Option<(DestinationId, DestinationPolicy)>, Error> {
+    let private_destination = request
+        .headers()
+        .get(DESTINATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::parse)
+        .transpose()?;
+
+    if kind != SessionKind::Udp || request.uri().path() == "/" {
+        let destination = private_destination.ok_or(Error::MissingDestination)?;
+        return Ok(
+            authorized_policy(policy, &destination, peer, kind).map(|entry| (destination, entry))
+        );
+    }
+
+    let (target_host, target_port) = parse_connect_udp_target(request.uri())?;
+    if let Some(destination) = private_destination {
+        let Some(entry) = authorized_policy(policy, &destination, peer, kind) else {
+            return Ok(None);
+        };
+        // The private ID selects policy; the standard tuple still has to name
+        // that policy's UDP target (or its canonical `udp-<port>` alias).
+        let requested_socket = target_host
+            .parse()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, target_port));
+        let target_matches = match entry.target {
+            Target::Udp(target) => {
+                requested_socket == Some(target)
+                    || (target_host == destination.as_str()
+                        && canonical_udp_port(&destination) == Some(target_port))
+            }
+            Target::Tcp(_) => false,
+        };
+        if !target_matches {
+            return Err(Error::Protocol(
+                "CONNECT-UDP URI conflicts with private destination".into(),
+            ));
+        }
+        return Ok(Some((destination, entry)));
+    }
+
+    // A third-party client has no Datum destination header. Resolve the RFC
+    // target only through existing policy; never turn this into an open proxy.
+    let requested_socket = target_host
+        .parse()
+        .ok()
+        .map(|ip| SocketAddr::new(ip, target_port));
+    let named_destination = DestinationId::new(target_host).ok();
+    Ok(policy.destinations.iter().find_map(|(destination, entry)| {
+        let target_matches = match entry.target {
+            Target::Udp(target) => {
+                requested_socket == Some(target)
+                    || (named_destination.as_ref() == Some(destination)
+                        && target.port() == target_port)
+            }
+            Target::Tcp(_) => false,
+        };
+        (target_matches && entry.access.allows(peer)).then(|| (destination.clone(), entry.clone()))
+    }))
+}
+
+fn canonical_udp_port(destination: &DestinationId) -> Option<u16> {
+    destination
+        .as_str()
+        .strip_prefix("udp-")?
+        .parse::<u16>()
+        .ok()
+}
+
+fn parse_connect_udp_target(uri: &http::Uri) -> Result<(String, u16), Error> {
+    if uri.query().is_some() {
+        return Err(Error::Protocol(
+            "CONNECT-UDP default URI must not contain a query".into(),
+        ));
+    }
+    let suffix = uri
+        .path()
+        .strip_prefix(CONNECT_UDP_PATH_PREFIX)
+        .ok_or_else(|| Error::Protocol("invalid CONNECT-UDP URI template".into()))?;
+    let suffix = suffix
+        .strip_suffix('/')
+        .ok_or_else(|| Error::Protocol("CONNECT-UDP URI must end in a slash".into()))?;
+    let mut segments = suffix.split('/');
+    let encoded_host = segments
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Protocol("CONNECT-UDP target host is missing".into()))?;
+    let port = segments
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Protocol("CONNECT-UDP target port is missing".into()))?;
+    if segments.next().is_some() {
+        return Err(Error::Protocol("invalid CONNECT-UDP URI template".into()));
+    }
+    let host = decode_uri_template_value(encoded_host)?;
+    if host.is_empty() || host.len() > 255 || host.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(Error::Protocol("invalid CONNECT-UDP target host".into()));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| Error::Protocol("invalid CONNECT-UDP target port".into()))?;
+    Ok((host, port))
+}
+
+fn encode_uri_template_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
+}
+
+fn decode_uri_template_value(value: &str) -> Result<String, Error> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let hex = bytes
+            .get(index + 1..index + 3)
+            .ok_or_else(|| Error::Protocol("invalid CONNECT-UDP percent encoding".into()))?;
+        let high = decode_hex(hex[0])?;
+        let low = decode_hex(hex[1])?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| Error::Protocol("CONNECT-UDP target host is not UTF-8".into()))
+}
+
+fn decode_hex(byte: u8) -> Result<u8, Error> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(Error::Protocol(
+            "invalid CONNECT-UDP percent encoding".into(),
+        )),
+    }
+}
+
+fn capsule_protocol_enabled(headers: &http::HeaderMap) -> bool {
+    let mut values = headers.get_all(CAPSULE_PROTOCOL_HEADER).iter();
+    matches!(
+        values
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim),
+        Some("?1")
+    ) && values.next().is_none()
 }
 
 fn authorized_policy(
@@ -1133,6 +1424,14 @@ fn response(status: StatusCode) -> Response<()> {
         .body(())
         .expect("static response")
 }
+
+fn connect_udp_response(status: StatusCode) -> Response<()> {
+    Response::builder()
+        .status(status)
+        .header(CAPSULE_PROTOCOL_HEADER, "?1")
+        .body(())
+        .expect("static CONNECT-UDP response")
+}
 fn add_context_id(payload: Bytes) -> Bytes {
     let mut framed = BytesMut::with_capacity(payload.len() + 1);
     framed.extend_from_slice(&[0]);
@@ -1196,6 +1495,184 @@ mod tests {
         })
         .await
         .expect("active count converged");
+    }
+
+    #[test]
+    fn canonical_udp_request_uses_rfc_9298_default_template() {
+        let peer = SecretKey::generate().public();
+        let request = connect_request(peer, &DestinationId::udp(5353), SessionKind::Udp, None)
+            .expect("CONNECT-UDP request");
+        assert_eq!(request.method(), Method::CONNECT);
+        assert_eq!(
+            request.uri().path(),
+            "/.well-known/masque/udp/udp-5353/5353/"
+        );
+        assert_eq!(request.uri().query(), None);
+        assert_eq!(
+            request.extensions().get::<Protocol>(),
+            Some(&Protocol::CONNECT_UDP)
+        );
+        assert_eq!(
+            request.headers().get(CAPSULE_PROTOCOL_HEADER).unwrap(),
+            "?1"
+        );
+        assert_eq!(
+            request.headers().get(DESTINATION_HEADER).unwrap(),
+            "udp-5353"
+        );
+        assert_eq!(request_kind(&request).unwrap(), SessionKind::Udp);
+        assert!(capsule_protocol_enabled(
+            connect_udp_response(StatusCode::OK).headers()
+        ));
+    }
+
+    #[test]
+    fn opaque_udp_destination_retains_legacy_request_contract() {
+        let peer = SecretKey::generate().public();
+        let destination = DestinationId::new("dns-service").unwrap();
+        let request = connect_request(peer, &destination, SessionKind::Udp, None).unwrap();
+        assert_eq!(request.uri().path(), "/");
+        assert!(!request.headers().contains_key(CAPSULE_PROTOCOL_HEADER));
+        assert_eq!(request_kind(&request).unwrap(), SessionKind::Udp);
+    }
+
+    #[test]
+    fn explicit_udp_target_uses_default_template_for_opaque_policy_id() {
+        let peer = SecretKey::generate().public();
+        let destination = DestinationId::new("dns-service").unwrap();
+        let request = connect_request(
+            peer,
+            &destination,
+            SessionKind::Udp,
+            Some(("2001:db8::53", 53)),
+        )
+        .unwrap();
+        assert_eq!(
+            request.uri().path(),
+            "/.well-known/masque/udp/2001%3Adb8%3A%3A53/53/"
+        );
+        assert_eq!(
+            request.headers().get(DESTINATION_HEADER).unwrap(),
+            "dns-service"
+        );
+        assert!(capsule_protocol_enabled(request.headers()));
+    }
+
+    #[test]
+    fn standard_udp_request_parses_encoded_target_and_requires_capsules() {
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://proxy.example/.well-known/masque/udp/2001%3Adb8%3A%3A1/443/")
+            .header(CAPSULE_PROTOCOL_HEADER, " \t?1 \t")
+            .body(())
+            .unwrap();
+        request.extensions_mut().insert(Protocol::CONNECT_UDP);
+        assert_eq!(request_kind(&request).unwrap(), SessionKind::Udp);
+        assert_eq!(
+            parse_connect_udp_target(request.uri()).unwrap(),
+            ("2001:db8::1".to_owned(), 443)
+        );
+        assert_eq!(
+            standard_connect_udp_target(&request).unwrap(),
+            ("2001:db8::1".to_owned(), 443)
+        );
+
+        request.headers_mut().remove(CAPSULE_PROTOCOL_HEADER);
+        assert!(matches!(request_kind(&request), Err(Error::Protocol(_))));
+        request.headers_mut().insert(
+            CAPSULE_PROTOCOL_HEADER,
+            http::HeaderValue::from_static("?0"),
+        );
+        assert!(matches!(request_kind(&request), Err(Error::Protocol(_))));
+        request.headers_mut().insert(
+            CAPSULE_PROTOCOL_HEADER,
+            http::HeaderValue::from_static("?1"),
+        );
+        request.headers_mut().append(
+            CAPSULE_PROTOCOL_HEADER,
+            http::HeaderValue::from_static("?1"),
+        );
+        assert!(matches!(request_kind(&request), Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn malformed_connect_udp_default_uris_are_rejected() {
+        for uri in [
+            "https://proxy.example/.well-known/masque/udp/example.com/53",
+            "https://proxy.example/.well-known/masque/udp//53/",
+            "https://proxy.example/.well-known/masque/udp/example.com/not-a-port/",
+            "https://proxy.example/.well-known/masque/udp/example.com/53/extra/",
+            "https://proxy.example/.well-known/masque/udp/%GG/53/",
+            "https://proxy.example/.well-known/masque/udp/example.com/53/?x=1",
+        ] {
+            let mut request = Request::builder()
+                .method(Method::CONNECT)
+                .uri(uri)
+                .header(CAPSULE_PROTOCOL_HEADER, "?1")
+                .body(())
+                .unwrap();
+            request.extensions_mut().insert(Protocol::CONNECT_UDP);
+            assert!(request_kind(&request).is_err(), "accepted {uri}");
+        }
+    }
+
+    #[test]
+    fn standard_headerless_udp_target_resolves_only_through_policy() {
+        let peer = SecretKey::generate().public();
+        let destination = DestinationId::new("dns-service").unwrap();
+        let policy = Policy {
+            destinations: HashMap::from([(
+                destination.clone(),
+                DestinationPolicy {
+                    target: Target::Udp("127.0.0.1:5353".parse().unwrap()),
+                    access: Access::Peers(HashSet::from([peer])),
+                },
+            )]),
+        };
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://proxy.example/.well-known/masque/udp/127.0.0.1/5353/")
+            .header(CAPSULE_PROTOCOL_HEADER, "?1")
+            .body(())
+            .unwrap();
+        request.extensions_mut().insert(Protocol::CONNECT_UDP);
+        let kind = request_kind(&request).unwrap();
+        let (resolved, entry) = authorized_request(&policy, &request, peer, kind)
+            .unwrap()
+            .expect("authorized standard target");
+        assert_eq!(resolved, destination);
+        assert_eq!(entry.target, Target::Udp("127.0.0.1:5353".parse().unwrap()));
+
+        let denied = SecretKey::generate().public();
+        assert!(
+            authorized_request(&policy, &request, denied, kind)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn private_and_standard_udp_targets_must_agree() {
+        let peer = SecretKey::generate().public();
+        let destination = DestinationId::new("udp-echo-service").unwrap();
+        let policy = Policy {
+            destinations: HashMap::from([(
+                destination.clone(),
+                DestinationPolicy {
+                    target: Target::Udp("127.0.0.1:5353".parse().unwrap()),
+                    access: Access::Peers(HashSet::from([peer])),
+                },
+            )]),
+        };
+        let mut request = connect_request(peer, &destination, SessionKind::Udp, None)
+            .expect("CONNECT-UDP request");
+        *request.uri_mut() = format!("https://{peer}{CONNECT_UDP_PATH_PREFIX}udp-5353/5354/")
+            .parse()
+            .unwrap();
+        assert!(matches!(
+            authorized_request(&policy, &request, peer, SessionKind::Udp),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[tokio::test]
@@ -1471,7 +1948,7 @@ mod tests {
         });
         let server = endpoint().await;
         let client = endpoint().await;
-        let destination = DestinationId::udp(5353);
+        let destination = DestinationId::new("udp-echo-service").unwrap();
         let policy = Policy {
             destinations: HashMap::from([(
                 destination.clone(),
@@ -1484,9 +1961,11 @@ mod tests {
         server.replace_policy(policy.clone()).await.unwrap();
 
         let tunnel = client
-            .connect_udp(
+            .connect_udp_target(
                 address(&server),
                 destination.clone(),
+                echo_addr.ip().to_string(),
+                echo_addr.port(),
                 CancellationToken::new(),
             )
             .await
