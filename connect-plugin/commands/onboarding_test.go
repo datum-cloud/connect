@@ -106,6 +106,7 @@ func TestGuidedSetupAllowsOnlyInteractiveLocalDaemonTargets(t *testing.T) {
 	t.Cleanup(func() { interactiveTerminal = old })
 	t.Setenv("DATUM_CONNECT_TOKEN", "")
 	interactiveTerminal = func(*cobra.Command) bool { return true }
+	localDaemonTargetAllowed := runtime.GOOS != "windows"
 	for _, tt := range []struct {
 		format, url, token, env string
 		terminal                bool
@@ -113,9 +114,9 @@ func TestGuidedSetupAllowsOnlyInteractiveLocalDaemonTargets(t *testing.T) {
 	}{
 		{"json", connectapi.DefaultBaseURL, "", "", true, false},
 		{"yaml", connectapi.DefaultBaseURL, "", "", true, false},
-		{"table", "http://127.0.0.1:48888", "", "", true, true},
-		{"table", "http://localhost:48888", "", "", true, true},
-		{"table", "http://[::1]:48888", "", "", true, true},
+		{"table", "http://127.0.0.1:48888", "", "", true, localDaemonTargetAllowed},
+		{"table", "http://localhost:48888", "", "", true, localDaemonTargetAllowed},
+		{"table", "http://[::1]:48888", "", "", true, localDaemonTargetAllowed},
 		{"table", "https://example.com", "", "", true, false},
 		{"table", "http://127.0.0.1.evil.example", "", "", true, false},
 		{"table", connectapi.DefaultBaseURL, "/scoped-token", "", true, false},
