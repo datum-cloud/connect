@@ -30,6 +30,9 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
+#[cfg(feature = "otel")]
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub const ALPN: &[u8] = b"datum-connect/connect-ip-v1";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -49,6 +52,49 @@ fn session_id() -> String {
         rand::random::<u64>(),
         SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+#[cfg(feature = "otel")]
+#[derive(Default)]
+struct TraceHeaderMap(HashMap<String, String>);
+
+#[cfg(feature = "otel")]
+impl opentelemetry::propagation::Injector for TraceHeaderMap {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_ascii_lowercase(), value);
+    }
+}
+
+#[cfg(feature = "otel")]
+impl opentelemetry::propagation::Extractor for TraceHeaderMap {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(&key.to_ascii_lowercase()).map(String::as_str)
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(String::as_str).collect()
+    }
+}
+
+#[cfg(feature = "otel")]
+fn inject_trace_context() -> HashMap<String, String> {
+    let mut headers = TraceHeaderMap::default();
+    let context = tracing::Span::current().context();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut headers)
+    });
+    headers.0
+}
+
+#[cfg(feature = "otel")]
+fn extract_trace_context(headers: &http::HeaderMap) -> opentelemetry::Context {
+    let mut carrier = TraceHeaderMap::default();
+    for (name, value) in headers {
+        if let Ok(value) = value.to_str() {
+            carrier.0.insert(name.as_str().to_owned(), value.to_owned());
+        }
+    }
+    opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&carrier))
 }
 
 /// A bounded, non-sensitive reason returned when a peer rejects CONNECT-IP.
@@ -304,6 +350,9 @@ enum Role {
 /// Authorized packet channel. Dropping it or calling cancel revokes this session.
 /// `config` is a metadata snapshot; changing it does not broaden wire policy.
 pub struct IpSession {
+    pub session_id: String,
+    #[cfg(feature = "otel")]
+    pub trace_context: opentelemetry::Context,
     pub config: SessionConfig,
     policy: SessionConfig,
     role: Role,
@@ -362,6 +411,9 @@ impl Drop for IpSession {
 pub struct Incoming {
     pub peer: EndpointId,
     pub network: String,
+    pub session_id: String,
+    #[cfg(feature = "otel")]
+    pub trace_context: opentelemetry::Context,
     pub session: IpSession,
     pub ready: oneshot::Sender<bool>,
 }
@@ -483,11 +535,16 @@ impl Registry {
 fn session_parts(
     config: SessionConfig,
     role: Role,
+    session_id: String,
+    #[cfg(feature = "otel")] trace_context: opentelemetry::Context,
     cancel: CancellationToken,
 ) -> (IpSession, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>) {
     let (sender, outgoing) = mpsc::channel(64);
     let (incoming, receiver) = mpsc::channel(64);
     let session = IpSession {
+        session_id,
+        #[cfg(feature = "otel")]
+        trace_context,
         config: config.clone(),
         policy: config,
         role,
@@ -509,6 +566,7 @@ pub async fn connect(
     let local = cancel.child_token();
     let guard = local.clone().drop_guard();
     let session_id = session_id();
+    let setup_span = tracing::info_span!("connect_ip.setup", peer=%peer.id, %network, %session_id);
     tracing::info!(peer=%peer.id, %network, %session_id, stage="ip_setup", "CONNECT-IP setup started");
     let result = tokio::select! {
         _ = local.cancelled() => Err(Error::Closed),
@@ -527,6 +585,15 @@ pub async fn connect(
                 Error::Transport
             })?;
             let mut request = Request::builder().method(Method::CONNECT).uri(format!("https://{}{PATH}", peer.id)).header("capsule-protocol", "?1").header("x-datum-network", network).header("x-datum-connect-session", &session_id).body(()).map_err(|_| Error::Configuration("invalid network request"))?;
+            #[cfg(feature = "otel")]
+            for (name, value) in inject_trace_context() {
+                if let (Ok(name), Ok(value)) = (
+                    http::header::HeaderName::from_bytes(name.as_bytes()),
+                    http::header::HeaderValue::from_str(&value),
+                ) {
+                    request.headers_mut().insert(name, value);
+                }
+            }
             request.extensions_mut().insert(Protocol::CONNECT_IP);
             let mut stream = sender.send_request(request).await.map_err(|error| {
                 tracing::warn!(peer=%peer.id, %network, %session_id, %error, stage="connect_request", "CONNECT-IP request send failed");
@@ -579,14 +646,17 @@ pub async fn connect(
             if kind != 3 { return Err(Error::Protocol("expected ROUTE_ADVERTISEMENT")); }
             let config = SessionConfig { address, routes: decode_routes(&routes)?, mtu }; config.validate()?;
             tracing::info!(peer=%peer.id, %network, %session_id, assigned_address=%config.address, routes=?config.routes, mtu=config.mtu, datagram_capacity=capacity, stage="ip_ready", "CONNECT-IP session negotiated");
-            let (session, outgoing, incoming) = session_parts(config.clone(), Role::Client, local.clone());
+            #[cfg(feature = "otel")]
+            let trace_context = setup_span.context();
+            let (session, outgoing, incoming) = session_parts(config.clone(), Role::Client, session_id.clone(), #[cfg(feature = "otel")] trace_context, local.clone());
             session.counters.capacity.store(capacity, Ordering::Relaxed);
             let counters = session.counters.clone(); let task_cancel = local.clone();
             let session_network = network.to_owned();
             let session_id = session_id.clone();
-            tokio::spawn(async move { let _bridge = bridge_guard; run_session(io, DatagramPath { connection: conn, stream_id, low_capacity_since: None }, config, Role::Client, session_network, session_id, outgoing, incoming, task_cancel, counters).await; });
+            let session_span = tracing::info_span!("connect_ip.session", peer=%peer.id, network=%network, %session_id);
+            tokio::spawn(async move { let _bridge = bridge_guard; run_session(io, DatagramPath { connection: conn, stream_id, low_capacity_since: None }, config, Role::Client, session_network, session_id, outgoing, incoming, task_cancel, counters).await; }.instrument(session_span));
             Ok(session)
-        }) => result.map_err(|_| {
+        }.instrument(setup_span.clone())) => result.map_err(|_| {
             tracing::warn!(peer=%peer.id, %network, %session_id, stage="ip_setup_timeout", timeout_seconds=SETUP_TIMEOUT.as_secs(), "CONNECT-IP setup timed out");
             Error::Timeout
         })?,
@@ -694,6 +764,8 @@ pub(crate) async fn serve_connection(
             })
             .unwrap_or("unidentified")
             .to_owned();
+        #[cfg(feature = "otel")]
+        let trace_context = extract_trace_context(request.headers());
         let network = one_header(request.headers(), "x-datum-network")
             .filter(|name| valid_network(name).is_ok());
         network_name = network.unwrap_or("unknown").to_owned();
@@ -811,8 +883,14 @@ pub(crate) async fn serve_connection(
         };
         let session_cancel = membership_lifetime.child_token();
         _session_lifetime = Some(session_cancel.clone().drop_guard());
-        let (session, outgoing, packets) =
-            session_parts(config.clone(), Role::Gateway, session_cancel.clone());
+        let (session, outgoing, packets) = session_parts(
+            config.clone(),
+            Role::Gateway,
+            session_id.clone(),
+            #[cfg(feature = "otel")]
+            trace_context.clone(),
+            session_cancel.clone(),
+        );
         let counters = session.counters.clone();
         counters.capacity.store(capacity, Ordering::Relaxed);
         let (ready, accepted) = oneshot::channel();
@@ -820,6 +898,9 @@ pub(crate) async fn serve_connection(
             .try_send(Incoming {
                 peer,
                 network: network.unwrap().into(),
+                session_id: session_id.clone(),
+                #[cfg(feature = "otel")]
+                trace_context,
                 session,
                 ready,
             })

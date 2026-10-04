@@ -9,8 +9,13 @@ use datum_connect_daemon::{
     runtime::RealControl,
     store::Store,
 };
+use opentelemetry::{KeyValue, trace::TracerProvider as _};
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, Layer, Registry, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 #[cfg(windows)]
 #[path = "main/windows_service.rs"]
@@ -74,7 +79,7 @@ fn main() {
 }
 
 async fn run_console(args: Args) {
-    let _log_guard = match init_tracing(args.log_file.as_deref()).await {
+    let (_log_guard, _otel_guard) = match init_tracing(args.log_file.as_deref()).await {
         Ok(guard) => guard,
         Err(error) => {
             eprintln!("failed to initialize logging: {error}");
@@ -209,8 +214,16 @@ async fn wait_for_shutdown_signal() {
 
 async fn init_tracing(
     log_file: Option<&std::path::Path>,
-) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>, std::io::Error> {
+) -> Result<
+    (
+        Option<tracing_appender::non_blocking::WorkerGuard>,
+        OtelGuard,
+    ),
+    std::io::Error,
+> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let (otel_layer, otel_guard) = init_otel("datum-connect-daemon");
+    let otel_enabled = otel_layer.is_some();
     let stderr_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(std::io::stderr);
@@ -222,16 +235,101 @@ async fn init_tracing(
         let (writer, guard) = tracing_appender::non_blocking(file);
         let file_layer = tracing_subscriber::fmt::layer().json().with_writer(writer);
         tracing_subscriber::registry()
+            .with(otel_layer)
             .with(filter)
             .with(stderr_layer)
             .with(file_layer)
             .init();
-        Ok(Some(guard))
+        if otel_enabled {
+            tracing::info!(
+                stage = "otel_exporter_init",
+                "OpenTelemetry OTLP tracing enabled"
+            );
+        }
+        Ok((Some(guard), otel_guard))
     } else {
         tracing_subscriber::registry()
+            .with(otel_layer)
             .with(filter)
             .with(stderr_layer)
             .init();
-        Ok(None)
+        if otel_enabled {
+            tracing::info!(
+                stage = "otel_exporter_init",
+                "OpenTelemetry OTLP tracing enabled"
+            );
+        }
+        Ok((None, otel_guard))
+    }
+}
+
+struct OtelGuard(Option<SdkTracerProvider>);
+
+impl Drop for OtelGuard {
+    fn drop(&mut self) {
+        if let Some(provider) = self.0.take()
+            && let Err(error) = provider.shutdown()
+        {
+            tracing::warn!(%error, stage="otel_shutdown", "OpenTelemetry exporter shutdown failed");
+        }
+    }
+}
+
+fn init_otel(
+    service_name: &'static str,
+) -> (Option<Box<dyn Layer<Registry> + Send + Sync>>, OtelGuard) {
+    let endpoint = std::env::var("DATUM_CONNECT_OTEL_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| otlp_traces_endpoint(&value))
+        .or_else(|| {
+            std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| otlp_traces_endpoint(&value))
+        });
+    let Some(endpoint) = endpoint else {
+        return (None, OtelGuard(None));
+    };
+    let exporter = match SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .with_timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(exporter) => exporter,
+        Err(error) => {
+            eprintln!("OpenTelemetry exporter disabled: {error}");
+            return (None, OtelGuard(None));
+        }
+    };
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            Resource::builder()
+                .with_service_name(service_name)
+                .with_attributes([KeyValue::new("service.namespace", "datum")])
+                .build(),
+        )
+        .build();
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    let layer = tracing_opentelemetry::layer()
+        .with_tracer(provider.tracer(service_name))
+        .boxed();
+    (Some(layer), OtelGuard(Some(provider)))
+}
+
+fn otlp_traces_endpoint(endpoint: &str) -> String {
+    let endpoint = endpoint.trim_end_matches('/');
+    if endpoint.ends_with("/v1/traces") {
+        endpoint.to_owned()
+    } else {
+        format!("{endpoint}/v1/traces")
     }
 }

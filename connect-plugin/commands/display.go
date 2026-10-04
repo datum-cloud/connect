@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -41,24 +42,28 @@ type dialDisplay struct {
 }
 
 type networkDisplay struct {
-	Network            string   `json:"network"`
-	Mode               string   `json:"mode"`
-	Peer               string   `json:"peer"`
-	PeerAddress        string   `json:"peer_address"`
-	Connected          bool     `json:"connected"`
-	State              string   `json:"state"`
-	Address            string   `json:"assigned_address"`
-	Interface          string   `json:"interface_name"`
-	Routes             []string `json:"routes"`
-	AdvertiseRoutes    []string `json:"advertise_routes"`
-	Running            bool     `json:"running"`
-	LastError          string   `json:"last_error"`
-	LastConnectError   string   `json:"last_connect_error"`
-	ACLDrops           uint64   `json:"acl_drops"`
-	DeliveryMode       string   `json:"delivery_mode"`
-	DatagramCapacity   uint64   `json:"effective_datagram_ip_capacity"`
-	MTUErrors          uint64   `json:"mtu_errors"`
-	LastTransportError string   `json:"last_transport_error"`
+	Network                    string   `json:"network"`
+	Mode                       string   `json:"mode"`
+	Peer                       string   `json:"peer"`
+	PeerAddress                string   `json:"peer_address"`
+	Connected                  bool     `json:"connected"`
+	State                      string   `json:"state"`
+	Address                    string   `json:"assigned_address"`
+	Interface                  string   `json:"interface_name"`
+	Routes                     []string `json:"routes"`
+	AdvertiseRoutes            []string `json:"advertise_routes"`
+	Running                    bool     `json:"running"`
+	LastError                  string   `json:"last_error"`
+	LastConnectError           string   `json:"last_connect_error"`
+	ACLDrops                   uint64   `json:"acl_drops"`
+	DeliveryMode               string   `json:"delivery_mode"`
+	DatagramCapacity           uint64   `json:"effective_datagram_ip_capacity"`
+	MTUErrors                  uint64   `json:"mtu_errors"`
+	LastTransportError         string   `json:"last_transport_error"`
+	LocalTunToTransportPackets uint64   `json:"local_tun_to_transport_packets"`
+	TransportToLocalTunPackets uint64   `json:"transport_to_local_tun_packets"`
+	LastPacketSentAtUnixMS     *uint64  `json:"last_packet_sent_at_unix_ms"`
+	LastPacketReceivedAtUnixMS *uint64  `json:"last_packet_received_at_unix_ms"`
 }
 
 // writeHuman renders the daemon's observed state, never assuming that saved
@@ -240,6 +245,11 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			if network.DeliveryMode != "" {
 				fmt.Fprintf(&out, "  Transport: %s; IP datagram capacity: %d bytes; MTU errors: %d\n", network.DeliveryMode, network.DatagramCapacity, network.MTUErrors)
 			}
+			if cmd.Name() == "status" && network.Mode == "gateway" && network.DeliveryMode != "" {
+				fmt.Fprintf(&out, "  Packets: to gateway %d (last %s); from gateway %d (last %s)\n",
+					network.LocalTunToTransportPackets, packetAge(network.LastPacketSentAtUnixMS),
+					network.TransportToLocalTunPackets, packetAge(network.LastPacketReceivedAtUnixMS))
+			}
 			failure := network.LastError
 			if network.LastTransportError != "" {
 				failure = network.LastTransportError
@@ -401,6 +411,20 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 	}
 	_, err := io.WriteString(w, out.String())
 	return err
+}
+
+func packetAge(timestamp *uint64) string {
+	if timestamp == nil || *timestamp == 0 {
+		return "never"
+	}
+	age := time.Since(time.UnixMilli(int64(*timestamp)))
+	if age < 0 {
+		return "clock skew"
+	}
+	if age < time.Second {
+		return "just now"
+	}
+	return fmt.Sprintf("%s ago", age.Truncate(time.Second))
 }
 
 // Suggest an unprivileged port on the other device, not an allocated local port.

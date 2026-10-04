@@ -1,8 +1,9 @@
 # Validate the headless Connect preview
 
-You can build and exercise the new CLI, persistent daemon, and iroh transport
-locally. You cannot use this preview as a drop-in replacement for the deployed
-HTTP/1.1 gateway. No release or cloud deployment occurs when you build it.
+Use this guide to build and test the CLI, daemon, and transport. A local build
+does not create a release or deploy cloud components. Public ingress requires a
+gateway and control plane configured for the matching transport. Managed VPC
+joins use the Connect controller; see the [controller guide](../connect-controller/README.md).
 
 ## Build and test
 
@@ -60,8 +61,9 @@ matching release is not published yet.
 
 The release workflow bundles both binaries, `INSTALL.txt`, and the license for
 each platform. It stages releases as drafts and does not
-change the production latest-release pointer. Use a unique numbered tag such as
-`v1.0.0-preview.1`, not the unpublished `v0.1.0-dev` build identifier.
+change the production latest-release pointer. Use a unique numbered preview
+tag. Replace the example version in the packaging command with that tag. Do not
+use the unpublished `v0.1.0-dev` identifier.
 
 Review and commit the intended source changes first. From that clean checkout,
 run the tests with the pinned toolchains. Check that your chosen tag is unused.
@@ -76,7 +78,7 @@ downloads from this exact tag only after publication.
 For local evaluation before publication, package a freshly built native daemon:
 
 ```sh
-bash scripts/package-preview.sh v1.0.0-preview.1 \
+bash scripts/package-preview.sh v1.0.0-preview.N \
   /absolute/path/to/datum-connect-daemon /absolute/path/to/new-bundle-directory
 ```
 
@@ -294,7 +296,7 @@ project-wide transport diagnostics.
 | Public ingress | Requires approved gateway Connector identities in the class's `connect.datum.net/gateway-connectors` JSON-array annotation | Implement and deploy the gateway; certify HTTPProxy readiness |
 | Credentials | Uses a pinned host login session through `datumctl auth get-token`, or imports renewable OAuth/service-account JSON with in-process refresh | Issue least-privilege, per-Connector credentials; host-session mode currently uses user permissions |
 | Identity rotation | Restart and `up` refuse to recreate a revoked enrollment | Add an explicit administrator leave/rejoin workflow that rotates the key |
-| VPC | Static local approvals support IPv4/IPv6 CONNECT-IP over QUIC DATAGRAM, with Linux TUN, macOS utun, and Windows Wintun adapters | Implement production NetworkBinding approval, address allocation, and VPC routing; validate native hosts |
+| VPC | Managed joins use `ConnectGateway` and `ConnectNetworkBinding`; the local adapter installs approved routes for the assigned address | Validate routing and packet forwarding on each supported host; the gateway and VPC firewall must allow the traffic |
 | Desktop | Existing app remains unchanged | Convert it into a daemon client in `datum-cloud/app` |
 | Packaging | Includes the daemon and architecture-matched pinned Wintun DLLs for Windows | Validate native services, Windows ACLs, signing, upgrades, and rollback on each OS |
 
@@ -304,9 +306,9 @@ and a native SCM system service. Its interactive OIDC helper remains unsupported
 Native driver/service runtime verification still requires a Windows host. See the
 [native adapter guide](../connect-lib/daemon/README.md#install-a-native-privileged-daemon).
 
-Do not add the capability annotations to an old gateway to bypass these gates.
-They describe a new deployment contract, not a feature shipped by the current
-platform. This branch makes a clean CLI break: the `tunnel` tree and its
+Do not add capability annotations to an old gateway to bypass these gates.
+They describe a deployment contract, not a substitute for a compatible gateway.
+This branch makes a clean CLI break: the `tunnel` tree and its
 supervisor are removed, and release archives no longer include the legacy
 `datum-connect` executable. Migrate scripts to `serve --public` if they rely on
 public URLs, or use private `serve` and `dial` together. Stop existing legacy

@@ -1,8 +1,33 @@
 # Run the local CONNECT-IP prototype
 
-You can attach an enrolled Connector to an explicitly approved IPv4 or IPv6 network
-using native Linux, macOS, or Windows adapters. This does not create a production NetworkBinding
-or enable VPC attachment against an unmodified deployed gateway.
+## Export OpenTelemetry traces
+
+The daemon and gateway export OpenTelemetry traces only when you configure an
+OTLP endpoint. Without an endpoint, they keep writing their normal structured
+logs and send no telemetry to a collector.
+
+Set `DATUM_CONNECT_OTEL_ENDPOINT` on both processes to the collector's OTLP/HTTP
+base URL. For a local collector, use `http://127.0.0.1:4318`. You can also use
+the standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` variable with its full traces
+URL, or `OTEL_EXPORTER_OTLP_ENDPOINT` with the base URL. Restart each process
+after changing the environment.
+
+The client propagates W3C trace context in the CONNECT-IP request. The gateway
+continues the same trace, so you can follow setup and session health events on
+both sides. The processes export setup, session, and periodic health-snapshot
+spans; they do not create a span for each packet. Trace attributes can include
+network names, peer identifiers, and connection diagnostics. Send traces only
+to a collector you trust, and apply your normal retention and access controls.
+
+The exporter uses HTTP/protobuf and gives each export request a three-second
+timeout. Export is batched. A collector outage does not stop packet forwarding;
+check the process logs for exporter shutdown or delivery errors.
+
+This guide covers native adapters and low-level local CONNECT-IP tests. For
+managed VPC access, run `datumctl connect join NETWORK` against a deployed
+`ConnectGateway`; see the [controller guide](../../connect-controller/README.md).
+The static `--local-ip-config` example below does not create a
+`ConnectNetworkBinding`.
 
 Use a disposable test host for privileged adapter validation. The Linux container
 lab remains the default isolated test. Native macOS and Windows runs create a
@@ -113,6 +138,27 @@ link MTU. `mtu_errors` counts capacity failures. `last_transport_error` preserve
 the transport failure reason. The nested `transport` object also includes
 `datagrams_sent` and `datagrams_received`. Human-readable status shows the delivery
 mode, capacity, MTU error count, and latest transport error.
+
+For live packet-path diagnosis, daemon logs emit a `connect_ip_health` snapshot
+every 10 seconds with local-TUN-to-transport and transport-to-local-TUN packet
+counts, QUIC datagram counts, transport drops, and the last packet timestamp in
+each direction. `status --output json` exposes these counts as
+`local_tun_to_transport_packets` and `transport_to_local_tun_packets`, plus the
+same last-packet timestamps.
+The gateway emits the matching per-session `connect_ip_health` snapshot with
+QUIC datagrams received/sent, packets injected into/returned from its TUN, and
+policy-drop counts by reason. It also samples the per-session nftables
+postrouting rule every 10 seconds, with a 2-second query bound, to report
+packets and bytes matched by the VPC egress-NAT rule. Correlate client and
+gateway events by `network`, `gateway`/`peer`, and timestamp. If
+client-to-gateway counts advance but gateway injection does not, investigate
+transport or gateway admission; if injection
+advances but NAT does not, investigate gateway forwarding and routes; if NAT
+advances but return traffic does not, investigate VPC routing, workload
+firewall, or service health; if gateway return advances but client receive does
+not, investigate the QUIC path or local adapter. These counters locate the
+failing segment; they do not identify which VPC firewall or workload rule
+blocked a packet.
 
 Attachments do not persist across daemon restarts. `leave`, `down`, lost
 Connector authorization, session failure, and daemon shutdown close the owned

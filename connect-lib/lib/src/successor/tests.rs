@@ -168,6 +168,94 @@ async fn joining_managed_network_creates_connector_owned_binding_and_renews_leas
 }
 
 #[tokio::test]
+async fn joining_managed_network_waits_for_gateway_readiness_after_a_config_rollout() {
+    let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let connect_connector = json!({
+        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
+        "spec":{"publicKey":peer},
+        "status":{"leaseRef":"connect-lease","conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let endpoint_id = iroh::SecretKey::from_bytes(&[9; 32]).public().to_string();
+    let gateway = json!({
+        "metadata":{"name":"vpc-gateway","generation":2},
+        "spec":{"networkRef":"staging-vpc"},
+        "status":{"endpointID":endpoint_id,"conditions":[{"type":"Ready","status":"True","observedGeneration":2}]}
+    });
+    let mut provisioning = gateway.clone();
+    provisioning["status"]["conditions"][0]["status"] = json!("Unknown");
+    provisioning["status"]["conditions"][0]["reason"] = json!("WorkloadProvisioning");
+    let binding_name = network_binding_name("staging-vpc", &format!("connect-{}", &peer[..40]));
+    let created_binding = json!({
+        "metadata":{"name":binding_name,"uid":"binding-uid","resourceVersion":"1","generation":1},
+        "spec":{"gatewayRef":"vpc-gateway","connectorRef":format!("connect-{}", &peer[..40])},
+        "status":{"endpointID":endpoint_id,"assignedAddress":"fd79::1/128","peerAddress":"fd79::2/128","routes":["fd20:0:27::/48"],"relayURLs":["https://relay.example/"],"conditions":[{"type":"Accepted","status":"True","observedGeneration":1}]}
+    });
+    let lease = json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"connect-lease","resourceVersion":"4"},"spec":{"leaseDurationSeconds":30}});
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, json!({"items":[provisioning]})),
+        Reply::Json(200, json!({"items":[gateway]})),
+        Reply::Json(200, connect_connector),
+        Reply::Json(200, lease),
+        Reply::EchoCreated,
+        Reply::Json(404, json!({})),
+        Reply::Json(201, created_binding),
+    ])
+    .await;
+    let result = client(&base)
+        .join_gateway_network("staging-vpc", &ConnectionDetails::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["gateway"], "vpc-gateway");
+    assert_eq!(result["assignedAddress"], "fd79::1/128");
+    assert_eq!(task.await.unwrap().len(), 8);
+}
+
+#[tokio::test]
+async fn connect_enrollment_uses_only_the_connect_api() {
+    let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let class = json!({
+        "metadata":{"name":"masque-class","generation":1},
+        "spec":{"transports":["masque-v1"]},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let connector = json!({
+        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
+        "spec":{"classRef":"masque-class","publicKey":peer,"relayURLs":["https://relay.example/"]},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(404, json!({})),
+        Reply::Json(200, json!({"items":[class]})),
+        Reply::Json(201, connector),
+    ])
+    .await;
+    let cloud = client(&base);
+    let identity = cloud
+        .ensure_connect_connector(&ConnectionDetails {
+            relay_url: "https://relay.example/".into(),
+            addresses: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(identity.uid, "connect-uid");
+    assert_eq!(identity.public_key, peer);
+    let requests = task.await.unwrap();
+    assert!(requests.iter().any(|(line, body)| {
+        line.starts_with("POST ")
+            && line.contains("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectors/")
+            && body["spec"]["classRef"] == "masque-class"
+    }));
+    assert!(
+        requests
+            .iter()
+            .all(|(line, _)| !line.contains("networking.datumapis.com"))
+    );
+}
+
+#[tokio::test]
 async fn lease_renewal_uses_kubernetes_microtime_precision() {
     let mut value = connector();
     value["status"]["leaseRef"] = json!({"name":"connector-lease"});

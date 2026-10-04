@@ -116,6 +116,16 @@ impl crate::peer_ip::PeerResolver for CloudPeerResolver {
 }
 
 impl RealControl {
+    fn discovered_peer_binding<'a>(
+        config: &'a crate::local_ip::LocalIpConfig,
+        project: &str,
+        network: &str,
+    ) -> Option<&'a crate::peer_ip::Binding> {
+        config.peer_bindings.iter().find(|binding| {
+            binding.project == project && binding.network == network && binding.discover
+        })
+    }
+
     async fn ip_config(
         &self,
         runtime: &ProjectRuntime,
@@ -288,7 +298,7 @@ impl RealControl {
                         if runtime.cancel.is_cancelled() { break; }
                         let details = cloud_details(&runtime.transport);
                         let result = async {
-                            let identity = runtime.cloud.renew(&details).await.map_err(cloud_error)?;
+                            let identity = runtime.cloud.ensure_connect_connector(&details).await.map_err(cloud_error)?;
                             if identity.uid != runtime.identity.uid || identity.public_key != runtime.identity.public_key {
                                 return Err(ApiError::new(axum::http::StatusCode::CONFLICT, "Connector identity changed"));
                             }
@@ -298,12 +308,13 @@ impl RealControl {
                                     runtime.cloud.resolve_peer(&dial.connector).await.map_err(cloud_error)?;
                                 }
                             }
-                            // Revoke listeners waiting for a peer too, not only connected sessions.
+                            // Resolve direct peers while revoking listeners waiting for a peer.
+                            // Managed gateway bindings are control-plane resources, not entries
+                            // in the local peer-approval file; their absence there is expected.
                             if let Some(config) = control.ip_config(&runtime).await? {
                                 let networks: Vec<_> = runtime.networks.lock().await.keys().cloned().collect();
                                 for network in networks {
-                                    if let crate::local_ip::Approval::Peer(binding) = config.approval(&project, &network)?
-                                        && binding.discover {
+                                    if let Some(binding) = Self::discovered_peer_binding(&config, &project, &network) {
                                         runtime.cloud.resolve_peer(&binding.peer).await.map_err(cloud_error)?;
                                     }
                                 }
@@ -486,11 +497,10 @@ impl RealControl {
         if let Some(name) = name {
             cloud = cloud.with_name(name).map_err(cloud_error)?;
         }
-        let identity_result = if expected.is_some() {
-            cloud.renew(&initial_details).await
-        } else {
-            cloud.ensure_connector(&initial_details).await
-        };
+        // Enrollment and liveness belong to the Connect API. Do not create or
+        // renew the legacy networking.datumapis.com Connector here; managed
+        // gateway joins must work with Connect permissions alone.
+        let identity_result = cloud.ensure_connect_connector(&initial_details).await;
         let identity = match identity_result {
             Ok(identity) => identity,
             Err(error) => {
@@ -511,9 +521,7 @@ impl RealControl {
             }
         };
         if let Some(expected) = expected
-            && (identity.name != expected.name
-                || identity.uid != expected.uid
-                || identity.public_key != expected.public_key)
+            && (identity.name != expected.name || identity.public_key != expected.public_key)
         {
             transport.shutdown().await;
             return Err(ApiError::new(
@@ -977,11 +985,14 @@ impl Control for RealControl {
             if let Some(previous) = networks.remove(network) {
                 previous.stop().await;
             }
+            let helper_socket = crate::networking::helper_socket().ok();
             let attachment = crate::local_ip::NetworkAttachment::Gateway(
                 crate::local_ip::join(
                     binding,
+                    Some(peer),
                     runtime.transport.endpoint(),
                     runtime.cancel.child_token(),
+                    helper_socket.as_deref(),
                 )
                 .await?,
             );
@@ -1013,8 +1024,10 @@ impl Control for RealControl {
                 crate::local_ip::NetworkAttachment::Gateway(
                     crate::local_ip::join(
                         binding,
+                        None,
                         runtime.transport.endpoint(),
                         runtime.cancel.child_token(),
+                        config.network_helper.as_deref(),
                     )
                     .await?,
                 )
@@ -1150,6 +1163,22 @@ fn require_network_authorization(
 #[cfg(test)]
 mod network_authorization_tests {
     use super::*;
+
+    #[test]
+    fn managed_gateway_attachment_is_not_required_in_local_peer_approvals() {
+        let config = crate::local_ip::LocalIpConfig {
+            network_helper: None,
+            underlay_address: "192.0.2.10".parse().unwrap(),
+            underlay_port: 0,
+            bindings: vec![],
+            peer_bindings: vec![],
+        };
+        assert!(
+            RealControl::discovered_peer_binding(&config, "datum-cloud", "connect-subnet-lab-vpc")
+                .is_none()
+        );
+    }
+
     #[test]
     fn authorization_recheck_rejects_revocation_and_shutdown_without_preventing_recovery() {
         let authorized = AtomicBool::new(true);

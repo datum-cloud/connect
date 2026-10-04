@@ -1,8 +1,8 @@
 # Connect API and controller
 
-This module introduces the Connect-owned `connect.datumapis.com/v1alpha1` API
-and the Milo multi-cluster controller. It is deliberately separate from the
-Rust daemon and `datumctl` plugin.
+This module defines the Connect-owned `connect.datumapis.com/v1alpha1` API and
+the Milo multi-cluster controller. The controller provisions VPC gateways and
+bindings; the Rust daemon and `datumctl` plugin consume the binding API.
 
 ## Resource ownership
 
@@ -33,8 +33,7 @@ The controller provisions the first single-project CONNECT-IP gateway slice:
   removes the grant on the next reconciliation.
 - ConnectGateway status publishes the gateway endpoint ID and Workload name.
   Ready becomes true after the Compute Workload is Available. This reports
-  instance availability, not an active tunnel; clients still need to resolve
-  the endpoint and submit a ConnectNetworkBinding.
+  workload availability, not an active client attachment or a working packet path.
 
 The gateway private key is stored in a project Secret and mounted read-only in
 the Compute Workload; status exposes only its public endpoint ID. The Connect
@@ -74,26 +73,20 @@ The liveness/readiness endpoints use port 8081. The metrics endpoint uses port
 8080 and should be scraped only inside the cluster. The controller runs as a
 non-root user with a read-only root filesystem and leader election enabled.
 
-## API migration
+## Migration status
 
 This is a new API group, not an in-place change to NSO's
-`networking.datumapis.com` resources. The current Connect Rust library and CLI
-still use NSO's Connector APIs, so this controller does not yet replace those
-resources or make the current CLI use this API. No conversion webhook or
-automatic resource copy is included. Before rollout, publish the Connect CRDs
-and APIs, update clients and service authorization, then run an explicit
-inventory/copy/cutover for existing Connector, ConnectorClass, and
-ConnectorAdvertisement objects. Keep NSO serving the old API until every
-consumer has migrated and rollback is no longer required.
+`networking.datumapis.com` resources. `datumctl connect join` now discovers a
+ready `ConnectGateway` and creates or reuses a `ConnectNetworkBinding` for the
+current Connector. Service publication and peer discovery still use NSO's
+Connector APIs. No conversion webhook or automatic resource copy exists. Keep
+NSO serving those resources until their remaining consumers migrate.
 
 The Network reference remains a name-only cross-service reference because
-Network is NSO-owned. Compute Workload integration is now implemented, but
-the local daemon still resolves peers through the existing NSO Connector API,
-so the new ConnectGateway endpoint is not yet consumable by `datumctl connect
-join`. The plugin/daemon migration must create a ConnectNetworkBinding before
-this API can support the desired one-command user flow. Staging also needs an
-iroh-gateway image built with the sibling Connect transport crates, plus
-Compute/runtime support for IPv6 forwarding and `NET_ADMIN`.
+Network is NSO-owned. The controller reconciles a gateway into a Compute
+Workload, and the daemon consumes the resulting binding status. A staging
+deployment needs a gateway image with the matching CONNECT-IP transport and
+Compute runtime support for IPv6 forwarding and `NET_ADMIN`.
 
 The intended staging resources look like this:
 
@@ -119,7 +112,6 @@ spec:
 ```
 
 Creating the ConnectNetworkBinding is the project authorization boundary. Its
-status publishes the matching client/gateway `/128` addresses, gateway endpoint
-ID, configured routes, and relay URLs. Do not use a placeholder relay or image
-tag in staging; the gateway image must contain the current CONNECT-IP ALPN and
-MASQUE-over-QUIC-DATAGRAM implementation.
+status publishes the client and gateway `/128` addresses, gateway endpoint ID,
+configured routes, and relay URLs. Use an image and relay that match the daemon's
+CONNECT-IP transport. Do not use placeholder values in a staging deployment.

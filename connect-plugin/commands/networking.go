@@ -38,6 +38,23 @@ type networkPlan struct {
 		AdvertiseRoutes []string      `json:"advertise_routes"`
 	} `json:"binding"`
 }
+
+const defaultJoinRequestTimeout = 4 * time.Minute
+
+// A managed ConnectNetworkBinding can take up to 90 seconds to reconcile.
+// Keep the ordinary commands snappy, but don't let the global 30-second
+// default make a fresh join appear to fail while the controller is still
+// approving it. An explicitly supplied --timeout remains authoritative.
+func joinRequestTimeout(cmd *cobra.Command, opts *options) time.Duration {
+	if timeoutFlag := cmd.Root().PersistentFlags().Lookup("timeout"); timeoutFlag != nil && timeoutFlag.Changed {
+		return opts.timeout
+	}
+	if opts.timeout < defaultJoinRequestTimeout {
+		return defaultJoinRequestTimeout
+	}
+	return opts.timeout
+}
+
 type networkRule struct {
 	Protocol string   `json:"protocol"`
 	Ports    []uint16 `json:"ports,omitempty"`
@@ -225,7 +242,9 @@ func newJoin(opts *options) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		client, err := opts.client(cmd, true)
+		joinOpts := *opts
+		joinOpts.timeout = joinRequestTimeout(cmd, opts)
+		client, err := joinOpts.client(cmd, true)
 		if err != nil {
 			return err
 		}

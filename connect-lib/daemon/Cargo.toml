@@ -15,10 +15,13 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 connect-lib = { path = "../lib" }
-connect-transport = { path = "../transport" }
+connect-transport = { path = "../transport", features = ["otel"] }
 connect-ip-adapter = { path = "../ip-adapter" }
 fs2 = { workspace = true }
 iroh = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,6 +32,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }

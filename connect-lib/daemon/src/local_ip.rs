@@ -1,6 +1,6 @@
 //! Explicit local-only CONNECT-IP approvals. Attachments are never persisted.
 use crate::error::ApiError;
-use connect_ip_adapter::{IpNet, Tun};
+use connect_ip_adapter::{IpNet, PacketDevice};
 use connect_transport::ip;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use serde::Deserialize;
@@ -13,9 +13,12 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, info_span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -409,11 +412,14 @@ impl Binding {
 pub struct Attachment {
     binding: Binding,
     interface_name: String,
+    adapter: String,
     cancel: CancellationToken,
     pub task: JoinHandle<()>,
     failure: Arc<Mutex<Option<String>>>,
     sent: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
+    last_sent_at_ms: Arc<AtomicU64>,
+    last_received_at_ms: Arc<AtomicU64>,
     session: Arc<ip::IpSession>,
 }
 
@@ -421,11 +427,15 @@ impl Attachment {
     pub async fn status(&self) -> Value {
         let transport = self.session.stats();
         let last_transport_error = self.session.last_error();
-        json!({"network":self.binding.network,"project":self.binding.project,"gateway":self.binding.gateway,
+        json!({"network":self.binding.network,"project":self.binding.project,"gateway":self.binding.gateway,"session_id":self.session.session_id,
             "assigned_address":self.binding.assigned_address,"routes":self.binding.routes,"interface_name":self.interface_name,
-            "interface_label":self.binding.interface_name,"adapter":connect_ip_adapter::backend(),
+            "interface_label":self.binding.interface_name,"adapter":self.adapter,
             "mtu":self.binding.mtu,"running":!self.task.is_finished(),"ephemeral":true,"prototype":true,
             "packets_sent":self.sent.load(Ordering::Relaxed),"packets_received":self.received.load(Ordering::Relaxed),
+            "local_tun_to_transport_packets":self.sent.load(Ordering::Relaxed),
+            "transport_to_local_tun_packets":self.received.load(Ordering::Relaxed),
+            "last_packet_sent_at_unix_ms":nonzero(self.last_sent_at_ms.load(Ordering::Relaxed)),
+            "last_packet_received_at_unix_ms":nonzero(self.last_received_at_ms.load(Ordering::Relaxed)),
             "packets_dropped":transport.packets_dropped,"protocol_errors":transport.protocol_errors,
             "delivery_mode":transport.delivery_mode,"effective_datagram_ip_capacity":transport.effective_datagram_ip_capacity,
             "mtu_errors":transport.mtu_errors,"last_transport_error":last_transport_error,
@@ -440,8 +450,10 @@ impl Attachment {
 
 pub async fn join(
     binding: Binding,
+    peer_address: Option<connect_ip_adapter::IpNet>,
     endpoint: Endpoint,
     cancel: CancellationToken,
+    helper: Option<&Path>,
 ) -> Result<Attachment, ApiError> {
     let setup_guard = cancel.clone().drop_guard();
     let address = binding.address()?;
@@ -497,10 +509,21 @@ pub async fn join(
             "Gateway IP assignment or routes differ from local approval; no interface was created. Ask the gateway and daemon operators to agree on the assignment, routes, and MTU",
         ).with_code("local_ip_grant_mismatch"));
     }
+    let adapter = if helper.is_some() {
+        "privileged_network_helper"
+    } else {
+        connect_ip_adapter::backend()
+    }
+    .to_owned();
     let tun_setup = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(ApiError::internal("CONNECT-IP attachment setup was cancelled")),
-        result = tokio::time::timeout(std::time::Duration::from_secs(8), Tun::create(&binding.interface_name, address, binding.mtu, &routes)) => result.map_err(|_| ApiError::internal("TUN setup timed out; any partially created interface is removed"))?,
+        result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            match peer_address {
+                Some(peer_address) => PacketDevice::create_gateway(&binding.interface_name, address, peer_address, binding.mtu, &routes, helper).await,
+                None => PacketDevice::create(&binding.interface_name, address, binding.mtu, &routes, helper).await,
+            }
+        }) => result.map_err(|_| ApiError::internal("TUN setup timed out; any partially created interface is removed"))?,
     };
     let tun = match tun_setup {
         Ok(tun) => tun,
@@ -508,39 +531,73 @@ pub async fn join(
             session.cancel();
             return Err(ApiError::internal(format!(
                 "Could not create CONNECT-IP interface using {}: {error}",
-                connect_ip_adapter::backend()
+                adapter
             )));
         }
     };
     let interface_name = tun.name().to_owned();
-    tracing::info!(stage="connect_ip_adapter", network=%binding.network, interface=%interface_name, adapter=connect_ip_adapter::backend(), mtu=binding.mtu, "ip_interface_ready");
+    tracing::info!(stage="connect_ip_adapter", network=%binding.network, interface=%interface_name, adapter=%adapter, mtu=binding.mtu, "ip_interface_ready");
     let failure = Arc::new(Mutex::new(None));
     let sent = Arc::new(AtomicU64::new(0));
     let received = Arc::new(AtomicU64::new(0));
+    let last_sent_at_ms = Arc::new(AtomicU64::new(0));
+    let last_received_at_ms = Arc::new(AtomicU64::new(0));
     let session = Arc::new(session);
+    let session_id = session.session_id.clone();
+    let session_trace_context = session.trace_context.clone();
+    let session_span = info_span!("connect_ip.client_session", project=%binding.project, network=%binding.network, gateway=%binding.gateway, %session_id);
+    let _ = session_span.set_parent(session_trace_context);
     let task_session = session.clone();
-    let (task_failure, task_sent, task_received) =
-        (failure.clone(), sent.clone(), received.clone());
+    let (task_failure, task_sent, task_received, task_last_sent, task_last_received) = (
+        failure.clone(),
+        sent.clone(),
+        received.clone(),
+        last_sent_at_ms.clone(),
+        last_received_at_ms.clone(),
+    );
     let task_cancel = cancel.clone();
     let network = binding.network.clone();
+    let project = binding.project.clone();
+    let gateway = binding.gateway.clone();
+    let local_connector = connector.clone();
     let task = tokio::spawn(async move {
         let session = task_session;
         let result: Result<(), String> = tokio::select! {
             _ = task_cancel.cancelled() => Ok(()),
             result = async {
                 let mut buffer = vec![0u8; 65536];
+                let mut health_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
+                        _ = health_tick.tick() => {
+                            let stats = session.stats();
+                            let health_span = info_span!("connect_ip.health_snapshot", project=%project, network=%network, gateway=%gateway, connector=%local_connector, %session_id);
+                            health_span.in_scope(|| tracing::info!(project=%project, network=%network, gateway=%gateway, connector=%local_connector,
+                                local_tun_to_transport_packets=task_sent.load(Ordering::Relaxed),
+                                transport_to_local_tun_packets=task_received.load(Ordering::Relaxed),
+                                quic_datagrams_sent=stats.datagrams_sent,
+                                quic_datagrams_received=stats.datagrams_received,
+                                transport_drops=stats.packets_dropped,
+                                protocol_errors=stats.protocol_errors,
+                                last_packet_sent_at_unix_ms=nonzero(task_last_sent.load(Ordering::Relaxed)),
+                                last_packet_received_at_unix_ms=nonzero(task_last_received.load(Ordering::Relaxed)),
+                                stage="connect_ip_health", "CONNECT-IP directional health snapshot"));
+                        },
                         packet = session.recv() => {
                             let packet = packet.ok_or_else(|| session.last_error().unwrap_or_else(|| "CONNECT-IP gateway closed the session".to_string()))?;
                             tun.write_packet(&packet).await.map_err(|e| e.to_string())?;
                             task_received.fetch_add(1, Ordering::Relaxed);
+                            task_last_received.store(unix_time_ms(), Ordering::Relaxed);
                         },
                         read = tun.read_packet(&mut buffer) => {
                             let length = read.map_err(|e| e.to_string())?;
                             if length == 0 { return Err("TUN interface closed".to_owned()); }
                             match session.send(bytes::Bytes::copy_from_slice(&buffer[..length])).await {
-                                Ok(()) => { task_sent.fetch_add(1, Ordering::Relaxed); },
+                                Ok(()) => {
+                                    task_sent.fetch_add(1, Ordering::Relaxed);
+                                    task_last_sent.store(unix_time_ms(), Ordering::Relaxed);
+                                },
                                 Err(error @ (ip::Error::InvalidPacket | ip::Error::PacketTooLarge | ip::Error::AddressPolicy)) => {
                                     tracing::debug!(%network, %error, stage="connect_ip_packet", "packet_rejected");
                                 },
@@ -557,18 +614,32 @@ pub async fn join(
             tracing::warn!(%network, %error, stage="connect_ip", "local_ip_attachment_closed");
             *task_failure.lock().await = Some(error);
         }
-    });
+    }.instrument(session_span));
     let _ = setup_guard.disarm();
     Ok(Attachment {
         binding,
         interface_name,
+        adapter,
         cancel,
         task,
         failure,
         sent,
         received,
+        last_sent_at_ms,
+        last_received_at_ms,
         session,
     })
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn nonzero(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
 }
 
 pub(crate) fn transport_status(stats: ip::Stats, last_error: Option<String>) -> Value {

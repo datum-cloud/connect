@@ -22,6 +22,9 @@ release:
     This is the headless Connect preview. It makes breaking CLI changes.
     Each platform archive contains both datumctl-connect and datum-connect-daemon.
     Read INSTALL.txt for manual plugin installation, trust, and first-run setup.
+    Section 7 of INSTALL.txt covers joining a managed VPC and reaching a running
+    Compute instance by its VPC address. A project administrator must provision
+    a Ready ConnectGateway before a user can join.
     Checksums are not publisher signatures. macOS notarization is not included.
   extra_files:
     - glob: ../docs/INSTALL.txt

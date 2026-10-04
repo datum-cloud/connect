@@ -39,7 +39,18 @@ func testClient(t *testing.T, objs ...runtime.Object) *fake.ClientBuilder {
 func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	ctx := context.Background()
 	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", UID: types.UID("laptop-uid")}, Spec: connectv1alpha1.ConnectorSpec{ClassRef: "masque", PublicKey: strings.Repeat("a", 64)}}
-	projectClient := testClient(t, connector).Build()
+	legacyController := true
+	legacyLease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Name: "laptop",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "networking.datumapis.com/v1alpha1",
+			Kind:       "Connector",
+			Name:       "laptop",
+			UID:        types.UID("legacy-laptop-uid"),
+			Controller: &legacyController,
+		}},
+	}}
+	projectClient := testClient(t, connector, legacyLease).Build()
 	classClient := testClient(t).Build()
 	if err := reconcileConnector(ctx, projectClient, classClient, connector); err != nil {
 		t.Fatal(err)
@@ -59,8 +70,11 @@ func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	if got := meta.FindStatusCondition(connector.Status.Conditions, "Ready").Reason; got != "AgentOffline" {
 		t.Fatalf("ready reason=%q, want AgentOffline until the agent renews its Lease", got)
 	}
+	if got, want := connector.Status.LeaseRef, connectorLeaseName(connector.Name); got != want {
+		t.Fatalf("leaseRef=%q, want Connect-specific Lease %q", got, want)
+	}
 	var lease coordinationv1.Lease
-	if err := projectClient.Get(ctx, types.NamespacedName{Name: "laptop"}, &lease); err != nil {
+	if err := projectClient.Get(ctx, types.NamespacedName{Name: connectorLeaseName(connector.Name)}, &lease); err != nil {
 		t.Fatal(err)
 	}
 	now := metav1.NewMicroTime(time.Now())
@@ -73,6 +87,13 @@ func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	}
 	if got := meta.FindStatusCondition(connector.Status.Conditions, "Ready").Status; got != metav1.ConditionTrue {
 		t.Fatalf("ready=%q after Lease renewal, want True", got)
+	}
+	var preservedLegacyLease coordinationv1.Lease
+	if err := projectClient.Get(ctx, types.NamespacedName{Name: "laptop"}, &preservedLegacyLease); err != nil {
+		t.Fatal(err)
+	}
+	if got := preservedLegacyLease.OwnerReferences[0].UID; got != types.UID("legacy-laptop-uid") {
+		t.Fatalf("legacy Lease owner UID=%q, want it preserved", got)
 	}
 }
 
@@ -136,8 +157,11 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 		t.Fatalf("gateway command=%v, want TUN setup wrapper", command)
 	}
 	args, _, _ := unstructured.NestedStringSlice(container, "args")
-	if len(args) != 1 || !strings.Contains(args[0], "mknod /dev/net/tun c 10 200") {
-		t.Fatalf("gateway args=%v, want TUN device setup", args)
+	if len(args) != 1 || !strings.Contains(args[0], "mknod /dev/net/tun c 10 200") || !strings.Contains(args[0], "install -D -m 600 /etc/connect/key/key /run/connect-inputs/key") || !strings.Contains(args[0], "install -D -m 600 /etc/connect/gateway/grants.json /run/connect-inputs/grants.json") || !strings.Contains(args[0], "--config-file=/run/connect-inputs/gateway.yaml --key-file=/run/connect-inputs/key") {
+		t.Fatalf("gateway args=%v, want TUN setup and safe staging of projected Secret/ConfigMap files", args)
+	}
+	if !strings.Contains(args[0], "--ip-config=/run/connect-inputs/grants.json") {
+		t.Fatalf("gateway args=%v, want the strict IP grants loader to read the regular-file copy", args)
 	}
 	securityContext, ok := container["securityContext"].(map[string]interface{})
 	if !ok {

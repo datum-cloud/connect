@@ -43,6 +43,35 @@ func TestWaitForPeerPollsUntilConnected(t *testing.T) {
 	}
 }
 
+func TestJoinRequestTimeoutCoversFreshBindingReconciliation(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		provided bool
+		value    time.Duration
+		want     time.Duration
+	}{
+		{name: "default", value: 30 * time.Second, want: 4 * time.Minute},
+		{name: "custom longer", provided: true, value: 3 * time.Minute, want: 3 * time.Minute},
+		{name: "custom shorter", provided: true, value: 20 * time.Second, want: 20 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := &options{timeout: test.value}
+			root := &cobra.Command{Use: "datumctl"}
+			root.PersistentFlags().DurationVar(&opts.timeout, "timeout", 30*time.Second, "")
+			join := newJoin(opts)
+			root.AddCommand(join)
+			if test.provided {
+				if err := root.PersistentFlags().Set("timeout", test.value.String()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := joinRequestTimeout(join, opts); got != test.want {
+				t.Fatalf("joinRequestTimeout() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRoutedJoinWaitsByDefaultBeforeReturning(t *testing.T) {
 	t.Setenv("DATUM_CONNECT_TOKEN", "local-test-token")
 	statusRequests := 0

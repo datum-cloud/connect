@@ -4,7 +4,7 @@ use crate::{IpNet, Tun, invalid, validate};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     net::IpAddr,
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -78,6 +78,19 @@ impl Approval {
     }
 }
 
+fn routes_conflict(left: &Approval, right: &Approval) -> bool {
+    let left_routes = left.tun_routes();
+    let right_routes = right.tun_routes();
+    left_routes.iter().any(|route| {
+        route.contains(&right.assigned_address.addr())
+            || right_routes.iter().any(|candidate| {
+                candidate.contains(&route.network()) || route.contains(&candidate.network())
+            })
+    }) || right_routes
+        .iter()
+        .any(|route| route.contains(&left.assigned_address.addr()))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -147,31 +160,10 @@ impl Config {
                 ));
             }
         }
-        for (i, approval) in self.approvals.iter().enumerate() {
-            for other in &self.approvals[..i] {
-                for route in approval.tun_routes() {
-                    if route.contains(&other.assigned_address.addr())
-                        || other
-                            .tun_routes()
-                            .iter()
-                            .any(|r| r.contains(&route.network()) || route.contains(&r.network()))
-                    {
-                        return Err(invalid(
-                            "helper attachments must not install overlapping routes",
-                        ));
-                    }
-                }
-                if other
-                    .tun_routes()
-                    .iter()
-                    .any(|r| r.contains(&approval.assigned_address.addr()))
-                {
-                    return Err(invalid(
-                        "helper routes must not include another attachment's address",
-                    ));
-                }
-            }
-        }
+        // Approvals are durable authorization records, not installed routes.
+        // Different networks can legitimately advertise overlapping prefixes
+        // while only one attachment is active. Route conflicts are rejected
+        // atomically at session admission, where we know what is live.
         Ok(())
     }
 
@@ -474,7 +466,7 @@ pub async fn serve_reloadable(
         return Err(io::Error::last_os_error());
     }
     let config = Arc::new(config);
-    let active = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let active = Arc::new(Mutex::new(HashMap::<String, Approval>::new()));
     let mut tasks = tokio::task::JoinSet::new();
     tokio::pin!(shutdown);
     tracing::info!(
@@ -516,7 +508,7 @@ pub async fn serve_reloadable(
 async fn session(
     stream: UnixStream,
     config: Arc<Config>,
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<Mutex<HashMap<String, Approval>>>,
 ) -> io::Result<()> {
     let (read, mut write) = tokio::io::split(stream);
     let mut read = reader(read, MAX_CONTROL);
@@ -546,18 +538,25 @@ async fn session(
         .ok_or_else(|| invalid("missing interface approval"))?;
     let approved = request.version == VERSION && config.approvals.contains(&approval);
     let mut active_set = active.lock().await;
-    if !approved || active_set.contains(&approval.interface_name) {
-        drop(active_set);
+    let conflict = active_set
+        .values()
+        .any(|other| routes_conflict(&approval, other));
+    if !approved || active_set.contains_key(&approval.interface_name) || conflict {
+        let message = if conflict {
+            "Another active Connect IP attachment owns an overlapping route; leave it before joining this network".into()
+        } else {
+            "Interface configuration is not approved or is already active".into()
+        };
         let response = Response {
             approvals: None,
             version: VERSION,
             interface_name: None,
-            error: Some("Interface configuration is not approved or is already active".into()),
+            error: Some(message),
         };
         send_frame(&mut write, &serde_json::to_vec(&response)?).await?;
         return Ok(());
     }
-    active_set.insert(approval.interface_name.clone());
+    active_set.insert(approval.interface_name.clone(), approval.clone());
     drop(active_set);
     // Keep reservation cleanup on all exits, including setup failure.
     let result = session_approved(&approval, &mut read, &mut write).await;
@@ -724,6 +723,27 @@ mod tests {
             serde_json::from_str::<Config>(r#"{"allowed_uid":501,"approvals":[],"command":"sh"}"#)
                 .is_err()
         );
+    }
+    #[test]
+    fn stored_approvals_may_overlap_but_live_routes_conflict() {
+        let mut old = config().approvals[0].clone();
+        old.assigned_address = "fd60::10/128".parse().unwrap();
+        old.peer_address = "fd8f::10/128".parse().unwrap();
+        old.routes = vec!["fd20:0:27::/48".parse().unwrap()];
+        let mut new = old.clone();
+        new.interface_name = "dcnewnet".into();
+        new.assigned_address = "fd60::1/128".parse().unwrap();
+        new.peer_address = "fd8f::1/128".parse().unwrap();
+        new.routes = vec!["fd20:0:27::1:0:0/128".parse().unwrap()];
+        Config {
+            allowed_uid: 501,
+            approvals: vec![old.clone(), new.clone()],
+        }
+        .validate()
+        .expect("inactive approvals must not block setup for another network");
+        assert!(routes_conflict(&old, &new));
+        new.routes = vec!["fd20:0:28::/48".parse().unwrap()];
+        assert!(!routes_conflict(&old, &new));
     }
     #[test]
     fn packet_injection_stays_in_approved_host_pair() {

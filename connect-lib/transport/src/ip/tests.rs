@@ -1,5 +1,36 @@
 use super::*;
 
+#[cfg(feature = "otel")]
+#[test]
+fn trace_context_round_trips_through_connect_headers() {
+    use opentelemetry::{
+        Context,
+        propagation::TextMapPropagator,
+        trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId},
+    };
+
+    let context = Context::new().with_remote_span_context(SpanContext::new(
+        TraceId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
+        SpanId::from_hex("0123456789abcdef").unwrap(),
+        TraceFlags::SAMPLED,
+        true,
+        Default::default(),
+    ));
+    let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+    let mut headers = TraceHeaderMap::default();
+    propagator.inject_context(&context, &mut headers);
+    let extracted = propagator.extract(&headers);
+
+    assert_eq!(
+        extracted.span().span_context().trace_id(),
+        context.span().span_context().trace_id()
+    );
+    assert_eq!(
+        extracted.span().span_context().span_id(),
+        context.span().span_context().span_id()
+    );
+}
+
 // Each real iroh endpoint owns sockets and OS network monitors. Bound concurrent
 // integration fixtures so macOS's default per-process FD limit is not exceeded.
 static NETWORK_TESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
@@ -756,7 +787,14 @@ async fn invalid_wire_packets_drop_and_full_receiver_does_not_block_cancel() {
     wait_datagram_capacity(&server_conn, 0, 1280).await.unwrap();
     let config = config();
     let cancel = CancellationToken::new();
-    let (session, outgoing, packets) = session_parts(config.clone(), Role::Gateway, cancel.clone());
+    let (session, outgoing, packets) = session_parts(
+        config.clone(),
+        Role::Gateway,
+        session_id(),
+        #[cfg(feature = "otel")]
+        opentelemetry::Context::new(),
+        cancel.clone(),
+    );
     let counters = session.counters.clone();
     let (_wire, io) = tokio::io::duplex(64 * 1024);
     let worker = tokio::spawn(run_session(
@@ -996,7 +1034,14 @@ async fn path_capacity_failure_records_reason_before_close() {
     );
     let config = config();
     let cancel = CancellationToken::new();
-    let (session, outgoing, packets) = session_parts(config.clone(), Role::Gateway, cancel.clone());
+    let (session, outgoing, packets) = session_parts(
+        config.clone(),
+        Role::Gateway,
+        session_id(),
+        #[cfg(feature = "otel")]
+        opentelemetry::Context::new(),
+        cancel.clone(),
+    );
     let counters = session.counters.clone();
     let (_wire, io) = tokio::io::duplex(1024);
     let worker = tokio::spawn(run_session(
@@ -1045,8 +1090,14 @@ async fn reliable_packet_fallback_is_rejected_and_remote_mtu_reason_is_safe() {
         wait_datagram_capacity(&server_conn, 0, 1280).await.unwrap();
         let config = config();
         let cancel = CancellationToken::new();
-        let (session, outgoing, packets) =
-            session_parts(config.clone(), Role::Gateway, cancel.clone());
+        let (session, outgoing, packets) = session_parts(
+            config.clone(),
+            Role::Gateway,
+            session_id(),
+            #[cfg(feature = "otel")]
+            opentelemetry::Context::new(),
+            cancel.clone(),
+        );
         let counters = session.counters.clone();
         let (mut wire, io) = tokio::io::duplex(2048);
         let worker = tokio::spawn(run_session(

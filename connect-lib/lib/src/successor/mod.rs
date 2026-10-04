@@ -211,7 +211,10 @@ impl CloudConnector {
 
     /// Register the same live iroh identity with the Connect service. The legacy
     /// NSO Connector remains in place for existing HTTPProxy/advertisement APIs.
-    async fn ensure_connect_connector(&self, details: &ConnectionDetails) -> Result<()> {
+    pub async fn ensure_connect_connector(
+        &self,
+        details: &ConnectionDetails,
+    ) -> Result<PeerIdentity> {
         let existing = self.connect_get("connectors", &self.name).await?;
         let connector = if let Some(value) = existing {
             if value.pointer("/spec/publicKey").and_then(Value::as_str)
@@ -269,7 +272,7 @@ impl CloudConnector {
         loop {
             self.renew_connect_connector_lease(&connector).await?;
             if current_condition(&connector, "Ready") {
-                return Ok(());
+                return self.connect_identity(&connector, details);
             }
             if tokio::time::Instant::now() >= deadline {
                 let reason = connector
@@ -296,6 +299,24 @@ impl CloudConnector {
                 return Err(Error::Ownership(self.name.clone()));
             }
         }
+    }
+
+    fn connect_identity(
+        &self,
+        connector: &Value,
+        details: &ConnectionDetails,
+    ) -> Result<PeerIdentity> {
+        let public_key = string(connector, "/spec/publicKey")?;
+        if public_key != self.public_key {
+            return Err(Error::Ownership(self.name.clone()));
+        }
+        Ok(PeerIdentity {
+            name: string(connector, "/metadata/name")?,
+            uid: string(connector, "/metadata/uid")?,
+            public_key,
+            relay_url: details.relay_url.clone(),
+            addresses: details.addresses.clone(),
+        })
     }
 
     async fn renew_connect_connector_lease(&self, connector: &Value) -> Result<()> {
@@ -328,45 +349,66 @@ impl CloudConnector {
         details: &ConnectionDetails,
     ) -> Result<Option<Value>> {
         validate_name(network)?;
-        let Some(gateways) = self
-            .request(
-                Method::GET,
-                &self.connect_resource("connectgateways", ""),
-                None,
-            )
-            .await?
-        else {
-            // The controller CRD is optional during staged rollout; preserve
-            // legacy direct-peer behavior until ConnectGateway is installed.
-            return Ok(None);
+        let gateway_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        let mut gateway_wait_logged = false;
+        let gateway = loop {
+            let Some(gateways) = self
+                .request(
+                    Method::GET,
+                    &self.connect_resource("connectgateways", ""),
+                    None,
+                )
+                .await?
+            else {
+                // The controller CRD is optional during staged rollout; preserve
+                // legacy direct-peer behavior until ConnectGateway is installed.
+                return Ok(None);
+            };
+            let matches = gateways["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|gateway| gateway["spec"]["networkRef"] == network)
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return Ok(None);
+            }
+            if matches.len() != 1 {
+                let names = matches
+                    .iter()
+                    .filter_map(|item| item["metadata"]["name"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::Unsupported(format!(
+                    "ConnectGateway for network {network:?} is not unique (matching gateways: {names}); inspect `datumctl get connectgateways`"
+                )));
+            }
+            let candidate = &matches[0];
+            if current_condition(candidate, "Ready") {
+                break candidate.clone();
+            }
+            if !gateway_wait_logged {
+                tracing::info!(network, gateway = %candidate["metadata"]["name"].as_str().unwrap_or("unknown"), stage="gateway_readiness", "waiting for ConnectGateway reconciliation");
+                gateway_wait_logged = true;
+            }
+            if tokio::time::Instant::now() >= gateway_deadline {
+                let reason = candidate
+                    .pointer("/status/conditions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|condition| condition["type"] == "Ready")
+                    .and_then(|condition| condition["reason"].as_str())
+                    .unwrap_or("unknown");
+                return Err(Error::Unsupported(format!(
+                    "ConnectGateway for network {network:?} did not become ready within 90 seconds (reason: {reason}); inspect `datumctl get connectgateways`"
+                )));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         };
-        let matches = gateways["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|gateway| gateway["spec"]["networkRef"] == network)
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
-            return Ok(None);
-        }
-        let ready = matches
-            .iter()
-            .copied()
-            .filter(|gateway| current_condition(gateway, "Ready"))
-            .collect::<Vec<_>>();
-        if ready.len() != 1 {
-            let names = matches
-                .iter()
-                .filter_map(|item| item["metadata"]["name"].as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(Error::Unsupported(format!(
-                "ConnectGateway for network {network:?} is not uniquely ready (matching gateways: {names}); inspect `datumctl get connectgateways`"
-            )));
-        }
-        let gateway = ready[0];
-        let gateway_name = string(gateway, "/metadata/name")?;
-        let gateway_key = string(gateway, "/status/endpointID")?;
+        let gateway_name = string(&gateway, "/metadata/name")?;
+        let gateway_key = string(&gateway, "/status/endpointID")?;
         self.ensure_connect_connector(details).await?;
         let binding_name = network_binding_name(network, &self.name);
         let binding = match self

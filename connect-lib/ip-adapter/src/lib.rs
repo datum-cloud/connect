@@ -44,6 +44,47 @@ impl PacketDevice {
             .map(Self::Native)
     }
 
+    /// Create a device while preserving the complete gateway approval sent to
+    /// the privileged helper. Unlike `create`, this can authorize subnet
+    /// routes and the gateway peer address independently.
+    pub async fn create_gateway(
+        name: &str,
+        address: IpNet,
+        peer_address: IpNet,
+        mtu: u16,
+        routes: &[IpNet],
+        helper: Option<&std::path::Path>,
+    ) -> io::Result<Self> {
+        validate(name, address, mtu, routes)?;
+        if let Some(socket) = helper {
+            #[cfg(unix)]
+            return helper::Client::connect_approved(
+                socket,
+                helper::Approval {
+                    interface_name: name.into(),
+                    assigned_address: address,
+                    peer_address,
+                    mtu,
+                    routes: routes.to_vec(),
+                    advertise_routes: vec![],
+                },
+            )
+            .await
+            .map(Self::Helper);
+            #[cfg(not(unix))]
+            {
+                let _ = socket;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "The networking helper currently supports Unix only",
+                ));
+            }
+        }
+        Tun::create(name, address, mtu, routes)
+            .await
+            .map(Self::Native)
+    }
+
     pub fn name(&self) -> &str {
         match self {
             Self::Native(tun) => tun.name(),

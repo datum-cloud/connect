@@ -7,6 +7,13 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+]
+
 [dependencies]
 arc-swap = { workspace = true }
 bytes = { workspace = true }
@@ -15,11 +22,14 @@ h3 = { workspace = true }
 h3-datagram = { workspace = true }
 http = { workspace = true }
 iroh = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }

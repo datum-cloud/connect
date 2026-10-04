@@ -1,12 +1,29 @@
 # Datum Connect
 
-Use `datumctl connect` to connect your device, expose a local service, and open
-ports to other Connectors. A persistent Rust daemon owns networking and state.
-The Go CLI sends authenticated requests to its loopback API.
+Use `datumctl connect` to share a local service or join a Connect VPC. The CLI
+guides interactive setup and sends requests to a persistent local daemon. Start
+with the [documentation index](docs/README.md) or follow the quickstart below.
 
-For a preview binary, follow the [manual installation guide](docs/INSTALL.txt).
-It covers download verification, PATH discovery, `datumctl plugin trust connect`,
-staging login, testing with a friend, and upgrading an existing daemon.
+This repository builds a preview. Managed VPC attachment uses the Connect API
+and controller, which are still a staging prototype. `serve` and `dial` continue
+to use the existing service publication APIs. See the
+[controller guide](connect-controller/README.md) for the current boundary.
+
+For manual installation, follow the [installation guide](docs/INSTALL.txt).
+It covers plugin trust, checksum verification, first use, and upgrades.
+
+## Quickstart
+
+Install and trust the Connect plugin, sign in with `datumctl`, and start your
+local app. Then run:
+
+```sh
+datumctl connect serve localhost:8080
+```
+
+On macOS and Linux, the plugin guides daemon installation, enrollment, and
+service sharing. It prints the command another Connector can use to connect.
+Use `serve --public` only when you want to publish through an HTTPProxy.
 
 ## Command-line interface
 
@@ -87,8 +104,8 @@ address. Logs report `relay_configuration`, `relay_ready`, and
 ownership checks. API validation errors identify the rejected resource and field
 without printing rejected values or credentials.
 
-This branch is a local preview, not a production release. The platform must
-implement the new MASQUE contract before you can use the deployed gateway.
+This branch is a preview, not a production release. Public ingress requires a
+gateway and control plane configured for the matching transport profile.
 Interactive enrollment uses your current `datumctl` login session. The daemon
 pins that session and calls `datumctl auth get-token` to refresh authorization.
 It stores the session reference, not your access or refresh tokens. Your
@@ -113,13 +130,12 @@ separately; Connect never enables them globally. The client still has one
 approved source address, so this is not arbitrary site-to-site transit.
 Run `scripts/connect-peer-ip-local.py --help`
 for the isolated two-daemon test harness.
-The `connect-controller` module now defines a project `ConnectGateway` and
-`ConnectNetworkBinding` API and reconciles the gateway into a Compute Workload.
-That controller path is a staging prototype; the `datumctl connect join`
-control-plane discovery and binding creation path still uses the existing NSO
-Connector APIs and needs migration before the desired one-command VPC workflow
-is available. Identity rotation and the desktop thin client also remain
-unfinished.
+The `connect-controller` module defines project `ConnectGateway` and
+`ConnectNetworkBinding` resources and reconciles each gateway into a Compute
+Workload. Managed VPC joins use these Connect resources. Service publication
+and peer discovery still use NSO-backed resources. The VPC controller is a
+staging prototype; validate the gateway-to-instance packet path on each native OS.
+Identity rotation and the desktop thin client also remain unfinished.
 On macOS/Linux, first-time direct-peer setup no longer requires JSON files:
 
 ```sh
@@ -134,7 +150,9 @@ the explicit packet rules. Interactive `join` offers administrator-approved
 installation of the separate networking helper. Later, use `join friend` to
 reuse the saved configuration. Active attachments remain ephemeral; restarting
 does not automatically rejoin. `connect doctor` checks helper readiness without
-opening an interface. VPC membership still requires future control-plane work.
+opening an interface. A managed VPC join uses `ConnectGateway` and
+`ConnectNetworkBinding`; first-time local route installation still requires
+interactive administrator approval.
 `ping`
 currently probes a Connector, not an arbitrary VPC address. Native adapters use
 Linux TUN, macOS utun, and Windows Wintun. On macOS/Linux, the optional

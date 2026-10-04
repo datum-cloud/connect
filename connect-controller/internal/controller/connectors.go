@@ -221,7 +221,10 @@ func reconcileConnector(ctx context.Context, c, classClient client.Client, obj *
 }
 
 func ensureConnectorLease(ctx context.Context, c client.Client, connector *connectv1alpha1.Connector) (*coordinationv1.Lease, error) {
-	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: connector.Name, Namespace: connector.Namespace}}
+	// Keep Connect leases distinct from the legacy networking.datumapis.com
+	// Connector controller, which historically used the Connector name for its
+	// Lease. The two APIs can coexist during migration and cannot share owner refs.
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: connectorLeaseName(connector.Name), Namespace: connector.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, c, lease, func() error {
 		if err := controllerutil.SetControllerReference(connector, lease, schemeForConnector()); err != nil {
 			return err
@@ -236,6 +239,13 @@ func ensureConnectorLease(ctx context.Context, c client.Client, connector *conne
 		return nil, err
 	}
 	return lease, nil
+}
+
+func connectorLeaseName(connectorName string) string {
+	// Hash the Connector name so the derived Lease is DNS-safe, short, and
+	// collision-resistant even when a user-supplied Connector name is 63 chars.
+	sum := sha256.Sum256([]byte(connectorName))
+	return "connect-lease-" + hex.EncodeToString(sum[:8])
 }
 
 func schemeForConnector() *runtime.Scheme {
@@ -544,7 +554,8 @@ func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, se
 	if instanceType == "" {
 		instanceType = "datumcloud/d1-standard-2"
 	}
-	container := map[string]interface{}{"name": "connect-gateway", "image": spec.Image, "command": []interface{}{"/bin/sh", "-ec"}, "args": []interface{}{"mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && exec /usr/local/bin/iroh-gateway --config-file=/etc/connect/gateway/gateway.yaml --key-file=/etc/connect/key/key"}, "securityContext": map[string]interface{}{"capabilities": map[string]interface{}{"add": []interface{}{"NET_ADMIN", "MKNOD"}}}, "volumeAttachments": []interface{}{map[string]interface{}{"name": "connect-config", "mountPath": "/etc/connect/gateway"}, map[string]interface{}{"name": "connect-key", "mountPath": "/etc/connect/key"}}}
+	container := map[string]interface{}{"name": "connect-gateway", "image": spec.Image, "command": []interface{}{"/bin/sh", "-ec"}, "args": []interface{}{"mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && install -D -m 600 /etc/connect/key/key /run/connect-inputs/key && install -D -m 600 /etc/connect/gateway/gateway.yaml /run/connect-inputs/gateway.yaml && install -D -m 600 /etc/connect/gateway/grants.json /run/connect-inputs/grants.json && exec /usr/local/bin/iroh-gateway --config-file=/run/connect-inputs/gateway.yaml --key-file=/run/connect-inputs/key"}, "securityContext": map[string]interface{}{"capabilities": map[string]interface{}{"add": []interface{}{"NET_ADMIN", "MKNOD"}}}, "volumeAttachments": []interface{}{map[string]interface{}{"name": "connect-config", "mountPath": "/etc/connect/gateway"}, map[string]interface{}{"name": "connect-key", "mountPath": "/etc/connect/key"}}}
+	container["args"] = []interface{}{"mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && install -D -m 600 /etc/connect/key/key /run/connect-inputs/key && install -D -m 600 /etc/connect/gateway/gateway.yaml /run/connect-inputs/gateway.yaml && install -D -m 600 /etc/connect/gateway/grants.json /run/connect-inputs/grants.json && exec /usr/local/bin/iroh-gateway --config-file=/run/connect-inputs/gateway.yaml --key-file=/run/connect-inputs/key --ip-config=/run/connect-inputs/grants.json"}
 	if len(spec.RelayURLs) > 0 {
 		container["env"] = []interface{}{map[string]interface{}{"name": "IROH_GATEWAY_RELAY_URLS", "value": strings.Join(spec.RelayURLs, ",")}}
 	}
