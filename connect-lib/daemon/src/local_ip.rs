@@ -15,7 +15,10 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -416,21 +419,24 @@ pub struct Attachment {
     cancel: CancellationToken,
     pub task: JoinHandle<()>,
     failure: Arc<Mutex<Option<String>>>,
+    state: Arc<RwLock<&'static str>>,
     sent: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
     last_sent_at_ms: Arc<AtomicU64>,
     last_received_at_ms: Arc<AtomicU64>,
-    session: Arc<ip::IpSession>,
+    session: Arc<RwLock<Arc<ip::IpSession>>>,
 }
 
 impl Attachment {
     pub async fn status(&self) -> Value {
-        let transport = self.session.stats();
-        let last_transport_error = self.session.last_error();
-        json!({"network":self.binding.network,"project":self.binding.project,"gateway":self.binding.gateway,"session_id":self.session.session_id,
+        let session = self.session.read().await.clone();
+        let state = *self.state.read().await;
+        let transport = session.stats();
+        let last_transport_error = session.last_error();
+        json!({"network":self.binding.network,"project":self.binding.project,"gateway":self.binding.gateway,"mode":"gateway","session_id":session.session_id,
             "assigned_address":self.binding.assigned_address,"routes":self.binding.routes,"interface_name":self.interface_name,
             "interface_label":self.binding.interface_name,"adapter":self.adapter,
-            "mtu":self.binding.mtu,"running":!self.task.is_finished(),"ephemeral":true,"prototype":true,
+            "mtu":self.binding.mtu,"running":!self.task.is_finished(),"connected":state=="connected","state":state,"ephemeral":true,"prototype":true,
             "packets_sent":self.sent.load(Ordering::Relaxed),"packets_received":self.received.load(Ordering::Relaxed),
             "local_tun_to_transport_packets":self.sent.load(Ordering::Relaxed),
             "transport_to_local_tun_packets":self.received.load(Ordering::Relaxed),
@@ -476,7 +482,12 @@ pub async fn join(
     }
     let session = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        ip::connect(endpoint, peer, &binding.network, cancel.clone()),
+        ip::connect(
+            endpoint.clone(),
+            peer.clone(),
+            &binding.network,
+            cancel.clone(),
+        ),
     )
     .await
     .map_err(|_| ApiError::internal("CONNECT-IP gateway setup timed out"))?
@@ -543,13 +554,12 @@ pub async fn join(
     let last_sent_at_ms = Arc::new(AtomicU64::new(0));
     let last_received_at_ms = Arc::new(AtomicU64::new(0));
     let session = Arc::new(session);
-    let session_id = session.session_id.clone();
-    let session_trace_context = session.trace_context.clone();
-    let session_span = info_span!("connect_ip.client_session", project=%binding.project, network=%binding.network, gateway=%binding.gateway, %session_id);
-    let _ = session_span.set_parent(session_trace_context);
-    let task_session = session.clone();
-    let (task_failure, task_sent, task_received, task_last_sent, task_last_received) = (
+    let active_session = Arc::new(RwLock::new(session.clone()));
+    let connection_state = Arc::new(RwLock::new("connected"));
+    let task_active_session = active_session.clone();
+    let (task_failure, task_state, task_sent, task_received, task_last_sent, task_last_received) = (
         failure.clone(),
+        connection_state.clone(),
         sent.clone(),
         received.clone(),
         last_sent_at_ms.clone(),
@@ -560,61 +570,166 @@ pub async fn join(
     let project = binding.project.clone();
     let gateway = binding.gateway.clone();
     let local_connector = connector.clone();
+    let expected_routes = routes.clone();
+    let expected_address = address.addr();
+    let expected_mtu = binding.mtu;
+    let task_peer = peer.clone();
+    let task_endpoint = endpoint.clone();
+    let task_network = network.clone();
     let task = tokio::spawn(async move {
-        let session = task_session;
-        let result: Result<(), String> = tokio::select! {
-            _ = task_cancel.cancelled() => Ok(()),
-            result = async {
-                let mut buffer = vec![0u8; 65536];
-                let mut health_tick = tokio::time::interval(std::time::Duration::from_secs(10));
-                health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = health_tick.tick() => {
-                            let stats = session.stats();
-                            let health_span = info_span!("connect_ip.health_snapshot", project=%project, network=%network, gateway=%gateway, connector=%local_connector, %session_id);
-                            health_span.in_scope(|| tracing::info!(project=%project, network=%network, gateway=%gateway, connector=%local_connector,
-                                local_tun_to_transport_packets=task_sent.load(Ordering::Relaxed),
-                                transport_to_local_tun_packets=task_received.load(Ordering::Relaxed),
-                                quic_datagrams_sent=stats.datagrams_sent,
-                                quic_datagrams_received=stats.datagrams_received,
-                                transport_drops=stats.packets_dropped,
-                                protocol_errors=stats.protocol_errors,
-                                last_packet_sent_at_unix_ms=nonzero(task_last_sent.load(Ordering::Relaxed)),
-                                last_packet_received_at_unix_ms=nonzero(task_last_received.load(Ordering::Relaxed)),
-                                stage="connect_ip_health", "CONNECT-IP directional health snapshot"));
-                        },
-                        packet = session.recv() => {
-                            let packet = packet.ok_or_else(|| session.last_error().unwrap_or_else(|| "CONNECT-IP gateway closed the session".to_string()))?;
-                            tun.write_packet(&packet).await.map_err(|e| e.to_string())?;
-                            task_received.fetch_add(1, Ordering::Relaxed);
-                            task_last_received.store(unix_time_ms(), Ordering::Relaxed);
-                        },
-                        read = tun.read_packet(&mut buffer) => {
-                            let length = read.map_err(|e| e.to_string())?;
-                            if length == 0 { return Err("TUN interface closed".to_owned()); }
-                            match session.send(bytes::Bytes::copy_from_slice(&buffer[..length])).await {
-                                Ok(()) => {
-                                    task_sent.fetch_add(1, Ordering::Relaxed);
-                                    task_last_sent.store(unix_time_ms(), Ordering::Relaxed);
-                                },
-                                Err(error @ (ip::Error::InvalidPacket | ip::Error::PacketTooLarge | ip::Error::AddressPolicy)) => {
-                                    tracing::debug!(%network, %error, stage="connect_ip_packet", "packet_rejected");
-                                },
-                                Err(error) => return Err(session.last_error().unwrap_or_else(|| error.to_string())),
-                            }
+        let mut session = session;
+        let mut buffer = vec![0u8; 65536];
+        let mut reconnect_delay = std::time::Duration::from_secs(1);
+        let mut reconnect_attempt = 0u64;
+        'attachment: loop {
+            let session_id = session.session_id.clone();
+            let session_span = info_span!("connect_ip.client_session", project=%project, network=%network, gateway=%gateway, %session_id);
+            let _ = session_span.set_parent(session.trace_context.clone());
+            let mut health_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut fatal_error = None;
+            let failure_reason = loop {
+                tokio::select! {
+                    _ = task_cancel.cancelled() => {
+                        session.cancel();
+                        break 'attachment;
+                    },
+                    _ = health_tick.tick() => {
+                        let stats = session.stats();
+                        let health_span = info_span!("connect_ip.health_snapshot", project=%project, network=%network, gateway=%gateway, connector=%local_connector, %session_id);
+                        health_span.in_scope(|| tracing::info!(project=%project, network=%network, gateway=%gateway, connector=%local_connector,
+                            local_tun_to_transport_packets=task_sent.load(Ordering::Relaxed),
+                            transport_to_local_tun_packets=task_received.load(Ordering::Relaxed),
+                            quic_datagrams_sent=stats.datagrams_sent,
+                            quic_datagrams_received=stats.datagrams_received,
+                            transport_drops=stats.packets_dropped,
+                            protocol_errors=stats.protocol_errors,
+                            last_packet_sent_at_unix_ms=nonzero(task_last_sent.load(Ordering::Relaxed)),
+                            last_packet_received_at_unix_ms=nonzero(task_last_received.load(Ordering::Relaxed)),
+                            stage="connect_ip_health", "CONNECT-IP directional health snapshot"));
+                    },
+                    packet = session.recv() => {
+                        let Some(packet) = packet else {
+                            break session.last_error().unwrap_or_else(|| "CONNECT-IP gateway closed the session".to_owned());
+                        };
+                        if let Err(error) = tun.write_packet(&packet).await {
+                            let message = format!("write to CONNECT-IP interface: {error}");
+                            fatal_error = Some(message.clone());
+                            break message;
+                        }
+                        task_received.fetch_add(1, Ordering::Relaxed);
+                        task_last_received.store(unix_time_ms(), Ordering::Relaxed);
+                    },
+                    read = tun.read_packet(&mut buffer) => {
+                        let length = match read {
+                            Ok(length) if length > 0 => length,
+                            Ok(_) => {
+                                let message = "CONNECT-IP interface closed".to_owned();
+                                fatal_error = Some(message.clone());
+                                break message;
+                            },
+                            Err(error) => {
+                                let message = format!("read from CONNECT-IP interface: {error}");
+                                fatal_error = Some(message.clone());
+                                break message;
+                            },
+                        };
+                        match session.send(bytes::Bytes::copy_from_slice(&buffer[..length])).await {
+                            Ok(()) => {
+                                task_sent.fetch_add(1, Ordering::Relaxed);
+                                task_last_sent.store(unix_time_ms(), Ordering::Relaxed);
+                            },
+                            Err(error @ (ip::Error::InvalidPacket | ip::Error::PacketTooLarge | ip::Error::AddressPolicy)) => {
+                                tracing::debug!(%network, %error, stage="connect_ip_packet", "packet_rejected");
+                            },
+                            Err(error) => break session.last_error().unwrap_or_else(|| error.to_string()),
                         }
                     }
                 }
-            } => result,
-        };
-        session.cancel();
-        drop(tun);
-        if let Err(error) = result {
-            tracing::warn!(%network, %error, stage="connect_ip", "local_ip_attachment_closed");
-            *task_failure.lock().await = Some(error);
+            };
+            session.cancel();
+            if task_cancel.is_cancelled() {
+                break;
+            }
+            if let Some(error) = fatal_error {
+                *task_state.write().await = "failed";
+                *task_failure.lock().await = Some(error.clone());
+                tracing::error!(%project, %network, %gateway, %error, stage="connect_ip_interface_failed",
+                    "CONNECT-IP local interface failed; automatic transport retry stopped");
+                break;
+            }
+            reconnect_attempt += 1;
+            *task_state.write().await = "reconnecting";
+            *task_failure.lock().await = Some(failure_reason.clone());
+            tracing::warn!(%project, %network, %gateway, %session_id, attempt=reconnect_attempt,
+                error=%failure_reason, reconnect_delay_ms=reconnect_delay.as_millis() as u64,
+                stage="connect_ip_reconnect", "CONNECT-IP session ended; retrying with the approved binding");
+
+            loop {
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break 'attachment,
+                    _ = tokio::time::sleep(reconnect_delay) => {}
+                }
+                let attempt = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    ip::connect(task_endpoint.clone(), task_peer.clone(), &task_network, task_cancel.clone()),
+                ).await;
+                let replacement = match attempt {
+                    Ok(Ok(replacement)) => {
+                        let actual_routes: HashSet<_> = replacement.config.routes.iter().map(ToString::to_string).collect();
+                        let approved_routes: HashSet<_> = expected_routes.iter().map(ToString::to_string).collect();
+                        if replacement.config.address != expected_address
+                            || replacement.config.mtu != expected_mtu
+                            || actual_routes != approved_routes
+                        {
+                            let error = "gateway assignment or routes changed; leave and rejoin to approve the new settings".to_owned();
+                            *task_failure.lock().await = Some(error.clone());
+                            tracing::error!(%project, %network, %gateway, attempt=reconnect_attempt, %error,
+                                stage="connect_ip_reconnect_rejected", "CONNECT-IP reconnect does not match the approved binding");
+                            replacement.cancel();
+                            *task_state.write().await = "failed";
+                            break 'attachment;
+                        }
+                        Arc::new(replacement)
+                    }
+                    Ok(Err(error)) => {
+                        let message = error.to_string();
+                        *task_failure.lock().await = Some(message.clone());
+                        if !retryable_connect_error(&error) {
+                            *task_state.write().await = "failed";
+                            tracing::error!(%project, %network, %gateway, attempt=reconnect_attempt, error=%message,
+                                stage="connect_ip_reconnect_rejected", "CONNECT-IP reconnect requires a binding, gateway, or protocol change");
+                            break 'attachment;
+                        }
+                        tracing::warn!(%project, %network, %gateway, attempt=reconnect_attempt, error=%message,
+                            stage="connect_ip_reconnect_attempt_failed", "CONNECT-IP reconnect attempt failed");
+                        reconnect_delay = std::cmp::min(reconnect_delay * 2, std::time::Duration::from_secs(30));
+                        continue;
+                    }
+                    Err(_) => {
+                        let message = "CONNECT-IP reconnect handshake timed out".to_owned();
+                        *task_failure.lock().await = Some(message.clone());
+                        tracing::warn!(%project, %network, %gateway, attempt=reconnect_attempt,
+                            stage="connect_ip_reconnect_attempt_failed", "CONNECT-IP reconnect attempt timed out");
+                        reconnect_delay = std::cmp::min(reconnect_delay * 2, std::time::Duration::from_secs(30));
+                        continue;
+                    }
+                };
+                *task_active_session.write().await = replacement.clone();
+                *task_state.write().await = "connected";
+                *task_failure.lock().await = None;
+                tracing::info!(%project, %network, %gateway, session_id=%replacement.session_id,
+                    attempt=reconnect_attempt, stage="connect_ip_reconnected", "CONNECT-IP attachment recovered");
+                session = replacement;
+                reconnect_delay = std::time::Duration::from_secs(1);
+                break;
+            }
         }
-    }.instrument(session_span));
+        if *task_state.read().await != "failed" {
+            *task_state.write().await = "inactive";
+        }
+        tracing::info!(%project, %network, %gateway, stage="connect_ip_attachment_stopped", "CONNECT-IP attachment supervisor stopped");
+    }.instrument(info_span!("connect_ip.attachment", project=%binding.project, network=%binding.network, gateway=%binding.gateway)));
     let _ = setup_guard.disarm();
     Ok(Attachment {
         binding,
@@ -627,8 +742,16 @@ pub async fn join(
         received,
         last_sent_at_ms,
         last_received_at_ms,
-        session,
+        session: active_session,
+        state: connection_state,
     })
+}
+
+fn retryable_connect_error(error: &ip::Error) -> bool {
+    matches!(
+        error,
+        ip::Error::Closed | ip::Error::Timeout | ip::Error::Transport | ip::Error::Io(_)
+    )
 }
 
 fn unix_time_ms() -> u64 {
@@ -703,6 +826,30 @@ fn handshake_error(network: &str, connector: &str, error: ip::Error) -> ApiError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_retries_transient_failures_but_stops_on_configuration_rejections() {
+        for error in [
+            ip::Error::Timeout,
+            ip::Error::Transport,
+            ip::Error::Closed,
+            ip::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ] {
+            assert!(retryable_connect_error(&error), "{error}");
+        }
+        for error in [
+            ip::Error::DatagramsUnsupported,
+            ip::Error::InsufficientDatagramMtu {
+                required: 1280,
+                available: 1200,
+            },
+            ip::Error::Rejected(axum::http::StatusCode::FORBIDDEN),
+            ip::Error::Protocol("invalid negotiation"),
+        ] {
+            assert!(!retryable_connect_error(&error), "{error}");
+        }
+    }
+
     #[test]
     fn datagram_diagnostics_preserve_capacity_and_fatal_reason() {
         let value = transport_status(

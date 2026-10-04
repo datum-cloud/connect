@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/kardianos/service"
@@ -77,27 +78,93 @@ func StatusCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		status, err := svc.Status()
-		if errors.Is(err, service.ErrNotInstalled) {
-			return output.Write(cmd, map[string]any{"service": serviceName, "status": "not installed", "system": system}, "Connect daemon service is not installed ("+scopeLabel(system)+").\nInstall: datumctl connect daemon install"+scopeFlag(system)+"\n")
-		} else if err != nil {
+		status, err := statusService(svc, system)
+		notInstalled := errors.Is(err, service.ErrNotInstalled)
+		if err != nil && !notInstalled {
 			return fmt.Errorf("daemon service status: %w", err)
 		}
-		label := "unknown"
-		switch status {
-		case service.StatusRunning:
-			label = "running"
-		case service.StatusStopped:
-			label = "stopped"
+		label := "not installed"
+		if !notInstalled {
+			label = "unknown"
+			switch status {
+			case service.StatusRunning:
+				label = "running"
+			case service.StatusStopped:
+				label = "stopped"
+			}
 		}
-		human := fmt.Sprintf("Connect daemon service is %s (%s).\n", label, scopeLabel(system))
+		baseURL, _ := cmd.InheritedFlags().GetString("daemon-url")
+		apiStatus := "unreachable"
+		if daemonAPIHealthy(cmd.Context(), baseURL) {
+			apiStatus = "reachable"
+		}
+		human := fmt.Sprintf("Connect daemon service is %s (%s).\nConnect daemon API is %s.\n", label, scopeLabel(system), apiStatus)
+		if label == "stopped" && apiStatus == "reachable" {
+			human += "The API is responding even though the service manager reports it stopped; check for a manually started daemon or stale service-manager state.\n"
+		} else if label == "not installed" && apiStatus == "reachable" {
+			human += "The API is responding outside the managed daemon service.\n"
+		}
 		if label == "stopped" {
 			human += "Start: datumctl connect daemon start" + scopeFlag(system) + "\n"
+		} else if label == "not installed" {
+			human += "Install: datumctl connect daemon install" + scopeFlag(system) + "\n"
 		}
-		return output.Write(cmd, map[string]any{"service": serviceName, "status": label, "system": system}, human)
+		return output.Write(cmd, map[string]any{"service": serviceName, "status": label, "api_status": apiStatus, "system": system}, human)
 	}}
 	addScopeFlag(cmd, &system)
 	return cmd
+}
+
+// statusService uses launchctl's structured job report on macOS. kardianos/service
+// parses `launchctl list`, which can omit a PID for a live job in some launchd
+// contexts and then incorrectly reports an installed LaunchAgent as stopped.
+func statusService(svc service.Service, system bool) (service.Status, error) {
+	if runtime.GOOS != "darwin" {
+		return svc.Status()
+	}
+	domain := fmt.Sprintf("gui/%d/%s", os.Getuid(), serviceName)
+	if system {
+		domain = "system/" + serviceName
+	}
+	output, err := exec.Command("launchctl", "print", domain).CombinedOutput()
+	if err != nil {
+		message := string(output)
+		if strings.Contains(message, "Could not find service") || strings.Contains(message, "Service not found") {
+			return svc.Status()
+		}
+		return service.StatusUnknown, fmt.Errorf("launchctl print %s: %w: %s", domain, err, strings.TrimSpace(message))
+	}
+	if launchdJobRunning(string(output)) {
+		return service.StatusRunning, nil
+	}
+	return service.StatusStopped, nil
+}
+
+func launchdJobRunning(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "pid = ") && strings.TrimPrefix(line, "pid = ") != "0" {
+			return true
+		}
+	}
+	return false
+}
+
+func daemonAPIHealthy(ctx context.Context, baseURL string) bool {
+	client, err := connectapi.New(baseURL, "", 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 700*time.Millisecond)
+	defer cancel()
+	data, err := client.Request(ctx, "GET", "/v1/health", "", nil)
+	if err != nil {
+		return false
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	return json.Unmarshal(data, &health) == nil && health.Status == "ok"
 }
 
 func lifecycleCommand(use, short string, action func(service.Service) error) *cobra.Command {

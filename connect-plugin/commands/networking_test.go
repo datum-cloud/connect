@@ -38,7 +38,7 @@ func TestWaitForPeerPollsUntilConnected(t *testing.T) {
 		t.Fatalf("connected=%v requests=%d err=%v", connected, requests, err)
 	}
 	var value networkDisplay
-	if err := json.Unmarshal(result, &value); err != nil || !value.Connected {
+	if err := json.Unmarshal(result, &value); err != nil || value.Connected == nil || !*value.Connected {
 		t.Fatalf("result=%s err=%v", result, err)
 	}
 }

@@ -144,7 +144,7 @@ func waitForPeer(ctx context.Context, client *connectapi.Client, project, networ
 				return nil, false, err
 			}
 			if value.Network == network {
-				if value.Connected {
+				if value.Connected != nil && *value.Connected {
 					return attachment, true, nil
 				}
 				break
@@ -321,7 +321,7 @@ func newJoin(opts *options) *cobra.Command {
 		}
 		if waitTimeout > 0 {
 			var joined networkDisplay
-			if json.Unmarshal(result, &joined) == nil && shouldWaitForJoin(wait, noWait, joined) && joined.Mode == "peer" && !joined.Connected {
+			if json.Unmarshal(result, &joined) == nil && shouldWaitForJoin(wait, noWait, joined) && joined.Mode == "peer" && (joined.Connected == nil || !*joined.Connected) {
 				if hasSubnetRoutes(joined) {
 					fmt.Fprintf(cmd.ErrOrStderr(), "Waiting for the VPC connection to become ready (up to %s; Ctrl+C stops waiting, not the attachment)…\n", waitTimeout)
 				} else {

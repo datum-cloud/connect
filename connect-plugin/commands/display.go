@@ -46,7 +46,7 @@ type networkDisplay struct {
 	Mode                       string   `json:"mode"`
 	Peer                       string   `json:"peer"`
 	PeerAddress                string   `json:"peer_address"`
-	Connected                  bool     `json:"connected"`
+	Connected                  *bool    `json:"connected"`
 	State                      string   `json:"state"`
 	Address                    string   `json:"assigned_address"`
 	Interface                  string   `json:"interface_name"`
@@ -154,13 +154,13 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 					}
 				}
 				if !active {
-					fmt.Fprintf(&out, "  Saved attachment %s: inactive. Join: datumctl connect join %s%s\n", saved.Network, shellArg(saved.Network), displayProjectFlag(cmd))
+					fmt.Fprintf(&out, "  Saved attachment %s: approved, not attached on this device. Join: datumctl connect join %s%s\n", saved.Network, shellArg(saved.Network), displayProjectFlag(cmd))
 				}
 			}
 		}
 		for _, network := range value.Networks {
 			if network.Mode == "gateway" && !network.Running && network.Network != "" && !shownNetworks[network.Network] {
-				fmt.Fprintf(&out, "Saved VPC attachment %s: inactive. Join: datumctl connect join %s%s\n", network.Network, shellArg(network.Network), displayProjectFlag(cmd))
+				fmt.Fprintf(&out, "Saved VPC binding %s: approved, not attached on this device. Join: datumctl connect join %s%s\n", network.Network, shellArg(network.Network), displayProjectFlag(cmd))
 				if network.LastError != "" {
 					writeFailure(&out, "network", network.LastError)
 				}
@@ -219,20 +219,37 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			}
 		}
 		for _, network := range value.Networks {
+			connected := network.Running && network.Mode != "peer"
+			if network.Connected != nil {
+				connected = network.Running && *network.Connected
+			} else if network.Mode == "peer" {
+				connected = network.Running && network.Connected != nil && *network.Connected
+			}
 			state := "disconnected"
-			if network.Running && (network.Mode != "peer" || network.Connected) {
+			switch {
+			case network.State == "reconnecting" && network.Running:
+				state = "reconnecting"
+			case !network.Running && network.Mode == "gateway" && network.State == "inactive":
+				state = "approved, not attached locally"
+			case !network.Running && network.LastError != "":
+				state = "failed"
+			case connected:
 				state = "connected"
-			} else if network.Running && network.Mode == "peer" {
+			case network.Running && network.Mode == "peer":
 				state = "waiting for peer"
 			}
-			fmt.Fprintf(&out, "Network %s: %s, %s on %s (ephemeral native preview).\n", network.Network, state, network.Address, network.Interface)
+			interfaceName := network.Interface
+			if !network.Running {
+				interfaceName = "no active interface"
+			}
+			fmt.Fprintf(&out, "Network %s: %s, %s on %s (ephemeral native preview).\n", network.Network, state, network.Address, interfaceName)
 			fmt.Fprintf(&out, "  Routes: %s\n", strings.Join(network.Routes, ", "))
 			if len(network.AdvertiseRoutes) > 0 {
 				fmt.Fprintf(&out, "  Approved subnet access for peer: %s\n  Forwarding, firewall, and return routing are managed separately on this device.\n", strings.Join(network.AdvertiseRoutes, ", "))
 			}
 			if network.Mode == "peer" {
 				fmt.Fprintf(&out, "  Peer: %s (%s)\n", network.Peer, network.PeerAddress)
-				if network.Running && !network.Connected {
+				if network.Running && (network.Connected == nil || !*network.Connected) {
 					fmt.Fprintf(&out, "  The local attachment is ready, but peer traffic is not connected. Run datumctl connect join %s on the other device using its configured project. Both devices need matching peer approvals.\n", network.Network)
 				}
 				if network.LastConnectError != "" {
@@ -365,7 +382,10 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 		if !network.Running {
 			return fmt.Errorf("network attachment is not running; inspect datumctl connect status%s", displayProjectFlag(cmd))
 		}
-		if network.Mode == "peer" && !network.Connected {
+		connected := network.Connected == nil && network.Mode != "peer" || network.Connected != nil && *network.Connected
+		if network.State == "reconnecting" {
+			fmt.Fprintf(&out, "Reconnecting to %s; the approved routes remain installed.\n", network.Network)
+		} else if network.Mode == "peer" && !connected {
 			if hasSubnetRoutes(network) {
 				fmt.Fprintf(&out, "Waiting for the VPC connection to become ready for %s.\n", network.Network)
 			} else {
@@ -375,6 +395,8 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			if network.LastConnectError != "" {
 				fmt.Fprintf(&out, "Connection issue: %s\n", network.LastConnectError)
 			}
+		} else if network.Mode == "gateway" && !connected {
+			fmt.Fprintf(&out, "The VPC binding for %s is approved, but this device is not forwarding traffic.\n", network.Network)
 		} else {
 			fmt.Fprintf(&out, "Connected to %s.\n", network.Network)
 		}
