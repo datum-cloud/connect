@@ -478,6 +478,13 @@ impl Registry {
             .filter(|entry| !entry.cancel.is_cancelled())
             .cloned()
     }
+    pub(crate) fn allows_peer(&self, peer: EndpointId) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .any(|((candidate, _), entry)| *candidate == peer && !entry.cancel.is_cancelled())
+    }
 }
 
 fn session_parts(
@@ -613,6 +620,7 @@ pub async fn serve(
     for grant in grants {
         policies.insert(grant, incoming.clone())?;
     }
+    let admission = Arc::new(crate::ConnectionAdmission::new(32, 64, MAX_SESSIONS, 8));
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {
@@ -621,8 +629,9 @@ pub async fn serve(
             _ = tasks.join_next(), if !tasks.is_empty() => {},
             request = endpoint.accept() => {
                 let Some(request) = request else { break; };
-                if tasks.len() >= MAX_SESSIONS { request.refuse(); continue; }
+                let Some(handshake) = admission.try_handshake() else { request.refuse(); continue; };
                 let policies = policies.clone(); let child = local.child_token();
+                let admission = admission.clone();
                 tasks.spawn(async move {
                     let _guard = child.clone().drop_guard();
                     let result = async {
@@ -636,7 +645,17 @@ pub async fn serve(
                             tracing::warn!(stage="quic_handshake", timeout_seconds=SETUP_TIMEOUT.as_secs(), "CONNECT-IP QUIC handshake timed out");
                             Error::Timeout
                         })??;
-                        serve_connection(conn, policies, child).await
+                        let peer = conn.remote_id();
+                        if !policies.allows_peer(peer) {
+                            conn.close(0u8.into(), b"peer not eligible");
+                            return Err(Error::Rejected(StatusCode::FORBIDDEN));
+                        }
+                        let Some(connection_admission) = admission.try_setup(peer) else {
+                            conn.close(0u8.into(), b"connection admission limited");
+                            return Err(Error::Rejected(StatusCode::TOO_MANY_REQUESTS));
+                        };
+                        drop(handshake);
+                        serve_connection(conn, policies, child, connection_admission).await
                     }.await;
                     if let Err(error) = result { tracing::warn!(stage="connect_ip", %error, "CONNECT-IP incoming session ended"); }
                 });
@@ -653,11 +672,13 @@ pub(crate) async fn serve_connection(
     conn: iroh::endpoint::Connection,
     policies: Arc<Registry>,
     cancel: CancellationToken,
+    connection_admission: crate::SetupAdmission,
 ) -> Result<()> {
     let mut _session_lifetime = None;
     let peer = conn.remote_id();
     let mut session_id = String::from("unidentified");
     let mut network_name = String::from("unknown");
+    let deadline = tokio::time::Instant::now() + SETUP_TIMEOUT;
     let setup = async {
         if conn.alpn() != ALPN {
             return Err(Error::Protocol("wrong ALPN"));
@@ -763,6 +784,9 @@ pub(crate) async fn serve_connection(
             cancel: membership,
             ..
         } = admission;
+        let active_admission = connection_admission
+            .activate()
+            .map_err(|_| Error::Rejected(StatusCode::SERVICE_UNAVAILABLE))?;
         tracing::info!(peer=%peer, network=%network.unwrap(), %session_id, assigned_address=%config.address, routes=?config.routes, mtu=config.mtu, stage="connect_admission", "CONNECT-IP peer and network approved");
         let membership_lifetime = membership.clone();
         let connection_cancel = cancel.clone();
@@ -860,6 +884,7 @@ pub(crate) async fn serve_connection(
             guard,
             session_cancel,
             membership_guard,
+            active_admission,
             DatagramPath {
                 connection: conn,
                 stream_id,
@@ -869,23 +894,33 @@ pub(crate) async fn serve_connection(
     };
     let setup_result = tokio::select! {
         _ = cancel.cancelled() => return Err(Error::Closed),
-        result = tokio::time::timeout(SETUP_TIMEOUT, setup) => result,
+        result = tokio::time::timeout_at(deadline, setup) => result,
     };
-    let (mut io, config, outgoing, packets, counters, _bridge, session_cancel, _membership, path) =
-        match setup_result {
-            Err(_) => {
-                tracing::warn!(peer=%peer, network=%network_name, %session_id, stage="connect_setup_timeout", timeout_seconds=SETUP_TIMEOUT.as_secs(), "CONNECT-IP session setup timed out");
-                return Err(Error::Timeout);
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(peer=%peer, network=%network_name, %session_id, %error, stage="connect_setup_failed", "CONNECT-IP session setup failed");
-                return Err(error);
-            }
-            Ok(Ok(value)) => value,
-        };
+    let (
+        mut io,
+        config,
+        outgoing,
+        packets,
+        counters,
+        _bridge,
+        session_cancel,
+        _membership,
+        _admission,
+        path,
+    ) = match setup_result {
+        Err(_) => {
+            tracing::warn!(peer=%peer, network=%network_name, %session_id, stage="connect_setup_timeout", timeout_seconds=SETUP_TIMEOUT.as_secs(), "CONNECT-IP session setup timed out");
+            return Err(Error::Timeout);
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(peer=%peer, network=%network_name, %session_id, %error, stage="connect_setup_failed", "CONNECT-IP session setup failed");
+            return Err(error);
+        }
+        Ok(Ok(value)) => value,
+    };
     tokio::select! {
         _ = cancel.cancelled() => return Err(Error::Closed),
-        result = tokio::time::timeout(SETUP_TIMEOUT, async {
+        result = tokio::time::timeout_at(deadline, async {
             let (kind, payload) = read_capsule(&mut io).await?;
             if kind != 2 || payload.as_ref() != address_requests() { return Err(Error::Protocol("expected IPv4/IPv6 ADDRESS_REQUEST")); }
             let assignment = encode_assignment(config.address);

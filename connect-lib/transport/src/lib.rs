@@ -26,7 +26,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::presets};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
     net::{TcpStream, UdpSocket},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -43,6 +43,12 @@ const DESTINATION_HEADER: &str = "x-datum-destination";
 const KIND_HEADER: &str = "x-datum-connect-kind";
 const TUNNEL_BUFFER: usize = 64 * 1024;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const INBOUND_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_INBOUND_HANDSHAKES: usize = 32;
+const MAX_INBOUND_SETUPS: usize = 64;
+const MAX_INBOUND_ACTIVE: usize = 128;
+const MAX_INBOUND_PER_PEER: usize = 8;
 
 /// Stable identifier advertised by the control plane for one destination.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -112,6 +118,14 @@ impl Access {
             Self::Public => true,
             Self::Peers(peers) => peers.contains(&peer),
         }
+    }
+}
+
+impl Policy {
+    fn allows_peer(&self, peer: EndpointId) -> bool {
+        self.destinations
+            .values()
+            .any(|destination| destination.access.allows(peer))
     }
 }
 
@@ -229,6 +243,97 @@ struct Inner {
     metrics: Metrics,
     peer_diagnostics: RwLock<HashMap<EndpointId, PeerDiagnostics>>,
     ip_registry: Arc<ip::Registry>,
+    admission: Arc<ConnectionAdmission>,
+}
+
+pub(crate) struct ConnectionAdmission {
+    handshakes: Arc<Semaphore>,
+    setups: Arc<Semaphore>,
+    active: Arc<Semaphore>,
+    peers: std::sync::Mutex<HashMap<EndpointId, usize>>,
+    per_peer: usize,
+}
+
+impl ConnectionAdmission {
+    pub(crate) fn new(handshakes: usize, setups: usize, active: usize, per_peer: usize) -> Self {
+        Self {
+            handshakes: Arc::new(Semaphore::new(handshakes)),
+            setups: Arc::new(Semaphore::new(setups)),
+            active: Arc::new(Semaphore::new(active)),
+            peers: std::sync::Mutex::new(HashMap::new()),
+            per_peer,
+        }
+    }
+
+    pub(crate) fn try_handshake(&self) -> Option<OwnedSemaphorePermit> {
+        self.handshakes.clone().try_acquire_owned().ok()
+    }
+
+    pub(crate) fn try_setup(self: &Arc<Self>, peer: EndpointId) -> Option<SetupAdmission> {
+        let setup = self.setups.clone().try_acquire_owned().ok()?;
+        let mut peers = self.peers.lock().unwrap_or_else(|error| error.into_inner());
+        let count = peers.entry(peer).or_default();
+        if *count >= self.per_peer {
+            return None;
+        }
+        *count += 1;
+        drop(peers);
+        Some(SetupAdmission {
+            setup,
+            peer: PeerAdmission {
+                admission: self.clone(),
+                peer,
+            },
+        })
+    }
+}
+
+struct PeerAdmission {
+    admission: Arc<ConnectionAdmission>,
+    peer: EndpointId,
+}
+
+impl Drop for PeerAdmission {
+    fn drop(&mut self) {
+        let mut peers = self
+            .admission
+            .peers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let remove = if let Some(count) = peers.get_mut(&self.peer) {
+            *count -= 1;
+            *count == 0
+        } else {
+            false
+        };
+        if remove {
+            peers.remove(&self.peer);
+        }
+    }
+}
+
+pub(crate) struct SetupAdmission {
+    setup: OwnedSemaphorePermit,
+    peer: PeerAdmission,
+}
+
+impl SetupAdmission {
+    pub(crate) fn activate(self) -> Result<ActiveAdmission, Self> {
+        let Ok(active) = self.peer.admission.active.clone().try_acquire_owned() else {
+            return Err(self);
+        };
+        let Self { setup, peer } = self;
+        drop(setup);
+        Ok(ActiveAdmission {
+            _active: active,
+            _peer: peer,
+        })
+    }
+}
+
+pub(crate) struct ActiveAdmission {
+    _active: OwnedSemaphorePermit,
+    _peer: PeerAdmission,
 }
 
 /// A clonable, long-lived transport endpoint.
@@ -287,6 +392,12 @@ impl Transport {
                 metrics: Metrics::default(),
                 peer_diagnostics: RwLock::new(HashMap::new()),
                 ip_registry,
+                admission: Arc::new(ConnectionAdmission::new(
+                    MAX_INBOUND_HANDSHAKES,
+                    MAX_INBOUND_SETUPS,
+                    MAX_INBOUND_ACTIVE,
+                    MAX_INBOUND_PER_PEER,
+                )),
             }),
         }
     }
@@ -559,24 +670,51 @@ impl Transport {
         loop {
             let incoming = tokio::select! { biased; _ = self.inner.shutdown.cancelled() => break, _ = connections.join_next(), if !connections.is_empty() => continue, incoming = self.inner.endpoint.accept() => incoming };
             let Some(incoming) = incoming else { break };
-            if connections.len() >= 128 {
+            let Some(handshake) = self.inner.admission.try_handshake() else {
                 incoming.refuse();
                 continue;
-            }
+            };
             let transport = self.clone();
             connections.spawn(async move {
                 let cancel = transport.inner.shutdown.child_token();
                 let _guard = cancel.clone().drop_guard();
                 let result = async {
                     let accepting = incoming.accept().map_err(error_debug)?;
-                    let conn = setup(&transport.inner.shutdown, accepting).await?;
+                    let conn = tokio::select! {
+                        _ = transport.inner.shutdown.cancelled() => return Err(Error::Closed),
+                        result = tokio::time::timeout(INBOUND_HANDSHAKE_TIMEOUT, accepting) => {
+                            result.map_err(|_| Error::Timeout)?.map_err(error_debug)?
+                        }
+                    };
                     transport.observe_connection(&conn);
-                    if conn.alpn() == ip::ALPN {
-                        ip::serve_connection(conn, transport.inner.ip_registry.clone(), cancel)
-                            .await
-                            .map_err(error_display)
+                    let peer = conn.remote_id();
+                    let eligible = if conn.alpn() == ip::ALPN {
+                        transport.inner.ip_registry.allows_peer(peer)
                     } else if conn.alpn() == ALPN {
-                        transport.serve_connection(conn).await
+                        transport.inner.policy.load().allows_peer(peer)
+                    } else {
+                        false
+                    };
+                    if !eligible {
+                        conn.close(0u8.into(), b"peer not eligible");
+                        return Err(Error::Rejected(StatusCode::FORBIDDEN));
+                    }
+                    let Some(admission) = transport.inner.admission.try_setup(peer) else {
+                        conn.close(0u8.into(), b"connection admission limited");
+                        return Err(Error::Rejected(StatusCode::TOO_MANY_REQUESTS));
+                    };
+                    drop(handshake);
+                    if conn.alpn() == ip::ALPN {
+                        ip::serve_connection(
+                            conn,
+                            transport.inner.ip_registry.clone(),
+                            cancel,
+                            admission,
+                        )
+                        .await
+                        .map_err(error_display)
+                    } else if conn.alpn() == ALPN {
+                        transport.serve_connection(conn, admission).await
                     } else {
                         Err(Error::Protocol("unregistered ALPN".into()))
                     }
@@ -603,23 +741,31 @@ impl Transport {
         }
     }
 
-    async fn serve_connection(&self, conn: iroh::endpoint::Connection) -> Result<(), Error> {
+    async fn serve_connection(
+        &self,
+        conn: iroh::endpoint::Connection,
+        admission: SetupAdmission,
+    ) -> Result<(), Error> {
         let peer = conn.remote_id();
+        let deadline = tokio::time::Instant::now() + INBOUND_SETUP_TIMEOUT;
         self.observe_connection(&conn);
         let conn_guard = conn.clone();
         let adapter = h3_iroh::Connection::new(conn);
-        let mut h3 = setup(
+        let mut h3 = setup_before(
             &self.inner.shutdown,
+            deadline,
             h3::server::builder()
                 .enable_datagram(true)
                 .enable_extended_connect(true)
                 .build::<_, Bytes>(adapter),
         )
         .await?;
-        let Some(resolver) = setup(&self.inner.shutdown, h3.accept()).await? else {
+        let Some(resolver) = setup_before(&self.inner.shutdown, deadline, h3.accept()).await?
+        else {
             return Ok(());
         };
-        let (request, mut stream) = setup(&self.inner.shutdown, resolver.resolve_request()).await?;
+        let (request, mut stream) =
+            setup_before(&self.inner.shutdown, deadline, resolver.resolve_request()).await?;
         let destination: DestinationId = request
             .headers()
             .get(DESTINATION_HEADER)
@@ -639,6 +785,17 @@ impl Transport {
             h3.shutdown(0).await.map_err(error_display)?;
             let _ = tokio::time::timeout(Duration::from_secs(1), conn_guard.closed()).await;
             return Ok(());
+        };
+        let active_admission = match admission.activate() {
+            Ok(admission) => admission,
+            Err(_) => {
+                stream
+                    .send_response(response(StatusCode::SERVICE_UNAVAILABLE))
+                    .await
+                    .map_err(error_display)?;
+                stream.finish().await.map_err(error_display)?;
+                return Ok(());
+            }
         };
         let cancel = CancellationToken::new();
         let Some(session_id) = self
@@ -665,6 +822,7 @@ impl Transport {
             inner: Arc::clone(&self.inner),
             id: session_id,
             kind,
+            _admission: active_admission,
         };
         match destination_policy.target {
             Target::Tcp(target) if kind == SessionKind::Tcp => {
@@ -803,6 +961,7 @@ struct SessionGuard {
     inner: Arc<Inner>,
     id: u64,
     kind: SessionKind,
+    _admission: ActiveAdmission,
 }
 
 // Outbound sessions contribute to telemetry without entering the inbound
@@ -968,6 +1127,23 @@ where
     tokio::select! {
         _ = cancel.cancelled() => Err(Error::Closed),
         result = tokio::time::timeout(SETUP_TIMEOUT, future) => {
+            result.map_err(|_| Error::Timeout)?.map_err(error_display)
+        }
+    }
+}
+
+async fn setup_before<T, E, F>(
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Result<T, Error>
+where
+    E: std::fmt::Display,
+    F: Future<Output = Result<T, E>>,
+{
+    tokio::select! {
+        _ = cancel.cancelled() => Err(Error::Closed),
+        result = tokio::time::timeout_at(deadline, future) => {
             result.map_err(|_| Error::Timeout)?.map_err(error_display)
         }
     }
@@ -1196,6 +1372,69 @@ mod tests {
         })
         .await
         .expect("active count converged");
+    }
+
+    async fn wait_for_peer_admissions(transport: &Transport, peer: EndpointId, expected: usize) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let current = transport
+                    .inner
+                    .admission
+                    .peers
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&peer)
+                    .copied()
+                    .unwrap_or_default();
+                if current == expected {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("peer admission count converged");
+    }
+
+    #[test]
+    fn setup_and_active_capacity_are_independent_and_peer_scoped() {
+        let admission = Arc::new(ConnectionAdmission::new(1, 1, 1, 2));
+        let first = SecretKey::generate().public();
+        let second = SecretKey::generate().public();
+
+        let first_setup = admission.try_setup(first).expect("first setup admitted");
+        assert!(
+            admission.try_setup(second).is_none(),
+            "setup pool is bounded"
+        );
+        let first_active = match first_setup.activate() {
+            Ok(active) => active,
+            Err(_) => panic!("first session activated"),
+        };
+
+        let second_setup = admission
+            .try_setup(second)
+            .expect("active sessions do not consume setup capacity");
+        let second_setup = match second_setup.activate() {
+            Ok(_) => panic!("active pool is independently bounded"),
+            Err(setup) => setup,
+        };
+        drop(first_active);
+        let second_active = match second_setup.activate() {
+            Ok(active) => active,
+            Err(_) => panic!("released active slot is reusable"),
+        };
+
+        let same_peer_setup = admission
+            .try_setup(second)
+            .expect("second peer slot admitted");
+        assert!(
+            admission.try_setup(second).is_none(),
+            "active and setup connections share the peer limit"
+        );
+        drop(same_peer_setup);
+        drop(second_active);
+        assert!(admission.try_setup(second).is_some());
     }
 
     #[tokio::test]
@@ -1437,14 +1676,131 @@ mod tests {
             .await
             .err()
             .expect("peer denied");
-        assert!(
-            matches!(error, Error::Rejected(StatusCode::FORBIDDEN)),
-            "{error:?}"
-        );
+        assert!(!matches!(error, Error::Timeout), "{error:?}");
         assert_eq!(client.stats().active_tcp, 0);
         assert_eq!(client.stats().errors, 1);
         client.shutdown().await;
         server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unauthorized_peer_is_closed_before_h3_setup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = socket.split();
+                    let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                });
+            }
+        });
+        let server = endpoint().await;
+        let allowed = endpoint().await;
+        let stranger = endpoint().await;
+        let destination = DestinationId::tcp(8443);
+        server
+            .replace_policy(Policy {
+                destinations: HashMap::from([(
+                    destination.clone(),
+                    DestinationPolicy {
+                        target: Target::Tcp(target),
+                        access: Access::Peers(HashSet::from([allowed.endpoint_id()])),
+                    },
+                )]),
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..MAX_INBOUND_PER_PEER * 2 {
+            let conn = stranger
+                .inner
+                .endpoint
+                .connect(address(&server), ALPN)
+                .await
+                .expect("unauthorized QUIC handshake completes");
+            timeout(Duration::from_secs(2), conn.closed())
+                .await
+                .expect("unauthorized peer closed before waiting for H3");
+        }
+
+        let tunnel = allowed
+            .connect_tcp(address(&server), destination, CancellationToken::new())
+            .await
+            .expect("authorized peer remains admissible");
+        drop(tunnel);
+        stranger.shutdown().await;
+        allowed.shutdown().await;
+        server.shutdown().await;
+        echo.abort();
+    }
+
+    #[tokio::test]
+    async fn per_peer_stalled_setups_do_not_block_other_peers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = socket.split();
+                    let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                });
+            }
+        });
+        let server = endpoint().await;
+        let staller = endpoint().await;
+        let other = endpoint().await;
+        let destination = DestinationId::tcp(8443);
+        server
+            .replace_policy(Policy {
+                destinations: HashMap::from([(
+                    destination.clone(),
+                    DestinationPolicy {
+                        target: Target::Tcp(target),
+                        access: Access::Peers(HashSet::from([
+                            staller.endpoint_id(),
+                            other.endpoint_id(),
+                        ])),
+                    },
+                )]),
+            })
+            .await
+            .unwrap();
+
+        let mut stalled = Vec::new();
+        for expected in 1..=MAX_INBOUND_PER_PEER {
+            stalled.push(
+                staller
+                    .inner
+                    .endpoint
+                    .connect(address(&server), ALPN)
+                    .await
+                    .expect("stalled setup handshake"),
+            );
+            wait_for_peer_admissions(&server, staller.endpoint_id(), expected).await;
+        }
+        let limited = staller
+            .inner
+            .endpoint
+            .connect(address(&server), ALPN)
+            .await
+            .expect("over-limit QUIC handshake completes");
+        timeout(Duration::from_secs(2), limited.closed())
+            .await
+            .expect("over-limit peer connection closed");
+
+        let tunnel = other
+            .connect_tcp(address(&server), destination, CancellationToken::new())
+            .await
+            .expect("another authorized peer is not starved");
+        drop(tunnel);
+        for conn in stalled {
+            conn.close(0u8.into(), b"test complete");
+        }
+        staller.shutdown().await;
+        other.shutdown().await;
+        server.shutdown().await;
+        echo.abort();
     }
 
     #[tokio::test]
