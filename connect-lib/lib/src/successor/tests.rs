@@ -87,6 +87,11 @@ fn connector() -> Value {
     json!({"metadata":{"name":format!("connect-{}",&public[..40]),"uid":"connector-uid","annotations":{"connect.datum.net/public-key":public}},"spec":{"connectorClassName":"masque"},"status":{"connectionDetails":{"publicKey":{"id":public}}}})
 }
 
+fn connect_connector() -> Value {
+    let public = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    json!({"metadata":{"name":format!("connect-{}",&public[..40]),"uid":"connector-uid","generation":1},"spec":{"classRef":"masque","publicKey":public},"status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}})
+}
+
 #[test]
 fn project_connect_resources_use_the_connect_api_group() {
     let client = client("https://api.example");
@@ -487,7 +492,7 @@ async fn legacy_platform_fails_closed_before_connector_creation() {
 async fn private_service_creates_owned_advertisement_and_never_public_ingress() {
     let (base, task) = server(vec![
         token(),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
         Reply::Json(404, json!({})),
         Reply::Json(404, json!({})),
         Reply::EchoCreated,
@@ -507,6 +512,9 @@ async fn private_service_creates_owned_advertisement_and_never_public_ingress() 
     assert!(result.ready);
     assert!(result.hostnames.is_empty());
     let requests = task.await.unwrap();
+    assert!(requests.iter().all(|(line, _)| {
+        !line.contains("networking.datumapis.com/v1alpha1/namespaces/default/connectors/")
+    }));
     assert!(
         !requests
             .iter()
@@ -515,19 +523,18 @@ async fn private_service_creates_owned_advertisement_and_never_public_ingress() 
     let (_, ad) = requests.last().unwrap();
     assert_eq!(ad["metadata"]["labels"][OWNER], cloud.name());
     assert_eq!(ad["metadata"]["ownerReferences"][0]["uid"], "connector-uid");
-    assert_eq!(
-        ad["spec"]["layer4"][0]["services"][0]["ports"][0]["protocol"],
-        "TCP"
-    );
+    assert_eq!(ad["apiVersion"], CONNECT_GROUP);
+    assert_eq!(ad["spec"]["connectorRef"], cloud.name());
+    assert_eq!(ad["spec"]["services"][0]["protocol"], "TCP");
+    assert_eq!(ad["spec"]["services"][0]["port"], 22);
 }
 
 #[tokio::test]
 async fn deleting_foreign_resource_never_sends_delete() {
     let (base, task) = server(vec![
         token(),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
         Reply::Json(200, json!({"metadata":{"name":"foreign","uid":"other"}})),
-        Reply::Json(404, json!({})),
     ])
     .await;
     assert!(matches!(
@@ -542,7 +549,7 @@ async fn deleting_foreign_resource_never_sends_delete() {
 async fn refusing_private_reuse_of_public_name_prevents_false_privacy_claim() {
     let (base, task) = server(vec![
         token(),
-        Reply::Json(200, connector()),
+        Reply::Json(200, connect_connector()),
         Reply::Json(200, json!({"metadata":{"name":"web"}})),
     ])
     .await;

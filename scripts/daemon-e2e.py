@@ -52,9 +52,9 @@ class Platform(http.server.BaseHTTPRequestHandler):
         parts = self.path.strip('/').split('/')
         if 'connectorclasses' in parts:
             item = {
-                'metadata': {'name': 'local-masque', 'annotations': {'connect.datum.net/transport': 'masque-v1'}},
+                'metadata': {'name': 'local-masque', 'generation': 1, 'annotations': {'connect.datum.net/transport': 'masque-v1'}},
                 'spec': {'transports': ['masque-v1']},
-                'status': {'conditions': [{'type': 'Ready', 'status': 'True'}]},
+                'status': {'conditions': [{'type': 'Ready', 'status': 'True', 'observedGeneration': 1}]},
             }
             if self.gateway_connectors:
                 item['metadata']['annotations']['connect.datum.net/gateway-connectors'] = json.dumps(self.gateway_connectors)
@@ -81,6 +81,13 @@ class Platform(http.server.BaseHTTPRequestHandler):
                 if key in self.objects:
                     return self.reply(409, {})
                 value['metadata'].update(uid='uid-' + key[1], resourceVersion='1', generation=1)
+                if group == 'connect.datumapis.com' and plural == 'connectors':
+                    # The local e2e control plane simulates Connect controller
+                    # reconciliation; this is not a controller implementation test.
+                    value['status'] = {'conditions': [
+                        {'type': 'Accepted', 'status': 'True', 'observedGeneration': 1},
+                        {'type': 'Ready', 'status': 'True', 'observedGeneration': 1},
+                    ]}
                 self.objects[key] = value
                 return self.reply(201, value)
             if self.command == 'PUT':

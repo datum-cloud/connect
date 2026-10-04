@@ -209,8 +209,7 @@ impl CloudConnector {
         }
     }
 
-    /// Register the same live iroh identity with the Connect service. The legacy
-    /// NSO Connector remains in place for existing HTTPProxy/advertisement APIs.
+    /// Register the live iroh identity with the Connect service.
     pub async fn ensure_connect_connector(
         &self,
         details: &ConnectionDetails,
@@ -717,6 +716,19 @@ impl CloudConnector {
         Ok(connector)
     }
 
+    async fn owned_connect_connector(&self) -> Result<Value> {
+        let connector = self
+            .connect_get("connectors", &self.name)
+            .await?
+            .ok_or(Error::Api(404))?;
+        if connector.pointer("/spec/publicKey").and_then(Value::as_str) != Some(&self.public_key)
+            || !connector["metadata"]["deletionTimestamp"].is_null()
+        {
+            return Err(Error::Ownership(self.name.clone()));
+        }
+        Ok(connector)
+    }
+
     pub async fn ensure_connector(&self, details: &ConnectionDetails) -> Result<PeerIdentity> {
         if self.get("connectors", &self.name).await?.is_none() {
             let classes_url = format!("{}/apis/{GROUP}/connectorclasses", self.base);
@@ -972,7 +984,7 @@ impl CloudConnector {
 
     fn metadata(&self, name: &str, connector: &Value) -> Result<Value> {
         Ok(
-            json!({"name":name,"labels":{(OWNER):self.name},"ownerReferences":[{"apiVersion":GROUP,"kind":"Connector","name":self.name,"uid":string(connector,"/metadata/uid")?,"controller":true,"blockOwnerDeletion":false}]}),
+            json!({"name":name,"labels":{(OWNER):self.name},"ownerReferences":[{"apiVersion":CONNECT_GROUP,"kind":"Connector","name":self.name,"uid":string(connector,"/metadata/uid")?,"controller":true,"blockOwnerDeletion":false}]}),
         )
     }
 
@@ -1011,6 +1023,26 @@ impl CloudConnector {
         Ok(existing)
     }
 
+    async fn apply_connect_owned(
+        &self,
+        plural: &str,
+        object: Value,
+        connector: &Value,
+    ) -> Result<Value> {
+        let name = string(&object, "/metadata/name")?;
+        let existing = match self.connect_get(plural, &name).await? {
+            Some(value) => value,
+            None => self.connect_create(plural, &object).await?,
+        };
+        self.check_owner(&name, &existing, connector)?;
+        if !contains_intent(&existing["spec"], &object["spec"]) {
+            return Err(Error::Ownership(format!(
+                "{name}: existing spec differs; refusing overwrite"
+            )));
+        }
+        Ok(existing)
+    }
+
     pub async fn reconcile_service(&self, intent: &ServiceIntent) -> Result<CloudService> {
         validate_name(&intent.name)?;
         if !matches!(intent.protocol.as_str(), "tcp" | "udp") {
@@ -1032,19 +1064,19 @@ impl CloudConnector {
         {
             return Err(Error::Invalid("expected host:port endpoint".into()));
         }
-        let host = endpoint
+        let _host = endpoint
             .host_str()
             .ok_or_else(|| Error::Invalid("endpoint host missing".into()))?;
         let port = endpoint
             .port()
             .filter(|p| *p != 0)
             .ok_or_else(|| Error::Invalid("endpoint port missing".into()))?;
-        let connector = self.owned_connector().await?;
+        let connector = self.owned_connect_connector().await?;
         if !intent.public && self.get("httpproxies", &intent.name).await?.is_some() {
             return Err(Error::Invalid("a public ingress already uses this service name; explicitly remove it before creating a private service".into()));
         }
         let metadata = self.metadata(&intent.name, &connector)?;
-        self.apply_owned("connectoradvertisements",json!({"apiVersion":GROUP,"kind":"ConnectorAdvertisement","metadata":metadata,"spec":{"connectorRef":{"name":self.name},"layer4":[{"name":"service","services":[{"address":host,"ports":[{"name":intent.protocol,"port":port,"protocol":intent.protocol.to_uppercase()}]}]}]}}),&connector).await?;
+        self.apply_connect_owned("connectoradvertisements",json!({"apiVersion":CONNECT_GROUP,"kind":"ConnectorAdvertisement","metadata":metadata,"spec":{"connectorRef":self.name,"services":[{"protocol":intent.protocol.to_uppercase(),"port":port}]}}),&connector).await?;
         if !intent.public {
             return Ok(CloudService {
                 name: intent.name.clone(),
@@ -1056,6 +1088,8 @@ impl CloudConnector {
         if let Some(hostname) = &intent.hostname {
             spec["hostnames"] = json!([hostname]);
         }
+        // HTTPProxy remains an NSO ingress resource. Its metadata ownership is
+        // tied to the Connect Connector UID so cleanup cannot affect another device.
         let proxy = self.apply_owned("httpproxies",json!({"apiVersion":"networking.datumapis.com/v1alpha","kind":"HTTPProxy","metadata":metadata,"spec":spec}),&connector).await?;
         let hostnames = proxy
             .pointer("/status/hostnames")
@@ -1078,14 +1112,21 @@ impl CloudConnector {
 
     pub async fn delete_service(&self, name: &str) -> Result<()> {
         validate_name(name)?;
-        let connector = self.owned_connector().await?;
+        let connector = self.owned_connect_connector().await?;
         let mut first_error = None;
         for plural in ["httpproxies", "connectoradvertisements"] {
             let result = async {
-                if let Some(resource) = self.get(plural,name).await? {
+                let is_connect_resource = plural == "connectoradvertisements";
+                let resource = if is_connect_resource {
+                    self.connect_get(plural, name).await?
+                } else {
+                    self.get(plural, name).await?
+                };
+                if let Some(resource) = resource {
                     self.check_owner(name,&resource,&connector)?;
                     let preconditions = json!({"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":string(&resource,"/metadata/uid")?,"resourceVersion":string(&resource,"/metadata/resourceVersion")?}});
-                    match self.request(Method::DELETE,&self.resource(plural,name),Some(&preconditions)).await { Ok(_) | Err(Error::Api(404)) => {}, Err(error) => return Err(error) }
+                    let url = if is_connect_resource { self.connect_resource(plural, name) } else { self.resource(plural, name) };
+                    match self.request(Method::DELETE,&url,Some(&preconditions)).await { Ok(_) | Err(Error::Api(404)) => {}, Err(error) => return Err(error) }
                 }
                 Ok(())
             }.await;
