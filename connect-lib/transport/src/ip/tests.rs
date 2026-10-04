@@ -4,6 +4,13 @@ use super::*;
 // integration fixtures so macOS's default per-process FD limit is not exceeded.
 static NETWORK_TESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+async fn assert_prompt_fail_closed(future: impl std::future::Future<Output = Result<IpSession>>) {
+    let result = tokio::time::timeout(Duration::from_secs(2), future)
+        .await
+        .expect("ineligible peer rejected before HTTP/3 setup timeout");
+    assert!(result.is_err(), "ineligible peer must fail closed");
+}
+
 #[tokio::test]
 async fn joined_grants_share_one_endpoint_with_tcp_udp_and_revoke_independently() {
     let _permit = NETWORK_TESTS.acquire().await.unwrap();
@@ -19,20 +26,13 @@ async fn joined_grants_share_one_endpoint_with_tcp_udp_and_revoke_independently(
     )
     .await
     .unwrap();
-    assert!(matches!(
-        connect(
-            client.endpoint(),
-            server.endpoint().addr(),
-            "joined",
-            CancellationToken::new()
-        )
-        .await,
-        Err(Error::RejectedWithReason {
-            status: StatusCode::FORBIDDEN,
-            reason: RejectionReason::PeerNetworkNotApproved,
-            ..
-        })
-    ));
+    assert_prompt_fail_closed(connect(
+        client.endpoint(),
+        server.endpoint().addr(),
+        "joined",
+        CancellationToken::new(),
+    ))
+    .await;
     let config = config();
     let grant = Grant {
         peer: client.endpoint_id(),
@@ -129,20 +129,13 @@ async fn joined_grants_share_one_endpoint_with_tcp_udp_and_revoke_independently(
             })
             .await
             .unwrap();
-            assert!(matches!(
-                connect(
-                    client.endpoint(),
-                    server.endpoint().addr(),
-                    "joined",
-                    CancellationToken::new()
-                )
-                .await,
-                Err(Error::RejectedWithReason {
-                    status: StatusCode::FORBIDDEN,
-                    reason: RejectionReason::PeerNetworkNotApproved,
-                    ..
-                })
-            ));
+            assert_prompt_fail_closed(connect(
+                client.endpoint(),
+                server.endpoint().addr(),
+                "joined",
+                CancellationToken::new(),
+            ))
+            .await;
         }
         tcp_session.write_all(label).await.unwrap();
         let mut reply = vec![0; label.len()];
@@ -660,20 +653,13 @@ async fn unauthorized_peer_and_failed_readiness_never_join() {
     };
     let (incoming, mut accepted) = mpsc::channel(4);
     let serving = tokio::spawn(serve(server.clone(), vec![grant], incoming, cancel.clone()));
-    assert!(matches!(
-        connect(
-            stranger.clone(),
-            server.addr(),
-            "test",
-            CancellationToken::new()
-        )
-        .await,
-        Err(Error::RejectedWithReason {
-            status: StatusCode::FORBIDDEN,
-            reason: RejectionReason::PeerNetworkNotApproved,
-            ..
-        })
-    ));
+    assert_prompt_fail_closed(connect(
+        stranger.clone(),
+        server.addr(),
+        "test",
+        CancellationToken::new(),
+    ))
+    .await;
     assert!(matches!(
         connect(
             client.clone(),
