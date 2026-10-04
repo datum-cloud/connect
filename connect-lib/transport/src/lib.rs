@@ -1455,10 +1455,7 @@ mod tests {
     #[test]
     fn peer_diagnostics_cache_is_bounded() {
         let diagnostics = RwLock::new(HashMap::new());
-        let latest = (0..=MAX_PEER_DIAGNOSTICS)
-            .map(|_| SecretKey::generate().public())
-            .last()
-            .unwrap();
+        let latest = SecretKey::generate().public();
         for peer in (0..MAX_PEER_DIAGNOSTICS)
             .map(|_| SecretKey::generate().public())
             .chain(std::iter::once(latest))
