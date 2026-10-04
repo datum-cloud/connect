@@ -261,6 +261,18 @@ async fn connect_enrollment_uses_only_the_connect_api() {
 }
 
 #[tokio::test]
+async fn refreshing_a_deleted_connect_connector_never_recreates_it() {
+    let (base, task) = server(vec![token(), Reply::Json(404, json!({}))]).await;
+    let result = client(&base)
+        .refresh_connect_connector(&ConnectionDetails::default())
+        .await;
+    assert!(matches!(result, Err(Error::Api(404))));
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].0.starts_with("GET "));
+}
+
+#[tokio::test]
 async fn connect_peer_lookup_uses_connect_connector_identity_and_addresses() {
     let peer: iroh::EndpointId = iroh::SecretKey::from_bytes(&[9; 32]).public();
     let endpoint = iroh::EndpointAddr::new(peer)

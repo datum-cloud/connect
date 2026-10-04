@@ -298,7 +298,7 @@ impl RealControl {
                         if runtime.cancel.is_cancelled() { break; }
                         let details = cloud_details(&runtime.transport);
                         let result = async {
-                            let identity = runtime.cloud.ensure_connect_connector(&details).await.map_err(cloud_error)?;
+                            let identity = runtime.cloud.refresh_connect_connector(&details).await.map_err(cloud_error)?;
                             if identity.uid != runtime.identity.uid || identity.public_key != runtime.identity.public_key {
                                 return Err(ApiError::new(axum::http::StatusCode::CONFLICT, "Connector identity changed"));
                             }
@@ -500,7 +500,11 @@ impl RealControl {
         // Enrollment and liveness belong to the Connect API. Do not create or
         // renew the legacy networking.datumapis.com Connector here; managed
         // gateway joins must work with Connect permissions alone.
-        let identity_result = cloud.ensure_connect_connector(&initial_details).await;
+        let identity_result = if expected.is_some() {
+            cloud.refresh_connect_connector(&initial_details).await
+        } else {
+            cloud.ensure_connect_connector(&initial_details).await
+        };
         let identity = match identity_result {
             Ok(identity) => identity,
             Err(error) => {

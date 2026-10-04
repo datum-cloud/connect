@@ -214,6 +214,23 @@ impl CloudConnector {
         &self,
         details: &ConnectionDetails,
     ) -> Result<PeerIdentity> {
+        self.connect_connector(details, true).await
+    }
+
+    /// Refresh an enrolled Connector without recreating it if an administrator
+    /// deleted it. This keeps deletion an immediate revocation boundary.
+    pub async fn refresh_connect_connector(
+        &self,
+        details: &ConnectionDetails,
+    ) -> Result<PeerIdentity> {
+        self.connect_connector(details, false).await
+    }
+
+    async fn connect_connector(
+        &self,
+        details: &ConnectionDetails,
+        allow_create: bool,
+    ) -> Result<PeerIdentity> {
         let existing = self.connect_get("connectors", &self.name).await?;
         let connector = if let Some(value) = existing {
             if value.pointer("/spec/publicKey").and_then(Value::as_str)
@@ -223,6 +240,9 @@ impl CloudConnector {
             }
             value
         } else {
+            if !allow_create {
+                return Err(Error::Api(404));
+            }
             let classes_url = format!("{}/apis/{CONNECT_GROUP}/connectorclasses", self.base);
             let classes = self
                 .request(Method::GET, &classes_url, None)
