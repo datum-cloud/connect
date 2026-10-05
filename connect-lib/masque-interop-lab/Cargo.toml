@@ -1,0 +1,30 @@
+[package]
+name = "connect-masque-edge"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "masque-interop-lab"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+bytes = { workspace = true }
+connect-transport = { path = "../transport" }
+h3 = { workspace = true }
+h3-datagram = { workspace = true }
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
+http = { workspace = true }
+iroh = { workspace = true }
+quinn = { version = "0.11.7", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

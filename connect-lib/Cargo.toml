@@ -1,5 +1,5 @@
 [workspace]
-members = ["lib", "bin", "transport", "daemon", "ip-adapter", "network-helper"]
+members = ["lib", "bin", "transport", "daemon", "ip-adapter", "network-helper", "masque-interop-lab"]
 resolver = "2"
 
 [workspace.package]
@@ -48,3 +48,4 @@ iroh-proxy-utils = "0.3"
 
 [patch.crates-io]
 h3 = { path = "transport/vendor/h3" }
+h3-datagram = { path = "transport/vendor/h3-datagram" }

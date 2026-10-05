@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive", "env"] }
 connect-lib = { path = "../lib" }
 connect-transport = { path = "../transport", features = ["otel"] }
 connect-ip-adapter = { path = "../ip-adapter" }
+connect-masque-edge = { path = "../masque-interop-lab" }
 fs2 = { workspace = true }
 iroh = { workspace = true }
 opentelemetry = { workspace = true }

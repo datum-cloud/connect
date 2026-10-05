@@ -1,5 +1,9 @@
 # Run the local CONNECT-IP prototype
 
+For the opt-in production HTTP/3 CONNECT-UDP listener, certificate provisioning,
+static routing, and its fail-closed authorization boundary, see
+[`../../docs/masque-interoperability.md`](../../docs/masque-interoperability.md#run-the-production-listener).
+
 ## Export OpenTelemetry traces
 
 The daemon and gateway export OpenTelemetry traces only when you configure an
@@ -28,6 +32,10 @@ managed VPC access, run `datumctl connect join NETWORK` against a deployed
 `ConnectGateway`; see the [controller guide](../../connect-controller/README.md).
 The static `--local-ip-config` example below does not create a
 `ConnectNetworkBinding`.
+
+You can attach an enrolled Connector to an explicitly approved IPv4 or IPv6 network
+using native Linux, macOS, or Windows adapters. This does not create a production NetworkBinding
+or enable VPC attachment against an unmodified deployed gateway.
 
 Use a disposable test host for privileged adapter validation. The Linux container
 lab remains the default isolated test. Native macOS and Windows runs create a

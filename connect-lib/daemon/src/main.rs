@@ -52,6 +52,10 @@ struct Args {
     #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
     relay_urls: Option<String>,
 
+    /// Private JSON configuration for the opt-in standards-facing MASQUE listener.
+    #[arg(long, env = "DATUM_CONNECT_MASQUE_CONFIG")]
+    masque_config: Option<PathBuf>,
+
     /// Run under the Windows Service Control Manager.
     #[cfg(windows)]
     #[arg(long, hide = true)]
@@ -99,6 +103,7 @@ async fn run(
 ) -> Result<(), ApiError> {
     let store = Store::open(&args.repo).await?;
     auth::initialize_setup_token(&store, &args.repo).await?;
+    let shutdown = external_shutdown.unwrap_or_default();
 
     let mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
     let local_ip = match args.local_ip_config {
@@ -135,13 +140,18 @@ async fn run(
     let address = listener
         .local_addr()
         .map_err(|error| ApiError::internal(format!("reading API address: {error}")))?;
+    let masque_runtime = match args.masque_config.as_deref() {
+        Some(path) => {
+            Some(datum_connect_daemon::masque::Runtime::start(path, shutdown.child_token()).await?)
+        }
+        None => None,
+    };
     tracing::info!(stage = "startup", %address, "daemon_listening");
     if let Some(on_ready) = on_ready {
         on_ready();
     }
     let reconcile_state = app_state.clone();
     let reconcile_task = tokio::spawn(async move { api::reconcile_all(&reconcile_state).await });
-    let shutdown = external_shutdown.unwrap_or_default();
     #[cfg(windows)]
     let install_console_signal = !args.windows_service;
     #[cfg(not(windows))]
@@ -175,8 +185,14 @@ async fn run(
             None
         }
     };
+    // Also stop auxiliary listeners when the loopback server exits on error,
+    // not only when an external shutdown signal initiated the sequence.
+    shutdown.cancel();
     reconcile_task.abort();
     let _ = reconcile_task.await;
+    if let Some(runtime) = masque_runtime {
+        runtime.shutdown().await;
+    }
     if tokio::time::timeout(
         std::time::Duration::from_secs(10),
         app_state.control.shutdown(),
