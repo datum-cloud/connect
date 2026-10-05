@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 #[derive(Default)]
 struct MockControl {
     up_calls: AtomicUsize,
+    resume_failures: AtomicUsize,
     service_calls: AtomicUsize,
     fail_service: AtomicBool,
     fail_dial: AtomicBool,
@@ -63,6 +64,19 @@ impl Control for MockControl {
         expected: &ConnectorState,
     ) -> Result<ConnectorState, ApiError> {
         self.up_calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .resume_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "simulated transient relay failure",
+            )
+            .with_code("relay_unavailable"));
+        }
         Ok(ConnectorState {
             name: format!("connect-{project}"),
             uid: expected.uid.clone(),
@@ -1282,6 +1296,113 @@ async fn restart_reconciles_only_desired_active_intent() {
     let network = &state.projects["alpha"].managed_networks["vpc"];
     assert!(network.running);
     assert_eq!(network.state, "connected");
+}
+
+#[tokio::test]
+async fn startup_supervisor_retries_failed_project_resume_and_restores_network_intent() {
+    let repo = tempfile::tempdir().unwrap();
+    let store = Store::open(repo.path()).await.unwrap();
+    store
+        .transact(|root| {
+            let project = root.projects.entry("alpha".into()).or_default();
+            project.desired_up = true;
+            project.enrolled = true;
+            project.connector = Some(ConnectorState {
+                name: "connect-alpha".into(),
+                uid: "uid-1".into(),
+                public_key: "key-1".into(),
+            });
+            project.credentials_file = Some("/private/credentials.json".into());
+            project.managed_networks.insert(
+                "vpc".into(),
+                ManagedNetworkState {
+                    network: "vpc".into(),
+                    desired_attached: true,
+                    running: true,
+                    state: "connected".into(),
+                    last_error: None,
+                    last_error_stage: None,
+                    last_actor: "setup".into(),
+                },
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let control = Arc::new(MockControl::default());
+    control.resume_failures.store(2, Ordering::SeqCst);
+    let state = AppState {
+        store,
+        control: control.clone(),
+        default_credentials_file: None,
+        mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        api::reconcile_with_retry(&state, shutdown),
+    )
+    .await
+    .expect("resume backoff should recover after two transient failures");
+
+    assert_eq!(control.up_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(control.network_calls.load(Ordering::SeqCst), 1);
+    let snapshot = state.store.snapshot().await;
+    let project = &snapshot.projects["alpha"];
+    assert!(project.running);
+    assert!(project.last_error.is_none());
+    assert!(project.managed_networks["vpc"].running);
+    assert_eq!(project.managed_networks["vpc"].state, "connected");
+}
+
+#[tokio::test]
+async fn startup_supervisor_backoff_is_cancellable_and_does_not_spin() {
+    let repo = tempfile::tempdir().unwrap();
+    let store = Store::open(repo.path()).await.unwrap();
+    store
+        .transact(|root| {
+            let project = root.projects.entry("alpha".into()).or_default();
+            project.desired_up = true;
+            project.enrolled = true;
+            project.connector = Some(ConnectorState {
+                name: "connect-alpha".into(),
+                uid: "uid-1".into(),
+                public_key: "key-1".into(),
+            });
+            project.credentials_file = Some("/private/credentials.json".into());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let control = Arc::new(MockControl::default());
+    control.resume_failures.store(usize::MAX, Ordering::SeqCst);
+    let state = AppState {
+        store,
+        control: control.clone(),
+        default_credentials_file: None,
+        mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn({
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        async move { api::reconcile_with_retry(&state, shutdown).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while control.up_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor should make an initial resume attempt");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(control.up_calls.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("shutdown should interrupt retry backoff")
+        .unwrap();
 }
 
 #[tokio::test]

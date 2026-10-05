@@ -151,7 +151,10 @@ async fn run(
         on_ready();
     }
     let reconcile_state = app_state.clone();
-    let reconcile_task = tokio::spawn(async move { api::reconcile_all(&reconcile_state).await });
+    let reconcile_shutdown = shutdown.child_token();
+    let reconcile_task = tokio::spawn(async move {
+        api::reconcile_with_retry(&reconcile_state, reconcile_shutdown).await
+    });
     #[cfg(windows)]
     let install_console_signal = !args.windows_service;
     #[cfg(not(windows))]
