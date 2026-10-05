@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"net/url"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -377,7 +378,7 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	if err := c.List(ctx, bindings, client.InNamespace(gateway.Namespace)); err != nil {
 		return err
 	}
-	grants := make([]interface{}, 0, len(bindings.Items))
+	grantsByPeer := make(map[string]map[string]interface{}, len(bindings.Items))
 	for i := range bindings.Items {
 		binding := &bindings.Items[i]
 		if binding.Spec.GatewayRef != gateway.Name || binding.DeletionTimestamp != nil {
@@ -390,9 +391,18 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 		if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
 			continue
 		}
-		clientAddress, peerAddress, _ := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, strings.ToLower(connector.Spec.PublicKey), strings.ToLower(endpointID))
-		grant := map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": strings.ToLower(connector.Spec.PublicKey), "client_address": clientAddress + "/128", "gateway_address": peerAddress + "/128", "routes": gateway.Spec.Routes, "interface_name": gatewayInterfaceName(project, gateway.Spec.NetworkRef, endpointID), "mtu": 1280}
-		grants = append(grants, grant)
+		peer := strings.ToLower(connector.Spec.PublicKey)
+		clientAddress, peerAddress, interfaceName := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, peer, strings.ToLower(endpointID))
+		grantsByPeer[peer] = map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": peer, "client_address": clientAddress + "/128", "gateway_address": peerAddress + "/128", "routes": gateway.Spec.Routes, "interface_name": interfaceName, "mtu": 1280}
+	}
+	peers := make([]string, 0, len(grantsByPeer))
+	for peer := range grantsByPeer {
+		peers = append(peers, peer)
+	}
+	sort.Strings(peers)
+	grants := make([]interface{}, 0, len(peers))
+	for _, peer := range peers {
+		grants = append(grants, grantsByPeer[peer])
 	}
 	grantJSON, err := json.Marshal(map[string]interface{}{"grants": grants})
 	if err != nil {
@@ -544,11 +554,6 @@ func gatewayConfigIncludesConnector(ctx context.Context, c client.Client, gatewa
 	return false
 }
 
-func gatewayInterfaceName(project, network, gatewayKey string) string {
-	digest := gatewayDigest(project, network, gatewayKey)
-	return fmt.Sprintf("dc%x", digest[:5])
-}
-
 func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, secretName string) map[string]interface{} {
 	instanceType := spec.InstanceType
 	if instanceType == "" {
@@ -605,7 +610,10 @@ func gatewayPeerAddresses(project, network, clientKey, gatewayKey string) (strin
 		address[0] = 0xfd
 		return netip.AddrFrom16(address).String()
 	}
-	label := gatewayDigest(project, network, gatewayKey)
+	// The gateway creates one TUN per active peer, so its interface label must
+	// identify the complete attachment rather than only the shared gateway.
+	// Sorting the keys above makes this derivation symmetric and stable.
+	label := gatewayDigest(project, network, a, b, "interface")
 	return address(clientKey), address(gatewayKey), fmt.Sprintf("dc%x", label[:5])
 }
 
