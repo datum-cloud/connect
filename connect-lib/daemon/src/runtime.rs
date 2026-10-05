@@ -1052,9 +1052,9 @@ impl Control for RealControl {
                     "ConnectNetworkBinding must assign IPv6 /128 host addresses",
                 ));
             }
-            let parsed_routes = binding.parsed_routes()?;
             #[cfg(unix)]
             let helper_validation: Result<Option<PathBuf>, ApiError> = async {
+                let parsed_routes = binding.parsed_routes()?;
                 let helper_socket = crate::networking::helper_socket()?;
                 let expected = connect_ip_adapter::helper::Approval {
                     interface_name: binding.interface_name.clone(),
@@ -1211,10 +1211,10 @@ impl Control for RealControl {
                 .await
                 .map_err(cloud_error)?;
         }
-        if let Some(config) = &self.local_ip {
-            if !gateway_left {
-                config.approval(project, network)?;
-            }
+        if let Some(config) = &self.local_ip
+            && !gateway_left
+        {
+            config.approval(project, network)?;
         }
         Ok(serde_json::json!({
             "network":network,
