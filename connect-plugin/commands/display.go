@@ -53,6 +53,8 @@ type networkDisplay struct {
 	Routes                     []string `json:"routes"`
 	AdvertiseRoutes            []string `json:"advertise_routes"`
 	Running                    bool     `json:"running"`
+	Persistent                 bool     `json:"persistent"`
+	DesiredAttached            bool     `json:"desired_attached"`
 	LastError                  string   `json:"last_error"`
 	LastConnectError           string   `json:"last_connect_error"`
 	ACLDrops                   uint64   `json:"acl_drops"`
@@ -229,6 +231,10 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			switch {
 			case network.State == "reconnecting" && network.Running:
 				state = "reconnecting"
+			case network.State == "reconnecting":
+				state = "waiting to reconnect"
+			case network.State == "approval_required":
+				state = "administrator approval required"
 			case !network.Running && network.Mode == "gateway" && network.State == "inactive":
 				state = "approved, not attached locally"
 			case !network.Running && network.LastError != "":
@@ -242,7 +248,11 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			if !network.Running {
 				interfaceName = "no active interface"
 			}
-			fmt.Fprintf(&out, "Network %s: %s, %s on %s (ephemeral native preview).\n", network.Network, state, network.Address, interfaceName)
+			lifetime := "ephemeral native preview"
+			if network.Persistent {
+				lifetime = "persistent managed attachment"
+			}
+			fmt.Fprintf(&out, "Network %s: %s, %s on %s (%s).\n", network.Network, state, network.Address, interfaceName, lifetime)
 			fmt.Fprintf(&out, "  Routes: %s\n", strings.Join(network.Routes, ", "))
 			if len(network.AdvertiseRoutes) > 0 {
 				fmt.Fprintf(&out, "  Approved subnet access for peer: %s\n  Forwarding, firewall, and return routing are managed separately on this device.\n", strings.Join(network.AdvertiseRoutes, ", "))

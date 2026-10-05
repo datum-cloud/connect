@@ -19,8 +19,8 @@ use crate::{
     control::Control,
     error::ApiError,
     model::{
-        AuditEntry, AuthenticationState, DaemonState, DialState, ProjectState, Protocol, Role,
-        ServiceState, TokenRecord, append_audit,
+        AuditEntry, AuthenticationState, DaemonState, DialState, ManagedNetworkState, ProjectState,
+        Protocol, Role, ServiceState, TokenRecord, append_audit,
     },
     store::Store,
 };
@@ -136,25 +136,67 @@ async fn status(
         project.connector = None;
         project.authentication = None;
     }
-    let diagnostics =
-        if actor.role != Role::Operate || actor.scopes.iter().any(|scope| scope == "project") {
-            state.control.diagnostics(&query.project).await
-        } else {
-            Value::Null
-        };
-    let networks =
-        if actor.role != Role::Operate || actor.scopes.iter().any(|scope| scope == "project") {
-            state.control.networks(&query.project).await
-        } else {
-            json!([])
-        };
+    let project_scope =
+        actor.role != Role::Operate || actor.scopes.iter().any(|scope| scope == "project");
+    let diagnostics = if project_scope {
+        state.control.diagnostics(&query.project).await
+    } else {
+        Value::Null
+    };
+    let networks = if project_scope {
+        state.control.networks(&query.project).await
+    } else {
+        json!([])
+    };
+    let managed_networks = if project_scope {
+        project.managed_networks.clone()
+    } else {
+        Default::default()
+    };
     let mut result = ProjectStatus::from_state(query.project, project);
     result.transport = diagnostics;
-    result.networks = networks;
-    if actor.role != Role::Operate || actor.scopes.iter().any(|scope| scope == "project") {
+    result.networks = merge_managed_network_intent(networks, &managed_networks);
+    if project_scope {
         result.networking = networking_status(&snapshot, &result.project).await;
     }
     Ok(Json(result))
+}
+
+fn merge_managed_network_intent(
+    observed: Value,
+    desired: &std::collections::BTreeMap<String, ManagedNetworkState>,
+) -> Value {
+    let mut values = observed.as_array().cloned().unwrap_or_default();
+    for intent in desired.values() {
+        if let Some(value) = values.iter_mut().find(|value| {
+            value.get("network").and_then(Value::as_str) == Some(intent.network.as_str())
+        }) {
+            value["desired_attached"] = json!(intent.desired_attached);
+            value["persistent"] = json!(true);
+            value["ephemeral"] = json!(false);
+            if !intent.running {
+                value["running"] = json!(false);
+                value["connected"] = json!(false);
+                value["state"] = json!(intent.state);
+                value["last_error"] = json!(intent.last_error);
+                value["last_error_stage"] = json!(intent.last_error_stage);
+            }
+        } else {
+            values.push(json!({
+                "network": intent.network,
+                "mode": "gateway",
+                "desired_attached": intent.desired_attached,
+                "persistent": true,
+                "ephemeral": false,
+                "running": intent.running,
+                "connected": false,
+                "state": intent.state,
+                "last_error": intent.last_error,
+                "last_error_stage": intent.last_error_stage,
+            }));
+        }
+    }
+    json!(values)
 }
 
 #[derive(Debug, Serialize)]
@@ -457,6 +499,10 @@ async fn down(
             for dial in project.dials.values_mut() {
                 dial.running = false;
                 dial.local_port = None;
+            }
+            for network in project.managed_networks.values_mut() {
+                network.running = false;
+                network.state = "inactive".into();
             }
             append_audit(
                 root,
@@ -1231,9 +1277,29 @@ async fn join_network(
         .control
         .join_network(&query.project, &request.network)
         .await?;
+    let managed = result
+        .get("managed_gateway")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if let Err(error) = state
         .store
         .transact(|root| {
+            if managed {
+                require_project_mut(root, &query.project)?
+                    .managed_networks
+                    .insert(
+                        request.network.clone(),
+                        ManagedNetworkState {
+                            network: request.network.clone(),
+                            desired_attached: true,
+                            running: true,
+                            state: "connected".into(),
+                            last_error: None,
+                            last_error_stage: None,
+                            last_actor: actor.label(),
+                        },
+                    );
+            }
             append_audit(
                 root,
                 audit_entry(
@@ -1267,10 +1333,31 @@ async fn leave_network(
     connect_lib::TunnelId::try_from(network.as_str())
         .map_err(|_| ApiError::bad_request("Invalid network name"))?;
     let _mutation_guard = state.mutation_lock.lock().await;
-    let result = state
+    let persistent_intent = state
+        .store
+        .snapshot()
+        .await
+        .projects
+        .get(&query.project)
+        .is_some_and(|project| project.managed_networks.contains_key(&network));
+    // Persist revocation before touching the live/control-plane resources so a
+    // failed delete can never cause a restart to silently reattach.
+    state
+        .store
+        .transact(|root| {
+            if let Some(project) = root.projects.get_mut(&query.project) {
+                project.managed_networks.remove(&network);
+            }
+            Ok(())
+        })
+        .await?;
+    let mut result = state
         .control
         .leave_network(&query.project, &network)
         .await?;
+    if persistent_intent {
+        result["persistent_intent_cleared"] = json!(true);
+    }
     state
         .store
         .transact(|root| {
@@ -1431,6 +1518,12 @@ pub async fn reconcile_all(state: &AppState) {
                     dial.running = false;
                     dial.local_port = None;
                 }
+                for network in project.managed_networks.values_mut() {
+                    network.running = false;
+                    network.state = "reconnecting".into();
+                    network.last_error = None;
+                    network.last_error_stage = None;
+                }
             }
             Ok(())
         })
@@ -1547,6 +1640,54 @@ async fn reconcile_project(state: &AppState, project: &str) {
                 let key = dial.local_port.unwrap_or(dial.bind);
                 let message = error.message;
                 let _ = record_dial_error(state, project, key, "restart_dial", &message).await;
+            }
+        }
+    }
+    for network in desired
+        .managed_networks
+        .values()
+        .filter(|network| network.desired_attached)
+    {
+        match state.control.join_network(project, &network.network).await {
+            Ok(_) => {
+                let _ = state
+                    .store
+                    .transact(|root| {
+                        if let Some(current) = require_project_mut(root, project)?
+                            .managed_networks
+                            .get_mut(&network.network)
+                        {
+                            current.running = true;
+                            current.state = "connected".into();
+                            current.last_error = None;
+                            current.last_error_stage = None;
+                        }
+                        Ok(())
+                    })
+                    .await;
+            }
+            Err(error) => {
+                let approval_required = error.code.as_deref() == Some("network_setup_required")
+                    || error.message.to_ascii_lowercase().contains("approv");
+                let _ = state
+                    .store
+                    .transact(|root| {
+                        if let Some(current) = require_project_mut(root, project)?
+                            .managed_networks
+                            .get_mut(&network.network)
+                        {
+                            current.running = false;
+                            current.state = if approval_required {
+                                "approval_required".into()
+                            } else {
+                                "reconnecting".into()
+                            };
+                            current.last_error = Some(error.message.clone());
+                            current.last_error_stage = Some("restart_network".into());
+                        }
+                        Ok(())
+                    })
+                    .await;
             }
         }
     }

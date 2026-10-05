@@ -64,7 +64,7 @@ func TestHelpExplainsScopeAndPreviewLimitations(t *testing.T) {
 		{newDial(&options{}), []string{"loopback-only", "Traffic connects when your application", "hangup LOCALPORT"}},
 		{newUp(&options{}), upWants},
 		{newPing(&options{}), []string{"CONNECTOR", "ICMP ping are not supported"}},
-		{newJoin(&options{}), []string{"--peer", "Administrator approval", "explicit rejoin", "Scripts never prompt or elevate"}},
+		{newJoin(&options{}), []string{"--peer", "Administrator approval", "reconnect when the daemon", "fail closed", "Scripts never prompt or elevate"}},
 		{newLeave(&options{}), []string{"--local-ip-config", "serve and dial", "ephemeral"}},
 	} {
 		t.Run(tt.cmd.Name(), func(t *testing.T) {

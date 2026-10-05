@@ -130,11 +130,16 @@ datumctl connect status --project demo
 datumctl connect leave local-vpc --project demo
 ```
 
-Successful `join` output identifies the assigned address and interface, lists
-the routes, marks the attachment as an ephemeral native prototype, and provides
-the matching `leave` command. Repeating `join` for a running attachment is
-idempotent. Repeating `leave` is safe. Use `status --output json` for packet and
-drop counters and the last attachment error.
+Successful managed `join` output identifies the assigned address and interface,
+lists the routes, persists desired attachment intent, and provides the matching
+`leave` command. The daemon recreates managed CONNECT-IP attachments when it or
+the project resumes. Repeating `join` for a running attachment is idempotent.
+`leave` clears the intent, closes the local data path, and removes the
+ConnectNetworkBinding; repeating it is safe. Direct peer and static
+`--local-ip-config` attachments remain ephemeral. The privileged helper always
+checks the exact address and routes: missing or stale approval reports
+`approval_required` and no interface is created. Use `status --output json` for
+packet and drop counters and the last attachment error.
 `packets_sent` and `packets_received` count local adapter delivery. The nested
 `transport` object reports wire-layer packet counters, policy drops, and protocol
 errors. Gateway attachments mirror transport `packets_dropped` and

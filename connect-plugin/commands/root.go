@@ -377,7 +377,7 @@ func newHangup(opts *options) *cobra.Command {
 func newLeave(opts *options) *cobra.Command { return networkCommand(opts, "leave", http.MethodDelete) }
 
 func networkCommand(opts *options, name, method string) *cobra.Command {
-	return &cobra.Command{Use: name + " NETWORK", Short: strings.Title(name) + " a project VPC network", Long: "Join selects the ready ConnectGateway for NETWORK and creates this Connector's ConnectNetworkBinding. The daemon asks before installing the local interface and approved routes. Leave deletes this Connector's binding; the local interface is ephemeral and disappears on daemon restart.\n\nWhen no managed gateway exists, join can use the direct Connector preview with\n--peer. Legacy --local-ip-config setups remain supported. Use serve and dial\nfor individual TCP or UDP services.", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	return &cobra.Command{Use: name + " NETWORK", Short: strings.Title(name) + " a project VPC network", Long: "Join selects the ready ConnectGateway for NETWORK and creates this Connector's ConnectNetworkBinding. The daemon asks before installing the local interface and exact approved routes. Successful managed VPC joins persist and reconnect when the daemon or project resumes. Leave clears that intent and deletes the binding.\n\nWhen no managed gateway exists, join can use the direct Connector preview with\n--peer. Direct and legacy --local-ip-config attachments remain ephemeral. Use serve and dial\nfor individual TCP or UDP services.", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		p, err := project(cmd)
 		if err != nil {
 			return err

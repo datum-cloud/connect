@@ -274,6 +274,12 @@ impl RealControl {
                         dial.last_error_stage = Some(stage.to_owned());
                         dial.last_error = Some(error.to_owned());
                     }
+                    for network in current.managed_networks.values_mut() {
+                        network.running = false;
+                        network.state = "reconnecting".into();
+                        network.last_error_stage = Some(stage.to_owned());
+                        network.last_error = Some(error.to_owned());
+                    }
                 }
                 Ok(())
             })
@@ -369,6 +375,40 @@ impl RealControl {
                                     }).await; }
                                     Err(error) => { control.fail_closed(&project, &runtime, "dial_authorization_refresh", &error.message).await; break; }
                                 }
+                            }
+                            // Managed VPC intent is durable. Re-run the
+                            // idempotent join during the normal authorization
+                            // refresh so startup-time gateway outages and a
+                            // newly installed exact helper approval recover
+                            // without another CLI command.
+                            let desired_networks: Vec<_> = control.store.snapshot().await.projects
+                                .get(&project).into_iter().flat_map(|state| state.managed_networks.values())
+                                .filter(|network| network.desired_attached).map(|network| network.network.clone()).collect();
+                            for network in desired_networks {
+                                let observed = control.join_network(&project, &network).await;
+                                let _ = control.store.transact(|root| {
+                                    if let Some(current) = root.projects.get_mut(&project).and_then(|state| state.managed_networks.get_mut(&network)) {
+                                        match &observed {
+                                            Ok(_) => {
+                                                current.running = true;
+                                                current.state = "connected".into();
+                                                current.last_error = None;
+                                                current.last_error_stage = None;
+                                            }
+                                            Err(error) => {
+                                                current.running = false;
+                                                current.state = if error.code.as_deref() == Some("network_setup_required") || error.message.to_ascii_lowercase().contains("approv") {
+                                                    "approval_required".into()
+                                                } else {
+                                                    "reconnecting".into()
+                                                };
+                                                current.last_error = Some(error.message.clone());
+                                                current.last_error_stage = Some("network_reconcile".into());
+                                            }
+                                        }
+                                    }
+                                    Ok(())
+                                }).await;
                             }
                         }
                     }
@@ -1012,19 +1052,68 @@ impl Control for RealControl {
                     "ConnectNetworkBinding must assign IPv6 /128 host addresses",
                 ));
             }
-            binding.parsed_routes()?;
+            let parsed_routes = binding.parsed_routes()?;
+            #[cfg(unix)]
+            let helper_validation: Result<Option<PathBuf>, ApiError> = async {
+                let helper_socket = crate::networking::helper_socket()?;
+                let expected = connect_ip_adapter::helper::Approval {
+                    interface_name: binding.interface_name.clone(),
+                    assigned_address: assigned,
+                    peer_address: peer,
+                    mtu: binding.mtu,
+                    routes: parsed_routes.clone(),
+                    advertise_routes: vec![],
+                };
+                let helper = connect_ip_adapter::helper::inspect(&helper_socket)
+                    .await
+                    .map_err(|error| {
+                        ApiError::new(
+                            axum::http::StatusCode::CONFLICT,
+                            format!("Administrator approval is required for this VPC attachment: {error}"),
+                        )
+                        .with_code("network_setup_required")
+                    })?;
+                if !helper.approvals.contains(&expected) {
+                    return Err(ApiError::new(
+                        axum::http::StatusCode::CONFLICT,
+                        "Administrator approval is required for the exact VPC address and routes; no interface was created",
+                    )
+                    .with_code("network_setup_required"));
+                }
+                Ok(Some(helper_socket))
+            }
+            .await;
+            #[cfg(not(unix))]
+            let helper_validation: Result<Option<PathBuf>, ApiError> = Ok(None);
             let mut networks = runtime.networks.lock().await;
             require_network_authorization(&runtime.authorized, &runtime.cancel)?;
+            let helper_socket = match helper_validation {
+                Ok(socket) => socket,
+                Err(error) => {
+                    // Approval is continuously authoritative. If it is removed
+                    // or the controller proposes new routes, close any old
+                    // attachment before reporting that interactive approval is
+                    // required.
+                    if let Some(previous) = networks.remove(network) {
+                        previous.stop().await;
+                    }
+                    return Err(error);
+                }
+            };
             if let Some(existing) = networks
                 .get(network)
                 .filter(|attachment| !attachment.is_finished())
             {
-                return Ok(existing.status().await);
+                let mut result = existing.status().await;
+                result["managed_gateway"] = serde_json::json!(true);
+                result["persistent"] = serde_json::json!(true);
+                result["ephemeral"] = serde_json::json!(false);
+                result["desired_attached"] = serde_json::json!(true);
+                return Ok(result);
             }
             if let Some(previous) = networks.remove(network) {
                 previous.stop().await;
             }
-            let helper_socket = crate::networking::helper_socket().ok();
             let attachment = crate::local_ip::NetworkAttachment::Gateway(
                 crate::local_ip::join(
                     binding,
@@ -1043,6 +1132,10 @@ impl Control for RealControl {
             let mut result = attachment.status().await;
             result["gateway"] = serde_json::json!(endpoint_id);
             result["routes"] = serde_json::json!(routes);
+            result["managed_gateway"] = serde_json::json!(true);
+            result["persistent"] = serde_json::json!(true);
+            result["ephemeral"] = serde_json::json!(false);
+            result["desired_attached"] = serde_json::json!(true);
             networks.insert(network.to_owned(), attachment);
             return Ok(result);
         }
@@ -1102,8 +1195,16 @@ impl Control for RealControl {
         project: &str,
         network: &str,
     ) -> Result<serde_json::Value, ApiError> {
+        let runtime = self.projects.lock().await.get(project).cloned();
+        // Remove the local data path first. A control-plane deletion failure
+        // must not leave traffic flowing after the user requested leave.
+        if let Some(runtime) = &runtime
+            && let Some(attachment) = runtime.networks.lock().await.remove(network)
+        {
+            attachment.stop().await;
+        }
         let mut gateway_left = false;
-        if let Some(runtime) = self.projects.lock().await.get(project).cloned() {
+        if let Some(runtime) = &runtime {
             gateway_left = runtime
                 .cloud
                 .leave_gateway_network(network)
@@ -1114,27 +1215,12 @@ impl Control for RealControl {
             if !gateway_left {
                 config.approval(project, network)?;
             }
-        } else if !self
-            .store
-            .snapshot()
-            .await
-            .projects
-            .get(project)
-            .is_some_and(|p| p.peer_networks.contains_key(network))
-            && !gateway_left
-        {
-            return Err(ApiError::not_found(
-                "No saved peer attachment with this name",
-            ));
         }
-        if let Some(runtime) = self.projects.lock().await.get(project).cloned()
-            && let Some(attachment) = runtime.networks.lock().await.remove(network)
-        {
-            attachment.stop().await;
-        }
-        Ok(
-            serde_json::json!({"network":network,"left":true,"ephemeral":true,"control_plane_binding_removed":gateway_left}),
-        )
+        Ok(serde_json::json!({
+            "network":network,
+            "left":true,
+            "control_plane_binding_removed":gateway_left
+        }))
     }
 
     async fn networks(&self, project: &str) -> serde_json::Value {

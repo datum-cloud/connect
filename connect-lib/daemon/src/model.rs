@@ -31,6 +31,11 @@ pub struct ProjectState {
     /// Saved peer approvals, not an instruction to reconnect after restart.
     #[serde(default)]
     pub peer_networks: BTreeMap<String, crate::peer_ip::Binding>,
+    /// Controller-managed VPC attachments that should be recreated whenever
+    /// this project is running. The privileged helper remains the authority
+    /// for the exact address and routes; this intent never expands approval.
+    #[serde(default)]
+    pub managed_networks: BTreeMap<String, ManagedNetworkState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
     pub desired_up: bool,
@@ -52,6 +57,25 @@ pub struct ProjectState {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_stage: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedNetworkState {
+    pub network: String,
+    pub desired_attached: bool,
+    #[serde(default)]
+    pub running: bool,
+    #[serde(default = "inactive_network_state")]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_stage: Option<String>,
+    pub last_actor: String,
+}
+
+fn inactive_network_state() -> String {
+    "inactive".into()
 }
 
 /// Non-secret authentication provenance for status and restart diagnostics.

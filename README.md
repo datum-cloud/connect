@@ -152,11 +152,12 @@ datumctl connect join friend --peer YOUR_CONNECTOR --allow-tcp 8080 --allow-ping
 The daemon pins each peer's key, derives matching IPv6 host addresses, and saves
 the explicit packet rules. Interactive `join` offers administrator-approved
 installation of the separate networking helper. Later, use `join friend` to
-reuse the saved configuration. Active attachments remain ephemeral; restarting
-does not automatically rejoin. `connect doctor` checks helper readiness without
-opening an interface. A managed VPC join uses `ConnectGateway` and
-`ConnectNetworkBinding`; first-time local route installation still requires
-interactive administrator approval.
+reuse the saved configuration. Direct peer attachments remain ephemeral. A
+successful managed VPC join persists attachment intent and automatically
+recreates its CONNECT-IP session when the daemon or project resumes. The helper
+still enforces the exact administrator-approved address and routes; changed or
+missing approval fails closed and requires an interactive join. `connect doctor`
+checks helper readiness without opening an interface.
 `ping`
 currently probes a Connector, not an arbitrary VPC address. Native adapters use
 Linux TUN, macOS utun, and Windows Wintun. On macOS/Linux, the optional

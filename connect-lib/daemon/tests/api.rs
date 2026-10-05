@@ -13,7 +13,7 @@ use datum_connect_daemon::{
     auth,
     control::{Control, PingResult, ServiceOutcome},
     error::ApiError,
-    model::{ConnectorState, DialState, Protocol, ServiceState},
+    model::{ConnectorState, DialState, ManagedNetworkState, Protocol, ServiceState},
     store::Store,
 };
 use serde_json::{Value, json};
@@ -24,6 +24,8 @@ struct MockControl {
     service_calls: AtomicUsize,
     fail_service: AtomicBool,
     fail_dial: AtomicBool,
+    fail_network: AtomicBool,
+    approval_required: AtomicBool,
     network_calls: AtomicUsize,
 }
 
@@ -112,7 +114,24 @@ impl Control for MockControl {
     async fn shutdown(&self) {}
     async fn join_network(&self, project: &str, network: &str) -> Result<Value, ApiError> {
         self.network_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({"project":project,"network":network,"running":true,"ephemeral":true}))
+        if self.fail_network.load(Ordering::SeqCst) {
+            let error = ApiError::new(
+                StatusCode::CONFLICT,
+                if self.approval_required.load(Ordering::SeqCst) {
+                    "administrator approval does not include the current routes"
+                } else {
+                    "gateway temporarily unavailable"
+                },
+            );
+            return Err(if self.approval_required.load(Ordering::SeqCst) {
+                error.with_code("network_setup_required")
+            } else {
+                error
+            });
+        }
+        Ok(
+            json!({"project":project,"network":network,"running":true,"managed_gateway":true,"persistent":true,"ephemeral":false}),
+        )
     }
     async fn leave_network(&self, _project: &str, network: &str) -> Result<Value, ApiError> {
         self.network_calls.fetch_add(1, Ordering::SeqCst);
@@ -370,6 +389,65 @@ async fn network_mutations_require_enrollment_and_project_operate_authority() {
     assert!(
         state["projects"]["alpha"].get("networks").is_none(),
         "local network intent must not be persisted"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn managed_network_join_persists_one_intent_and_leave_revokes_it() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control.clone()).await;
+    let token = enroll_test_project(&base, &client, repo.path()).await;
+    let url = format!("{base}/v1/networks?project=alpha");
+
+    for _ in 0..2 {
+        let response = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&json!({"network":"vpc"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let saved: Value = serde_json::from_slice(
+        &tokio::fs::read(repo.path().join("daemon/state.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        saved["projects"]["alpha"]["managed_networks"]["vpc"]["desired_attached"],
+        true
+    );
+    assert_eq!(
+        saved["projects"]["alpha"]["managed_networks"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let response = client
+        .delete(format!("{base}/v1/networks/vpc?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: Value = serde_json::from_slice(
+        &tokio::fs::read(repo.path().join("daemon/state.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        saved["projects"]["alpha"]["managed_networks"]
+            .as_object()
+            .unwrap()
+            .len(),
+        0
     );
     server.abort();
 }
@@ -1134,6 +1212,18 @@ async fn restart_reconciles_only_desired_active_intent() {
                 public_key: "key-1".into(),
             });
             project.credentials_file = Some("/private/credentials.json".into());
+            project.managed_networks.insert(
+                "vpc".into(),
+                ManagedNetworkState {
+                    network: "vpc".into(),
+                    desired_attached: true,
+                    running: true,
+                    state: "connected".into(),
+                    last_error: None,
+                    last_error_stage: None,
+                    last_actor: "setup".into(),
+                },
+            );
             project.services.insert(
                 "active".into(),
                 ServiceState {
@@ -1187,6 +1277,76 @@ async fn restart_reconciles_only_desired_active_intent() {
     api::reconcile_all(&restarted).await;
     assert_eq!(control.up_calls.load(Ordering::SeqCst), 1);
     assert_eq!(control.service_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(control.network_calls.load(Ordering::SeqCst), 1);
+    let state = restarted.store.snapshot().await;
+    let network = &state.projects["alpha"].managed_networks["vpc"];
+    assert!(network.running);
+    assert_eq!(network.state, "connected");
+}
+
+#[tokio::test]
+async fn restart_keeps_managed_intent_fail_closed_when_approval_is_stale() {
+    let repo = tempfile::tempdir().unwrap();
+    let store = Store::open(repo.path()).await.unwrap();
+    store
+        .transact(|root| {
+            let project = root.projects.entry("alpha".into()).or_default();
+            project.desired_up = true;
+            project.enrolled = true;
+            project.connector = Some(ConnectorState {
+                name: "connect-alpha".into(),
+                uid: "uid-1".into(),
+                public_key: "key-1".into(),
+            });
+            project.credentials_file = Some("/private/credentials.json".into());
+            project.managed_networks.insert(
+                "vpc".into(),
+                ManagedNetworkState {
+                    network: "vpc".into(),
+                    desired_attached: true,
+                    running: true,
+                    state: "connected".into(),
+                    last_error: None,
+                    last_error_stage: None,
+                    last_actor: "setup".into(),
+                },
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let control = Arc::new(MockControl::default());
+    control.fail_network.store(true, Ordering::SeqCst);
+    control.approval_required.store(true, Ordering::SeqCst);
+    let state = AppState {
+        store,
+        control: control.clone(),
+        default_credentials_file: None,
+        mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    api::reconcile_all(&state).await;
+
+    let snapshot = state.store.snapshot().await;
+    let network = &snapshot.projects["alpha"].managed_networks["vpc"];
+    assert!(network.desired_attached);
+    assert!(!network.running);
+    assert_eq!(network.state, "approval_required");
+    assert_eq!(network.last_error_stage.as_deref(), Some("restart_network"));
+    assert!(network.last_error.as_deref().unwrap().contains("approval"));
+    assert_eq!(control.network_calls.load(Ordering::SeqCst), 1);
+
+    // Installing the exact approval allows the same durable intent to recover
+    // on the next reconciliation without another join request.
+    control.fail_network.store(false, Ordering::SeqCst);
+    control.approval_required.store(false, Ordering::SeqCst);
+    api::reconcile_all(&state).await;
+    let snapshot = state.store.snapshot().await;
+    let network = &snapshot.projects["alpha"].managed_networks["vpc"];
+    assert!(network.running);
+    assert_eq!(network.state, "connected");
+    assert!(network.last_error.is_none());
+    assert_eq!(control.network_calls.load(Ordering::SeqCst), 2);
 }
 
 #[cfg(unix)]
