@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"net/url"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -377,6 +378,7 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	if err := c.List(ctx, bindings, client.InNamespace(gateway.Namespace)); err != nil {
 		return err
 	}
+	sortGatewayBindings(bindings.Items)
 	grants := make([]interface{}, 0, len(bindings.Items))
 	for i := range bindings.Items {
 		binding := &bindings.Items[i]
@@ -565,6 +567,10 @@ func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, se
 			"volumes": []interface{}{map[string]interface{}{"name": "connect-config", "configMap": map[string]interface{}{"name": configName}}, map[string]interface{}{"name": "connect-key", "secret": map[string]interface{}{"secretName": secretName, "defaultMode": int64(256)}}},
 		}},
 	}
+}
+
+func sortGatewayBindings(bindings []connectv1alpha1.ConnectNetworkBinding) {
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Name < bindings[j].Name })
 }
 
 func gatewayChildName(parent, suffix string) string {

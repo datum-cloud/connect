@@ -263,6 +263,17 @@ func TestGatewayPeerAddressDerivationIsSymmetric(t *testing.T) {
 	}
 }
 
+func TestSortGatewayBindingsMakesGrantOrderDeterministic(t *testing.T) {
+	bindings := []connectv1alpha1.ConnectNetworkBinding{
+		{ObjectMeta: metav1.ObjectMeta{Name: "connector-z"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "connector-a"}},
+	}
+	sortGatewayBindings(bindings)
+	if bindings[0].Name != "connector-a" || bindings[1].Name != "connector-z" {
+		t.Fatalf("binding order = [%s, %s], want stable alphabetical order", bindings[0].Name, bindings[1].Name)
+	}
+}
+
 func TestGatewayRejectsDefaultRoute(t *testing.T) {
 	spec := connectv1alpha1.ConnectGatewaySpec{NetworkRef: "vpc", LocationRef: "DFW", Image: "gateway:dev", Routes: []string{"::/0"}}
 	if err := validateGatewaySpec(spec); err == nil {
