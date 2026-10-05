@@ -5,12 +5,15 @@
 //! authorize that public key for every configured destination.
 
 use std::{
+    collections::HashSet,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use connect_masque_edge::{IpRoute, Ipv4RouteRange, Route, Server, ServerOptions};
+use connect_masque_edge::{
+    BearerCredential, ClientAuthentication, IpRoute, Ipv4RouteRange, Route, Server, ServerOptions,
+};
 use connect_transport::{DestinationId, Transport, TransportConfig, masque::ConnectUdpUriTemplate};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde::Deserialize;
@@ -38,6 +41,7 @@ struct Config {
     routes: Vec<RouteConfig>,
     #[serde(default)]
     ip_routes: Vec<IpRouteConfig>,
+    clients: Vec<ClientConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +81,31 @@ struct Ipv4RouteRangeConfig {
     protocol: u8,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientConfig {
+    client_id: String,
+    bearer_token_file: PathBuf,
+    #[serde(default)]
+    udp_targets: Vec<UdpTargetConfig>,
+    #[serde(default)]
+    ip_targets: Vec<IpTargetConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct UdpTargetConfig {
+    target_host: String,
+    target_port: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct IpTargetConfig {
+    target: String,
+    protocol: String,
+}
+
 pub struct Runtime {
     transport: Transport,
     task: JoinHandle<()>,
@@ -96,6 +125,7 @@ impl Runtime {
             )
             .map_err(|_| ApiError::bad_request("Invalid MASQUE CONNECT-UDP URI template"))?,
             drain_timeout: Duration::from_secs(config.drain_timeout_seconds),
+            client_authentication: config.client_authentication().await?,
         };
 
         let certificate_chain =
@@ -202,6 +232,51 @@ impl Config {
                 ));
             }
         }
+        if self.clients.is_empty() || self.clients.len() > 1024 {
+            return Err(ApiError::bad_request(
+                "MASQUE configuration requires 1 to 1024 authenticated clients",
+            ));
+        }
+        let mut client_ids = HashSet::new();
+        let mut token_files = HashSet::new();
+        for client in &self.clients {
+            if client.client_id.is_empty()
+                || client.client_id.len() > 128
+                || client.client_id.chars().any(char::is_control)
+                || !client.bearer_token_file.is_absolute()
+                || (client.udp_targets.is_empty() && client.ip_targets.is_empty())
+                || !client_ids.insert(client.client_id.clone())
+                || !token_files.insert(client.bearer_token_file.clone())
+            {
+                return Err(ApiError::bad_request(
+                    "Each MASQUE client needs a unique ID, private absolute token file, and at least one route grant",
+                ));
+            }
+            let udp_targets = client
+                .udp_targets
+                .iter()
+                .map(|target| (target.target_host.to_ascii_lowercase(), target.target_port))
+                .collect::<HashSet<_>>();
+            let ip_targets = client.ip_targets.iter().collect::<HashSet<_>>();
+            if udp_targets.len() != client.udp_targets.len()
+                || ip_targets.len() != client.ip_targets.len()
+                || client.udp_targets.iter().any(|grant| {
+                    !self.routes.iter().any(|route| {
+                        route.target_host.eq_ignore_ascii_case(&grant.target_host)
+                            && route.target_port == grant.target_port
+                    })
+                })
+                || client.ip_targets.iter().any(|grant| {
+                    !self.ip_routes.iter().any(|route| {
+                        route.target == grant.target && route.protocol == grant.protocol
+                    })
+                })
+            {
+                return Err(ApiError::bad_request(
+                    "MASQUE client grants must be unique exact configured routes",
+                ));
+            }
+        }
         for route in &self.routes {
             if route.target_host.is_empty()
                 || route.target_host.len() > 255
@@ -253,6 +328,38 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    async fn client_authentication(&self) -> Result<ClientAuthentication, ApiError> {
+        let mut credentials = Vec::with_capacity(self.clients.len());
+        for client in &self.clients {
+            let mut token = read_private(&client.bearer_token_file, "MASQUE bearer token").await?;
+            while matches!(token.last(), Some(b'\n' | b'\r')) {
+                token.pop();
+            }
+            let credential = BearerCredential::new(
+                client.client_id.clone(),
+                &token,
+                client
+                    .udp_targets
+                    .iter()
+                    .map(|target| (target.target_host.clone(), target.target_port))
+                    .collect(),
+                client
+                    .ip_targets
+                    .iter()
+                    .map(|target| (target.target.clone(), target.protocol.clone()))
+                    .collect(),
+            );
+            token.fill(0);
+            let credential = credential.map_err(|_| {
+                ApiError::bad_request("Invalid MASQUE client authentication configuration")
+            })?;
+            credentials.push(credential);
+        }
+        ClientAuthentication::bearer(credentials).map_err(|_| {
+            ApiError::bad_request("Invalid MASQUE client authentication configuration")
+        })
     }
 }
 
@@ -392,6 +499,30 @@ fn read_file_blocking(path: &Path, label: &str, private: bool) -> Result<Vec<u8>
 mod tests {
     use super::*;
 
+    fn udp_client(target_host: &str, target_port: u16) -> ClientConfig {
+        ClientConfig {
+            client_id: "staging-client".into(),
+            bearer_token_file: "/tmp/masque-client.token".into(),
+            udp_targets: vec![UdpTargetConfig {
+                target_host: target_host.into(),
+                target_port,
+            }],
+            ip_targets: vec![],
+        }
+    }
+
+    fn ip_client(target: &str, protocol: &str) -> ClientConfig {
+        ClientConfig {
+            client_id: "staging-client".into(),
+            bearer_token_file: "/tmp/masque-client.token".into(),
+            udp_targets: vec![],
+            ip_targets: vec![IpTargetConfig {
+                target: target.into(),
+                protocol: protocol.into(),
+            }],
+        }
+    }
+
     #[test]
     fn config_rejects_implicit_or_unroutable_targets() {
         let base = Config {
@@ -405,6 +536,7 @@ mod tests {
             drain_timeout_seconds: default_drain_timeout_seconds(),
             routes: vec![],
             ip_routes: vec![],
+            clients: vec![udp_client("target.example", 53)],
         };
         assert!(base.validate().is_err());
         let route = RouteConfig {
@@ -451,6 +583,7 @@ mod tests {
                     protocol: 0,
                 }]],
             }],
+            clients: vec![ip_client("ip.example", "connect-ip")],
         };
         assert!(config.validate().is_ok());
 
@@ -478,6 +611,7 @@ mod tests {
                 destination_port: 53,
             }],
             ip_routes: vec![],
+            clients: vec![udp_client("target.example", 53)],
         };
         assert!(config.validate().is_ok());
         config.connect_udp_uri_template = "/missing/{target_host}/".into();
@@ -485,6 +619,35 @@ mod tests {
         config.connect_udp_uri_template = default_connect_udp_uri_template();
         config.drain_timeout_seconds = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_requires_authentication_and_exact_route_grants() {
+        let mut config = Config {
+            listen: "127.0.0.1:4433".parse().unwrap(),
+            certificate_chain: "/tmp/cert.pem".into(),
+            private_key: "/tmp/key.pem".into(),
+            connector_key: "/tmp/connector.key".into(),
+            max_connections: default_max_connections(),
+            max_associations_per_connection: default_max_associations(),
+            connect_udp_uri_template: default_connect_udp_uri_template(),
+            drain_timeout_seconds: default_drain_timeout_seconds(),
+            routes: vec![RouteConfig {
+                target_host: "target.example".into(),
+                target_port: 53,
+                backend_endpoint_id: "validated when materialized".into(),
+                backend_addresses: vec!["127.0.0.1:7777".parse().unwrap()],
+                backend_relay_url: None,
+                destination_port: 53,
+            }],
+            ip_routes: vec![],
+            clients: vec![],
+        };
+        assert!(config.validate().is_err());
+        config.clients.push(udp_client("other.example", 53));
+        assert!(config.validate().is_err());
+        config.clients[0] = udp_client("TARGET.EXAMPLE", 53);
+        assert!(config.validate().is_ok());
     }
 
     #[cfg(unix)]

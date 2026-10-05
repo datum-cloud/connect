@@ -8,7 +8,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use connect_masque_edge::{IpRoute, Ipv4RouteRange, Route, Server, tls_config};
+use connect_masque_edge::{
+    BearerCredential, ClientAuthentication, IpRoute, Ipv4RouteRange, Route, Server, ServerOptions,
+    tls_config,
+};
 use connect_transport::{
     Access, DestinationId, DestinationPolicy, Policy, Target, Transport, TransportConfig, ip,
 };
@@ -20,6 +23,7 @@ const IP_PATH: &str = "/.well-known/masque/ip/*/*/";
 const IP_NETWORK: &str = "masque-interop";
 const IP_ASSIGNED: Ipv4Addr = Ipv4Addr::new(10, 20, 0, 2);
 const IP_REMOTE: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 9);
+const TEST_BEARER_TOKEN: &str = "datum-masque-interop-client-token-00000001";
 
 struct Options {
     listen: SocketAddr,
@@ -125,16 +129,37 @@ async fn main() -> Result<()> {
         end: IP_REMOTE,
         protocol: 0,
     };
-    let server = Server::bind_with_ip_routes(
+    let client_authentication = ClientAuthentication::bearer(vec![BearerCredential::new(
+        "independent-masque-client".into(),
+        TEST_BEARER_TOKEN.as_bytes(),
+        vec![(options.origin.ip().to_string(), options.origin.port())],
+        vec![("*".into(), "*".into())],
+    )?])?;
+    let denied_target_port = if options.origin.port() == u16::MAX {
+        options.origin.port() - 1
+    } else {
+        options.origin.port() + 1
+    };
+    let server = Server::bind_with_options_and_ip_routes(
         options.listen,
         tls,
         edge.clone(),
-        vec![Route {
-            target_host: options.origin.ip().to_string(),
-            target_port: options.origin.port(),
-            backend: backend_addr.clone(),
-            destination: destination.clone(),
-        }],
+        vec![
+            Route {
+                target_host: options.origin.ip().to_string(),
+                target_port: options.origin.port(),
+                backend: backend_addr.clone(),
+                destination: destination.clone(),
+            },
+            // This route is deliberately real but absent from the test
+            // client's grants, proving authorization is per route.
+            Route {
+                target_host: options.origin.ip().to_string(),
+                target_port: denied_target_port,
+                backend: backend_addr.clone(),
+                destination: destination.clone(),
+            },
+        ],
         vec![IpRoute {
             target: "*".into(),
             protocol: "*".into(),
@@ -147,6 +172,7 @@ async fn main() -> Result<()> {
                 vec![advertised_route],
             ],
         }],
+        ServerOptions::authenticated(client_authentication),
     )?;
     let public_addr = server.local_addr()?;
     std::fs::write(
@@ -155,10 +181,12 @@ async fn main() -> Result<()> {
             "proxy_addr": public_addr.to_string(),
             "proxy_uri_template": format!("https://localhost:{}/.well-known/masque/udp/{{target_host}}/{{target_port}}/", public_addr.port()),
             "allowed_target": options.origin.to_string(),
+            "denied_target": format!("{}:{denied_target_port}", options.origin.ip()),
             "ip_uri": format!("https://localhost:{}{IP_PATH}", public_addr.port()),
             "ip_assigned": IP_ASSIGNED.to_string(),
             "ip_remote": IP_REMOTE.to_string(),
             "service_endpoint": details.endpoint_id.to_string(),
+            "bearer_token": TEST_BEARER_TOKEN,
         }))?,
     )
     .context("write readiness metadata")?;

@@ -57,17 +57,37 @@ def main():
         if not ready.exists():
             raise AssertionError(f"lab was not ready; inspect {root / 'lab.log'}")
         metadata = json.loads(ready.read_text())
-        common = [
+        unauthenticated = [
             str(client),
             "-proxy", metadata["proxy_uri_template"],
             "-proxy-address", metadata["proxy_addr"],
             "-ca", str(cert),
         ]
+        for credential_args in ([], ["-bearer-token", "invalid-staging-token"]):
+            rejected = subprocess.run(
+                [
+                    *unauthenticated,
+                    *credential_args,
+                    "-target", allowed,
+                    "-expect-status", "407",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            assert rejected.returncode == 0, rejected.stdout + rejected.stderr
+            assert Echo.packets == [], Echo.packets
+            print(rejected.stdout.strip(), flush=True)
+
+        common = [
+            *unauthenticated,
+            "-bearer-token", metadata["bearer_token"],
+        ]
         positive = subprocess.run(
             [
                 *common,
                 "-target", allowed,
-                "-denied-target", f"127.0.0.1:{echo.server_address[1] + 1}",
+                "-denied-target", metadata["denied_target"],
                 "-payload", "datum-masque-e2e",
                 "-sessions", str(args.sessions),
             ],
@@ -104,6 +124,7 @@ def main():
                 "-proxy-address", metadata["proxy_addr"],
                 "-ca", str(cert),
                 "-ip-proxy", metadata["ip_uri"],
+                "-bearer-token", metadata["bearer_token"],
                 "-connect-ip",
             ],
             text=True,
@@ -118,6 +139,7 @@ def main():
                 "-proxy-address", metadata["proxy_addr"],
                 "-ca", str(cert),
                 "-ip-proxy", metadata["ip_uri"].replace("/*/*/", "/10.30.0.10/17/"),
+                "-bearer-token", metadata["bearer_token"],
                 "-connect-ip",
                 "-expect-status", "403",
             ],

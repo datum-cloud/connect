@@ -26,6 +26,7 @@ func main() {
 	target := flag.String("target", "", "UDP target as host:port")
 	deniedTarget := flag.String("denied-target", "", "optional target expected to receive HTTP 403 on the shared connection")
 	caFile := flag.String("ca", "", "PEM certificate trusted for the lab proxy")
+	bearerToken := flag.String("bearer-token", "", "bearer credential sent in Proxy-Authorization")
 	payload := flag.String("payload", "masque-independent-client", "UDP payload")
 	expectStatus := flag.Int("expect-status", 200, "expected HTTP response status")
 	sessions := flag.Int("sessions", 1, "number of CONNECT-UDP sessions to multiplex on one HTTP/3 connection")
@@ -50,11 +51,11 @@ func main() {
 		MinVersion: tls.VersionTLS13,
 	}
 	if *connectIP {
-		must(runConnectIP(*ipProxy, *proxyAddr, *expectStatus, tlsConfig))
+		must(runConnectIP(*ipProxy, *proxyAddr, *expectStatus, *bearerToken, tlsConfig))
 		return
 	}
 	if *capsuleFallback {
-		must(runCapsuleFallback(*proxy, *proxyAddr, *target, *payload, tlsConfig))
+		must(runCapsuleFallback(*proxy, *proxyAddr, *target, *payload, *bearerToken, tlsConfig))
 		return
 	}
 	transport := masque.Transport{
@@ -76,6 +77,7 @@ func main() {
 			*target,
 		)
 		must(err)
+		setMasqueProxyAuthorization(request, *bearerToken)
 		_, response, err := transport.Dial(request)
 		if response == nil || response.StatusCode != *expectStatus {
 			must(fmt.Errorf("expected HTTP %d, response=%v, error=%v", *expectStatus, response, err))
@@ -93,6 +95,7 @@ func main() {
 	for i := 0; i < *sessions; i++ {
 		request, err := masque.NewRequest(context.Background(), uritemplate.MustNew(*proxy), *target)
 		must(err)
+		setMasqueProxyAuthorization(request, *bearerToken)
 		conn, response, err := clientConn.Dial(request)
 		must(err)
 		if response.StatusCode != *expectStatus {
@@ -109,6 +112,7 @@ func main() {
 			*deniedTarget,
 		)
 		must(err)
+		setMasqueProxyAuthorization(request, *bearerToken)
 		_, response, err := clientConn.Dial(request)
 		if response == nil || response.StatusCode != 403 || err == nil {
 			must(fmt.Errorf("expected shared-connection HTTP 403, response=%v, error=%v", response, err))
@@ -135,7 +139,7 @@ func main() {
 	fmt.Printf("PASS %d independent masque-go sessions multiplexed on one HTTP/3 connection\n", *sessions)
 }
 
-func runConnectIP(proxyURL, proxyAddr string, expectStatus int, tlsConfig *tls.Config) error {
+func runConnectIP(proxyURL, proxyAddr string, expectStatus int, bearerToken string, tlsConfig *tls.Config) error {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, proxyURL, nil)
 	if err != nil {
 		return err
@@ -143,6 +147,7 @@ func runConnectIP(proxyURL, proxyAddr string, expectStatus int, tlsConfig *tls.C
 	req.Proto = "connect-ip"
 	req.Host = req.URL.Host
 	req.Header.Set(http3.CapsuleProtocolHeader, "?1")
+	setProxyAuthorization(req, bearerToken)
 	quicConn, err := quic.DialAddr(context.Background(), proxyAddr, tlsConfig, &quic.Config{EnableDatagrams: true})
 	if err != nil {
 		return err
@@ -262,7 +267,7 @@ func ipv4Packet(source, destination [4]byte) []byte {
 	return packet
 }
 
-func runCapsuleFallback(proxy, proxyAddr, target, payload string, tlsConfig *tls.Config) error {
+func runCapsuleFallback(proxy, proxyAddr, target, payload, bearerToken string, tlsConfig *tls.Config) error {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		return err
@@ -281,6 +286,7 @@ func runCapsuleFallback(proxy, proxyAddr, target, payload string, tlsConfig *tls
 	req.Proto = "connect-udp"
 	req.Host = req.URL.Host
 	req.Header.Set(http3.CapsuleProtocolHeader, "?1")
+	setProxyAuthorization(req, bearerToken)
 
 	quicConn, err := quic.DialAddr(context.Background(), proxyAddr, tlsConfig, &quic.Config{})
 	if err != nil {
@@ -330,6 +336,18 @@ func runCapsuleFallback(proxy, proxyAddr, target, payload string, tlsConfig *tls
 	}
 	fmt.Printf("PASS DATAGRAM capsule fallback round trip: %q\n", body[1:])
 	return nil
+}
+
+func setProxyAuthorization(request *http.Request, bearerToken string) {
+	if bearerToken != "" {
+		request.Header.Set("Proxy-Authorization", "Bearer "+bearerToken)
+	}
+}
+
+func setMasqueProxyAuthorization(request *masque.Request, bearerToken string) {
+	if bearerToken != "" {
+		request.Header().Set("Proxy-Authorization", "Bearer "+bearerToken)
+	}
 }
 
 func must(err error) {

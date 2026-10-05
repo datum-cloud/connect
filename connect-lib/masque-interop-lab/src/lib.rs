@@ -4,7 +4,7 @@
 //! MASQUE target must be mapped to an already-authorized Connect destination.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::Arc,
@@ -20,16 +20,22 @@ use connect_transport::{
 use h3::error::Code;
 use h3::ext::Protocol;
 use h3_datagram::datagram_handler::{HandleDatagramsExt, SendDatagramError};
-use http::{Method, Response, StatusCode};
+use http::{
+    HeaderMap, Method, Response, StatusCode,
+    header::{PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
+};
 use iroh::EndpointAddr;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 const CAPSULE_PROTOCOL: &str = "capsule-protocol";
 const DATAGRAM_CAPSULE: u64 = 0;
 const MAX_CAPSULE: usize = 64 * 1024;
+const AUTH_REALM: &str = "datum-connect";
 
 /// A single exact public target routed to a policy-checked Connect destination.
 #[derive(Clone, Debug)]
@@ -62,6 +68,152 @@ pub struct IpRoute {
     pub route_updates: Vec<Vec<Ipv4RouteRange>>,
 }
 
+/// One caller credential and its exact route grants. Only a SHA-256 digest of
+/// the bearer token is retained in memory.
+#[derive(Clone)]
+pub struct BearerCredential {
+    client_id: String,
+    token_digest: [u8; 32],
+    udp_targets: HashSet<(String, u16)>,
+    ip_targets: HashSet<(String, String)>,
+}
+
+impl BearerCredential {
+    pub fn new(
+        client_id: String,
+        token: &[u8],
+        udp_targets: Vec<(String, u16)>,
+        ip_targets: Vec<(String, String)>,
+    ) -> Result<Self> {
+        if client_id.is_empty() || client_id.len() > 128 || client_id.chars().any(char::is_control)
+        {
+            bail!("MASQUE client ID must contain 1 to 128 printable characters");
+        }
+        if token.len() < 32
+            || token.len() > 4096
+            || !token.is_ascii()
+            || token.iter().any(u8::is_ascii_whitespace)
+        {
+            bail!("MASQUE bearer tokens must contain 32 to 4096 non-whitespace ASCII bytes");
+        }
+        if udp_targets.is_empty() && ip_targets.is_empty() {
+            bail!("MASQUE clients require at least one exact route grant");
+        }
+        let udp_targets = udp_targets
+            .into_iter()
+            .map(|(host, port)| (host.to_ascii_lowercase(), port))
+            .collect();
+        let token_digest: [u8; 32] = Sha256::digest(token).into();
+        Ok(Self {
+            client_id,
+            token_digest,
+            udp_targets,
+            ip_targets: ip_targets.into_iter().collect(),
+        })
+    }
+}
+
+/// Required HTTP proxy authentication for a MASQUE listener.
+#[derive(Clone)]
+pub struct ClientAuthentication {
+    credentials: Arc<[BearerCredential]>,
+}
+
+impl ClientAuthentication {
+    pub fn bearer(credentials: Vec<BearerCredential>) -> Result<Self> {
+        if credentials.is_empty() {
+            bail!("MASQUE listener requires at least one caller credential");
+        }
+        let mut client_ids = HashSet::new();
+        let mut token_digests = HashSet::new();
+        for credential in &credentials {
+            if !client_ids.insert(credential.client_id.clone()) {
+                bail!("duplicate MASQUE client ID");
+            }
+            if !token_digests.insert(credential.token_digest) {
+                bail!("duplicate MASQUE bearer token");
+            }
+        }
+        Ok(Self {
+            credentials: credentials.into(),
+        })
+    }
+
+    fn validate_routes(
+        &self,
+        udp_routes: &HashMap<(String, u16), Route>,
+        ip_routes: &HashMap<(String, String), IpRoute>,
+    ) -> Result<()> {
+        if self.credentials.is_empty() {
+            bail!("MASQUE listener requires caller authentication");
+        }
+        for credential in self.credentials.iter() {
+            if credential
+                .udp_targets
+                .iter()
+                .any(|target| !udp_routes.contains_key(target))
+                || credential
+                    .ip_targets
+                    .iter()
+                    .any(|target| !ip_routes.contains_key(target))
+            {
+                bail!("MASQUE client route grant does not match a configured route");
+            }
+        }
+        Ok(())
+    }
+
+    fn authenticate<'a>(&'a self, headers: &HeaderMap) -> Option<&'a BearerCredential> {
+        let mut values = headers.get_all(PROXY_AUTHORIZATION).iter();
+        let value = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        let value = value.as_bytes();
+        let separator = value.iter().position(|byte| *byte == b' ')?;
+        if !value[..separator].eq_ignore_ascii_case(b"bearer") {
+            return None;
+        }
+        let token = &value[separator + 1..];
+        if token.is_empty() || token.iter().any(u8::is_ascii_whitespace) {
+            return None;
+        }
+        let digest: [u8; 32] = Sha256::digest(token).into();
+        self.credentials
+            .iter()
+            .find(|credential| bool::from(credential.token_digest.ct_eq(&digest)))
+    }
+
+    fn authorize_udp(&self, headers: &HeaderMap, target: &(String, u16)) -> AuthDecision {
+        let Some(credential) = self.authenticate(headers) else {
+            return AuthDecision::AuthenticationRequired;
+        };
+        credential
+            .udp_targets
+            .contains(&(target.0.to_ascii_lowercase(), target.1))
+            .then_some(AuthDecision::Allowed)
+            .unwrap_or(AuthDecision::Forbidden)
+    }
+
+    fn authorize_ip(&self, headers: &HeaderMap, target: &str, protocol: &str) -> AuthDecision {
+        let Some(credential) = self.authenticate(headers) else {
+            return AuthDecision::AuthenticationRequired;
+        };
+        credential
+            .ip_targets
+            .contains(&(target.to_owned(), protocol.to_owned()))
+            .then_some(AuthDecision::Allowed)
+            .unwrap_or(AuthDecision::Forbidden)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthDecision {
+    Allowed,
+    AuthenticationRequired,
+    Forbidden,
+}
+
 /// Bound edge listener. Binding is separate from serving so callers can publish
 /// readiness only after the UDP socket and TLS configuration are usable.
 pub struct Server {
@@ -73,6 +225,7 @@ pub struct Server {
     max_associations_per_connection: usize,
     connect_udp_uri_template: ConnectUdpUriTemplate,
     target_policy: TargetSecurityPolicy,
+    client_authentication: ClientAuthentication,
     drain_timeout: Duration,
 }
 
@@ -83,25 +236,28 @@ struct ConnectionConfig {
     ip_routes: Arc<HashMap<(String, String), IpRoute>>,
     connect_udp_uri_template: ConnectUdpUriTemplate,
     target_policy: TargetSecurityPolicy,
+    client_authentication: ClientAuthentication,
     max_associations: usize,
 }
 
 /// Limits and protocol shape for one standards-facing listener.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerOptions {
     pub max_connections: usize,
     pub max_associations_per_connection: usize,
     pub connect_udp_uri_template: ConnectUdpUriTemplate,
     pub drain_timeout: Duration,
+    pub client_authentication: ClientAuthentication,
 }
 
-impl Default for ServerOptions {
-    fn default() -> Self {
+impl ServerOptions {
+    pub fn authenticated(client_authentication: ClientAuthentication) -> Self {
         Self {
             max_connections: 1024,
             max_associations_per_connection: 128,
             connect_udp_uri_template: ConnectUdpUriTemplate::default(),
             drain_timeout: Duration::from_secs(5),
+            client_authentication,
         }
     }
 }
@@ -112,6 +268,7 @@ impl Server {
         tls: rustls::ServerConfig,
         transport: Transport,
         routes: Vec<Route>,
+        client_authentication: ClientAuthentication,
     ) -> Result<Self> {
         Self::bind_with_options_and_ip_routes(
             listen,
@@ -119,7 +276,7 @@ impl Server {
             transport,
             routes,
             vec![],
-            ServerOptions::default(),
+            ServerOptions::authenticated(client_authentication),
         )
     }
 
@@ -129,6 +286,7 @@ impl Server {
         transport: Transport,
         routes: Vec<Route>,
         ip_routes: Vec<IpRoute>,
+        client_authentication: ClientAuthentication,
     ) -> Result<Self> {
         Self::bind_with_options_and_ip_routes(
             listen,
@@ -136,7 +294,7 @@ impl Server {
             transport,
             routes,
             ip_routes,
-            ServerOptions::default(),
+            ServerOptions::authenticated(client_authentication),
         )
     }
 
@@ -147,6 +305,7 @@ impl Server {
         routes: Vec<Route>,
         max_connections: usize,
         max_associations_per_connection: usize,
+        client_authentication: ClientAuthentication,
     ) -> Result<Self> {
         Self::bind_with_options_and_ip_routes(
             listen,
@@ -157,7 +316,7 @@ impl Server {
             ServerOptions {
                 max_connections,
                 max_associations_per_connection,
-                ..ServerOptions::default()
+                ..ServerOptions::authenticated(client_authentication)
             },
         )
     }
@@ -170,6 +329,7 @@ impl Server {
         ip_routes: Vec<IpRoute>,
         max_connections: usize,
         max_associations_per_connection: usize,
+        client_authentication: ClientAuthentication,
     ) -> Result<Self> {
         Self::bind_with_options_and_ip_routes(
             listen,
@@ -180,7 +340,7 @@ impl Server {
             ServerOptions {
                 max_connections,
                 max_associations_per_connection,
-                ..ServerOptions::default()
+                ..ServerOptions::authenticated(client_authentication)
             },
         )
     }
@@ -201,6 +361,9 @@ impl Server {
         }
         let indexed = index_routes(routes, !ip_routes.is_empty())?;
         let indexed_ip = index_ip_routes(ip_routes, !indexed.is_empty())?;
+        options
+            .client_authentication
+            .validate_routes(&indexed, &indexed_ip)?;
         let target_policy = indexed
             .keys()
             .fold(TargetSecurityPolicy::new(), |policy, (host, port)| {
@@ -223,6 +386,7 @@ impl Server {
             max_associations_per_connection: options.max_associations_per_connection,
             connect_udp_uri_template: options.connect_udp_uri_template,
             target_policy,
+            client_authentication: options.client_authentication,
             drain_timeout: options.drain_timeout,
         })
     }
@@ -241,6 +405,7 @@ impl Server {
             ip_routes: self.ip_routes,
             connect_udp_uri_template: self.connect_udp_uri_template,
             target_policy: self.target_policy,
+            client_authentication: self.client_authentication,
             max_associations: self.max_associations_per_connection,
         };
         let connection_config = Arc::new(connection_config);
@@ -414,6 +579,23 @@ async fn serve_connection(
                         continue;
                     }
                     let (target, protocol) = target.expect("checked CONNECT-IP target");
+                    match config.client_authentication.authorize_ip(
+                        request.headers(),
+                        target,
+                        protocol,
+                    ) {
+                        AuthDecision::Allowed => {}
+                        AuthDecision::AuthenticationRequired => {
+                            stream.send_response(authentication_required_response()).await?;
+                            stream.finish().await?;
+                            continue;
+                        }
+                        AuthDecision::Forbidden => {
+                            stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
+                            stream.finish().await?;
+                            continue;
+                        }
+                    }
                     let Some(route) = config.ip_routes.get(&(target.into(), protocol.into())).cloned() else {
                         stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
                         stream.finish().await?;
@@ -505,6 +687,22 @@ async fn serve_connection(
                         continue;
                     }
                 };
+                match config
+                    .client_authentication
+                    .authorize_udp(request.headers(), &target)
+                {
+                    AuthDecision::Allowed => {}
+                    AuthDecision::AuthenticationRequired => {
+                        stream.send_response(authentication_required_response()).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
+                    AuthDecision::Forbidden => {
+                        stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
+                }
                 if config.target_policy.authorize(&target.0, target.1).is_err() {
                     stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
                     stream.finish().await?;
@@ -613,6 +811,18 @@ async fn serve_connection(
     }
     cancel.cancel();
     Ok(())
+}
+
+fn authentication_required_response() -> Response<()> {
+    Response::builder()
+        .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+        .header(PROXY_AUTHENTICATE, format!("Bearer realm=\"{AUTH_REALM}\""))
+        .header(
+            connect_transport::masque::PROXY_STATUS_HEADER,
+            "datum-connect; error=http_protocol_error",
+        )
+        .body(())
+        .expect("static MASQUE authentication response")
 }
 
 fn admission_failure(active: usize, maximum: usize, draining: bool) -> Option<MasqueFailure> {
@@ -861,6 +1071,70 @@ mod tests {
         assert_eq!(
             route_advertisement_capsule(&[route]).as_ref(),
             &[3, 10, 4, 10, 30, 0, 9, 10, 30, 0, 9, 0]
+        );
+    }
+
+    #[test]
+    fn bearer_authentication_is_required_and_route_scoped() {
+        let token = b"a-secure-test-token-with-at-least-32-bytes";
+        let authentication = ClientAuthentication::bearer(vec![
+            BearerCredential::new(
+                "client-a".into(),
+                token,
+                vec![("DNS.Example.NET".into(), 53)],
+                vec![("*".into(), "*".into())],
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            authentication.authorize_udp(&headers, &("dns.example.net".into(), 53)),
+            AuthDecision::AuthenticationRequired
+        );
+        headers.insert(PROXY_AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
+        assert_eq!(
+            authentication.authorize_udp(&headers, &("dns.example.net".into(), 53)),
+            AuthDecision::AuthenticationRequired
+        );
+        headers.insert(
+            PROXY_AUTHORIZATION,
+            format!("Bearer {}", String::from_utf8_lossy(token))
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            authentication.authorize_udp(&headers, &("dns.example.net".into(), 53)),
+            AuthDecision::Allowed
+        );
+        assert_eq!(
+            authentication.authorize_udp(&headers, &("dns.example.net".into(), 54)),
+            AuthDecision::Forbidden
+        );
+        assert_eq!(
+            authentication.authorize_ip(&headers, "*", "*"),
+            AuthDecision::Allowed
+        );
+        assert_eq!(
+            authentication.authorize_ip(&headers, "other", "*"),
+            AuthDecision::Forbidden
+        );
+    }
+
+    #[test]
+    fn authentication_challenge_is_standard_and_detail_free() {
+        let response = authentication_required_response();
+        assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        assert_eq!(
+            response.headers().get(PROXY_AUTHENTICATE).unwrap(),
+            "Bearer realm=\"datum-connect\""
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(connect_transport::masque::PROXY_STATUS_HEADER)
+                .unwrap(),
+            "datum-connect; error=http_protocol_error"
         );
     }
 }
