@@ -36,7 +36,7 @@ This is deliberately policy lookup, not arbitrary target dialing.
 | CONNECT-UDP response | 2xx response with Capsule Protocol negotiation and correct stream errors | Failures have stable HTTP and RFC 9209 `Proxy-Status` mappings without backend detail leakage |
 | HTTP Datagrams | Quarter Stream ID association, context ID zero, unknown-context handling | Independent multi-stream coverage is present, including a patched Quarter Stream ID encoder; unknown and malformed contexts are dropped without affecting context zero |
 | Capsule fallback | DATAGRAM capsules when QUIC/H3 datagrams are unavailable | Implemented in the shared production edge and end-to-end tested with a bounded incremental decoder; CONNECT-IP still needs the same fallback |
-| CONNECT-IP | RFC 9484 request plus repeated address/route assignments and withdrawals | The shared edge and opt-in daemon listener accept exact configured targets, relay through explicitly granted private CONNECT-IP sessions, and publish configured IPv4 route snapshots including withdrawals; dual stack, capsule fallback, and live policy-driven reconfiguration remain |
+| CONNECT-IP | RFC 9484 request plus repeated address/route assignments and withdrawals | The shared edge and opt-in daemon listener accept exact configured targets, negotiate IPv4, IPv6, or both on one public association, relay each family through its own explicitly granted private CONNECT-IP session, and publish ordered mixed-family snapshots including withdrawals; capsule fallback, ICMP/PMTU generation, and live policy-driven reconfiguration remain |
 | Multiplexing | Multiple concurrent CONNECT streams per HTTP/3 connection | Implemented in the standards-facing edge and tested with three tunnels plus an isolated denied stream; the private iroh listener still uses one stream per connection |
 | HTTP/2 and HTTP/1.1 | RFC 9297/9298 mappings; RFC 9931 optimistic-transition safety for HTTP/1.1 | Deferred until the HTTP/3 edge is conformant; advertise only implemented versions |
 
@@ -53,8 +53,8 @@ This is deliberately policy lookup, not arbitrary target dialing.
 4. Add reliable DATAGRAM capsules and negotiate either QUIC DATAGRAM or capsule
    delivery per RFC 9297. Test loss, reordering, path-MTU changes, and oversized
    payloads.
-5. Complete CONNECT-IP configuration updates and withdrawals, dual-stack
-   policy, ICMP/PMTU behavior, and capsule fallback.
+5. Complete CONNECT-IP live policy updates, ICMP/PMTU behavior, and capsule
+   fallback.
 6. Put the codec behind an ordinary WebPKI HTTP/3 gateway and test unmodified
    independent clients. Add HTTP/2 and HTTP/1.1 only if those versions are part
    of the advertised product profile.
@@ -106,18 +106,18 @@ directory.
 
 The same run opens an RFC 9484 CONNECT-IP request on the default
 `/.well-known/masque/ip/*/*/` path without any private request headers. The
-edge returns an IPv4 ADDRESS_ASSIGN, advertises the one approved host route,
-withdraws the route with an empty full-snapshot advertisement, restores it,
-and completes a bidirectional IP-packet round trip through the real private
-CONNECT-IP transport. A second valid CONNECT-IP target receives HTTP 403 and
-never creates a private session.
+edge returns IPv4 and IPv6 addresses in one ADDRESS_ASSIGN, advertises ordered
+host routes for both families, withdraws them with an empty full-snapshot
+advertisement, restores them, and completes bidirectional IPv4 and IPv6 packet
+round trips through two real private CONNECT-IP transports. A second valid
+CONNECT-IP target receives HTTP 403 and never creates a private session.
 
-This lab proves CONNECT-UDP and a constrained IPv4 CONNECT-IP profile at the
+This lab proves CONNECT-UDP and a constrained dual-stack CONNECT-IP profile at the
 HTTP/3 edge and exercises the corresponding real Connect transports behind it.
 It does not yet prove production certificate provisioning, external identity
-provider integration, dual-stack CONNECT-IP, live grant updates, a second independent CONNECT-IP
-implementation, or deployed gateway configuration. Those remain explicit
-release gates above.
+provider integration, live grant updates, ICMP/PMTU generation, a second
+independent CONNECT-IP implementation, or deployed gateway configuration.
+Those remain explicit release gates above.
 
 ## Run the production listener
 
@@ -148,16 +148,23 @@ targets, or provide a general UDP proxy.
   "ip_routes": [{
     "target": "*",
     "protocol": "*",
-    "backend_endpoint_id": "BACKEND_CONNECTOR_PUBLIC_KEY",
-    "backend_addresses": ["192.0.2.20:4433"],
-    "backend_relay_url": "https://relay.example.net",
-    "network": "production-vpc",
-    "assigned_address": "10.20.0.2",
-    "route_updates": [[{
-      "start": "10.30.0.0",
-      "end": "10.30.0.255",
-      "protocol": 0
-    }]]
+    "backends": [{
+      "backend_endpoint_id": "BACKEND_CONNECTOR_PUBLIC_KEY",
+      "backend_addresses": ["192.0.2.20:4433"],
+      "backend_relay_url": "https://relay.example.net",
+      "network": "production-vpc-v4",
+      "assigned_address": "10.20.0.2"
+    }, {
+      "backend_endpoint_id": "BACKEND_CONNECTOR_PUBLIC_KEY",
+      "backend_addresses": ["[2001:db8::20]:4433"],
+      "backend_relay_url": "https://relay.example.net",
+      "network": "production-vpc-v6",
+      "assigned_address": "fd42:20::2"
+    }],
+    "route_updates": [[
+      {"start": "10.30.0.0", "end": "10.30.0.255", "protocol": 0},
+      {"start": "fd42:30::", "end": "fd42:30::ffff", "protocol": 0}
+    ]]
   }],
   "clients": [{
     "client_id": "staging-smoke-test",
@@ -173,6 +180,12 @@ targets, or provide a general UDP proxy.
   }]
 }
 ```
+
+Configure one `backends` entry per enabled address family. A single-stack route
+may contain one entry; a dual-stack route contains one IPv4 and one IPv6 entry.
+Each entry names the independently authorized private CONNECT-IP network for
+that family. Route snapshots must be ordered by IP version, then protocol, then
+non-overlapping address range as required by RFC 9484.
 
 Use an absolute path for every file. The configuration, TLS private key, and
 Connector key must be regular files owned by the daemon user or root with

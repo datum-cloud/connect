@@ -176,16 +176,27 @@ func runConnectIP(proxyURL, proxyAddr string, expectStatus int, bearerToken stri
 	if response.Header.Get(http3.CapsuleProtocolHeader) != "?1" {
 		return fmt.Errorf("CONNECT-IP response omitted capsule negotiation: headers=%v", response.Header)
 	}
-	// Request ID 1, IPv4, wildcard address, host prefix.
-	if _, err := stream.Write([]byte{2, 7, 1, 4, 0, 0, 0, 0, 32}); err != nil {
+	// Request IDs 1 and 2 ask for wildcard IPv4 and IPv6 host addresses.
+	addressRequest := []byte{2, 26, 1, 4, 0, 0, 0, 0, 32, 2, 6}
+	addressRequest = append(addressRequest, make([]byte, 16)...)
+	addressRequest = append(addressRequest, 128)
+	if _, err := stream.Write(addressRequest); err != nil {
 		return err
 	}
 	kind, assignment, err := readCapsule(stream)
-	if err != nil || kind != 1 || string(assignment) != string([]byte{1, 4, 10, 20, 0, 2, 32}) {
+	wantAssignment := []byte{1, 4, 10, 20, 0, 2, 32, 2, 6}
+	wantAssignment = append(wantAssignment, []byte{0xfd, 0x42, 0x00, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}...)
+	wantAssignment = append(wantAssignment, 128)
+	if err != nil || kind != 1 || string(assignment) != string(wantAssignment) {
 		return fmt.Errorf("invalid ADDRESS_ASSIGN: type=%d payload=%x error=%v", kind, assignment, err)
 	}
 	kind, route, err := readCapsule(stream)
-	if err != nil || kind != 3 || string(route) != string([]byte{4, 10, 30, 0, 9, 10, 30, 0, 9, 0}) {
+	wantRoute := []byte{4, 10, 30, 0, 9, 10, 30, 0, 9, 0, 6}
+	v6Remote := []byte{0xfd, 0x42, 0x00, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9}
+	wantRoute = append(wantRoute, v6Remote...)
+	wantRoute = append(wantRoute, v6Remote...)
+	wantRoute = append(wantRoute, 0)
+	if err != nil || kind != 3 || string(route) != string(wantRoute) {
 		return fmt.Errorf("invalid initial ROUTE_ADVERTISEMENT: type=%d payload=%x error=%v", kind, route, err)
 	}
 	kind, withdrawal, err := readCapsule(stream)
@@ -196,21 +207,43 @@ func runConnectIP(proxyURL, proxyAddr string, expectStatus int, bearerToken stri
 	if err != nil || kind != 3 || string(restored) != string(route) {
 		return fmt.Errorf("invalid restored route: type=%d payload=%x error=%v", kind, restored, err)
 	}
-	packet := ipv4Packet([4]byte{10, 20, 0, 2}, [4]byte{10, 30, 0, 9})
-	if err := stream.SendDatagram(append([]byte{0}, packet...)); err != nil {
-		return err
+	packets := [][]byte{
+		ipv4Packet([4]byte{10, 20, 0, 2}, [4]byte{10, 30, 0, 9}),
+		ipv6Packet(
+			[16]byte{0xfd, 0x42, 0x00, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2},
+			[16]byte{0xfd, 0x42, 0x00, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9},
+		),
+	}
+	for _, packet := range packets {
+		if err := stream.SendDatagram(append([]byte{0}, packet...)); err != nil {
+			return err
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	reply, err := stream.ReceiveDatagram(ctx)
-	if err != nil {
-		return err
+	wants := map[byte][]byte{
+		4: ipv4Packet([4]byte{10, 30, 0, 9}, [4]byte{10, 20, 0, 2}),
+		6: ipv6Packet(
+			[16]byte{0xfd, 0x42, 0x00, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9},
+			[16]byte{0xfd, 0x42, 0x00, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2},
+		),
 	}
-	want := ipv4Packet([4]byte{10, 30, 0, 9}, [4]byte{10, 20, 0, 2})
-	if len(reply) != len(want)+1 || reply[0] != 0 || string(reply[1:]) != string(want) {
-		return fmt.Errorf("unexpected CONNECT-IP reply: %x", reply)
+	for range wants {
+		reply, err := stream.ReceiveDatagram(ctx)
+		if err != nil {
+			return err
+		}
+		if len(reply) < 2 || reply[0] != 0 {
+			return fmt.Errorf("unexpected CONNECT-IP reply: %x", reply)
+		}
+		version := reply[1] >> 4
+		want, ok := wants[version]
+		if !ok || string(reply[1:]) != string(want) {
+			return fmt.Errorf("unexpected CONNECT-IP reply: %x", reply)
+		}
+		delete(wants, version)
 	}
-	fmt.Println("PASS RFC 9484 CONNECT-IP assignment, route withdrawal/restoration, and IP packet round trip")
+	fmt.Println("PASS RFC 9484 dual-stack assignment, mixed routes, withdrawal/restoration, and IPv4/IPv6 packet round trips")
 	return nil
 }
 
@@ -264,6 +297,32 @@ func ipv4Packet(source, destination [4]byte) []byte {
 	checksum := ^uint16(sum)
 	packet[10], packet[11] = byte(checksum>>8), byte(checksum)
 	copy(packet[20:], []byte("datum-connect-ip-e2e"))
+	return packet
+}
+
+func ipv6Packet(source, destination [16]byte) []byte {
+	packet := make([]byte, 64)
+	packet[0] = 0x60
+	packet[4], packet[5] = 0, byte(len(packet)-40)
+	packet[6], packet[7] = 58, 64
+	copy(packet[8:24], source[:])
+	copy(packet[24:40], destination[:])
+	packet[40], packet[41] = 128, 0
+	copy(packet[48:], []byte("datum-ipv6-e2e"))
+	pseudo := make([]byte, 0, 40+len(packet)-40)
+	pseudo = append(pseudo, source[:]...)
+	pseudo = append(pseudo, destination[:]...)
+	pseudo = append(pseudo, 0, 0, 0, byte(len(packet)-40), 0, 0, 0, 58)
+	pseudo = append(pseudo, packet[40:]...)
+	var sum uint32
+	for i := 0; i < len(pseudo); i += 2 {
+		sum += uint32(pseudo[i])<<8 | uint32(pseudo[i+1])
+	}
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	checksum := ^uint16(sum)
+	packet[42], packet[43] = byte(checksum>>8), byte(checksum)
 	return packet
 }
 

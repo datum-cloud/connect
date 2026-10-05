@@ -6,13 +6,14 @@
 
 use std::{
     collections::HashSet,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use connect_masque_edge::{
-    BearerCredential, ClientAuthentication, IpRoute, Ipv4RouteRange, Route, Server, ServerOptions,
+    BearerCredential, ClientAuthentication, IpBackend, IpRoute, IpRouteRange, Route, Server,
+    ServerOptions,
 };
 use connect_transport::{DestinationId, Transport, TransportConfig, masque::ConnectUdpUriTemplate};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
@@ -62,21 +63,27 @@ struct RouteConfig {
 struct IpRouteConfig {
     target: String,
     protocol: String,
+    backends: Vec<IpBackendConfig>,
+    route_updates: Vec<Vec<IpRouteRangeConfig>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpBackendConfig {
     backend_endpoint_id: String,
     #[serde(default)]
     backend_addresses: Vec<SocketAddr>,
     #[serde(default)]
     backend_relay_url: Option<String>,
     network: String,
-    assigned_address: Ipv4Addr,
-    route_updates: Vec<Vec<Ipv4RouteRangeConfig>>,
+    assigned_address: IpAddr,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Ipv4RouteRangeConfig {
-    start: Ipv4Addr,
-    end: Ipv4Addr,
+struct IpRouteRangeConfig {
+    start: IpAddr,
+    end: IpAddr,
     #[serde(default)]
     protocol: u8,
 }
@@ -299,31 +306,42 @@ impl Config {
             }
         }
         for route in &self.ip_routes {
+            let families = route
+                .backends
+                .iter()
+                .map(|backend| backend.assigned_address.is_ipv6())
+                .collect::<HashSet<_>>();
             if route.target.is_empty()
                 || route.target.contains('/')
                 || route.protocol.is_empty()
                 || route.protocol.contains('/')
-                || route.network.is_empty()
-                || route.network.len() > 255
-                || route.assigned_address.is_unspecified()
-                || route.assigned_address.is_multicast()
+                || route.backends.is_empty()
+                || route.backends.len() > 2
+                || families.len() != route.backends.len()
+                || route.backends.iter().any(|backend| {
+                    backend.network.is_empty()
+                        || backend.network.len() > 255
+                        || backend.assigned_address.is_unspecified()
+                        || backend.assigned_address.is_multicast()
+                        || (backend.backend_addresses.is_empty()
+                            && backend.backend_relay_url.is_none())
+                        || backend.backend_addresses.iter().any(|address| {
+                            address.port() == 0
+                                || address.ip().is_unspecified()
+                                || address.ip().is_multicast()
+                        })
+                })
                 || route.route_updates.is_empty()
                 || route.route_updates.len() > 128
                 || route.route_updates.iter().any(|update| update.len() > 256)
-                || (route.backend_addresses.is_empty() && route.backend_relay_url.is_none())
-                || route.backend_addresses.iter().any(|address| {
-                    address.port() == 0
-                        || address.ip().is_unspecified()
-                        || address.ip().is_multicast()
+                || route.route_updates.iter().flatten().any(|range| {
+                    range.start.is_ipv4() != range.end.is_ipv4()
+                        || ip_value(range.start) > ip_value(range.end)
+                        || !families.contains(&range.start.is_ipv6())
                 })
-                || route
-                    .route_updates
-                    .iter()
-                    .flatten()
-                    .any(|range| u32::from(range.start) > u32::from(range.end))
             {
                 return Err(ApiError::bad_request(
-                    "Each MASQUE IP route needs an exact target/protocol, network, IPv4 assignment, route snapshots, and backend address or relay",
+                    "Each MASQUE IP route needs exact scope, one valid backend per IP family, and same-family route ranges",
                 ));
             }
         }
@@ -396,20 +414,28 @@ impl IpRouteConfig {
         Ok(IpRoute {
             target: self.target,
             protocol: self.protocol,
-            backend: backend_addr(
-                &self.backend_endpoint_id,
-                self.backend_addresses,
-                self.backend_relay_url,
-            )?,
-            network: self.network,
-            assigned_address: self.assigned_address,
+            backends: self
+                .backends
+                .into_iter()
+                .map(|backend| {
+                    Ok(IpBackend {
+                        backend: backend_addr(
+                            &backend.backend_endpoint_id,
+                            backend.backend_addresses,
+                            backend.backend_relay_url,
+                        )?,
+                        network: backend.network,
+                        assigned_address: backend.assigned_address,
+                    })
+                })
+                .collect::<Result<_, ApiError>>()?,
             route_updates: self
                 .route_updates
                 .into_iter()
                 .map(|update| {
                     update
                         .into_iter()
-                        .map(|range| Ipv4RouteRange {
+                        .map(|range| IpRouteRange {
                             start: range.start,
                             end: range.end,
                             protocol: range.protocol,
@@ -418,6 +444,13 @@ impl IpRouteConfig {
                 })
                 .collect(),
         })
+    }
+}
+
+fn ip_value(address: IpAddr) -> u128 {
+    match address {
+        IpAddr::V4(address) => u128::from(u32::from(address)),
+        IpAddr::V6(address) => u128::from(address),
     }
 }
 
@@ -572,22 +605,44 @@ mod tests {
             ip_routes: vec![IpRouteConfig {
                 target: "ip.example".into(),
                 protocol: "connect-ip".into(),
-                backend_endpoint_id: "validated when materialized".into(),
-                backend_addresses: vec!["127.0.0.1:7777".parse().unwrap()],
-                backend_relay_url: None,
-                network: "private".into(),
-                assigned_address: "10.20.0.2".parse().unwrap(),
-                route_updates: vec![vec![Ipv4RouteRangeConfig {
-                    start: "10.30.0.1".parse().unwrap(),
-                    end: "10.30.0.9".parse().unwrap(),
-                    protocol: 0,
-                }]],
+                backends: vec![
+                    IpBackendConfig {
+                        backend_endpoint_id: "validated when materialized".into(),
+                        backend_addresses: vec!["127.0.0.1:7777".parse().unwrap()],
+                        backend_relay_url: None,
+                        network: "private-v4".into(),
+                        assigned_address: "10.20.0.2".parse().unwrap(),
+                    },
+                    IpBackendConfig {
+                        backend_endpoint_id: "validated when materialized".into(),
+                        backend_addresses: vec!["[::1]:7777".parse().unwrap()],
+                        backend_relay_url: None,
+                        network: "private-v6".into(),
+                        assigned_address: "fd42:20::2".parse().unwrap(),
+                    },
+                ],
+                route_updates: vec![vec![
+                    IpRouteRangeConfig {
+                        start: "10.30.0.1".parse().unwrap(),
+                        end: "10.30.0.9".parse().unwrap(),
+                        protocol: 0,
+                    },
+                    IpRouteRangeConfig {
+                        start: "fd42:30::1".parse().unwrap(),
+                        end: "fd42:30::9".parse().unwrap(),
+                        protocol: 0,
+                    },
+                ]],
             }],
             clients: vec![ip_client("ip.example", "connect-ip")],
         };
         assert!(config.validate().is_ok());
 
         config.ip_routes[0].route_updates[0][0].start = "10.30.0.10".parse().unwrap();
+        assert!(config.validate().is_err());
+
+        config.ip_routes[0].route_updates[0][0].start = "10.30.0.1".parse().unwrap();
+        config.ip_routes[0].backends[1].assigned_address = "10.20.0.3".parse().unwrap();
         assert!(config.validate().is_err());
     }
 

@@ -5,7 +5,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::Arc,
     time::Duration,
@@ -46,13 +46,21 @@ pub struct Route {
     pub destination: DestinationId,
 }
 
-/// One IPv4 range record carried in an RFC 9484 ROUTE_ADVERTISEMENT capsule.
+/// One address range record carried in an RFC 9484 ROUTE_ADVERTISEMENT capsule.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Ipv4RouteRange {
-    pub start: Ipv4Addr,
-    pub end: Ipv4Addr,
+pub struct IpRouteRange {
+    pub start: IpAddr,
+    pub end: IpAddr,
     /// IP protocol number, or zero for all protocols.
     pub protocol: u8,
+}
+
+/// One family-specific private Connect tunnel behind a public CONNECT-IP route.
+#[derive(Clone, Debug)]
+pub struct IpBackend {
+    pub backend: EndpointAddr,
+    pub network: String,
+    pub assigned_address: IpAddr,
 }
 
 /// An exact public CONNECT-IP target routed to an authorized Connect IP grant.
@@ -62,10 +70,8 @@ pub struct Ipv4RouteRange {
 pub struct IpRoute {
     pub target: String,
     pub protocol: String,
-    pub backend: EndpointAddr,
-    pub network: String,
-    pub assigned_address: Ipv4Addr,
-    pub route_updates: Vec<Vec<Ipv4RouteRange>>,
+    pub backends: Vec<IpBackend>,
+    pub route_updates: Vec<Vec<IpRouteRange>>,
 }
 
 /// One caller credential and its exact route grants. Only a SHA-256 digest of
@@ -453,24 +459,51 @@ fn index_ip_routes(
     }
     let mut indexed = HashMap::new();
     for route in routes {
+        let backend_families = route
+            .backends
+            .iter()
+            .map(|backend| backend.assigned_address.is_ipv6())
+            .collect::<HashSet<_>>();
         if route.target.is_empty()
             || route.target.contains('/')
             || route.protocol.is_empty()
             || route.protocol.contains('/')
-            || route.network.is_empty()
-            || route.network.len() > 255
-            || route.assigned_address.is_unspecified()
-            || route.assigned_address.is_multicast()
+            || route.backends.is_empty()
+            || route.backends.len() > 2
+            || backend_families.len() != route.backends.len()
+            || route.backends.iter().any(|backend| {
+                backend.network.is_empty()
+                    || backend.network.len() > 255
+                    || backend.assigned_address.is_unspecified()
+                    || backend.assigned_address.is_multicast()
+            })
             || route.route_updates.is_empty()
             || route.route_updates.len() > 128
             || route.route_updates.iter().any(|update| update.len() > 256)
-            || route
-                .route_updates
-                .iter()
-                .flatten()
-                .any(|range| u32::from(range.start) > u32::from(range.end))
+            || route.route_updates.iter().flatten().any(|range| {
+                range.start.is_ipv4() != range.end.is_ipv4()
+                    || ip_value(range.start) > ip_value(range.end)
+                    || !backend_families.contains(&range.start.is_ipv6())
+            })
+            || route.route_updates.iter().any(|update| {
+                update
+                    .windows(2)
+                    .any(|pair| !ordered_ranges(&pair[0], &pair[1]))
+                    || update.iter().enumerate().any(|(index, range)| {
+                        update[index + 1..].iter().any(|other| {
+                            range.start.is_ipv4() == other.start.is_ipv4()
+                                && (range.protocol == 0
+                                    || other.protocol == 0
+                                    || range.protocol == other.protocol)
+                                && ip_value(range.start) <= ip_value(other.end)
+                                && ip_value(other.start) <= ip_value(range.end)
+                        })
+                    })
+            })
         {
-            bail!("CONNECT-IP routes require an exact target, protocol, network, and route update");
+            bail!(
+                "CONNECT-IP routes require exact scope, one backend per IP family, and ordered same-family route updates"
+            );
         }
         let key = (route.target.clone(), route.protocol.clone());
         if indexed.insert(key.clone(), route).is_some() {
@@ -478,6 +511,23 @@ fn index_ip_routes(
         }
     }
     Ok(indexed)
+}
+
+fn ip_value(address: IpAddr) -> u128 {
+    match address {
+        IpAddr::V4(address) => u128::from(u32::from(address)),
+        IpAddr::V6(address) => u128::from(address),
+    }
+}
+
+fn ordered_ranges(first: &IpRouteRange, second: &IpRouteRange) -> bool {
+    let first_version = if first.start.is_ipv4() { 4 } else { 6 };
+    let second_version = if second.start.is_ipv4() { 4 } else { 6 };
+    first_version < second_version
+        || (first_version == second_version
+            && (first.protocol < second.protocol
+                || (first.protocol == second.protocol
+                    && ip_value(first.end) < ip_value(second.start))))
 }
 
 /// Load a caller-provisioned PEM certificate chain and private key for `h3`.
@@ -588,20 +638,36 @@ async fn serve_connection(
                         stream.finish().await?;
                         continue;
                     }
-                    let session = match ip::connect(
-                        config.transport.endpoint(),
-                        route.backend,
-                        &route.network,
-                        cancel.child_token(),
-                    ).await {
-                        Ok(session) => session,
-                        Err(error) => {
-                            tracing::warn!(target, protocol, error = %error, "masque_ip_backend_connect_failed");
-                            stream.send_response(ip_backend_failure(&error).response()).await?;
-                            stream.finish().await?;
-                            continue;
+                    let mut backend_sessions = Vec::with_capacity(route.backends.len());
+                    let mut backend_failure = None;
+                    for backend in &route.backends {
+                        match ip::connect(
+                            config.transport.endpoint(),
+                            backend.backend.clone(),
+                            &backend.network,
+                            cancel.child_token(),
+                        ).await {
+                            Ok(session) if session.config.address == backend.assigned_address => {
+                                backend_sessions.push(Arc::new(session));
+                            }
+                            Ok(session) => {
+                                tracing::warn!(target, protocol, configured = %backend.assigned_address,
+                                    negotiated = %session.config.address, "masque_ip_backend_assignment_mismatch");
+                                backend_failure = Some(ip::Error::AddressPolicy);
+                                break;
+                            }
+                            Err(error) => {
+                                backend_failure = Some(error);
+                                break;
+                            }
                         }
-                    };
+                    }
+                    if let Some(error) = backend_failure {
+                        tracing::warn!(target, protocol, error = %error, "masque_ip_backend_connect_failed");
+                        stream.send_response(ip_backend_failure(&error).response()).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
                     let stream_id = stream.id();
                     let association_id = stream_id.into_inner();
                     let mut datagram_sender = h3.get_datagram_sender(stream_id);
@@ -614,6 +680,7 @@ async fn serve_connection(
                     let closed_tx = closed_tx.clone();
                     let association_cancel = cancel.child_token();
                     tokio::spawn(async move {
+                        let task_cancel = association_cancel.clone();
                         let result: Result<()> = async {
                             let mut capsule_bytes = BytesMut::new();
                             let request = loop {
@@ -626,19 +693,60 @@ async fn serve_connection(
                                 let remaining = chunk.remaining();
                                 capsule_bytes.extend_from_slice(&chunk.copy_to_bytes(remaining));
                             };
-                            let request_id = validate_ipv4_address_request(&request)?;
-                            stream.send_data(address_assignment_capsule(request_id, route.assigned_address)).await?;
+                            let requests = validate_address_request(&request)?;
+                            let assigned_families = requests
+                                .iter()
+                                .filter_map(|request| {
+                                    backend_sessions.iter().find(|session| {
+                                        session.config.address.is_ipv4() == request.version.is_ipv4()
+                                    }).map(|session| session.config.address.is_ipv6())
+                                })
+                                .collect::<HashSet<_>>();
+                            let assigned_addresses = backend_sessions
+                                .iter()
+                                .map(|session| session.config.address)
+                                .collect::<Vec<_>>();
+                            stream.send_data(address_assignment_capsule(&requests, &assigned_addresses)).await?;
                             for update in &route.route_updates {
-                                stream.send_data(route_advertisement_capsule(update)).await?;
+                                let update = update.iter().filter(|range| {
+                                    assigned_families.contains(&range.start.is_ipv6())
+                                }).cloned().collect::<Vec<_>>();
+                                stream.send_data(route_advertisement_capsule(&update)).await?;
                             }
+                            let (backend_tx, mut backend_rx) = mpsc::channel::<Bytes>(64);
+                            for session in &backend_sessions {
+                                let session = session.clone();
+                                let backend_tx = backend_tx.clone();
+                                let recv_cancel = task_cancel.clone();
+                                tokio::spawn(async move {
+                                    loop {
+                                        tokio::select! {
+                                            _ = recv_cancel.cancelled() => break,
+                                            packet = session.recv() => {
+                                                let Some(packet) = packet else { break };
+                                                if backend_tx.send(packet).await.is_err() { break; }
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            drop(backend_tx);
                             loop {
                                 tokio::select! {
                                     _ = association_cancel.cancelled() => break,
                                     incoming = incoming_rx.recv() => {
                                         let Some(packet) = incoming else { break };
+                                        let family = packet_family(&packet)
+                                            .ok_or_else(|| anyhow!("invalid IP packet version"))?;
+                                        if !assigned_families.contains(&family.is_ipv6()) {
+                                            continue;
+                                        }
+                                        let Some(session) = backend_sessions.iter().find(|session| {
+                                            session.config.address.is_ipv4() == family.is_ipv4()
+                                        }) else { continue };
                                         session.send(packet).await.context("send internal IP packet")?;
                                     }
-                                    incoming = session.recv() => {
+                                    incoming = backend_rx.recv() => {
                                         let Some(packet) = incoming else { break };
                                         let mut framed = Vec::with_capacity(packet.len() + 1);
                                         framed.push(0);
@@ -656,6 +764,7 @@ async fn serve_connection(
                         if let Err(error) = result {
                             tracing::warn!(error = %format!("{error:#}"), "masque_ip_association_failed");
                         }
+                        task_cancel.cancel();
                         stream.stop_stream(Code::H3_REQUEST_CANCELLED);
                         let _ = closed_tx.send(association_id).await;
                     });
@@ -888,36 +997,124 @@ fn capsule(kind: u64, payload: &[u8]) -> Bytes {
     Bytes::from(capsule)
 }
 
-fn validate_ipv4_address_request(request: &(u64, Bytes)) -> Result<u64> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AddressRequest {
+    id: u64,
+    version: IpAddr,
+}
+
+fn validate_address_request(request: &(u64, Bytes)) -> Result<Vec<AddressRequest>> {
     if request.0 != 2 {
         bail!("expected RFC 9484 ADDRESS_REQUEST capsule");
     }
-    let (request_id, width) =
-        decode_varint(&request.1).ok_or_else(|| anyhow!("invalid ADDRESS_REQUEST ID"))?;
-    if request_id == 0 || request.1[width..] != [4, 0, 0, 0, 0, 32] {
-        bail!("edge requires one wildcard IPv4 host ADDRESS_REQUEST");
+    let mut payload = request.1.as_ref();
+    let mut requests = Vec::new();
+    let mut ids = HashSet::new();
+    while !payload.is_empty() {
+        let (id, width) =
+            decode_varint(payload).ok_or_else(|| anyhow!("invalid ADDRESS_REQUEST ID"))?;
+        payload = &payload[width..];
+        let Some((&version, rest)) = payload.split_first() else {
+            bail!("missing ADDRESS_REQUEST IP version");
+        };
+        let address_width = match version {
+            4 => 4,
+            6 => 16,
+            _ => bail!("invalid ADDRESS_REQUEST IP version"),
+        };
+        if rest.len() < address_width + 1 {
+            bail!("truncated ADDRESS_REQUEST address");
+        }
+        let address = match version {
+            4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&rest[..4])?)),
+            6 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&rest[..16])?)),
+            _ => unreachable!(),
+        };
+        let prefix = rest[address_width];
+        let address_bits = if version == 4 { 32 } else { 128 };
+        if id == 0
+            || !ids.insert(id)
+            || prefix > address_bits
+            || ip_value(address) & prefix_mask(prefix, address_bits) != ip_value(address)
+        {
+            bail!("invalid ADDRESS_REQUEST entry");
+        }
+        requests.push(AddressRequest {
+            id,
+            version: if version == 4 {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            },
+        });
+        payload = &rest[address_width + 1..];
     }
-    Ok(request_id)
+    if requests.is_empty() || requests.len() > 32 {
+        bail!("ADDRESS_REQUEST requires 1 to 32 entries");
+    }
+    Ok(requests)
 }
 
-fn address_assignment_capsule(request_id: u64, assigned: Ipv4Addr) -> Bytes {
-    let mut payload = Vec::with_capacity(14);
-    encode_varint(request_id, &mut payload);
-    payload.push(4);
-    payload.extend_from_slice(&assigned.octets());
-    payload.push(32);
+fn prefix_mask(prefix: u8, bits: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (bits - prefix)
+    }
+}
+
+fn address_assignment_capsule(requests: &[AddressRequest], assigned_addresses: &[IpAddr]) -> Bytes {
+    let mut payload = Vec::with_capacity(requests.len() * 20);
+    for request in requests {
+        encode_varint(request.id, &mut payload);
+        let assigned = assigned_addresses
+            .iter()
+            .copied()
+            .find(|address| address.is_ipv4() == request.version.is_ipv4())
+            .unwrap_or(request.version);
+        match assigned {
+            IpAddr::V4(address) => {
+                payload.push(4);
+                payload.extend_from_slice(&address.octets());
+                payload.push(32);
+            }
+            IpAddr::V6(address) => {
+                payload.push(6);
+                payload.extend_from_slice(&address.octets());
+                payload.push(128);
+            }
+        }
+    }
     capsule(1, &payload)
 }
 
-fn route_advertisement_capsule(routes: &[Ipv4RouteRange]) -> Bytes {
-    let mut payload = Vec::with_capacity(routes.len() * 10);
+fn route_advertisement_capsule(routes: &[IpRouteRange]) -> Bytes {
+    let mut payload = Vec::with_capacity(routes.len() * 34);
     for route in routes {
-        payload.push(4);
-        payload.extend_from_slice(&route.start.octets());
-        payload.extend_from_slice(&route.end.octets());
+        match (route.start, route.end) {
+            (IpAddr::V4(start), IpAddr::V4(end)) => {
+                payload.push(4);
+                payload.extend_from_slice(&start.octets());
+                payload.extend_from_slice(&end.octets());
+            }
+            (IpAddr::V6(start), IpAddr::V6(end)) => {
+                payload.push(6);
+                payload.extend_from_slice(&start.octets());
+                payload.extend_from_slice(&end.octets());
+            }
+            _ => unreachable!("route validation rejects mixed-family ranges"),
+        }
         payload.push(route.protocol);
     }
     capsule(3, &payload)
+}
+
+fn packet_family(packet: &[u8]) -> Option<IpAddr> {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        Some(6) => Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        _ => None,
+    }
 }
 
 fn take_capsule(buffer: &mut BytesMut) -> Result<Option<(u64, Bytes)>> {
@@ -954,6 +1151,48 @@ mod tests {
         };
         assert!(index_routes(vec![], false).is_err());
         assert!(index_routes(vec![route.clone(), route], false).is_err());
+    }
+
+    #[test]
+    fn connect_ip_routes_require_unique_families_and_rfc_ordering() {
+        let backend = EndpointAddr::new(SecretKey::generate().public());
+        let valid = IpRoute {
+            target: "*".into(),
+            protocol: "*".into(),
+            backends: vec![
+                IpBackend {
+                    backend: backend.clone(),
+                    network: "v4".into(),
+                    assigned_address: "10.20.0.2".parse().unwrap(),
+                },
+                IpBackend {
+                    backend,
+                    network: "v6".into(),
+                    assigned_address: "fd42:20::2".parse().unwrap(),
+                },
+            ],
+            route_updates: vec![vec![
+                IpRouteRange {
+                    start: "10.30.0.1".parse().unwrap(),
+                    end: "10.30.0.9".parse().unwrap(),
+                    protocol: 0,
+                },
+                IpRouteRange {
+                    start: "fd42:30::1".parse().unwrap(),
+                    end: "fd42:30::9".parse().unwrap(),
+                    protocol: 0,
+                },
+            ]],
+        };
+        assert!(index_ip_routes(vec![valid.clone()], false).is_ok());
+
+        let mut reversed = valid.clone();
+        reversed.route_updates[0].reverse();
+        assert!(index_ip_routes(vec![reversed], false).is_err());
+
+        let mut duplicate_family = valid;
+        duplicate_family.backends[1].assigned_address = "10.20.0.3".parse().unwrap();
+        assert!(index_ip_routes(vec![duplicate_family], false).is_err());
     }
 
     #[test]
@@ -1038,21 +1277,52 @@ mod tests {
 
     #[test]
     fn connect_ip_capsules_encode_assignment_update_withdrawal_and_restoration() {
-        let request = (2, Bytes::from_static(&[7, 4, 0, 0, 0, 0, 32]));
-        assert_eq!(validate_ipv4_address_request(&request).unwrap(), 7);
+        let mut payload = vec![7, 4, 0, 0, 0, 0, 32, 8, 6];
+        payload.extend([0; 16]);
+        payload.push(128);
+        let request = (2, Bytes::from(payload));
+        let requests = validate_address_request(&request).unwrap();
+        assert_eq!(requests.len(), 2);
         assert_eq!(
-            address_assignment_capsule(7, Ipv4Addr::new(10, 20, 0, 2)).as_ref(),
-            &[1, 7, 7, 4, 10, 20, 0, 2, 32]
+            address_assignment_capsule(
+                &requests,
+                &[
+                    IpAddr::V4(Ipv4Addr::new(10, 20, 0, 2)),
+                    "fd42:20::2".parse().unwrap(),
+                ],
+            )
+            .as_ref(),
+            &[
+                1, 26, 7, 4, 10, 20, 0, 2, 32, 8, 6, 0xfd, 0x42, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 2, 128,
+            ]
         );
         assert_eq!(route_advertisement_capsule(&[]).as_ref(), &[3, 0]);
-        let route = Ipv4RouteRange {
-            start: Ipv4Addr::new(10, 30, 0, 9),
-            end: Ipv4Addr::new(10, 30, 0, 9),
+        let route = IpRouteRange {
+            start: IpAddr::V4(Ipv4Addr::new(10, 30, 0, 9)),
+            end: IpAddr::V4(Ipv4Addr::new(10, 30, 0, 9)),
             protocol: 0,
         };
         assert_eq!(
             route_advertisement_capsule(&[route]).as_ref(),
             &[3, 10, 4, 10, 30, 0, 9, 10, 30, 0, 9, 0]
+        );
+    }
+
+    #[test]
+    fn address_requests_reject_duplicate_ids_and_noncanonical_prefixes() {
+        assert!(validate_address_request(&(2, Bytes::new())).is_err());
+        assert!(
+            validate_address_request(&(
+                2,
+                Bytes::from_static(&[
+                    1, 4, 0, 0, 0, 0, 32, 1, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128
+                ]),
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_address_request(&(2, Bytes::from_static(&[1, 4, 10, 0, 0, 1, 24]),)).is_err()
         );
     }
 

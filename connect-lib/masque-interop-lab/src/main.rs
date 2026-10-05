@@ -2,15 +2,15 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use connect_masque_edge::{
-    BearerCredential, ClientAuthentication, IpRoute, Ipv4RouteRange, Route, Server, ServerOptions,
-    tls_config,
+    BearerCredential, ClientAuthentication, IpBackend, IpRoute, IpRouteRange, Route, Server,
+    ServerOptions, tls_config,
 };
 use connect_transport::{
     Access, DestinationId, DestinationPolicy, Policy, Target, Transport, TransportConfig, ip,
@@ -20,9 +20,12 @@ use rustls::pki_types::PrivateKeyDer;
 use tokio_util::sync::CancellationToken;
 
 const IP_PATH: &str = "/.well-known/masque/ip/*/*/";
-const IP_NETWORK: &str = "masque-interop";
-const IP_ASSIGNED: Ipv4Addr = Ipv4Addr::new(10, 20, 0, 2);
-const IP_REMOTE: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 9);
+const IP_V4_NETWORK: &str = "masque-interop-v4";
+const IP_V6_NETWORK: &str = "masque-interop-v6";
+const IP_V4_ASSIGNED: Ipv4Addr = Ipv4Addr::new(10, 20, 0, 2);
+const IP_V4_REMOTE: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 9);
+const IP_V6_ASSIGNED: Ipv6Addr = Ipv6Addr::new(0xfd42, 0x20, 0, 0, 0, 0, 0, 2);
+const IP_V6_REMOTE: Ipv6Addr = Ipv6Addr::new(0xfd42, 0x30, 0, 0, 0, 0, 0, 9);
 const TEST_BEARER_TOKEN: &str = "datum-masque-interop-client-token-00000001";
 
 struct Options {
@@ -90,33 +93,38 @@ async fn main() -> Result<()> {
         EndpointAddr::with_ip_addr,
     );
 
-    let mut ip_registration = backend
-        .register_ip_grant(ip::Grant {
-            peer: edge.endpoint_id(),
-            network: IP_NETWORK.into(),
-            address: IpAddr::V4(IP_ASSIGNED),
-            routes: vec!["10.30.0.9/32".parse()?],
-            mtu: 1280,
-        })
-        .await
-        .context("install test CONNECT-IP grant")?;
-    tokio::spawn(async move {
-        while let Some(incoming) = ip_registration.recv().await {
-            if incoming.ready.send(true).is_err() {
-                continue;
-            }
-            tokio::spawn(async move {
-                while let Some(packet) = incoming.session.recv().await {
-                    let Some(reply) = reverse_ipv4_packet(packet) else {
-                        continue;
-                    };
-                    if incoming.session.send(reply).await.is_err() {
-                        break;
-                    }
+    for (network, address, route) in [
+        (IP_V4_NETWORK, IpAddr::V4(IP_V4_ASSIGNED), "10.30.0.9/32"),
+        (IP_V6_NETWORK, IpAddr::V6(IP_V6_ASSIGNED), "fd42:30::9/128"),
+    ] {
+        let mut ip_registration = backend
+            .register_ip_grant(ip::Grant {
+                peer: edge.endpoint_id(),
+                network: network.into(),
+                address,
+                routes: vec![route.parse()?],
+                mtu: 1280,
+            })
+            .await
+            .context("install test CONNECT-IP grant")?;
+        tokio::spawn(async move {
+            while let Some(incoming) = ip_registration.recv().await {
+                if incoming.ready.send(true).is_err() {
+                    continue;
                 }
-            });
-        }
-    });
+                tokio::spawn(async move {
+                    while let Some(packet) = incoming.session.recv().await {
+                        let Some(reply) = reverse_ip_packet(packet) else {
+                            continue;
+                        };
+                        if incoming.session.send(reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+    }
 
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     std::fs::write(&options.cert_out, certified.cert.pem()).context("write test CA certificate")?;
@@ -124,11 +132,18 @@ async fn main() -> Result<()> {
         vec![certified.cert.der().clone()],
         PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into()),
     )?;
-    let advertised_route = Ipv4RouteRange {
-        start: IP_REMOTE,
-        end: IP_REMOTE,
-        protocol: 0,
-    };
+    let advertised_routes = vec![
+        IpRouteRange {
+            start: IpAddr::V4(IP_V4_REMOTE),
+            end: IpAddr::V4(IP_V4_REMOTE),
+            protocol: 0,
+        },
+        IpRouteRange {
+            start: IpAddr::V6(IP_V6_REMOTE),
+            end: IpAddr::V6(IP_V6_REMOTE),
+            protocol: 0,
+        },
+    ];
     let client_authentication = ClientAuthentication::bearer(vec![BearerCredential::new(
         "independent-masque-client".into(),
         TEST_BEARER_TOKEN.as_bytes(),
@@ -163,14 +178,19 @@ async fn main() -> Result<()> {
         vec![IpRoute {
             target: "*".into(),
             protocol: "*".into(),
-            backend: backend_addr,
-            network: IP_NETWORK.into(),
-            assigned_address: IP_ASSIGNED,
-            route_updates: vec![
-                vec![advertised_route.clone()],
-                vec![],
-                vec![advertised_route],
+            backends: vec![
+                IpBackend {
+                    backend: backend_addr.clone(),
+                    network: IP_V4_NETWORK.into(),
+                    assigned_address: IpAddr::V4(IP_V4_ASSIGNED),
+                },
+                IpBackend {
+                    backend: backend_addr,
+                    network: IP_V6_NETWORK.into(),
+                    assigned_address: IpAddr::V6(IP_V6_ASSIGNED),
+                },
             ],
+            route_updates: vec![advertised_routes.clone(), vec![], advertised_routes],
         }],
         ServerOptions::authenticated(client_authentication),
     )?;
@@ -183,8 +203,10 @@ async fn main() -> Result<()> {
             "allowed_target": options.origin.to_string(),
             "denied_target": format!("{}:{denied_target_port}", options.origin.ip()),
             "ip_uri": format!("https://localhost:{}{IP_PATH}", public_addr.port()),
-            "ip_assigned": IP_ASSIGNED.to_string(),
-            "ip_remote": IP_REMOTE.to_string(),
+            "ip_v4_assigned": IP_V4_ASSIGNED.to_string(),
+            "ip_v4_remote": IP_V4_REMOTE.to_string(),
+            "ip_v6_assigned": IP_V6_ASSIGNED.to_string(),
+            "ip_v6_remote": IP_V6_REMOTE.to_string(),
             "service_endpoint": details.endpoint_id.to_string(),
             "bearer_token": TEST_BEARER_TOKEN,
         }))?,
@@ -204,11 +226,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn reverse_ipv4_packet(packet: Bytes) -> Option<Bytes> {
-    if packet.len() < 20 || packet[0] != 0x45 {
+fn reverse_ip_packet(packet: Bytes) -> Option<Bytes> {
+    let mut bytes = packet.to_vec();
+    if bytes.first().map(|byte| byte >> 4) == Some(6) {
+        if bytes.len() < 40 {
+            return None;
+        }
+        let source = <[u8; 16]>::try_from(&bytes[8..24]).ok()?;
+        let destination = <[u8; 16]>::try_from(&bytes[24..40]).ok()?;
+        bytes[8..24].copy_from_slice(&destination);
+        bytes[24..40].copy_from_slice(&source);
+        return Some(Bytes::from(bytes));
+    }
+    if bytes.len() < 20 || bytes[0] != 0x45 {
         return None;
     }
-    let mut bytes = packet.to_vec();
     let source = <[u8; 4]>::try_from(&bytes[12..16]).ok()?;
     let destination = <[u8; 4]>::try_from(&bytes[16..20]).ok()?;
     bytes[12..16].copy_from_slice(&destination);
