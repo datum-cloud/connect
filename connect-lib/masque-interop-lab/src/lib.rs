@@ -188,22 +188,28 @@ impl ClientAuthentication {
         let Some(credential) = self.authenticate(headers) else {
             return AuthDecision::AuthenticationRequired;
         };
-        credential
+        if credential
             .udp_targets
             .contains(&(target.0.to_ascii_lowercase(), target.1))
-            .then_some(AuthDecision::Allowed)
-            .unwrap_or(AuthDecision::Forbidden)
+        {
+            AuthDecision::Allowed
+        } else {
+            AuthDecision::Forbidden
+        }
     }
 
     fn authorize_ip(&self, headers: &HeaderMap, target: &str, protocol: &str) -> AuthDecision {
         let Some(credential) = self.authenticate(headers) else {
             return AuthDecision::AuthenticationRequired;
         };
-        credential
+        if credential
             .ip_targets
             .contains(&(target.to_owned(), protocol.to_owned()))
-            .then_some(AuthDecision::Allowed)
-            .unwrap_or(AuthDecision::Forbidden)
+        {
+            AuthDecision::Allowed
+        } else {
+            AuthDecision::Forbidden
+        }
     }
 }
 
@@ -313,30 +319,6 @@ impl Server {
             transport,
             routes,
             vec![],
-            ServerOptions {
-                max_connections,
-                max_associations_per_connection,
-                ..ServerOptions::authenticated(client_authentication)
-            },
-        )
-    }
-
-    pub fn bind_with_limits_and_ip_routes(
-        listen: SocketAddr,
-        tls: rustls::ServerConfig,
-        transport: Transport,
-        routes: Vec<Route>,
-        ip_routes: Vec<IpRoute>,
-        max_connections: usize,
-        max_associations_per_connection: usize,
-        client_authentication: ClientAuthentication,
-    ) -> Result<Self> {
-        Self::bind_with_options_and_ip_routes(
-            listen,
-            tls,
-            transport,
-            routes,
-            ip_routes,
             ServerOptions {
                 max_connections,
                 max_associations_per_connection,
