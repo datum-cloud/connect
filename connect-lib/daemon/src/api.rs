@@ -12,6 +12,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::{
@@ -1505,6 +1506,39 @@ async fn audit(
 }
 
 pub async fn reconcile_all(state: &AppState) {
+    reset_observed_state(state).await;
+    let _ = reconcile_pending_projects(state).await;
+}
+
+/// Restore saved projects at daemon startup and keep retrying transient resume
+/// failures independently of any live project runtime. A runtime installs its
+/// own service, dial, and managed-network reconciliation only after resume
+/// succeeds, so this outer supervisor is what recovers relay/auth failures that
+/// happen before `RealControl::start_project` can publish a runtime.
+pub async fn reconcile_with_retry(state: &AppState, shutdown: CancellationToken) {
+    reset_observed_state(state).await;
+    let mut delay = std::time::Duration::from_secs(1);
+    const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+    loop {
+        let failures = reconcile_pending_projects(state).await;
+        if failures == 0 {
+            return;
+        }
+        tracing::warn!(
+            failed_projects = failures,
+            retry_delay_ms = delay.as_millis() as u64,
+            stage = "restart_enrollment_retry",
+            "saved Connect projects did not resume; retrying"
+        );
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        delay = std::cmp::min(delay.saturating_mul(2), MAX_DELAY);
+    }
+}
+
+async fn reset_observed_state(state: &AppState) {
     let _ = state
         .store
         .transact(|root| {
@@ -1528,12 +1562,27 @@ pub async fn reconcile_all(state: &AppState) {
             Ok(())
         })
         .await;
+}
+
+async fn reconcile_pending_projects(state: &AppState) -> usize {
     let snapshot = state.store.snapshot().await;
+    let mut failures = 0;
     for (project, desired) in snapshot.projects {
-        if !desired.desired_up {
+        if !desired.desired_up || desired.running {
             continue;
         }
-        let Some(credentials) = desired.credentials_file else {
+        let _mutation_guard = state.mutation_lock.lock().await;
+        // An API request may have brought the project up while this retry was
+        // waiting for the mutation lock. Re-read intent before touching the
+        // runtime so a delayed retry cannot replace a healthy project.
+        let current = state.store.snapshot().await;
+        let Some(desired) = current.projects.get(&project) else {
+            continue;
+        };
+        if !desired.desired_up || desired.running {
+            continue;
+        }
+        let Some(credentials) = desired.credentials_file.clone() else {
             let _ = record_project_error(
                 state,
                 &project,
@@ -1543,7 +1592,7 @@ pub async fn reconcile_all(state: &AppState) {
             .await;
             continue;
         };
-        let Some(expected) = desired.connector.as_ref() else {
+        let Some(expected) = desired.connector.clone() else {
             let _ = record_project_error(
                 state,
                 &project,
@@ -1553,7 +1602,11 @@ pub async fn reconcile_all(state: &AppState) {
             .await;
             continue;
         };
-        match state.control.resume(&project, &credentials, expected).await {
+        match state
+            .control
+            .resume(&project, &credentials, &expected)
+            .await
+        {
             Ok(connector) => {
                 let _ = state
                     .store
@@ -1570,11 +1623,25 @@ pub async fn reconcile_all(state: &AppState) {
                 reconcile_project(state, &project).await;
             }
             Err(error) => {
+                if retryable_project_resume_error(&error) {
+                    failures += 1;
+                }
                 let _ = record_project_error(state, &project, "restart_enrollment", &error.message)
                     .await;
             }
         }
     }
+    failures
+}
+
+fn retryable_project_resume_error(error: &ApiError) -> bool {
+    matches!(
+        error.status,
+        StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+    )
 }
 
 async fn reconcile_project(state: &AppState, project: &str) {
