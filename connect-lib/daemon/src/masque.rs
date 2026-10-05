@@ -398,6 +398,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn config_accepts_explicit_ip_route_and_rejects_reversed_range() {
+        let mut config = Config {
+            listen: "127.0.0.1:4433".parse().unwrap(),
+            certificate_chain: "/tmp/cert.pem".into(),
+            private_key: "/tmp/key.pem".into(),
+            connector_key: "/tmp/connector.key".into(),
+            max_connections: default_max_connections(),
+            max_associations_per_connection: default_max_associations(),
+            routes: vec![],
+            ip_routes: vec![IpRouteConfig {
+                target: "ip.example".into(),
+                protocol: "connect-ip".into(),
+                backend_endpoint_id: "validated when materialized".into(),
+                backend_addresses: vec!["127.0.0.1:7777".parse().unwrap()],
+                backend_relay_url: None,
+                network: "private".into(),
+                assigned_address: "10.20.0.2".parse().unwrap(),
+                route_updates: vec![vec![Ipv4RouteRangeConfig {
+                    start: "10.30.0.1".parse().unwrap(),
+                    end: "10.30.0.9".parse().unwrap(),
+                    protocol: 0,
+                }]],
+            }],
+        };
+        assert!(config.validate().is_ok());
+
+        config.ip_routes[0].route_updates[0][0].start = "10.30.0.10".parse().unwrap();
+        assert!(config.validate().is_err());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn private_files_reject_broad_permissions() {
