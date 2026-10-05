@@ -25,6 +25,8 @@ quinn = { version = "0.11.7", default-features = false, features = ["runtime-tok
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde_json = { workspace = true }
+sha2 = "0.10"
+subtle = "2.6"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
