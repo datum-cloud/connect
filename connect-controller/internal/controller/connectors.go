@@ -547,7 +547,13 @@ func readyGatewayGrants(ctx context.Context, c client.Client, project string, ga
 			}
 			return nil, err
 		}
-		if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
+		// Gateway grants represent durable authorization from the existence of
+		// the Connector and its binding. Do not remove a grant just because the
+		// Connector's liveness lease expires temporarily: that would change the
+		// gateway Workload config and restart the gateway, interrupting every
+		// other attached Connector. Binding readiness still checks the liveness
+		// condition before allowing a client to join.
+		if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Accepted") {
 			continue
 		}
 		peer := strings.ToLower(connector.Spec.PublicKey)

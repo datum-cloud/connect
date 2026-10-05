@@ -101,8 +101,8 @@ func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 
 func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *testing.T) {
 	ctx := context.Background()
-	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
-	secondConnector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "phone", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("b", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
+	secondConnector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "phone", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("b", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}, Image: "ghcr.io/datum-cloud/iroh-gateway:connect-ip", PeerRouting: true}}
 	c := testClient(t, connector, secondConnector, gateway).Build()
 	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
@@ -326,10 +326,59 @@ func TestGatewayGrantInterfaceDerivationIsPerPeerAndSymmetric(t *testing.T) {
 	}
 }
 
+func TestGatewayGrantPersistsWhenConnectorIsTemporarilyOffline(t *testing.T) {
+	ctx := context.Background()
+	connector := &connectv1alpha1.Connector{
+		ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"},
+		Spec:       connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)},
+		Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{
+			{Type: "Accepted", Status: metav1.ConditionTrue},
+			{Type: "Ready", Status: metav1.ConditionFalse, Reason: "AgentOffline"},
+		}},
+	}
+	gateway := &connectv1alpha1.ConnectGateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")},
+		Spec:       connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}, Image: "ghcr.io/datum-cloud/iroh-gateway:connect-ip"},
+	}
+	binding := &connectv1alpha1.ConnectNetworkBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc", Namespace: "project"},
+		Spec:       connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name},
+	}
+	c := testClient(t, connector, gateway, binding).Build()
+	if err := reconcileGatewayResources(ctx, c, "project-id", gateway); err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: gateway.Namespace}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		Grants []struct {
+			Peer string `json:"peer"`
+		} `json:"grants"`
+	}
+	if err := json.Unmarshal([]byte(configMap.Data["grants.json"]), &config); err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Grants) != 1 || config.Grants[0].Peer != connector.Spec.PublicKey {
+		t.Fatalf("gateway grants=%v, want offline but authorized Connector %q to retain its grant", config.Grants, connector.Spec.PublicKey)
+	}
+	if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Accepted") || meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
+		t.Fatalf("test Connector conditions=%v, want Accepted=True and Ready=False", connector.Status.Conditions)
+	}
+	if err := reconcileNetworkBinding(ctx, c, "project-id", binding); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(binding.Status.Conditions, "Accepted")
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "ConnectorNotReady" {
+		t.Fatalf("binding condition=%#v, want ConnectorNotReady while the Connector is offline", condition)
+	}
+}
+
 func TestPeerRoutingIsDisabledByDefault(t *testing.T) {
 	ctx := context.Background()
-	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
-	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
+	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20::/48"}, Image: "gateway:dev"}}
 	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
 	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
@@ -366,8 +415,8 @@ func TestGatewayReportsPeerRouteCapacityExceeded(t *testing.T) {
 	for index := range routes {
 		routes[index] = fmt.Sprintf("fd20::%x/128", index+1)
 	}
-	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
-	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
+	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: routes, Image: "gateway:dev", PeerRouting: true}}
 	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
 	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
