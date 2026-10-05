@@ -349,6 +349,8 @@ async fn read_file(path: &Path, label: &str, private: bool) -> Result<Vec<u8>, A
 
 fn read_file_blocking(path: &Path, label: &str, private: bool) -> Result<Vec<u8>, ApiError> {
     use std::io::Read;
+    #[cfg(windows)]
+    let _ = private; // Windows validates private paths before this blocking read.
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
