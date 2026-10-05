@@ -21,6 +21,7 @@ h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt
 h3-datagram = "0.0.2"
 futures-util = "0.3"
 bytes = "1"
+ed25519-dalek = "2"
 k8s-openapi = { version = "0.26.1", features = ["v1_30"] }
 kube = { version = "2.0.1", default-features = false, features = ["client", "derive", "rustls-tls"] }
 n0-error = { version = "1.0", features = ["anyhow"] }

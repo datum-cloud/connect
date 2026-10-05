@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -380,6 +381,21 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	publicKey := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
 	endpointID := hex.EncodeToString(publicKey)
 	gateway.Status.EndpointID = endpointID
+	routeGrantSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: gatewayChildName(gateway.Name, "route-grant"), Namespace: gateway.Namespace}}
+	_, err = controllerutil.CreateOrUpdate(ctx, c, routeGrantSecret, func() error {
+		if len(routeGrantSecret.Data["key"]) != ed25519.SeedSize {
+			seed := make([]byte, ed25519.SeedSize)
+			if _, err := rand.Read(seed); err != nil {
+				return err
+			}
+			routeGrantSecret.Data = map[string][]byte{"key": seed}
+		}
+		routeGrantSecret.Type = corev1.SecretTypeOpaque
+		return controllerutil.SetControllerReference(gateway, routeGrantSecret, scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("reconcile gateway route-grant Secret: %w", err)
+	}
 	peerGrants, err := readyGatewayGrants(ctx, c, project, gateway, endpointID)
 	if err != nil {
 		return err
@@ -447,13 +463,74 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	return nil
 }
 
+type routeGrantClaims struct {
+	Version         int      `json:"version"`
+	Project         string   `json:"project"`
+	Network         string   `json:"network"`
+	Connector       string   `json:"connector"`
+	Gateway         string   `json:"gateway"`
+	Revision        string   `json:"revision"`
+	IssuedAtUnix    int64    `json:"issued_at_unix"`
+	ExpiresAtUnix   int64    `json:"expires_at_unix"`
+	InterfaceName   string   `json:"interface_name"`
+	AssignedAddress string   `json:"assigned_address"`
+	PeerAddress     string   `json:"peer_address"`
+	MTU             int      `json:"mtu"`
+	Routes          []string `json:"routes"`
+}
+
+func clientInterfaceName(project, network string) string {
+	digest := sha256.Sum256([]byte(project + "\x00" + network))
+	return fmt.Sprintf("dc%x", digest[:5])
+}
+
+func signRouteGrant(ctx context.Context, c client.Client, project string, gateway *connectv1alpha1.ConnectGateway, connector *connectv1alpha1.Connector, binding *connectv1alpha1.ConnectNetworkBinding) (connectv1alpha1.SignedRouteGrant, error) {
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "route-grant"), Namespace: gateway.Namespace}, secret); err != nil {
+		return connectv1alpha1.SignedRouteGrant{}, fmt.Errorf("read route-grant signing key: %w", err)
+	}
+	seed := secret.Data["key"]
+	if len(seed) != ed25519.SeedSize {
+		return connectv1alpha1.SignedRouteGrant{}, fmt.Errorf("route-grant signing key is invalid")
+	}
+	key := ed25519.NewKeyFromSeed(seed)
+	keyID := hex.EncodeToString(key.Public().(ed25519.PublicKey))
+	revisionInput, err := json.Marshal(struct {
+		Project, Network, Connector, Gateway, AssignedAddress, PeerAddress, InterfaceName string
+		MTU                                                                               int
+		Routes                                                                            []string
+	}{project, gateway.Spec.NetworkRef, strings.ToLower(connector.Spec.PublicKey), strings.ToLower(gateway.Status.EndpointID), binding.Status.AssignedAddress, binding.Status.PeerAddress, clientInterfaceName(project, gateway.Spec.NetworkRef), 1280, binding.Status.Routes})
+	if err != nil {
+		return connectv1alpha1.SignedRouteGrant{}, err
+	}
+	revision := fmt.Sprintf("%x", sha256.Sum256(revisionInput))
+	issued := time.Now().UTC().Truncate(5 * time.Minute)
+	claims := routeGrantClaims{
+		Version: 1, Project: project, Network: gateway.Spec.NetworkRef,
+		Connector: strings.ToLower(connector.Spec.PublicKey), Gateway: strings.ToLower(gateway.Status.EndpointID),
+		Revision: revision, IssuedAtUnix: issued.Unix(), ExpiresAtUnix: issued.Add(15 * time.Minute).Unix(),
+		InterfaceName:   clientInterfaceName(project, gateway.Spec.NetworkRef),
+		AssignedAddress: binding.Status.AssignedAddress, PeerAddress: binding.Status.PeerAddress,
+		MTU: 1280, Routes: append([]string(nil), binding.Status.Routes...),
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return connectv1alpha1.SignedRouteGrant{}, err
+	}
+	return connectv1alpha1.SignedRouteGrant{
+		KeyID:     keyID,
+		Payload:   base64.RawURLEncoding.EncodeToString(payload),
+		Signature: base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, payload)),
+	}, nil
+}
+
 func reconcileNetworkBinding(ctx context.Context, c client.Client, project string, binding *connectv1alpha1.ConnectNetworkBinding) error {
 	before := binding.Status.DeepCopy()
 	status, reason, message := metav1.ConditionFalse, "GatewayNotFound", "referenced ConnectGateway does not exist in this project"
 	var gateway connectv1alpha1.ConnectGateway
+	var connector connectv1alpha1.Connector
 	err := c.Get(ctx, types.NamespacedName{Name: binding.Spec.GatewayRef, Namespace: binding.Namespace}, &gateway)
 	if err == nil {
-		var connector connectv1alpha1.Connector
 		err = c.Get(ctx, types.NamespacedName{Name: binding.Spec.ConnectorRef, Namespace: binding.Namespace}, &connector)
 		if apierrors.IsNotFound(err) {
 			reason, message = "ConnectorNotFound", "referenced Connector does not exist in this project"
@@ -504,6 +581,15 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return err
+	}
+	if status == metav1.ConditionTrue {
+		grant, err := signRouteGrant(ctx, c, project, &gateway, &connector, binding)
+		if err != nil {
+			return err
+		}
+		binding.Status.RouteGrant = grant
+	} else {
+		binding.Status.RouteGrant = connectv1alpha1.SignedRouteGrant{}
 	}
 	meta.SetStatusCondition(&binding.Status.Conditions, metav1.Condition{Type: "Accepted", Status: status, Reason: reason, Message: message, ObservedGeneration: binding.Generation})
 	binding.Status.ObservedGeneration = binding.Generation

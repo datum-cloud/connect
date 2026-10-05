@@ -136,9 +136,14 @@ lists the routes, persists desired attachment intent, and provides the matching
 the project resumes. Repeating `join` for a running attachment is idempotent.
 `leave` clears the intent, closes the local data path, and removes the
 ConnectNetworkBinding; repeating it is safe. Direct peer and static
-`--local-ip-config` attachments remain ephemeral. The privileged helper always
-checks the exact address and routes: missing or stale approval reports
-`approval_required` and no interface is created. Use `status --output json` for
+`--local-ip-config` attachments remain ephemeral. For a managed VPC, initial
+local setup trusts the selected gateway's route-grant signing key. The helper
+then verifies short-lived grants bound to the Connector, project, network,
+gateway, interface, address, and exact routes. Valid grants renew an unchanged
+interface in place; changed claims replace the attachment without another
+administrator prompt. Unknown issuers and invalid, expired, or mismatched grants
+fail closed. Direct peers still require exact static approvals. Use
+`status --output json` for
 packet and drop counters and the last attachment error.
 `packets_sent` and `packets_received` count local adapter delivery. The nested
 `transport` object reports wire-layer packet counters, policy drops, and protocol
@@ -397,7 +402,9 @@ and old binaries remain for recovery. Manually managed helper installations are
 never silently replaced.
 
 Scripts, JSON/YAML output, custom daemon URLs, and scoped tokens never trigger
-elevation. An administrator must complete setup locally first. API clients with
+elevation. An administrator must complete initial issuer trust or direct-peer
+setup locally first. Later controller-signed managed-route changes do not
+elevate. API clients with
 the setup role can prepare an attachment with `POST /v1/networks/prepare`, inspect
 its single-attachment approval plan with `GET /v1/networks/NAME/setup`, and then
 use the normal join endpoint. Preparing a plan does not grant OS privileges or

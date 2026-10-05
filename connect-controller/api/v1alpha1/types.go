@@ -194,7 +194,17 @@ type ConnectNetworkBindingStatus struct {
 	PeerAddress        string             `json:"peerAddress,omitempty"`
 	Routes             []string           `json:"routes,omitempty"`
 	RelayURLs          []string           `json:"relayURLs,omitempty"`
+	RouteGrant         SignedRouteGrant   `json:"routeGrant,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// SignedRouteGrant is an opaque, expiring Ed25519 capability consumed by the
+// local privileged networking helper. Payload is signed JSON encoded with
+// unpadded base64url; KeyID is the trusted issuer's hex public key.
+type SignedRouteGrant struct {
+	KeyID     string `json:"keyID,omitempty"`
+	Payload   string `json:"payload,omitempty"`
+	Signature string `json:"signature,omitempty"`
 }
 
 // +kubebuilder:object:root=true

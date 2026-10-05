@@ -120,6 +120,16 @@ spec:
                 items:
                   type: string
                 type: array
+              routeGrant:
+                description: Expiring Ed25519 capability for the privileged local networking helper.
+                properties:
+                  keyID:
+                    type: string
+                  payload:
+                    type: string
+                  signature:
+                    type: string
+                type: object
               routes:
                 items:
                   type: string

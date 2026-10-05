@@ -53,6 +53,10 @@ pub struct Binding {
     pub routes: Vec<String>,
     pub interface_name: String,
     pub mtu: u16,
+    /// Controller-issued capability used only by the privileged helper. Static
+    /// and direct-peer bindings continue to use explicit root approvals.
+    #[serde(default)]
+    pub route_grant: Option<serde_json::Value>,
 }
 
 impl LocalIpConfig {
@@ -531,7 +535,7 @@ pub async fn join(
         _ = cancel.cancelled() => return Err(ApiError::internal("CONNECT-IP attachment setup was cancelled")),
         result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
             match peer_address {
-                Some(peer_address) => PacketDevice::create_gateway(&binding.interface_name, address, peer_address, binding.mtu, &routes, helper).await,
+                Some(peer_address) => PacketDevice::create_gateway(&binding.interface_name, address, peer_address, binding.mtu, &routes, helper, binding.route_grant.as_ref()).await,
                 None => PacketDevice::create(&binding.interface_name, address, binding.mtu, &routes, helper).await,
             }
         }) => result.map_err(|_| ApiError::internal("TUN setup timed out; any partially created interface is removed"))?,

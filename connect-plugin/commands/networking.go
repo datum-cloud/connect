@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -26,7 +27,11 @@ type networkPlan struct {
 	Network        string                        `json:"network"`
 	ManagedGateway bool                          `json:"managed_gateway"`
 	HelperConfig   daemonservice.HelperApprovals `json:"helper_config"`
-	Binding        struct {
+	RouteGrant     struct {
+		KeyID   string `json:"keyID"`
+		Payload string `json:"payload"`
+	} `json:"route_grant"`
+	Binding struct {
 		Peer            string        `json:"peer"`
 		Address         string        `json:"assigned_address"`
 		PeerAddress     string        `json:"peer_address"`
@@ -105,7 +110,7 @@ func writeNetworkApproval(out io.Writer, plan networkPlan, peer string) {
 		if len(plan.Binding.Routes) > 0 {
 			fmt.Fprintf(out, "Routes through VPC gateway: %s\n", strings.Join(plan.Binding.Routes, ", "))
 		}
-		fmt.Fprintln(out, "This approves the local interface and these routes. VPC firewall rules still control access to workloads.")
+		fmt.Fprintln(out, "This trusts the gateway to sign short-lived grants for this local interface. VPC firewall rules still control access to workloads.")
 		return
 	}
 	if len(plan.Binding.Routes) > 0 {
@@ -161,7 +166,23 @@ func waitForPeer(ctx context.Context, client *connectapi.Client, project, networ
 }
 
 func validateNetworkPlan(plan networkPlan, network string) error {
-	if plan.Network != network || len(plan.HelperConfig.Approvals) != 1 {
+	if plan.Network != network {
+		return fmt.Errorf("daemon returned an ambiguous networking approval plan")
+	}
+	if plan.ManagedGateway {
+		payload, err := base64.RawURLEncoding.DecodeString(plan.RouteGrant.Payload)
+		var claims struct {
+			Gateway string `json:"gateway"`
+		}
+		if err == nil {
+			err = json.Unmarshal(payload, &claims)
+		}
+		if len(plan.HelperConfig.Approvals) != 0 || len(plan.HelperConfig.TrustedIssuers) != 1 || plan.RouteGrant.KeyID != plan.HelperConfig.TrustedIssuers[0] || err != nil || plan.Binding.Peer != claims.Gateway {
+			return fmt.Errorf("daemon returned an ambiguous signed route-grant plan")
+		}
+		return nil
+	}
+	if len(plan.HelperConfig.Approvals) != 1 || len(plan.HelperConfig.TrustedIssuers) != 0 {
 		return fmt.Errorf("daemon returned an ambiguous networking approval plan")
 	}
 	approval := plan.HelperConfig.Approvals[0]
@@ -195,7 +216,7 @@ func newJoin(opts *options) *cobra.Command {
 	var routes, advertise []string
 	var ping, upgrade, wait, noWait bool
 	var waitTimeout time.Duration
-	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC gateway or direct Connector", Long: "Join the ready ConnectGateway configured for NETWORK. Connect creates or reuses this device's ConnectNetworkBinding, then asks for Administrator approval before installing the local interface and exact approved routes.\n\nIf no managed gateway exists, pass --peer and explicit traffic permissions\nfor direct Connector setup. Both peers use the same network name and approve\neach other. Routed direct attachments wait for the peer by default.\n\nSuccessful managed VPC attachments reconnect when the daemon or project resumes. Route changes outside the existing helper approval fail closed and require interactive approval. Direct peer attachments remain ephemeral. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC gateway or direct Connector", Long: "Join the ready ConnectGateway configured for NETWORK. Connect creates or reuses this device's ConnectNetworkBinding, then asks for Administrator approval to trust that gateway's route-grant signing key.\n\nIf no managed gateway exists, pass --peer and explicit traffic permissions\nfor direct Connector setup. Both peers use the same network name and approve\neach other. Routed direct attachments wait for the peer by default.\n\nSuccessful managed VPC attachments reconnect when the daemon or project resumes. Later controller-signed route changes from the trusted gateway do not need another prompt; unknown issuers and invalid or expired grants fail closed. Direct peer attachments remain ephemeral and use exact approvals. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if wait && noWait {
 			return fmt.Errorf("choose either --wait or --no-wait")
 		}

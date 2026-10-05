@@ -379,7 +379,7 @@ impl RealControl {
                             // Managed VPC intent is durable. Re-run the
                             // idempotent join during the normal authorization
                             // refresh so startup-time gateway outages and a
-                            // newly installed exact helper approval recover
+                            // newly trusted route-grant issuer recover
                             // without another CLI command.
                             let desired_networks: Vec<_> = control.store.snapshot().await.projects
                                 .get(&project).into_iter().flat_map(|state| state.managed_networks.values())
@@ -686,6 +686,7 @@ impl Control for RealControl {
                 routes: routes.clone(),
                 interface_name: interface_name.clone(),
                 mtu: 1280,
+                route_grant: None,
             };
             let local = binding.address()?;
             if local.prefix_len() != 128 || local.addr().is_ipv4() {
@@ -710,9 +711,33 @@ impl Control for RealControl {
                 routes: parsed_routes,
                 advertise_routes: vec![],
             };
+            let route_grant: connect_ip_adapter::helper::SignedRouteGrant =
+                serde_json::from_value(status["routeGrant"].clone()).map_err(|_| {
+                    ApiError::bad_request(
+                        "ConnectNetworkBinding is missing a valid signed route grant",
+                    )
+                })?;
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| ApiError::internal("System clock is before the Unix epoch"))?
+                .as_secs();
+            let (claims, granted) = route_grant
+                .verify(std::slice::from_ref(&route_grant.key_id), now_unix)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            if granted != approval
+                || claims.project != project
+                || claims.network != network
+                || claims.connector != runtime.identity.public_key
+                || claims.gateway != status["gatewayEndpointID"]
+            {
+                return Err(ApiError::bad_request(
+                    "Signed route grant does not match the Connector binding",
+                ));
+            }
             let config = connect_ip_adapter::helper::Config {
                 allowed_uid: unsafe { libc::geteuid() },
-                approvals: vec![approval],
+                approvals: vec![],
+                trusted_issuers: vec![route_grant.key_id.clone()],
             };
             config
                 .validate()
@@ -731,6 +756,7 @@ impl Control for RealControl {
                     "allow_inbound": [],
                     "allow_outbound": []
                 },
+                "route_grant": route_grant,
                 "helper_socket": crate::networking::helper_socket()?,
                 "helper_config": config
             })));
@@ -1038,7 +1064,15 @@ impl Control for RealControl {
                 routes: routes.clone(),
                 interface_name,
                 mtu: 1280,
+                route_grant: Some(status["routeGrant"].clone()),
             };
+            #[cfg(unix)]
+            let route_grant: connect_ip_adapter::helper::SignedRouteGrant =
+                serde_json::from_value(status["routeGrant"].clone()).map_err(|_| {
+                    ApiError::bad_request(
+                        "ConnectNetworkBinding is missing a valid signed route grant",
+                    )
+                })?;
             let assigned = binding.address()?;
             let peer: connect_ip_adapter::IpNet = peer_address.parse().map_err(|_| {
                 ApiError::bad_request("ConnectNetworkBinding peerAddress is invalid")
@@ -1064,6 +1098,23 @@ impl Control for RealControl {
                     routes: parsed_routes.clone(),
                     advertise_routes: vec![],
                 };
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| ApiError::internal("System clock is before the Unix epoch"))?
+                    .as_secs();
+                let (claims, granted) = route_grant
+                    .verify(std::slice::from_ref(&route_grant.key_id), now_unix)
+                    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                if granted != expected
+                    || claims.project != project
+                    || claims.network != network
+                    || claims.connector != runtime.identity.public_key
+                    || claims.gateway != endpoint_id
+                {
+                    return Err(ApiError::bad_request(
+                        "Signed route grant does not match the Connector binding",
+                    ));
+                }
                 let helper = connect_ip_adapter::helper::inspect(&helper_socket)
                     .await
                     .map_err(|error| {
@@ -1073,10 +1124,10 @@ impl Control for RealControl {
                         )
                         .with_code("network_setup_required")
                     })?;
-                if !helper.approvals.contains(&expected) {
+                if !helper.trusted_issuers.contains(&route_grant.key_id) {
                     return Err(ApiError::new(
                         axum::http::StatusCode::CONFLICT,
-                        "Administrator approval is required for the exact VPC address and routes; no interface was created",
+                        "Administrator approval is required for this route-grant issuer; no interface was created",
                     )
                     .with_code("network_setup_required"));
                 }
@@ -1105,11 +1156,40 @@ impl Control for RealControl {
                 .filter(|attachment| !attachment.is_finished())
             {
                 let mut result = existing.status().await;
-                result["managed_gateway"] = serde_json::json!(true);
-                result["persistent"] = serde_json::json!(true);
-                result["ephemeral"] = serde_json::json!(false);
-                result["desired_attached"] = serde_json::json!(true);
-                return Ok(result);
+                if result["gateway"] == endpoint_id
+                    && result["assigned_address"] == binding.assigned_address
+                    && result["routes"] == serde_json::json!(routes)
+                {
+                    #[cfg(unix)]
+                    let renewed = match helper_socket.as_deref() {
+                        Some(socket) => connect_ip_adapter::helper::Client::renew_granted(
+                            socket,
+                            route_grant.clone(),
+                        )
+                        .await
+                        .map(|()| true)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(
+                                project,
+                                network,
+                                %error,
+                                stage = "route_grant_renewal",
+                                "route_grant_renewal_failed"
+                            );
+                            false
+                        }),
+                        None => true,
+                    };
+                    #[cfg(not(unix))]
+                    let renewed = true;
+                    if renewed {
+                        result["managed_gateway"] = serde_json::json!(true);
+                        result["persistent"] = serde_json::json!(true);
+                        result["ephemeral"] = serde_json::json!(false);
+                        result["desired_attached"] = serde_json::json!(true);
+                        return Ok(result);
+                    }
+                }
             }
             if let Some(previous) = networks.remove(network) {
                 previous.stop().await;

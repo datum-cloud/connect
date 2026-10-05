@@ -54,25 +54,33 @@ impl PacketDevice {
         mtu: u16,
         routes: &[IpNet],
         helper: Option<&std::path::Path>,
+        route_grant: Option<&serde_json::Value>,
     ) -> io::Result<Self> {
         #[cfg(not(unix))]
-        let _ = peer_address;
+        let _ = (peer_address, route_grant);
 
         validate(name, address, mtu, routes)?;
         if let Some(socket) = helper {
             #[cfg(unix)]
-            return helper::Client::connect_approved(
-                socket,
-                helper::Approval {
-                    interface_name: name.into(),
-                    assigned_address: address,
-                    peer_address,
-                    mtu,
-                    routes: routes.to_vec(),
-                    advertise_routes: vec![],
-                },
-            )
-            .await
+            return if let Some(grant) = route_grant {
+                let grant = serde_json::from_value(grant.clone()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid signed route grant")
+                })?;
+                helper::Client::connect_granted(socket, grant).await
+            } else {
+                helper::Client::connect_approved(
+                    socket,
+                    helper::Approval {
+                        interface_name: name.into(),
+                        assigned_address: address,
+                        peer_address,
+                        mtu,
+                        routes: routes.to_vec(),
+                        advertise_routes: vec![],
+                    },
+                )
+                .await
+            }
             .map(Self::Helper);
             #[cfg(not(unix))]
             {

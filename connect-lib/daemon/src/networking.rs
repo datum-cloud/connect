@@ -167,6 +167,7 @@ pub fn approvals(state: &DaemonState) -> Result<connect_ip_adapter::helper::Conf
                 })
             })
             .collect::<Result<Vec<_>, ApiError>>()?,
+        trusted_issuers: vec![],
     };
     config
         .validate()

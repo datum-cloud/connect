@@ -2,6 +2,9 @@ package controller
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -20,6 +23,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func mustDecodeHex(t *testing.T, value string) []byte {
+	t.Helper()
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decoded
+}
 
 func testClient(t *testing.T, objs ...runtime.Object) *fake.ClientBuilder {
 	t.Helper()
@@ -292,6 +304,24 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 		}
 		if !meta.IsStatusConditionTrue(item.Status.Conditions, "Accepted") {
 			t.Fatalf("binding should be accepted only after the gateway applies its grant: %#v", item.Status.Conditions)
+		}
+		payload, err := base64.RawURLEncoding.DecodeString(item.Status.RouteGrant.Payload)
+		if err != nil {
+			t.Fatalf("decode signed route grant: %v", err)
+		}
+		signature, err := base64.RawURLEncoding.DecodeString(item.Status.RouteGrant.Signature)
+		if err != nil || !ed25519.Verify(ed25519.PublicKey(mustDecodeHex(t, item.Status.RouteGrant.KeyID)), payload, signature) {
+			t.Fatalf("binding route grant signature is invalid: err=%v grant=%#v", err, item.Status.RouteGrant)
+		}
+		var claims routeGrantClaims
+		if err := json.Unmarshal(payload, &claims); err != nil {
+			t.Fatal(err)
+		}
+		if claims.Project != "project-id" || claims.Network != gateway.Spec.NetworkRef || claims.Connector == "" || claims.Gateway != gateway.Status.EndpointID || claims.InterfaceName != clientInterfaceName("project-id", gateway.Spec.NetworkRef) || !reflect.DeepEqual(claims.Routes, item.Status.Routes) || claims.ExpiresAtUnix <= claims.IssuedAtUnix {
+			t.Fatalf("route grant claims do not match binding: %#v status=%#v", claims, item.Status)
+		}
+		if item.Status.RouteGrant.KeyID == gateway.Status.EndpointID {
+			t.Fatal("the route-grant signing key must not be exposed to the gateway workload")
 		}
 	}
 	if got, want := binding.Status.Routes, []string{"fd20:0:27::/48", secondBinding.Status.AssignedAddress}; !reflect.DeepEqual(got, want) {

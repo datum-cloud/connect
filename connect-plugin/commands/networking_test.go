@@ -3,6 +3,7 @@ package commands
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -316,6 +317,23 @@ func TestApprovalPlanCannotHideAdditionalHostPairs(t *testing.T) {
 	}
 }
 
+func TestManagedApprovalPlanPinsSignerAndGatewayClaim(t *testing.T) {
+	issuer := strings.Repeat("a", 64)
+	gateway := strings.Repeat("b", 64)
+	plan := networkPlan{Network: "vpc", ManagedGateway: true}
+	plan.HelperConfig.TrustedIssuers = []string{issuer}
+	plan.RouteGrant.KeyID = issuer
+	plan.RouteGrant.Payload = base64.RawURLEncoding.EncodeToString([]byte(`{"gateway":"` + gateway + `"}`))
+	plan.Binding.Peer = gateway
+	if err := validateNetworkPlan(plan, "vpc"); err != nil {
+		t.Fatal(err)
+	}
+	plan.Binding.Peer = strings.Repeat("c", 64)
+	if validateNetworkPlan(plan, "vpc") == nil {
+		t.Fatal("accepted a displayed gateway that differs from the signed claim")
+	}
+}
+
 func TestNetworkApprovalShowsOnlyActionableAccess(t *testing.T) {
 	plan := networkPlan{}
 	plan.Network = "staging-vpc-mac"
@@ -344,7 +362,7 @@ func TestManagedGatewayApprovalExplainsRouteAndFirewallBoundary(t *testing.T) {
 	plan.Binding.Routes = []string{"fd20:0:27::/48"}
 	var output bytes.Buffer
 	writeNetworkApproval(&output, plan, "")
-	for _, want := range []string{"Routes through VPC gateway: fd20:0:27::/48", "VPC firewall rules still control access"} {
+	for _, want := range []string{"Routes through VPC gateway: fd20:0:27::/48", "short-lived grants", "VPC firewall rules still control access"} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("approval output %q does not contain %q", output.String(), want)
 		}

@@ -154,9 +154,13 @@ the explicit packet rules. Interactive `join` offers administrator-approved
 installation of the separate networking helper. Later, use `join friend` to
 reuse the saved configuration. Direct peer attachments remain ephemeral. A
 successful managed VPC join persists attachment intent and automatically
-recreates its CONNECT-IP session when the daemon or project resumes. The helper
-still enforces the exact administrator-approved address and routes; changed or
-missing approval fails closed and requires an interactive join. `connect doctor`
+recreates its CONNECT-IP session when the daemon or project resumes. Its initial
+local setup trusts that gateway's route-grant signing key. The controller can
+then issue short-lived, Connector-bound grants for changed addresses and routes
+without another administrator prompt; the daemon renews unchanged grants in
+place. Unknown issuers, invalid signatures, expired grants, or claims that do not
+exactly match the binding fail closed. Direct-peer attachments continue to use
+exact static administrator approvals. `connect doctor`
 checks helper readiness without opening an interface.
 `ping`
 currently probes a Connector, not an arbitrary VPC address. Native adapters use

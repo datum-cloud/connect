@@ -32,8 +32,9 @@ type InterfaceApproval struct {
 	AdvertiseRoutes []string `json:"advertise_routes,omitempty"`
 }
 type HelperApprovals struct {
-	AllowedUID uint32              `json:"allowed_uid"`
-	Approvals  []InterfaceApproval `json:"approvals"`
+	AllowedUID     uint32              `json:"allowed_uid"`
+	Approvals      []InterfaceApproval `json:"approvals"`
+	TrustedIssuers []string            `json:"trusted_issuers,omitempty"`
 }
 
 func sameApproval(a, b InterfaceApproval) bool {
@@ -113,6 +114,18 @@ func mergeApprovals(existing, requested HelperApprovals) (HelperApprovals, error
 		return HelperApprovals{}, fmt.Errorf("approval user mismatch")
 	}
 	existing.AllowedUID = requested.AllowedUID
+	for _, incoming := range requested.TrustedIssuers {
+		if len(incoming) != 64 {
+			return HelperApprovals{}, fmt.Errorf("trusted route-grant issuer must be a 32-byte hex key")
+		}
+		decoded, err := hex.DecodeString(incoming)
+		if err != nil || hex.EncodeToString(decoded) != incoming {
+			return HelperApprovals{}, fmt.Errorf("trusted route-grant issuer must be a 32-byte hex key")
+		}
+		if !slices.Contains(existing.TrustedIssuers, incoming) {
+			existing.TrustedIssuers = append(existing.TrustedIssuers, incoming)
+		}
+	}
 	for _, incoming := range requested.Approvals {
 		found := false
 		for _, current := range existing.Approvals {
@@ -127,8 +140,8 @@ func mergeApprovals(existing, requested HelperApprovals) (HelperApprovals, error
 			existing.Approvals = append(existing.Approvals, incoming)
 		}
 	}
-	if len(existing.Approvals) == 0 || len(existing.Approvals) > 16 {
-		return HelperApprovals{}, fmt.Errorf("approve between 1 and 16 peer host pairs")
+	if len(existing.Approvals)+len(existing.TrustedIssuers) == 0 || len(existing.Approvals)+len(existing.TrustedIssuers) > 16 {
+		return HelperApprovals{}, fmt.Errorf("approve between 1 and 16 peer host pairs or route-grant issuers")
 	}
 	return existing, nil
 }

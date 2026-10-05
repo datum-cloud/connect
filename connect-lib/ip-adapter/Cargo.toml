@@ -8,6 +8,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
 ipnet = { version = "2", features = ["serde"] }
 tokio = { workspace = true }
 libc = "0.2"

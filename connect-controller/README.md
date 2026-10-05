@@ -31,8 +31,13 @@ The controller provisions the first single-project CONNECT-IP gateway slice:
 - ConnectNetworkBinding attaches one project Connector to a ConnectGateway.
   Project authorization to create the resource is the approval boundary. The
   controller derives matching `/128` peer addresses and routes, then reconciles
-  an approved peer grant into the gateway ConfigMap. Deleting the binding
-  removes the grant on the next reconciliation.
+  an approved peer grant into the gateway ConfigMap. It also signs a short-lived
+  local route grant with a dedicated controller-owned key that is not mounted
+  into the gateway Workload. The grant binds the Connector,
+  project, network, gateway, interface, address, and exact route set so a helper
+  that already trusts the gateway can apply controller changes without another
+  administrator prompt. Deleting the binding removes the peer grant and stops
+  refreshing the local grant on the next reconciliation.
 - `ConnectGateway.spec.peerRouting` optionally adds every other ready Connector's
   assigned `/128` to each binding and gateway grant. It is disabled by default.
   Peer packets are forwarded between authenticated gateway sessions without

@@ -1,6 +1,8 @@
 //! Root-owned, explicit host/subnet interface approvals over authenticated Unix IPC.
 //! No cloud credentials, shell commands, arbitrary routes, or file paths cross IPC.
 use crate::{IpNet, Tun, invalid, validate};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signature, VerifyingKey};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,13 +17,117 @@ use std::{
 use tokio::{
     io::{AsyncWriteExt, ReadHalf, WriteHalf},
     net::{UnixListener, UnixStream},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, watch},
     task::JoinHandle,
 };
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const MAX_CONTROL: usize = 65535;
+const MAX_GRANT_LIFETIME_SECONDS: u64 = 3600;
+
+/// Opaque controller-issued route capability. The signature covers the raw
+/// base64url payload bytes so Go and Rust never need to agree on JSON
+/// canonicalization rules.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SignedRouteGrant {
+    #[serde(rename = "keyID")]
+    pub key_id: String,
+    pub payload: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteGrantClaims {
+    pub version: u8,
+    pub project: String,
+    pub network: String,
+    pub connector: String,
+    pub gateway: String,
+    pub revision: String,
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub interface_name: String,
+    pub assigned_address: IpNet,
+    pub peer_address: IpNet,
+    pub mtu: u16,
+    pub routes: Vec<IpNet>,
+}
+
+impl SignedRouteGrant {
+    pub fn verify(
+        &self,
+        trusted_issuers: &[String],
+        now_unix: u64,
+    ) -> io::Result<(RouteGrantClaims, Approval)> {
+        if !trusted_issuers.iter().any(|issuer| issuer == &self.key_id) {
+            return Err(invalid("route grant issuer is not trusted by this helper"));
+        }
+        let decoded_key = hex::decode(&self.key_id)
+            .map_err(|_| invalid("route grant key_id must be a 32-byte hex Ed25519 key"))?;
+        if hex::encode(&decoded_key) != self.key_id {
+            return Err(invalid(
+                "route grant key_id must be a 32-byte lowercase hex Ed25519 key",
+            ));
+        }
+        let key_bytes: [u8; 32] = decoded_key
+            .try_into()
+            .map_err(|_| invalid("route grant key_id must be a 32-byte hex Ed25519 key"))?;
+        let payload = URL_SAFE_NO_PAD
+            .decode(&self.payload)
+            .map_err(|_| invalid("route grant payload is not canonical base64url"))?;
+        let signature_bytes: [u8; 64] = URL_SAFE_NO_PAD
+            .decode(&self.signature)
+            .map_err(|_| invalid("route grant signature is not canonical base64url"))?
+            .try_into()
+            .map_err(|_| invalid("route grant signature must be 64 bytes"))?;
+        VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|_| invalid("route grant issuer key is invalid"))?
+            .verify_strict(&payload, &Signature::from_bytes(&signature_bytes))
+            .map_err(|_| invalid("route grant signature is invalid"))?;
+        let claims: RouteGrantClaims = serde_json::from_slice(&payload)
+            .map_err(|_| invalid("route grant payload is invalid"))?;
+        let gateway_key = hex::decode(&claims.gateway)
+            .ok()
+            .filter(|key| key.len() == 32 && hex::encode(key) == claims.gateway);
+        let connector_key = hex::decode(&claims.connector)
+            .ok()
+            .filter(|key| key.len() == 32 && hex::encode(key) == claims.connector);
+        if claims.version != 1
+            || gateway_key.is_none()
+            || connector_key.is_none()
+            || claims.project.is_empty()
+            || claims.network.is_empty()
+            || claims.connector.is_empty()
+            || claims.revision.is_empty()
+            || claims.issued_at_unix > now_unix.saturating_add(60)
+            || claims.expires_at_unix <= now_unix
+            || claims.expires_at_unix <= claims.issued_at_unix
+            || claims.expires_at_unix - claims.issued_at_unix > MAX_GRANT_LIFETIME_SECONDS
+        {
+            return Err(invalid(
+                "route grant claims are invalid, expired, or too long-lived",
+            ));
+        }
+        let approval = Approval {
+            interface_name: claims.interface_name.clone(),
+            assigned_address: claims.assigned_address,
+            peer_address: claims.peer_address,
+            mtu: claims.mtu,
+            routes: claims.routes.clone(),
+            advertise_routes: vec![],
+        };
+        Config {
+            allowed_uid: 1,
+            approvals: vec![approval.clone()],
+            trusted_issuers: vec![],
+        }
+        .validate()?;
+        Ok((claims, approval))
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -95,19 +201,33 @@ fn routes_conflict(left: &Approval, right: &Approval) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub allowed_uid: u32,
+    #[serde(default)]
     pub approvals: Vec<Approval>,
+    #[serde(default)]
+    pub trusted_issuers: Vec<String>,
 }
 
 impl Config {
     pub fn validate(&self) -> io::Result<()> {
         if self.allowed_uid == 0
             || self.allowed_uid == u32::MAX
-            || self.approvals.is_empty()
-            || self.approvals.len() > 16
+            || (self.approvals.is_empty() && self.trusted_issuers.is_empty())
+            || self.approvals.len() + self.trusted_issuers.len() > 16
         {
             return Err(invalid(
-                "helper requires a non-root user and 1..16 explicit interface approvals",
+                "helper requires a non-root user and 1..16 explicit approvals or trusted route-grant issuers",
             ));
+        }
+        let mut issuers = HashSet::new();
+        for issuer in &self.trusted_issuers {
+            let decoded = hex::decode(issuer).map_err(|_| {
+                invalid("trusted route-grant issuers must be unique 32-byte lowercase hex keys")
+            })?;
+            if decoded.len() != 32 || hex::encode(&decoded) != *issuer || !issuers.insert(issuer) {
+                return Err(invalid(
+                    "trusted route-grant issuers must be unique 32-byte lowercase hex keys",
+                ));
+            }
         }
         let mut names = HashSet::new();
         let mut addresses = HashSet::new();
@@ -223,6 +343,10 @@ struct Request {
     #[serde(default)]
     approval: Option<Approval>,
     #[serde(default)]
+    route_grant: Option<SignedRouteGrant>,
+    #[serde(default)]
+    renew_grant: bool,
+    #[serde(default)]
     inspect: bool,
 }
 #[derive(Deserialize, Serialize)]
@@ -233,12 +357,15 @@ struct Response {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approvals: Option<Vec<Approval>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trusted_issuers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Status {
     pub version: u8,
     pub approvals: Vec<Approval>,
+    pub trusted_issuers: Vec<String>,
 }
 
 /// Authenticate the privileged service and read approvals without creating an interface.
@@ -247,10 +374,14 @@ pub async fn inspect(socket: &Path) -> io::Result<Status> {
         let stream = UnixStream::connect(socket).await?;
         if stream.peer_cred()?.uid() != 0 { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "network helper is not root-owned")); }
         let (read, mut write) = tokio::io::split(stream);
-        send_frame(&mut write, &serde_json::to_vec(&Request { version:VERSION, approval:None, inspect:true })?).await?;
+        send_frame(&mut write, &serde_json::to_vec(&Request { version:VERSION, approval:None, route_grant:None, renew_grant:false, inspect:true })?).await?;
         let response: Response = serde_json::from_slice(&receive(&mut reader(read, MAX_CONTROL)).await?)?;
         if response.version != VERSION { return Err(invalid("network helper protocol mismatch; upgrade the helper with the matching Connect release")); }
-        Ok(Status { version:response.version, approvals:response.approvals.ok_or_else(|| invalid("network helper needs an upgrade; approval inspection is unavailable"))? })
+        Ok(Status {
+            version:response.version,
+            approvals:response.approvals.ok_or_else(|| invalid("network helper needs an upgrade; approval inspection is unavailable"))?,
+            trusted_issuers:response.trusted_issuers.ok_or_else(|| invalid("network helper needs an upgrade; signed route grants are unavailable"))?,
+        })
     }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "network helper did not respond"))?
 }
 
@@ -311,7 +442,61 @@ impl Client {
     }
 
     pub async fn connect_approved(socket: &Path, approval: Approval) -> io::Result<Self> {
-        let mtu = approval.mtu;
+        Self::connect_request(socket, approval.mtu, Some(approval), None).await
+    }
+
+    pub async fn connect_granted(socket: &Path, grant: SignedRouteGrant) -> io::Result<Self> {
+        let payload = URL_SAFE_NO_PAD
+            .decode(&grant.payload)
+            .map_err(|_| invalid("route grant payload is not canonical base64url"))?;
+        let claims: RouteGrantClaims = serde_json::from_slice(&payload)
+            .map_err(|_| invalid("route grant payload is invalid"))?;
+        Self::connect_request(socket, claims.mtu, None, Some(grant)).await
+    }
+
+    /// Extend an active interface using a fresh grant for the exact same
+    /// capability. Route or address changes require a new interface session.
+    pub async fn renew_granted(socket: &Path, grant: SignedRouteGrant) -> io::Result<()> {
+        let stream = UnixStream::connect(socket).await?;
+        if stream.peer_cred()?.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "network helper is not root-owned",
+            ));
+        }
+        let (read, mut write) = tokio::io::split(stream);
+        let mut read = reader(read, MAX_CONTROL);
+        send_frame(
+            &mut write,
+            &serde_json::to_vec(&Request {
+                version: VERSION,
+                approval: None,
+                route_grant: Some(grant),
+                renew_grant: true,
+                inspect: false,
+            })?,
+        )
+        .await?;
+        let response: Response = serde_json::from_slice(
+            &tokio::time::timeout(Duration::from_secs(3), receive(&mut read))
+                .await
+                .map_err(|_| invalid("network helper grant renewal timed out"))??,
+        )?;
+        if response.version != VERSION {
+            return Err(invalid("network helper protocol mismatch"));
+        }
+        if let Some(error) = response.error {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, error));
+        }
+        Ok(())
+    }
+
+    async fn connect_request(
+        socket: &Path,
+        mtu: u16,
+        approval: Option<Approval>,
+        route_grant: Option<SignedRouteGrant>,
+    ) -> io::Result<Self> {
         let stream = UnixStream::connect(socket).await.map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -334,7 +519,9 @@ impl Client {
                 &mut write,
                 &serde_json::to_vec(&Request {
                     version: VERSION,
-                    approval: Some(approval),
+                    approval,
+                    route_grant,
+                    renew_grant: false,
                     inspect: false,
                 })?,
             )
@@ -466,7 +653,7 @@ pub async fn serve_reloadable(
         return Err(io::Error::last_os_error());
     }
     let config = Arc::new(config);
-    let active = Arc::new(Mutex::new(HashMap::<String, Approval>::new()));
+    let active = Arc::new(Mutex::new(HashMap::<String, ActiveApproval>::new()));
     let mut tasks = tokio::task::JoinSet::new();
     tokio::pin!(shutdown);
     tracing::info!(
@@ -508,7 +695,7 @@ pub async fn serve_reloadable(
 async fn session(
     stream: UnixStream,
     config: Arc<Config>,
-    active: Arc<Mutex<HashMap<String, Approval>>>,
+    active: Arc<Mutex<HashMap<String, ActiveApproval>>>,
 ) -> io::Result<()> {
     let (read, mut write) = tokio::io::split(stream);
     let mut read = reader(read, MAX_CONTROL);
@@ -518,7 +705,12 @@ async fn session(
     })
     .await
     .map_err(|_| invalid("helper request timed out"))??;
-    if request.version == VERSION && request.inspect && request.approval.is_none() {
+    if request.version == VERSION
+        && request.inspect
+        && request.approval.is_none()
+        && request.route_grant.is_none()
+        && !request.renew_grant
+    {
         return send_frame(
             &mut write,
             &serde_json::to_vec(&Response {
@@ -526,21 +718,68 @@ async fn session(
                 interface_name: None,
                 error: None,
                 approvals: Some(config.approvals.clone()),
+                trusted_issuers: Some(config.trusted_issuers.clone()),
             })?,
         )
         .await;
     }
-    if request.inspect {
+    if request.inspect
+        || (request.renew_grant && (request.route_grant.is_none() || request.approval.is_some()))
+    {
         return Err(invalid("ambiguous helper request"));
     }
-    let approval = request
-        .approval
-        .ok_or_else(|| invalid("missing interface approval"))?;
-    let approved = request.version == VERSION && config.approvals.contains(&approval);
+    if request.version != VERSION || (request.approval.is_some() == request.route_grant.is_some()) {
+        return Err(invalid("supply exactly one supported interface approval"));
+    }
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| invalid("system clock is before the Unix epoch"))?
+        .as_secs();
+    let renew_grant = request.renew_grant;
+    let (approval, expires_at_unix, approved) = match (request.approval, request.route_grant) {
+        (Some(approval), None) => {
+            let approved = config.approvals.contains(&approval);
+            (approval, None, approved)
+        }
+        (None, Some(grant)) => match grant.verify(&config.trusted_issuers, now_unix) {
+            Ok((claims, approval)) => (approval, Some(claims.expires_at_unix), true),
+            Err(error) => {
+                tracing::warn!(stage = "network_helper", %error, "signed_route_grant_rejected");
+                return send_frame(
+                    &mut write,
+                    &serde_json::to_vec(&Response {
+                        approvals: None,
+                        trusted_issuers: None,
+                        version: VERSION,
+                        interface_name: None,
+                        error: Some("Signed route grant was rejected".into()),
+                    })?,
+                )
+                .await;
+            }
+        },
+        _ => unreachable!(),
+    };
     let mut active_set = active.lock().await;
+    if renew_grant {
+        let renewed = renew_active_grant(
+            &active_set,
+            &approval,
+            expires_at_unix.expect("grant expiry was verified"),
+        );
+        let response = Response {
+            approvals: None,
+            trusted_issuers: None,
+            version: VERSION,
+            interface_name: renewed.then(|| approval.interface_name.clone()),
+            error: (!renewed)
+                .then(|| "Signed route grant does not match an active interface".to_owned()),
+        };
+        return send_frame(&mut write, &serde_json::to_vec(&response)?).await;
+    }
     let conflict = active_set
         .values()
-        .any(|other| routes_conflict(&approval, other));
+        .any(|other| routes_conflict(&approval, &other.approval));
     if !approved || active_set.contains_key(&approval.interface_name) || conflict {
         let message = if conflict {
             "Another active Connect IP attachment owns an overlapping route; leave it before joining this network".into()
@@ -549,6 +788,7 @@ async fn session(
         };
         let response = Response {
             approvals: None,
+            trusted_issuers: None,
             version: VERSION,
             interface_name: None,
             error: Some(message),
@@ -556,18 +796,76 @@ async fn session(
         send_frame(&mut write, &serde_json::to_vec(&response)?).await?;
         return Ok(());
     }
-    active_set.insert(approval.interface_name.clone(), approval.clone());
+    let (expires_tx, expires_rx) = if let Some(expires_at_unix) = expires_at_unix {
+        let (tx, rx) = watch::channel(expires_at_unix);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    active_set.insert(
+        approval.interface_name.clone(),
+        ActiveApproval {
+            approval: approval.clone(),
+            expires_at_unix: expires_tx,
+        },
+    );
     drop(active_set);
     // Keep reservation cleanup on all exits, including setup failure.
-    let result = session_approved(&approval, &mut read, &mut write).await;
+    let result = session_approved(&approval, &mut read, &mut write, expires_rx).await;
     active.lock().await.remove(&approval.interface_name);
     result
+}
+
+struct ActiveApproval {
+    approval: Approval,
+    expires_at_unix: Option<watch::Sender<u64>>,
+}
+
+fn renew_active_grant(
+    active: &HashMap<String, ActiveApproval>,
+    approval: &Approval,
+    expires_at_unix: u64,
+) -> bool {
+    active
+        .get(&approval.interface_name)
+        .filter(|active| active.approval == *approval)
+        .and_then(|active| active.expires_at_unix.as_ref())
+        .map(|expires| {
+            let current = *expires.borrow();
+            expires.send_replace(current.max(expires_at_unix));
+        })
+        .is_some()
+}
+
+async fn grant_expired(mut expires_at_unix: watch::Receiver<u64>) -> io::Result<()> {
+    loop {
+        let expires = *expires_at_unix.borrow_and_update();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| invalid("system clock is before the Unix epoch"))?
+            .as_secs();
+        if expires <= now {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "signed route grant expired",
+            ));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(expires - now)) => {},
+            changed = expires_at_unix.changed() => {
+                if changed.is_err() {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "signed route grant expired"));
+                }
+            }
+        }
+    }
 }
 
 async fn session_approved(
     approval: &Approval,
     read: &mut Reader,
     write: &mut WriteHalf<UnixStream>,
+    expires_at_unix: Option<watch::Receiver<u64>>,
 ) -> io::Result<()> {
     let tun = Tun::create(
         &approval.interface_name,
@@ -578,6 +876,7 @@ async fn session_approved(
     .await?;
     let response = Response {
         approvals: None,
+        trusted_issuers: None,
         version: VERSION,
         interface_name: Some(tun.name().into()),
         error: None,
@@ -612,7 +911,16 @@ async fn session_approved(
         #[allow(unreachable_code)]
         Ok::<(), io::Error>(())
     };
-    let result = tokio::try_join!(inbound, outbound).map(|_| ());
+    let transfer = async { tokio::try_join!(inbound, outbound) };
+    tokio::pin!(transfer);
+    let result = if let Some(expires_at_unix) = expires_at_unix {
+        tokio::select! {
+            result = &mut transfer => result.map(|_| ()),
+            result = grant_expired(expires_at_unix) => result,
+        }
+    } else {
+        transfer.await.map(|_| ())
+    };
     tracing::info!(
         stage = "network_helper",
         interface = tun.name(),
@@ -651,6 +959,93 @@ fn host_pair(packet: &[u8], source: IpAddr, destination: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    fn signed_grant(now: u64) -> (String, SignedRouteGrant, RouteGrantClaims) {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let key_id = hex::encode(key.verifying_key().to_bytes());
+        let claims = RouteGrantClaims {
+            version: 1,
+            project: "project-a".into(),
+            network: "vpc-a".into(),
+            connector: hex::encode([8; 32]),
+            gateway: hex::encode([9; 32]),
+            revision: "revision-a".into(),
+            issued_at_unix: now.saturating_sub(5),
+            expires_at_unix: now + 300,
+            interface_name: "dcgrant".into(),
+            assigned_address: "fd10::2/128".parse().unwrap(),
+            peer_address: "fd10::1/128".parse().unwrap(),
+            mtu: 1280,
+            routes: vec!["fd20::/48".parse().unwrap()],
+        };
+        let payload = serde_json::to_vec(&claims).unwrap();
+        let grant = SignedRouteGrant {
+            key_id: key_id.clone(),
+            payload: URL_SAFE_NO_PAD.encode(&payload),
+            signature: URL_SAFE_NO_PAD.encode(key.sign(&payload).to_bytes()),
+        };
+        (key_id, grant, claims)
+    }
+
+    #[test]
+    fn signed_route_grants_are_trusted_expiring_exact_capabilities() {
+        let now = 1_800_000_000;
+        let (key_id, grant, claims) = signed_grant(now);
+        let (verified, approval) = grant.verify(std::slice::from_ref(&key_id), now).unwrap();
+        assert_eq!(verified, claims);
+        assert_eq!(approval.routes, claims.routes);
+        assert!(
+            grant.verify(&[], now).is_err(),
+            "unknown issuers must fail closed"
+        );
+        assert!(
+            grant
+                .verify(std::slice::from_ref(&key_id), claims.expires_at_unix)
+                .is_err()
+        );
+
+        let mut tampered = grant.clone();
+        let mut payload = URL_SAFE_NO_PAD.decode(&tampered.payload).unwrap();
+        payload[0] ^= 1;
+        tampered.payload = URL_SAFE_NO_PAD.encode(payload);
+        assert!(tampered.verify(std::slice::from_ref(&key_id), now).is_err());
+
+        Config {
+            allowed_uid: 501,
+            approvals: vec![],
+            trusted_issuers: vec![key_id],
+        }
+        .validate()
+        .expect("an administrator may delegate managed route grants to a trusted issuer");
+    }
+
+    #[test]
+    fn signed_route_grant_renewal_only_extends_the_exact_active_capability() {
+        let approval = config().approvals.remove(0);
+        let (expires, receiver) = watch::channel(100);
+        let mut active = HashMap::new();
+        active.insert(
+            approval.interface_name.clone(),
+            ActiveApproval {
+                approval: approval.clone(),
+                expires_at_unix: Some(expires),
+            },
+        );
+        assert!(renew_active_grant(&active, &approval, 200));
+        assert_eq!(*receiver.borrow(), 200);
+        assert!(renew_active_grant(&active, &approval, 150));
+        assert_eq!(
+            *receiver.borrow(),
+            200,
+            "replayed grants cannot shorten a lease"
+        );
+        let mut changed = approval.clone();
+        changed.routes = vec!["fd30::/48".parse().unwrap()];
+        assert!(!renew_active_grant(&active, &changed, 300));
+        assert_eq!(*receiver.borrow(), 200);
+    }
+
     #[tokio::test]
     async fn inspection_rejects_an_unprivileged_server() {
         if unsafe { libc::geteuid() } == 0 {
@@ -685,6 +1080,7 @@ mod tests {
             interface_name: None,
             error: None,
             approvals: Some(approvals),
+            trusted_issuers: Some(vec![]),
         };
         assert!(serde_json::to_vec(&response).unwrap().len() <= MAX_CONTROL);
     }
@@ -699,6 +1095,7 @@ mod tests {
                 advertise_routes: vec![],
                 mtu: 1280,
             }],
+            trusted_issuers: vec![],
         }
     }
     #[test]
@@ -738,6 +1135,7 @@ mod tests {
         Config {
             allowed_uid: 501,
             approvals: vec![old.clone(), new.clone()],
+            trusted_issuers: vec![],
         }
         .validate()
         .expect("inactive approvals must not block setup for another network");
@@ -776,12 +1174,14 @@ mod tests {
         Config {
             allowed_uid: 501,
             approvals: vec![client.clone()],
+            trusted_issuers: vec![],
         }
         .validate()
         .unwrap();
         Config {
             allowed_uid: 501,
             approvals: vec![router.clone()],
+            trusted_issuers: vec![],
         }
         .validate()
         .unwrap();
@@ -805,7 +1205,8 @@ mod tests {
         assert!(
             Config {
                 allowed_uid: 501,
-                approvals: vec![client]
+                approvals: vec![client],
+                trusted_issuers: vec![]
             }
             .validate()
             .is_err()

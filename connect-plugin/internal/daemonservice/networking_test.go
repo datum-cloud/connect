@@ -3,23 +3,24 @@ package daemonservice
 import (
 	"errors"
 	"github.com/kardianos/service"
+	"strings"
 	"testing"
 )
 
 func TestApprovalsAreAdditiveAndCannotRetarget(t *testing.T) {
 	first := InterfaceApproval{InterfaceName: "dcfirst", AssignedAddress: "fd00::1/128", PeerAddress: "fd00::2/128", MTU: 1280}
 	second := InterfaceApproval{InterfaceName: "dcsecond", AssignedAddress: "fd01::1/128", PeerAddress: "fd01::2/128", MTU: 1280}
-	old := HelperApprovals{501, []InterfaceApproval{first}}
-	merged, err := mergeApprovals(old, HelperApprovals{501, []InterfaceApproval{first, second}})
+	old := HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{first}}
+	merged, err := mergeApprovals(old, HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{first, second}})
 	if err != nil || len(merged.Approvals) != 2 {
 		t.Fatalf("%+v %v", merged, err)
 	}
 	changed := first
 	changed.PeerAddress = "fd00::3/128"
-	if _, err := mergeApprovals(old, HelperApprovals{501, []InterfaceApproval{changed}}); err == nil {
+	if _, err := mergeApprovals(old, HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{changed}}); err == nil {
 		t.Fatal("retargeted existing grant")
 	}
-	if _, err := mergeApprovals(old, HelperApprovals{502, []InterfaceApproval{second}}); err == nil {
+	if _, err := mergeApprovals(old, HelperApprovals{AllowedUID: 502, Approvals: []InterfaceApproval{second}}); err == nil {
 		t.Fatal("changed approved user")
 	}
 	if len(old.Approvals) != 1 || !sameApproval(old.Approvals[0], first) {
@@ -31,13 +32,31 @@ func TestExistingApprovalCannotGainSubnetAccess(t *testing.T) {
 	host := InterfaceApproval{InterfaceName: "dcfirst", AssignedAddress: "fd00::1/128", PeerAddress: "fd00::2/128", MTU: 1280}
 	subnet := host
 	subnet.Routes = []string{"fd20::/64"}
-	if _, err := mergeApprovals(HelperApprovals{501, []InterfaceApproval{host}}, HelperApprovals{501, []InterfaceApproval{subnet}}); err == nil {
+	if _, err := mergeApprovals(
+		HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{host}},
+		HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{subnet}},
+	); err == nil {
 		t.Fatal("expanded existing host approval")
 	}
 	empty := host
 	empty.Routes = []string{}
 	if !sameApproval(host, empty) {
 		t.Fatal("empty optional prefixes must remain compatible with old host approvals")
+	}
+}
+
+func TestTrustedRouteGrantIssuersAreCanonicalAndAdditive(t *testing.T) {
+	first := "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+	second := "0202020202020202020202020202020202020202020202020202020202020202"
+	merged, err := mergeApprovals(
+		HelperApprovals{AllowedUID: 501, TrustedIssuers: []string{first}},
+		HelperApprovals{AllowedUID: 501, TrustedIssuers: []string{first, second}},
+	)
+	if err != nil || len(merged.TrustedIssuers) != 2 {
+		t.Fatalf("%+v %v", merged, err)
+	}
+	if _, err := mergeApprovals(merged, HelperApprovals{AllowedUID: 501, TrustedIssuers: []string{strings.ToUpper(first)}}); err == nil {
+		t.Fatal("accepted a noncanonical issuer key")
 	}
 }
 
