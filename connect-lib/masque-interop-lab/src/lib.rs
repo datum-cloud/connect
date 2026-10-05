@@ -76,6 +76,16 @@ pub struct Server {
     drain_timeout: Duration,
 }
 
+#[derive(Clone)]
+struct ConnectionConfig {
+    transport: Transport,
+    routes: Arc<HashMap<(String, u16), Route>>,
+    ip_routes: Arc<HashMap<(String, String), IpRoute>>,
+    connect_udp_uri_template: ConnectUdpUriTemplate,
+    target_policy: TargetSecurityPolicy,
+    max_associations: usize,
+}
+
 /// Limits and protocol shape for one standards-facing listener.
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -225,6 +235,15 @@ impl Server {
 
     pub async fn serve(self, cancel: CancellationToken) -> Result<()> {
         let connections = Arc::new(Semaphore::new(self.max_connections));
+        let connection_config = ConnectionConfig {
+            transport: self.transport,
+            routes: self.routes,
+            ip_routes: self.ip_routes,
+            connect_udp_uri_template: self.connect_udp_uri_template,
+            target_policy: self.target_policy,
+            max_associations: self.max_associations_per_connection,
+        };
+        let connection_config = Arc::new(connection_config);
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             let permit = tokio::select! {
@@ -236,19 +255,11 @@ impl Server {
                 _ = cancel.cancelled() => break,
                 incoming = self.endpoint.accept() => {
                     let Some(incoming) = incoming else { break };
-                    let transport = self.transport.clone();
-                    let routes = self.routes.clone();
-                    let ip_routes = self.ip_routes.clone();
                     let connection_cancel = cancel.child_token();
-                    let max_associations = self.max_associations_per_connection;
-                    let uri_template = self.connect_udp_uri_template.clone();
-                    let target_policy = self.target_policy.clone();
+                    let connection_config = connection_config.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = serve_connection(
-                            incoming, transport, routes, ip_routes, uri_template, target_policy,
-                            max_associations, connection_cancel
-                        ).await {
+                        if let Err(error) = serve_connection(incoming, connection_config, connection_cancel).await {
                             tracing::warn!(error = %format!("{error:#}"), "masque_connection_failed");
                         }
                     });
@@ -360,12 +371,7 @@ pub fn tls_config(
 
 async fn serve_connection(
     incoming: quinn::Incoming,
-    transport: Transport,
-    routes: Arc<HashMap<(String, u16), Route>>,
-    ip_routes: Arc<HashMap<(String, String), IpRoute>>,
-    connect_udp_uri_template: ConnectUdpUriTemplate,
-    target_policy: TargetSecurityPolicy,
-    max_associations: usize,
+    config: Arc<ConnectionConfig>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let connection = incoming.await.context("accept QUIC")?;
@@ -388,7 +394,7 @@ async fn serve_connection(
                 let (request, mut stream) = resolver.resolve_request().await.context("decode request")?;
                 if let Some(failure) = admission_failure(
                     associations.len(),
-                    max_associations,
+                    config.max_associations,
                     cancel.is_cancelled(),
                 ) {
                     stream.send_response(failure.response()).await?;
@@ -408,7 +414,7 @@ async fn serve_connection(
                         continue;
                     }
                     let (target, protocol) = target.expect("checked CONNECT-IP target");
-                    let Some(route) = ip_routes.get(&(target.into(), protocol.into())).cloned() else {
+                    let Some(route) = config.ip_routes.get(&(target.into(), protocol.into())).cloned() else {
                         stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
                         stream.finish().await?;
                         continue;
@@ -419,7 +425,7 @@ async fn serve_connection(
                         continue;
                     }
                     let session = match ip::connect(
-                        transport.endpoint(),
+                        config.transport.endpoint(),
                         route.backend,
                         &route.network,
                         cancel.child_token(),
@@ -491,7 +497,7 @@ async fn serve_connection(
                     });
                     continue;
                 }
-                let target = match connect_udp_uri_template.target(&request) {
+                let target = match config.connect_udp_uri_template.target(&request) {
                     Ok(target) => target,
                     Err(_) => {
                         stream.send_response(MasqueFailure::MalformedRequest.response()).await?;
@@ -499,19 +505,19 @@ async fn serve_connection(
                         continue;
                     }
                 };
-                if target_policy.authorize(&target.0, target.1).is_err() {
+                if config.target_policy.authorize(&target.0, target.1).is_err() {
                     stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
                     stream.finish().await?;
                     continue;
                 }
                 let route_key = (target.0.to_ascii_lowercase(), target.1);
-                let Some(route) = routes.get(&route_key).cloned() else {
+                let Some(route) = config.routes.get(&route_key).cloned() else {
                     stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
                     stream.finish().await?;
                     continue;
                 };
 
-                let tunnel = match transport.connect_udp(
+                let tunnel = match config.transport.connect_udp(
                     route.backend, route.destination, cancel.child_token()
                 ).await {
                     Ok(tunnel) => tunnel,
