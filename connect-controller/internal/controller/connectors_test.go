@@ -242,10 +242,17 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 func TestGatewayPeerAddressDerivationIsSymmetric(t *testing.T) {
 	client := strings.Repeat("1", 64)
 	gateway := strings.Repeat("2", 64)
-	clientAddress, gatewayAddress, _ := gatewayPeerAddresses("project", "vpc", client, gateway)
-	reverseClientAddress, reverseGatewayAddress, _ := gatewayPeerAddresses("project", "vpc", gateway, client)
+	clientAddress, gatewayAddress, interfaceName := gatewayPeerAddresses("project", "vpc", client, gateway)
+	reverseClientAddress, reverseGatewayAddress, reverseInterfaceName := gatewayPeerAddresses("project", "vpc", gateway, client)
 	if clientAddress != reverseGatewayAddress || gatewayAddress != reverseClientAddress {
 		t.Fatalf("addresses are not symmetric: (%s, %s) vs (%s, %s)", clientAddress, gatewayAddress, reverseClientAddress, reverseGatewayAddress)
+	}
+	if interfaceName != reverseInterfaceName {
+		t.Fatalf("interface name is not symmetric: %q vs %q", interfaceName, reverseInterfaceName)
+	}
+	_, _, secondInterfaceName := gatewayPeerAddresses("project", "vpc", strings.Repeat("3", 64), gateway)
+	if interfaceName == secondInterfaceName {
+		t.Fatalf("two Connector grants on one gateway share interface name %q", interfaceName)
 	}
 }
 

@@ -390,8 +390,8 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 		if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
 			continue
 		}
-		clientAddress, peerAddress, _ := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, strings.ToLower(connector.Spec.PublicKey), strings.ToLower(endpointID))
-		grant := map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": strings.ToLower(connector.Spec.PublicKey), "client_address": clientAddress + "/128", "gateway_address": peerAddress + "/128", "routes": gateway.Spec.Routes, "interface_name": gatewayInterfaceName(project, gateway.Spec.NetworkRef, endpointID), "mtu": 1280}
+		clientAddress, peerAddress, interfaceName := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, strings.ToLower(connector.Spec.PublicKey), strings.ToLower(endpointID))
+		grant := map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": strings.ToLower(connector.Spec.PublicKey), "client_address": clientAddress + "/128", "gateway_address": peerAddress + "/128", "routes": gateway.Spec.Routes, "interface_name": interfaceName, "mtu": 1280}
 		grants = append(grants, grant)
 	}
 	grantJSON, err := json.Marshal(map[string]interface{}{"grants": grants})
@@ -544,11 +544,6 @@ func gatewayConfigIncludesConnector(ctx context.Context, c client.Client, gatewa
 	return false
 }
 
-func gatewayInterfaceName(project, network, gatewayKey string) string {
-	digest := gatewayDigest(project, network, gatewayKey)
-	return fmt.Sprintf("dc%x", digest[:5])
-}
-
 func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, secretName string) map[string]interface{} {
 	instanceType := spec.InstanceType
 	if instanceType == "" {
@@ -605,7 +600,9 @@ func gatewayPeerAddresses(project, network, clientKey, gatewayKey string) (strin
 		address[0] = 0xfd
 		return netip.AddrFrom16(address).String()
 	}
-	label := gatewayDigest(project, network, gatewayKey)
+	// The gateway creates one TUN interface per peer grant. Include both peer
+	// identities so multiple Connectors on the same gateway don't collide.
+	label := gatewayDigest(project, network, a, b)
 	return address(clientKey), address(gatewayKey), fmt.Sprintf("dc%x", label[:5])
 }
 
