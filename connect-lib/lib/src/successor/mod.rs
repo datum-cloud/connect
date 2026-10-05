@@ -900,12 +900,11 @@ impl CloudConnector {
             .await?
             .ok_or(Error::Api(500))?;
         self.renew_connect_connector_lease(&updated).await?;
-        if let Some(connector) = self.connect_get("connectors", &self.name).await? {
-            if connector.pointer("/spec/publicKey").and_then(Value::as_str)
+        if let Some(connector) = self.connect_get("connectors", &self.name).await?
+            && connector.pointer("/spec/publicKey").and_then(Value::as_str)
                 != Some(self.public_key.as_str())
-            {
-                return Err(Error::Ownership(self.name.clone()));
-            }
+        {
+            return Err(Error::Ownership(self.name.clone()));
         }
         self.identity(&updated)
     }
