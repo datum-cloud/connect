@@ -603,7 +603,7 @@ func gatewayPeerAddresses(project, network, clientKey, gatewayKey string) (strin
 	// The gateway creates one TUN interface per peer grant. Include both peer
 	// identities so multiple Connectors on the same gateway don't collide.
 	label := gatewayDigest(project, network, a, b)
-	return address(clientKey), address(gatewayKey), fmt.Sprintf("dc%x", label[:5])
+	return address(clientKey), address(gatewayKey), fmt.Sprintf("d%x", label[:7])
 }
 
 func gatewayDigest(parts ...string) [32]byte {

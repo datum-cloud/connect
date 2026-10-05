@@ -250,6 +250,9 @@ func TestGatewayPeerAddressDerivationIsSymmetric(t *testing.T) {
 	if interfaceName != reverseInterfaceName {
 		t.Fatalf("interface name is not symmetric: %q vs %q", interfaceName, reverseInterfaceName)
 	}
+	if len(interfaceName) > 15 {
+		t.Fatalf("interface name %q exceeds Linux's 15-character limit", interfaceName)
+	}
 	_, _, secondInterfaceName := gatewayPeerAddresses("project", "vpc", strings.Repeat("3", 64), gateway)
 	if interfaceName == secondInterfaceName {
 		t.Fatalf("two Connector grants on one gateway share interface name %q", interfaceName)
