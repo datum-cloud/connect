@@ -173,6 +173,52 @@ async fn joining_managed_network_creates_connector_owned_binding_and_renews_leas
 }
 
 #[tokio::test]
+async fn liveness_renewal_updates_only_the_connect_connector_lease() {
+    let public = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let connector = json!({
+        "metadata":{"name":format!("connect-{}", &public[..40])},
+        "spec":{"publicKey":public},
+        "status":{"leaseRef":"connect-lease"}
+    });
+    let lease = json!({
+        "apiVersion":"coordination.k8s.io/v1",
+        "kind":"Lease",
+        "metadata":{"name":"connect-lease","resourceVersion":"4"},
+        "spec":{"leaseDurationSeconds":30}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, connector),
+        Reply::Json(200, lease),
+        Reply::EchoCreated,
+    ])
+    .await;
+
+    let cloud = client(&base);
+    cloud.renew_connect_connector_liveness().await.unwrap();
+
+    let requests = task.await.unwrap();
+    assert!(
+        requests[1]
+            .0
+            .contains("connect.datumapis.com/v1alpha1/namespaces/default/connectors/")
+    );
+    assert!(
+        requests[2]
+            .0
+            .contains("/apis/coordination.k8s.io/v1/namespaces/default/leases/connect-lease ")
+    );
+    assert!(
+        requests[3]
+            .0
+            .contains("/apis/coordination.k8s.io/v1/namespaces/default/leases/connect-lease ")
+    );
+    assert!(requests[3].0.starts_with("PUT "));
+    assert_eq!(requests[3].1["metadata"]["resourceVersion"], "4");
+    assert!(requests[3].1["spec"]["renewTime"].as_str().is_some());
+}
+
+#[tokio::test]
 async fn joining_managed_network_waits_for_gateway_readiness_after_a_config_rollout() {
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connect_connector = json!({

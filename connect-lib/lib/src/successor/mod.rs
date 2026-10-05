@@ -411,6 +411,22 @@ impl CloudConnector {
         Ok(())
     }
 
+    /// Renew this device's Connect Connector lease without reconciling any
+    /// other project resources. The daemon runs this independently of slow
+    /// operations such as waiting for a gateway workload rollout.
+    pub async fn renew_connect_connector_liveness(&self) -> Result<()> {
+        let connector = self
+            .connect_get("connectors", &self.name)
+            .await?
+            .ok_or(Error::Api(404))?;
+        if connector.pointer("/spec/publicKey").and_then(Value::as_str)
+            != Some(self.public_key.as_str())
+        {
+            return Err(Error::Ownership(self.name.clone()));
+        }
+        self.renew_connect_connector_lease(&connector).await
+    }
+
     /// Create or reuse this Connector's project binding to the only Ready
     /// gateway for `network`. `None` means the project has no managed gateway
     /// for that network, allowing the legacy local approval flow to continue.

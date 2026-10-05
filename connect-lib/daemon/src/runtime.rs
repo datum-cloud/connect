@@ -55,6 +55,7 @@ struct ProjectRuntime {
     policy_lock: Mutex<()>,
     cancel: CancellationToken,
     refresh_task: Mutex<Option<JoinHandle<()>>>,
+    liveness_task: Mutex<Option<JoinHandle<()>>>,
     authorized: AtomicBool,
     identity: ConnectorState,
 }
@@ -377,6 +378,31 @@ impl RealControl {
         *runtime.refresh_task.lock().await = Some(task);
     }
 
+    async fn spawn_liveness_refresh(&self, project: String, runtime: Arc<ProjectRuntime>) {
+        let cloud = runtime.cloud.clone();
+        let cancel = runtime.cancel.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        let result = tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            result = cloud.renew_connect_connector_liveness() => result,
+                        };
+                        if let Err(error) = result {
+                            tracing::warn!(%project, %error, stage="connector_liveness", "connector_liveness_renewal_failed");
+                        }
+                    }
+                }
+            }
+        });
+        *runtime.liveness_task.lock().await = Some(task);
+    }
+
     async fn stop_runtime(
         runtime: Arc<ProjectRuntime>,
         remove_cloud_services: bool,
@@ -386,6 +412,11 @@ impl RealControl {
             && let Err(error) = task.await
         {
             tracing::error!(%error, "authorization_refresh_task_failed");
+        }
+        if let Some(task) = runtime.liveness_task.lock().await.take()
+            && let Err(error) = task.await
+        {
+            tracing::error!(%error, "connector_liveness_task_failed");
         }
         let mut first_error = {
             let _policy_guard = runtime.policy_lock.lock().await;
@@ -543,6 +574,7 @@ impl RealControl {
             policy_lock: Mutex::new(()),
             cancel: CancellationToken::new(),
             refresh_task: Mutex::new(None),
+            liveness_task: Mutex::new(None),
             authorized: AtomicBool::new(true),
             identity: connector_state(identity.clone()),
         });
@@ -550,7 +582,10 @@ impl RealControl {
             .lock()
             .await
             .insert(project.to_owned(), Arc::clone(&runtime));
-        self.spawn_refresh(project.to_owned(), runtime).await;
+        self.spawn_refresh(project.to_owned(), runtime.clone())
+            .await;
+        self.spawn_liveness_refresh(project.to_owned(), runtime)
+            .await;
         Ok(connector_state(identity))
     }
 }
