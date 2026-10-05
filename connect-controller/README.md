@@ -26,6 +26,8 @@ The controller provisions the first single-project CONNECT-IP gateway slice:
   the gateway's peer grants, and a one-replica Compute Workload attached to the
   requested IPv6 Network and Location. Compute creates the NSO NetworkBinding
   for the Workload interface. The gateway does not create a competing binding.
+  Its Prometheus endpoint binds to `127.0.0.1:9090`; the controller does not
+  expose a metrics port on the VPC interface.
 - ConnectNetworkBinding attaches one project Connector to a ConnectGateway.
   Project authorization to create the resource is the approval boundary. The
   controller derives matching `/128` peer addresses and routes, then reconciles
@@ -34,6 +36,14 @@ The controller provisions the first single-project CONNECT-IP gateway slice:
 - ConnectGateway status publishes the gateway endpoint ID and Workload name.
   Ready becomes true after the Compute Workload is Available. This reports
   workload availability, not an active client attachment or a working packet path.
+
+For gateway diagnostics, exec into the gateway Workload and query
+`http://127.0.0.1:9090/metrics`. CONNECT-IP counters show active/opened
+sessions, transport errors, drops, datagrams, MTU capacity, and packet/byte
+totals in each direction. Structured gateway logs include the client-provided
+`session_id`; correlate that ID with the daemon logs. Set
+`DATUM_CONNECT_OTEL_ENDPOINT` on the gateway process to export correlated
+OpenTelemetry traces to a trusted OTLP/HTTP collector.
 
 The gateway private key is stored in a project Secret and mounted read-only in
 the Compute Workload; status exposes only its public endpoint ID. The Connect

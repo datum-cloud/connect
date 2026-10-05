@@ -167,6 +167,9 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if !strings.Contains(args[0], "--ip-config=/run/connect-inputs/grants.json") {
 		t.Fatalf("gateway args=%v, want the strict IP grants loader to read the regular-file copy", args)
 	}
+	if !strings.Contains(args[0], "--metrics-addr=127.0.0.1 --metrics-port=9090") {
+		t.Fatalf("gateway metrics must be available only on loopback: %s", args[0])
+	}
 	securityContext, ok := container["securityContext"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("gateway securityContext=%T, want map", container["securityContext"])

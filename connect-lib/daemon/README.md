@@ -140,17 +140,23 @@ the transport failure reason. The nested `transport` object also includes
 mode, capacity, MTU error count, and latest transport error.
 
 For live packet-path diagnosis, daemon logs emit a `connect_ip_health` snapshot
-every 10 seconds with local-TUN-to-transport and transport-to-local-TUN packet
-counts, QUIC datagram counts, transport drops, and the last packet timestamp in
-each direction. `status --output json` exposes these counts as
+every 10 seconds with per-session and attachment-total packet counts, packet
+bytes in each direction, QUIC datagram counts, transport drops, and the last
+packet timestamp in each direction. The daemon emits a final
+`connect_ip_attachment_stopped` event with the last session ID, state, reconnect
+count, packet totals, and last error. `status --output json` exposes the current
+attachment counts as
 `local_tun_to_transport_packets` and `transport_to_local_tun_packets`, plus the
 same last-packet timestamps.
 The gateway emits the matching per-session `connect_ip_health` snapshot with
-QUIC datagrams received/sent, packets injected into/returned from its TUN, and
-policy-drop counts by reason. It also samples the per-session nftables
+the same `session_id`, QUIC datagrams received/sent, packets and bytes injected
+into/returned from its TUN, and policy-drop counts by reason. Its final
+`connect_ip_session_closed` event includes the session duration, close reason,
+directional totals, and datagram diagnostics. It also samples the per-session nftables
 postrouting rule every 10 seconds, with a 2-second query bound, to report
 packets and bytes matched by the VPC egress-NAT rule. Correlate client and
-gateway events by `network`, `gateway`/`peer`, and timestamp. If
+gateway events by `session_id`; use `network`, `gateway`/`peer`, and timestamps
+when one side did not receive the session request. If
 client-to-gateway counts advance but gateway injection does not, investigate
 transport or gateway admission; if injection
 advances but NAT does not, investigate gateway forwarding and routes; if NAT

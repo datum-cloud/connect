@@ -587,6 +587,10 @@ pub async fn join(
             let _ = session_span.set_parent(session.trace_context.clone());
             let mut health_tick = tokio::time::interval(std::time::Duration::from_secs(10));
             health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut session_packets_sent = 0u64;
+            let mut session_packets_received = 0u64;
+            let mut session_bytes_sent = 0u64;
+            let mut session_bytes_received = 0u64;
             let mut fatal_error = None;
             let failure_reason = loop {
                 tokio::select! {
@@ -598,8 +602,12 @@ pub async fn join(
                         let stats = session.stats();
                         let health_span = info_span!("connect_ip.health_snapshot", project=%project, network=%network, gateway=%gateway, connector=%local_connector, %session_id);
                         health_span.in_scope(|| tracing::info!(project=%project, network=%network, gateway=%gateway, connector=%local_connector,
-                            local_tun_to_transport_packets=task_sent.load(Ordering::Relaxed),
-                            transport_to_local_tun_packets=task_received.load(Ordering::Relaxed),
+                            session_local_tun_to_transport_packets=session_packets_sent,
+                            session_transport_to_local_tun_packets=session_packets_received,
+                            session_local_tun_to_transport_bytes=session_bytes_sent,
+                            session_transport_to_local_tun_bytes=session_bytes_received,
+                            attachment_local_tun_to_transport_packets_total=task_sent.load(Ordering::Relaxed),
+                            attachment_transport_to_local_tun_packets_total=task_received.load(Ordering::Relaxed),
                             quic_datagrams_sent=stats.datagrams_sent,
                             quic_datagrams_received=stats.datagrams_received,
                             transport_drops=stats.packets_dropped,
@@ -618,6 +626,8 @@ pub async fn join(
                             break message;
                         }
                         task_received.fetch_add(1, Ordering::Relaxed);
+                        session_packets_received += 1;
+                        session_bytes_received = session_bytes_received.saturating_add(packet.len() as u64);
                         task_last_received.store(unix_time_ms(), Ordering::Relaxed);
                     },
                     read = tun.read_packet(&mut buffer) => {
@@ -637,6 +647,8 @@ pub async fn join(
                         match session.send(bytes::Bytes::copy_from_slice(&buffer[..length])).await {
                             Ok(()) => {
                                 task_sent.fetch_add(1, Ordering::Relaxed);
+                                session_packets_sent += 1;
+                                session_bytes_sent = session_bytes_sent.saturating_add(length as u64);
                                 task_last_sent.store(unix_time_ms(), Ordering::Relaxed);
                             },
                             Err(error @ (ip::Error::InvalidPacket | ip::Error::PacketTooLarge | ip::Error::AddressPolicy)) => {
@@ -728,7 +740,15 @@ pub async fn join(
         if *task_state.read().await != "failed" {
             *task_state.write().await = "inactive";
         }
-        tracing::info!(%project, %network, %gateway, stage="connect_ip_attachment_stopped", "CONNECT-IP attachment supervisor stopped");
+        let final_state = *task_state.read().await;
+        let final_session_id = task_active_session.read().await.session_id.clone();
+        let final_error = task_failure.lock().await.clone();
+        tracing::info!(%project, %network, %gateway, session_id=%final_session_id,
+            state=final_state, reconnect_attempts=reconnect_attempt,
+            attachment_local_tun_to_transport_packets_total=task_sent.load(Ordering::Relaxed),
+            attachment_transport_to_local_tun_packets_total=task_received.load(Ordering::Relaxed),
+            last_error=?final_error, stage="connect_ip_attachment_stopped",
+            "CONNECT-IP attachment supervisor stopped");
     }.instrument(info_span!("connect_ip.attachment", project=%binding.project, network=%binding.network, gateway=%binding.gateway)));
     let _ = setup_guard.disarm();
     Ok(Attachment {
