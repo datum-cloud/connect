@@ -393,10 +393,11 @@ impl CloudConnector {
     }
 
     async fn renew_connect_connector_lease(&self, connector: &Value) -> Result<()> {
-        let Some(name) = connector
-            .pointer("/status/leaseRef")
-            .and_then(Value::as_str)
-        else {
+        let Some(name) = connector.pointer("/status/leaseRef").and_then(|lease| {
+            lease
+                .as_str()
+                .or_else(|| lease.get("name").and_then(Value::as_str))
+        }) else {
             // The controller creates the Lease after observing the Connector.
             return Ok(());
         };
@@ -898,13 +899,13 @@ impl CloudConnector {
             )
             .await?
             .ok_or(Error::Api(500))?;
+        self.renew_connect_connector_lease(&updated).await?;
         if let Some(connector) = self.connect_get("connectors", &self.name).await? {
             if connector.pointer("/spec/publicKey").and_then(Value::as_str)
                 != Some(self.public_key.as_str())
             {
                 return Err(Error::Ownership(self.name.clone()));
             }
-            self.renew_connect_connector_lease(&connector).await?;
         }
         self.identity(&updated)
     }
