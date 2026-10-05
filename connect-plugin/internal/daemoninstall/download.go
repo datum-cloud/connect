@@ -59,7 +59,7 @@ func (i Installer) AcquireHelper(ctx context.Context, version string) (string, e
 
 func assetName(version, goos, arch string) (string, error) {
 	if !releaseTag.MatchString(version) || strings.Contains(version, "dev") {
-		return "", fmt.Errorf("%q is not a published release version; use a released plugin, or explicitly install a local build with connect install --executable /absolute/path/to/datum-connect-daemon", version)
+		return "", fmt.Errorf("plugin version %q is not a published release", version)
 	}
 	platform := map[string]string{"darwin": "Darwin", "linux": "Linux"}[goos]
 	machine := map[string]string{"arm64": "arm64", "amd64": "x86_64"}[arch]
@@ -82,7 +82,10 @@ func (i Installer) Acquire(ctx context.Context, version string) (string, error) 
 	}
 	asset, err := assetName(version, i.GOOS, i.GOARCH)
 	if err != nil {
-		return "", err
+		if executableName == "datum-connect-network-helper" {
+			return "", fmt.Errorf("cannot download a matching network helper: %w. Install a released Connect plugin to download its helper automatically, or rerun `datumctl connect join` with `--helper-executable /absolute/path/to/datum-connect-network-helper` to use a local helper", err)
+		}
+		return "", fmt.Errorf("cannot download the Connect daemon: %w. Install a released Connect plugin, or install a local daemon with `datumctl connect install --executable /absolute/path/to/datum-connect-daemon`", err)
 	}
 	if i.Progress == nil {
 		i.Progress = io.Discard

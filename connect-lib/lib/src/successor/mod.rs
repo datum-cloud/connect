@@ -545,6 +545,7 @@ impl CloudConnector {
         // for that status so `join` never reports a half-created attachment.
         let until = tokio::time::Instant::now() + Duration::from_secs(90);
         let mut binding = binding;
+        let mut connector_not_ready_logged = false;
         loop {
             if current_condition(&binding, "Accepted") {
                 let mut result = binding["status"].clone();
@@ -562,12 +563,33 @@ impl CloudConnector {
                 .flatten()
                 .find(|condition| condition["type"] == "Accepted" && condition["status"] == "False")
             {
-                return Err(Error::Unsupported(format!(
-                    "ConnectNetworkBinding was rejected ({})",
-                    condition["reason"].as_str().unwrap_or("unknown reason")
-                )));
+                let reason = condition["reason"].as_str().unwrap_or("unknown reason");
+                if reason != "ConnectorNotReady" {
+                    return Err(Error::Unsupported(format!(
+                        "ConnectNetworkBinding was rejected ({reason})"
+                    )));
+                }
+                // Connector Ready can lag behind the liveness lease renewal
+                // immediately before binding creation. This rejection is
+                // recoverable: keep polling rather than returning stale state.
+                if !connector_not_ready_logged {
+                    tracing::info!(
+                        network,
+                        connector = %self.name,
+                        binding = %binding_name,
+                        stage = "connector_readiness",
+                        "waiting for Connector readiness to reconcile"
+                    );
+                    connector_not_ready_logged = true;
+                }
             }
             if tokio::time::Instant::now() >= until {
+                if connector_not_ready_logged {
+                    return Err(Error::Unsupported(format!(
+                        "ConnectNetworkBinding {binding_name} is still rejected because Connector {} is not Ready; verify its liveness lease and retry `datumctl connect join {network}`",
+                        self.name
+                    )));
+                }
                 return Err(Error::Unsupported(format!(
                     "timed out waiting for ConnectNetworkBinding {binding_name} approval; inspect `datumctl get connectnetworkbindings {binding_name}`"
                 )));

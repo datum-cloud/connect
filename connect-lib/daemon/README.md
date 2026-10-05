@@ -140,6 +140,14 @@ ConnectNetworkBinding; repeating it is safe. Direct peer and static
 checks the exact address and routes: missing or stale approval reports
 `approval_required` and no interface is created. Use `status --output json` for
 packet and drop counters and the last attachment error.
+If an existing helper approval for the same interface no longer matches the
+routes shown by `join`, review the new route list and retry with
+`datumctl connect join NETWORK --replace-helper-approval`. Connect asks for
+confirmation before replacing only that interface's root approval. The helper
+restarts only when a replacement is needed, so active Connect-IP attachments
+then disconnect briefly; join them again if they do not reconnect. Other
+interface approvals remain unchanged. This is separate from `--upgrade-helper`,
+which only replaces the helper binary.
 `packets_sent` and `packets_received` count local adapter delivery. The nested
 `transport` object reports wire-layer packet counters, policy drops, and protocol
 errors. Gateway attachments mirror transport `packets_dropped` and

@@ -141,12 +141,14 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 	for _, test := range []struct {
 		name, input            string
 		guided, ready, success bool
+		replace                bool
 		prompts                int
 	}{
-		{"first join accepted", "y\n", true, false, true, 1},
-		{"declined", "n\n", true, false, false, 0},
-		{"script never elevates", "", false, false, false, 0},
-		{"saved ready", "", false, true, true, 0},
+		{"first join accepted", "y\n", true, false, true, false, 1},
+		{"declined", "n\n", true, false, false, false, 0},
+		{"script never elevates", "", false, false, false, false, 0},
+		{"saved ready", "", false, true, true, false, 0},
+		{"approval replacement accepted", "y\n", true, false, true, true, 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv("DATUM_CONNECT_TOKEN", "local-test-token")
@@ -154,10 +156,13 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 			t.Cleanup(func() { guidedSetupEnabled, ensureNetworking = previousGuided, previousEnsure })
 			guidedSetupEnabled = func(*cobra.Command, *options) bool { return test.guided }
 			approvals, prepared, joins := 0, 0, 0
-			ensureNetworking = func(_ *cobra.Command, _, _ string, config daemonservice.HelperApprovals, _ bool) error {
+			ensureNetworking = func(_ *cobra.Command, _, _ string, config daemonservice.HelperApprovals, _, replace bool) error {
 				approvals++
 				if len(config.Approvals) != 1 {
 					t.Fatal("unexpected approval")
+				}
+				if replace != test.replace {
+					t.Fatalf("replace approval=%v, want %v", replace, test.replace)
 				}
 				return nil
 			}
@@ -198,7 +203,11 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 			cmd.SetOut(io.Discard)
 			cmd.SetErr(io.Discard)
 			cmd.SetIn(strings.NewReader(test.input))
-			cmd.SetArgs([]string{"friend", "--peer", "friend-mac", "--allow-tcp", "8080", "--allow-ping"})
+			args := []string{"friend", "--peer", "friend-mac", "--allow-tcp", "8080", "--allow-ping"}
+			if test.replace {
+				args = append(args, "--replace-helper-approval")
+			}
+			cmd.SetArgs(args)
 			err := cmd.Execute()
 			if (err == nil) != test.success || approvals != test.prompts || prepared != 1 || joins < 1 {
 				t.Fatalf("err=%v approvals=%d prepared=%d joins=%d", err, approvals, prepared, joins)

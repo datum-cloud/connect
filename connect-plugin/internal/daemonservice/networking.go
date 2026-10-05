@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kardianos/service"
@@ -47,7 +48,7 @@ type helperReceipt struct {
 
 // EnsureNetworking runs only after interactive consent. The daemon never elevates
 // itself. Configuration crosses stdin; tokens and OIDC environment do not.
-func EnsureNetworking(cmd *cobra.Command, version, executable string, config HelperApprovals, upgrade bool) error {
+func EnsureNetworking(cmd *cobra.Command, version, executable string, config HelperApprovals, upgrade, replaceApproval bool) error {
 	if runtime.GOOS == "windows" || os.Geteuid() <= 0 || config.AllowedUID != uint32(os.Geteuid()) {
 		return fmt.Errorf("networking approval must run locally as the daemon's ordinary user")
 	}
@@ -77,6 +78,9 @@ func EnsureNetworking(cmd *cobra.Command, version, executable string, config Hel
 	args := []string{"--", plugin, "daemon", "helper", "authorize", "--uid", strconv.FormatUint(uint64(config.AllowedUID), 10), "--executable", executable, "--sha256", hash}
 	if upgrade {
 		args = append(args, "--upgrade")
+	}
+	if replaceApproval {
+		args = append(args, "--replace-approval")
 	}
 	child := exec.CommandContext(cmd.Context(), "/usr/bin/sudo", args...)
 	// sudo reads the administrator password from /dev/tty, not plan stdin.
@@ -108,36 +112,41 @@ func executableHash(path string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func mergeApprovals(existing, requested HelperApprovals) (HelperApprovals, error) {
+func mergeApprovals(existing, requested HelperApprovals, replace bool) (HelperApprovals, bool, error) {
 	if requested.AllowedUID == 0 || requested.AllowedUID == ^uint32(0) || (existing.AllowedUID != 0 && existing.AllowedUID != requested.AllowedUID) {
-		return HelperApprovals{}, fmt.Errorf("approval user mismatch")
+		return HelperApprovals{}, false, fmt.Errorf("approval user mismatch")
 	}
-	existing.AllowedUID = requested.AllowedUID
+	merged := HelperApprovals{AllowedUID: requested.AllowedUID, Approvals: append([]InterfaceApproval(nil), existing.Approvals...)}
+	changed := false
 	for _, incoming := range requested.Approvals {
 		found := false
-		for _, current := range existing.Approvals {
+		for i, current := range merged.Approvals {
 			if current.InterfaceName == incoming.InterfaceName {
 				if !sameApproval(current, incoming) {
-					return HelperApprovals{}, fmt.Errorf("refuse to change existing administrator approval %q", current.InterfaceName)
+					if !replace {
+						return HelperApprovals{}, false, fmt.Errorf("existing administrator approval %q differs; review the displayed routes and retry with --replace-helper-approval", current.InterfaceName)
+					}
+					merged.Approvals[i] = incoming
+					changed = true
 				}
 				found = true
 			}
 		}
 		if !found {
-			existing.Approvals = append(existing.Approvals, incoming)
+			merged.Approvals = append(merged.Approvals, incoming)
 		}
 	}
-	if len(existing.Approvals) == 0 || len(existing.Approvals) > 16 {
-		return HelperApprovals{}, fmt.Errorf("approve between 1 and 16 peer host pairs")
+	if len(merged.Approvals) == 0 || len(merged.Approvals) > 16 {
+		return HelperApprovals{}, false, fmt.Errorf("approve between 1 and 16 peer host pairs")
 	}
-	return existing, nil
+	return merged, changed, nil
 }
 
 // Hidden elevated implementation. Normal callers use join, not this command.
 func helperAuthorizeCommand() *cobra.Command {
 	var uid uint32
 	var executable, digest string
-	var upgrade bool
+	var upgrade, replaceApproval bool
 	cmd := &cobra.Command{Use: "authorize", Hidden: true, Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
 		if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 			return fmt.Errorf("unsupported helper platform")
@@ -166,16 +175,17 @@ func helperAuthorizeCommand() *cobra.Command {
 		if decoder.Decode(new(any)) != io.EOF {
 			return fmt.Errorf("unexpected data after approval document")
 		}
-		return authorizeNetworking(cmd.Context(), requested, executable, digest, upgrade)
+		return authorizeNetworking(cmd.Context(), requested, executable, digest, upgrade, replaceApproval)
 	}}
 	cmd.Flags().Uint32Var(&uid, "uid", 0, "Approved user ID")
 	cmd.Flags().StringVar(&executable, "executable", "", "Verified helper to stage")
 	cmd.Flags().StringVar(&digest, "sha256", "", "Expected executable digest")
 	cmd.Flags().BoolVar(&upgrade, "upgrade", false, "Approve restart to upgrade the helper; active IP attachments disconnect")
+	cmd.Flags().BoolVar(&replaceApproval, "replace-approval", false, "Replace a changed administrator approval for the same interface")
 	return cmd
 }
 
-func authorizeNetworking(ctx context.Context, requested HelperApprovals, source, digest string, upgrade bool) error {
+func authorizeNetworking(ctx context.Context, requested HelperApprovals, source, digest string, upgrade, replaceApproval bool) error {
 	dir := helperStateDir(requested.AllowedUID)
 	if err := validatePrivilegedExecutable(filepath.Dir(dir)); err != nil {
 		return err
@@ -224,6 +234,7 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	}
 	path := filepath.Join(dir, "approvals.json")
 	var existing HelperApprovals
+	var existingBytes []byte
 	if data, err := os.ReadFile(path); err == nil {
 		if err := validatePrivilegedExecutable(path); err != nil {
 			return err
@@ -231,10 +242,11 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 		if err := json.Unmarshal(data, &existing); err != nil {
 			return err
 		}
+		existingBytes = data
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	merged, err := mergeApprovals(existing, requested)
+	merged, approvalChanged, err := mergeApprovals(existing, requested, replaceApproval)
 	if err != nil {
 		return err
 	}
@@ -260,7 +272,7 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	defer cancel()
 	output, err := exec.CommandContext(check, target, "--config", name, "--check").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("network helper rejected requested approvals: %s", bytes.TrimSpace(output))
+		return helperCheckError(output)
 	}
 	svc, err := service.New(nil, helperServiceConfig(requested.AllowedUID, target))
 	if err != nil {
@@ -289,12 +301,28 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	if installed && old.Executable != target && !upgrade {
 		return fmt.Errorf("helper upgrade requires explicit approval: retry join with --upgrade-helper; existing IP attachments will disconnect")
 	}
-	// Publish only validated additive approvals. Existing sessions remain live.
-	if err := os.Rename(name, path); err != nil {
-		return err
-	}
-	receipt, _ := json.Marshal(helperReceipt{Executable: target, SHA256: digest})
 	replacing := installed && old.Executable != target
+	if approvalChanged && status == service.StatusRunning && !replacing {
+		// A running helper keeps its startup configuration in memory. Restart it
+		// only after explicit re-approval, and restore the previous file/service
+		// if the new configuration cannot start.
+		if err := svc.Stop(); err != nil {
+			return fmt.Errorf("stop helper before replacing its approval: %w", err)
+		}
+		if err := os.Rename(name, path); err != nil {
+			_ = svc.Start()
+			return err
+		}
+		if err := svc.Start(); err != nil {
+			restoreErr := writeRootFile(path, existingBytes)
+			startErr := svc.Start()
+			return errors.Join(fmt.Errorf("start helper with replacement approval: %w", err), restoreErr, startErr)
+		}
+		return nil
+	}
+	// Additive approvals preserve live sessions. A stopped or new service reads
+	// the new file when it starts.
+	receipt, _ := json.Marshal(helperReceipt{Executable: target, SHA256: digest})
 	var restore func() error
 	if replacing {
 		if err := validatePrivilegedExecutable(old.Executable); err != nil {
@@ -305,18 +333,47 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 			return err
 		}
 		restore = func() error {
-			err := previous.Install()
-			if err == nil && status == service.StatusRunning {
-				err = previous.Start()
+			var failures []error
+			if len(existingBytes) != 0 {
+				if err := writeRootFile(path, existingBytes); err != nil {
+					failures = append(failures, fmt.Errorf("restore previous helper approvals: %w", err))
+				}
 			}
-			if err == nil {
+			if err := previous.Install(); err != nil {
+				failures = append(failures, fmt.Errorf("restore previous helper service: %w", err))
+			} else {
+				if status == service.StatusRunning {
+					if err := previous.Start(); err != nil {
+						failures = append(failures, fmt.Errorf("restart previous helper: %w", err))
+					}
+				}
 				data, _ := json.Marshal(old)
-				err = writeRootFile(receiptPath, data)
+				if err := writeRootFile(receiptPath, data); err != nil {
+					failures = append(failures, fmt.Errorf("restore previous helper receipt: %w", err))
+				}
 			}
-			return err
+			return errors.Join(failures...)
+		}
+	} else if approvalChanged {
+		restore = func() error {
+			if len(existingBytes) == 0 {
+				return nil
+			}
+			return writeRootFile(path, existingBytes)
 		}
 	}
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
 	return activateHelper(svc, installed, status, replacing, func() error { return writeRootFile(receiptPath, receipt) }, restore)
+}
+
+func helperCheckError(output []byte) error {
+	message := strings.TrimSpace(string(output))
+	if strings.Contains(message, "helper attachments must not install overlapping routes") {
+		return fmt.Errorf("the selected networking helper is outdated and rejects overlapping route approvals saved for different networks. No approval or active interface was changed. Upgrade to a helper build that supports overlapping saved routes, then retry `datumctl connect join NETWORK --upgrade-helper --replace-helper-approval --helper-executable PATH`")
+	}
+	return fmt.Errorf("network helper rejected the requested approvals: %s", message)
 }
 
 func writeRootFile(path string, data []byte) error {
@@ -337,42 +394,45 @@ func writeRootFile(path string, data []byte) error {
 // Additive approvals do not restart a running helper. An explicitly approved
 // binary replacement restores the previous service if activation fails.
 func activateHelper(svc service.Service, installed bool, status service.Status, replacing bool, receipt func() error, restore func() error) error {
-	if replacing {
-		if status == service.StatusRunning {
-			if err := svc.Stop(); err != nil {
-				return err
-			}
-		}
-		if err := svc.Uninstall(); err != nil {
-			return err
-		}
-		installed = false
-	}
-	added := false
 	rollback := func(cause error) error {
-		if added {
-			_ = svc.Stop()
-			if err := svc.Uninstall(); err != nil {
-				return errors.Join(cause, fmt.Errorf("remove failed helper installation: %w", err))
-			}
-		}
-		if replacing {
+		if restore != nil {
 			return errors.Join(cause, restore())
 		}
 		return cause
 	}
+	if replacing {
+		if status == service.StatusRunning {
+			if err := svc.Stop(); err != nil {
+				return rollback(err)
+			}
+		}
+		if err := svc.Uninstall(); err != nil {
+			return rollback(err)
+		}
+		installed = false
+	}
+	added := false
+	rollbackInstall := func(cause error) error {
+		if added {
+			_ = svc.Stop()
+			if err := svc.Uninstall(); err != nil {
+				cause = errors.Join(cause, fmt.Errorf("remove failed helper installation: %w", err))
+			}
+		}
+		return rollback(cause)
+	}
 	if !installed {
 		if err := svc.Install(); err != nil {
-			return rollback(err)
+			return rollbackInstall(err)
 		}
 		added = true
 	}
 	if err := receipt(); err != nil {
-		return rollback(err)
+		return rollbackInstall(err)
 	}
 	if !installed || status != service.StatusRunning {
 		if err := svc.Start(); err != nil {
-			return rollback(err)
+			return rollbackInstall(err)
 		}
 	}
 	return nil

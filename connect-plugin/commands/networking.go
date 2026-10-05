@@ -193,7 +193,7 @@ func newJoin(opts *options) *cobra.Command {
 	var peer, executable string
 	var tcp, udp []string
 	var routes, advertise []string
-	var ping, upgrade, wait, noWait bool
+	var ping, upgrade, replaceApproval, wait, noWait bool
 	var waitTimeout time.Duration
 	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC gateway or direct Connector", Long: "Join the ready ConnectGateway configured for NETWORK. Connect creates or reuses this device's ConnectNetworkBinding, then asks for Administrator approval before installing the local interface and exact approved routes.\n\nIf no managed gateway exists, pass --peer and explicit traffic permissions\nfor direct Connector setup. Both peers use the same network name and approve\neach other. Routed direct attachments wait for the peer by default.\n\nSuccessful managed VPC attachments reconnect when the daemon or project resumes. Route changes outside the existing helper approval fail closed and require interactive approval. Direct peer attachments remain ephemeral. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if wait && noWait {
@@ -296,11 +296,13 @@ func newJoin(opts *options) *cobra.Command {
 			question := "Install the privileged helper and approve this access?"
 			if upgrade {
 				question = "Upgrade the helper? Active IP attachments will disconnect; services and local ports stay running."
+			} else if replaceApproval {
+				question = "Replace this interface's administrator approval if it changed? Replacement disconnects active IP attachments; services and local ports stay running."
 			}
 			if err := confirmSetup(cmd, question); err != nil {
 				return err
 			}
-			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, upgrade); err != nil {
+			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, upgrade, replaceApproval); err != nil {
 				return err
 			}
 			// launchd/systemd acknowledging Start is not yet helper readiness.
@@ -348,6 +350,7 @@ func newJoin(opts *options) *cobra.Command {
 	cmd.Flags().BoolVar(&ping, "allow-ping", false, "Permit ping (subnet mode: client to subnet; host mode: both directions)")
 	cmd.Flags().StringVar(&executable, "helper-executable", "", "Explicit local helper build instead of downloading this plugin's release")
 	cmd.Flags().BoolVar(&upgrade, "upgrade-helper", false, "Approve matching-helper upgrade; active IP attachments disconnect")
+	cmd.Flags().BoolVar(&replaceApproval, "replace-helper-approval", false, "Replace a changed administrator approval for this network; active IP attachments disconnect")
 	cmd.Flags().BoolVar(&wait, "wait", false, "Wait for the peer to connect after joining")
 	cmd.Flags().BoolVar(&noWait, "no-wait", false, "Return immediately even if a routed peer is not connected yet")
 	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", 5*time.Minute, "Maximum time to wait with --wait (for example 30s or 5m)")

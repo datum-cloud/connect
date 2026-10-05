@@ -3,23 +3,39 @@ package daemonservice
 import (
 	"errors"
 	"github.com/kardianos/service"
+	"strings"
 	"testing"
 )
+
+func TestHelperCheckErrorExplainsStaleOverlapBehavior(t *testing.T) {
+	err := helperCheckError([]byte(`Error: Custom { kind: InvalidInput, error: "helper attachments must not install overlapping routes" }`))
+	message := err.Error()
+	for _, want := range []string{
+		"networking helper is outdated",
+		"overlapping route approvals saved for different networks",
+		"No approval or active interface was changed",
+		"--upgrade-helper --replace-helper-approval --helper-executable PATH",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("error %q does not explain %q", message, want)
+		}
+	}
+}
 
 func TestApprovalsAreAdditiveAndCannotRetarget(t *testing.T) {
 	first := InterfaceApproval{InterfaceName: "dcfirst", AssignedAddress: "fd00::1/128", PeerAddress: "fd00::2/128", MTU: 1280}
 	second := InterfaceApproval{InterfaceName: "dcsecond", AssignedAddress: "fd01::1/128", PeerAddress: "fd01::2/128", MTU: 1280}
 	old := HelperApprovals{501, []InterfaceApproval{first}}
-	merged, err := mergeApprovals(old, HelperApprovals{501, []InterfaceApproval{first, second}})
+	merged, _, err := mergeApprovals(old, HelperApprovals{501, []InterfaceApproval{first, second}}, false)
 	if err != nil || len(merged.Approvals) != 2 {
 		t.Fatalf("%+v %v", merged, err)
 	}
 	changed := first
 	changed.PeerAddress = "fd00::3/128"
-	if _, err := mergeApprovals(old, HelperApprovals{501, []InterfaceApproval{changed}}); err == nil {
+	if _, _, err := mergeApprovals(old, HelperApprovals{501, []InterfaceApproval{changed}}, false); err == nil {
 		t.Fatal("retargeted existing grant")
 	}
-	if _, err := mergeApprovals(old, HelperApprovals{502, []InterfaceApproval{second}}); err == nil {
+	if _, _, err := mergeApprovals(old, HelperApprovals{502, []InterfaceApproval{second}}, false); err == nil {
 		t.Fatal("changed approved user")
 	}
 	if len(old.Approvals) != 1 || !sameApproval(old.Approvals[0], first) {
@@ -31,8 +47,15 @@ func TestExistingApprovalCannotGainSubnetAccess(t *testing.T) {
 	host := InterfaceApproval{InterfaceName: "dcfirst", AssignedAddress: "fd00::1/128", PeerAddress: "fd00::2/128", MTU: 1280}
 	subnet := host
 	subnet.Routes = []string{"fd20::/64"}
-	if _, err := mergeApprovals(HelperApprovals{501, []InterfaceApproval{host}}, HelperApprovals{501, []InterfaceApproval{subnet}}); err == nil {
+	if _, _, err := mergeApprovals(HelperApprovals{501, []InterfaceApproval{host}}, HelperApprovals{501, []InterfaceApproval{subnet}}, false); err == nil {
 		t.Fatal("expanded existing host approval")
+	}
+	merged, changed, err := mergeApprovals(HelperApprovals{501, []InterfaceApproval{host}}, HelperApprovals{501, []InterfaceApproval{subnet}}, true)
+	if err != nil || !changed || len(merged.Approvals) != 1 || !sameApproval(merged.Approvals[0], subnet) {
+		t.Fatalf("explicit replacement failed: merged=%+v changed=%v err=%v", merged, changed, err)
+	}
+	if !sameApproval(host, HelperApprovals{501, []InterfaceApproval{host}}.Approvals[0]) {
+		t.Fatal("replacement mutated the old approval")
 	}
 	empty := host
 	empty.Routes = []string{}
@@ -64,7 +87,7 @@ func TestHelperActivationKeepsLiveSessionsAndRollsBackUpgrades(t *testing.T) {
 	if err := activateHelper(svc, true, service.StatusRunning, false, func() error { return nil }, nil); err != nil || len(svc.events) != 0 {
 		t.Fatalf("additive change restarted service: %+v %v", svc.events, err)
 	}
-	for _, failure := range []string{"install", "start", "receipt"} {
+	for _, failure := range []string{"stop", "uninstall", "install", "start", "receipt"} {
 		t.Run(failure, func(t *testing.T) {
 			svc := &helperTestService{fail: failure}
 			restored := 0

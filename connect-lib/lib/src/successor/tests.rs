@@ -120,7 +120,7 @@ fn network_binding_name_is_deterministic_and_scoped_to_connector_and_network() {
 }
 
 #[tokio::test]
-async fn joining_managed_network_creates_connector_owned_binding_and_renews_lease() {
+async fn joining_managed_network_waits_for_transient_connector_not_ready() {
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connect_connector = json!({
         "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
@@ -136,8 +136,11 @@ async fn joining_managed_network_creates_connector_owned_binding_and_renews_leas
     let created_binding = json!({
         "metadata":{"name":binding_name,"uid":"binding-uid","resourceVersion":"1","generation":1},
         "spec":{"gatewayRef":"vpc-gateway","connectorRef":format!("connect-{}", &peer[..40])},
-        "status":{"endpointID":gateway["status"]["endpointID"],"assignedAddress":"fd79::1/128","peerAddress":"fd79::2/128","routes":["fd20:0:27::/48"],"relayURLs":["https://relay.example/"],"conditions":[{"type":"Accepted","status":"True","observedGeneration":1}]}
+        "status":{"endpointID":gateway["status"]["endpointID"],"assignedAddress":"fd79::1/128","peerAddress":"fd79::2/128","routes":["fd20:0:27::/48"],"relayURLs":["https://relay.example/"],"conditions":[{"type":"Accepted","status":"False","reason":"ConnectorNotReady","observedGeneration":1}]}
     });
+    let mut accepted_binding = created_binding.clone();
+    accepted_binding["status"]["conditions"][0]["status"] = json!("True");
+    accepted_binding["status"]["conditions"][0]["reason"] = json!("Approved");
     let lease = json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"connect-lease","resourceVersion":"4"},"spec":{"leaseDurationSeconds":30}});
     let (base, task) = server(vec![
         token(),
@@ -147,6 +150,7 @@ async fn joining_managed_network_creates_connector_owned_binding_and_renews_leas
         Reply::EchoCreated,
         Reply::Json(404, json!({})),
         Reply::Json(201, created_binding.clone()),
+        Reply::Json(200, accepted_binding),
     ])
     .await;
     let cloud = client(&base);
