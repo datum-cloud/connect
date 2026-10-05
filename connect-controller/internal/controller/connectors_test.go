@@ -100,8 +100,9 @@ func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *testing.T) {
 	ctx := context.Background()
 	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	secondConnector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "phone", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("b", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}, Image: "ghcr.io/datum-cloud/iroh-gateway:connect-ip"}}
-	c := testClient(t, connector, gateway).Build()
+	c := testClient(t, connector, secondConnector, gateway).Build()
 	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
@@ -184,14 +185,22 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	}
 
 	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
-	if err := c.Create(ctx, binding); err != nil {
-		t.Fatal(err)
+	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "phone-vpc", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: secondConnector.Name}}
+	// Create bindings in reverse peer-key order to ensure the rendered grants
+	// are deterministic rather than dependent on API list order.
+	for _, item := range []*connectv1alpha1.ConnectNetworkBinding{secondBinding, binding} {
+		if err := c.Create(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+		if err := reconcileNetworkBinding(ctx, c, "project-id", item); err != nil {
+			t.Fatal(err)
+		}
+		if condition := meta.FindStatusCondition(item.Status.Conditions, "Accepted"); condition == nil || condition.Status != metav1.ConditionUnknown || condition.Reason != "GatewayApplyingGrant" || item.Status.AssignedAddress == "" || item.Status.PeerAddress == "" {
+			t.Fatalf("binding should wait for the grant rollout and have addresses: %#v", item.Status)
+		}
 	}
-	if err := reconcileNetworkBinding(ctx, c, "project-id", binding); err != nil {
-		t.Fatal(err)
-	}
-	if condition := meta.FindStatusCondition(binding.Status.Conditions, "Accepted"); condition == nil || condition.Status != metav1.ConditionUnknown || condition.Reason != "GatewayApplyingGrant" || binding.Status.AssignedAddress == "" || binding.Status.PeerAddress == "" {
-		t.Fatalf("binding should wait for the grant rollout and have addresses: %#v", binding.Status)
+	if binding.Status.AssignedAddress == secondBinding.Status.AssignedAddress || binding.Status.PeerAddress == secondBinding.Status.PeerAddress {
+		t.Fatalf("distinct Connectors received overlapping attachment addresses: first=%#v second=%#v", binding.Status, secondBinding.Status)
 	}
 	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
@@ -213,8 +222,43 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if err := json.Unmarshal([]byte(configMap.Data["grants.json"]), &config); err != nil {
 		t.Fatal(err)
 	}
-	if len(config.Grants) != 1 {
-		t.Fatalf("grants=%v, want the approved Connector grant", config.Grants)
+	if len(config.Grants) != 2 {
+		t.Fatalf("grants=%v, want both approved Connector grants", config.Grants)
+	}
+	if config.Grants[0]["peer"] != connector.Spec.PublicKey || config.Grants[1]["peer"] != secondConnector.Spec.PublicKey {
+		t.Fatalf("grants are not sorted by peer identity: %v", config.Grants)
+	}
+	grantInterfaces := map[string]bool{}
+	addresses := map[string]bool{}
+	for _, grant := range config.Grants {
+		peer, _ := grant["peer"].(string)
+		interfaceName, _ := grant["interface_name"].(string)
+		clientAddress, _ := grant["client_address"].(string)
+		gatewayAddress, _ := grant["gateway_address"].(string)
+		if len(interfaceName) == 0 || len(interfaceName) > 15 || grantInterfaces[interfaceName] {
+			t.Fatalf("grant for %q has invalid or duplicate interface %q: %v", peer, interfaceName, config.Grants)
+		}
+		grantInterfaces[interfaceName] = true
+		for _, address := range []string{clientAddress, gatewayAddress} {
+			if address == "" || addresses[address] {
+				t.Fatalf("grant for %q has empty or duplicate address %q: %v", peer, address, config.Grants)
+			}
+			addresses[address] = true
+		}
+	}
+	originalGrantJSON := configMap.Data["grants.json"]
+	duplicateBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc-alias", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
+	if err := c.Create(ctx, duplicateBinding); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: "project"}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	if configMap.Data["grants.json"] != originalGrantJSON {
+		t.Fatalf("duplicate binding changed the canonical gateway grants: before=%s after=%s", originalGrantJSON, configMap.Data["grants.json"])
 	}
 	if err := unstructured.SetNestedSlice(workload.Object, []interface{}{map[string]interface{}{"type": "Available", "status": "True"}}, "status", "conditions"); err != nil {
 		t.Fatal(err)
@@ -232,17 +276,37 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if err := c.Update(ctx, workload); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileNetworkBinding(ctx, c, "project-id", binding); err != nil {
-		t.Fatal(err)
-	}
-	if !meta.IsStatusConditionTrue(binding.Status.Conditions, "Accepted") {
-		t.Fatalf("binding should be accepted only after the gateway applies its grant: %#v", binding.Status.Conditions)
+	for _, item := range []*connectv1alpha1.ConnectNetworkBinding{binding, secondBinding} {
+		if err := reconcileNetworkBinding(ctx, c, "project-id", item); err != nil {
+			t.Fatal(err)
+		}
+		if !meta.IsStatusConditionTrue(item.Status.Conditions, "Accepted") {
+			t.Fatalf("binding should be accepted only after the gateway applies its grant: %#v", item.Status.Conditions)
+		}
 	}
 	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
 	if !meta.IsStatusConditionTrue(gateway.Status.Conditions, "Ready") {
 		t.Fatalf("gateway should be ready after Compute Workload Available: %#v", gateway.Status.Conditions)
+	}
+}
+
+func TestGatewayGrantInterfaceDerivationIsPerPeerAndSymmetric(t *testing.T) {
+	gateway := strings.Repeat("f", 64)
+	first := strings.Repeat("1", 64)
+	second := strings.Repeat("2", 64)
+	_, _, firstInterface := gatewayPeerAddresses("project", "vpc", first, gateway)
+	_, _, reverseFirstInterface := gatewayPeerAddresses("project", "vpc", gateway, first)
+	_, _, secondInterface := gatewayPeerAddresses("project", "vpc", second, gateway)
+	if firstInterface != reverseFirstInterface {
+		t.Fatalf("interface derivation is not symmetric: %q != %q", firstInterface, reverseFirstInterface)
+	}
+	if firstInterface == secondInterface {
+		t.Fatalf("distinct peers share interface %q", firstInterface)
+	}
+	if len(firstInterface) > 15 || len(secondInterface) > 15 {
+		t.Fatalf("interface names exceed Linux IFNAMSIZ: %q %q", firstInterface, secondInterface)
 	}
 }
 

@@ -98,6 +98,21 @@ Workload, and the daemon consumes the resulting binding status. A staging
 deployment needs a gateway image with the matching CONNECT-IP transport and
 Compute runtime support for IPv6 forwarding and `NET_ADMIN`.
 
+For a local multi-device data-plane validation, build the Linux daemon, plugin,
+and gateway binaries into `target/connect-ip-linux-bin`, build the lab image
+from `scripts/connect-vpc-multi-device.Dockerfile`, and run:
+
+```sh
+python3 scripts/connect-vpc-multi-device-local.py \
+  --docker-context colima \
+  --binaries target/connect-ip-linux-bin
+```
+
+The disposable lab enrolls two real daemons, attaches both concurrently to one
+gateway, and verifies ICMP, TCP, and UDP across the gateway's IPv6 VPC packet
+path. Cloud authorization is simulated; TUN devices, iroh sessions, forwarding,
+and packets are real.
+
 The intended staging resources look like this:
 
 ```yaml
