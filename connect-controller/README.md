@@ -33,6 +33,11 @@ The controller provisions the first single-project CONNECT-IP gateway slice:
   controller derives matching `/128` peer addresses and routes, then reconciles
   an approved peer grant into the gateway ConfigMap. Deleting the binding
   removes the grant on the next reconciliation.
+- `ConnectGateway.spec.peerRouting` optionally adds every other ready Connector's
+  assigned `/128` to each binding and gateway grant. It is disabled by default.
+  Peer packets are forwarded between authenticated gateway sessions without
+  entering the VPC or its NAT path. VPC and peer routes together are limited to
+  32 routes per Connector.
 - ConnectGateway status publishes the gateway endpoint ID and Workload name.
   Ready becomes true after the Compute Workload is Available. This reports
   workload availability, not an active client attachment or a working packet path.
@@ -109,9 +114,9 @@ python3 scripts/connect-vpc-multi-device-local.py \
 ```
 
 The disposable lab enrolls two real daemons, attaches both concurrently to one
-gateway, and verifies ICMP, TCP, and UDP across the gateway's IPv6 VPC packet
-path. Cloud authorization is simulated; TUN devices, iroh sessions, forwarding,
-and packets are real.
+gateway, and verifies ICMP, TCP, and UDP both across the gateway's IPv6 VPC
+packet path and directly between the devices. Cloud authorization is simulated;
+TUN devices, iroh sessions, forwarding, and packets are real.
 
 The intended staging resources look like this:
 
@@ -124,6 +129,7 @@ spec:
   networkRef: staging-vpc
   locationRef: DFW
   routes: [fd20:0:27::/48]
+  peerRouting: true
   image: ghcr.io/datum-cloud/iroh-gateway:<connect-ip-build>
   relayURLs: [https://<staging-relay-host>]
 ---

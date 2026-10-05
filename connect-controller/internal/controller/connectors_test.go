@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -101,7 +103,7 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	ctx := context.Background()
 	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
 	secondConnector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "phone", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("b", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
-	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}, Image: "ghcr.io/datum-cloud/iroh-gateway:connect-ip"}}
+	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}, Image: "ghcr.io/datum-cloud/iroh-gateway:connect-ip", PeerRouting: true}}
 	c := testClient(t, connector, secondConnector, gateway).Build()
 	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
@@ -228,6 +230,14 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if config.Grants[0]["peer"] != connector.Spec.PublicKey || config.Grants[1]["peer"] != secondConnector.Spec.PublicKey {
 		t.Fatalf("grants are not sorted by peer identity: %v", config.Grants)
 	}
+	firstPeerRoutes, ok := config.Grants[0]["peer_routes"].([]interface{})
+	if !ok || len(firstPeerRoutes) != 1 || firstPeerRoutes[0] != config.Grants[1]["client_address"] {
+		t.Fatalf("first grant peer_routes=%v, want second Connector address %v", config.Grants[0]["peer_routes"], config.Grants[1]["client_address"])
+	}
+	secondPeerRoutes, ok := config.Grants[1]["peer_routes"].([]interface{})
+	if !ok || len(secondPeerRoutes) != 1 || secondPeerRoutes[0] != config.Grants[0]["client_address"] {
+		t.Fatalf("second grant peer_routes=%v, want first Connector address %v", config.Grants[1]["peer_routes"], config.Grants[0]["client_address"])
+	}
 	grantInterfaces := map[string]bool{}
 	addresses := map[string]bool{}
 	for _, grant := range config.Grants {
@@ -284,6 +294,12 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 			t.Fatalf("binding should be accepted only after the gateway applies its grant: %#v", item.Status.Conditions)
 		}
 	}
+	if got, want := binding.Status.Routes, []string{"fd20:0:27::/48", secondBinding.Status.AssignedAddress}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("first binding routes=%v, want VPC and second Connector routes %v", got, want)
+	}
+	if got, want := secondBinding.Status.Routes, []string{"fd20:0:27::/48", binding.Status.AssignedAddress}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("second binding routes=%v, want VPC and first Connector routes %v", got, want)
+	}
 	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
@@ -307,6 +323,68 @@ func TestGatewayGrantInterfaceDerivationIsPerPeerAndSymmetric(t *testing.T) {
 	}
 	if len(firstInterface) > 15 || len(secondInterface) > 15 {
 		t.Fatalf("interface names exceed Linux IFNAMSIZ: %q %q", firstInterface, secondInterface)
+	}
+}
+
+func TestPeerRoutingIsDisabledByDefault(t *testing.T) {
+	ctx := context.Background()
+	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20::/48"}, Image: "gateway:dev"}}
+	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
+	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
+	c := testClient(t, first, second, gateway, firstBinding, secondBinding).Build()
+	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: gateway.Namespace}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		Grants []map[string]interface{} `json:"grants"`
+	}
+	if err := json.Unmarshal([]byte(configMap.Data["grants.json"]), &config); err != nil {
+		t.Fatal(err)
+	}
+	for _, grant := range config.Grants {
+		if _, found := grant["peer_routes"]; found {
+			t.Fatalf("peer_routes must be omitted unless explicitly enabled: %v", grant)
+		}
+	}
+	if err := reconcileNetworkBinding(ctx, c, "project-id", firstBinding); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := firstBinding.Status.Routes, gateway.Spec.Routes; !reflect.DeepEqual(got, want) {
+		t.Fatalf("routes=%v, want only VPC routes %v", got, want)
+	}
+}
+
+func TestGatewayReportsPeerRouteCapacityExceeded(t *testing.T) {
+	ctx := context.Background()
+	routes := make([]string, 32)
+	for index := range routes {
+		routes[index] = fmt.Sprintf("fd20::%x/128", index+1)
+	}
+	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: routes, Image: "gateway:dev", PeerRouting: true}}
+	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
+	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
+	c := testClient(t, first, second, gateway, firstBinding, secondBinding).Build()
+	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(gateway.Status.Conditions, "Ready")
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "PeerRouteCapacityExceeded" {
+		t.Fatalf("gateway condition=%#v, want PeerRouteCapacityExceeded", condition)
+	}
+	if err := reconcileNetworkBinding(ctx, c, "project-id", firstBinding); err != nil {
+		t.Fatal(err)
+	}
+	bindingCondition := meta.FindStatusCondition(firstBinding.Status.Conditions, "Accepted")
+	if bindingCondition == nil || bindingCondition.Status != metav1.ConditionFalse || bindingCondition.Reason != "PeerRouteCapacityExceeded" || firstBinding.Status.Routes != nil {
+		t.Fatalf("binding status=%#v, want route-capacity rejection without advertised routes", firstBinding.Status)
 	}
 }
 

@@ -135,6 +135,10 @@ The `connect-controller` module defines project `ConnectGateway` and
 Workload. Managed VPC joins use these Connect resources. Service publication
 and peer discovery still use NSO-backed resources. The VPC controller is a
 staging prototype; validate the gateway-to-instance packet path on each native OS.
+Gateway operators can explicitly enable `spec.peerRouting` to advertise the
+assigned `/128` addresses of other ready bindings. The gateway then forwards
+device traffic directly between authenticated sessions; this is disabled by
+default and does not turn the VPC into a general transit network.
 Identity rotation and the desktop thin client also remain unfinished.
 On macOS/Linux, first-time direct-peer setup no longer requires JSON files:
 

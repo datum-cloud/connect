@@ -160,21 +160,28 @@ def run(args):
             client_keys[role] = cli(name, "up", "--credentials-file", "/lab/credentials.json")["connector"]["public_key"]
             stop(name, "daemon")
 
-        grants = []
         attachments = {}
-        for role, name in clients.items():
+        for role in clients:
             assigned, gateway_tun, interface = attachment("demo", "local-vpc", client_keys[role], gateway_key)
             attachments[role] = {"assigned": assigned, "gateway": gateway_tun, "interface": interface}
+
+        grants = []
+        for role, name in clients.items():
+            values = attachments[role]
+            peer_routes = [other["assigned"] + "/128" for other_role, other in attachments.items()
+                           if other_role != role]
             client_ip = json.loads(cmd("inspect", name).stdout)[0]["NetworkSettings"]["Networks"][underlay]["IPAddress"]
             binding = {"project": "demo", "network": "local-vpc", "gateway": gateway_key,
-                       "addresses": [gateway_socket], "assigned_address": assigned + "/128",
-                       "routes": [vpc_subnet], "interface_name": "dcvpc0", "mtu": 1280}
+                       "addresses": [gateway_socket], "assigned_address": values["assigned"] + "/128",
+                       "routes": [vpc_subnet, *peer_routes], "interface_name": "dcvpc0", "mtu": 1280}
             write_json(name, "/lab/ip.json", {"underlay_address": client_ip, "bindings": [binding]})
             launch(name, "daemon", ["/binaries/datum-connect-daemon", "--repo", "/lab/repo", "--local-ip-config", "/lab/ip.json"])
             wait_port(name, 47780)
             grants.append({"network": "local-vpc", "peer": client_keys[role],
-                           "client_address": assigned + "/128", "gateway_address": gateway_tun + "/128",
-                           "routes": [vpc_subnet], "interface_name": interface, "mtu": 1280})
+                           "client_address": values["assigned"] + "/128",
+                           "gateway_address": values["gateway"] + "/128",
+                           "routes": [vpc_subnet], "peer_routes": peer_routes,
+                           "interface_name": values["interface"], "mtu": 1280})
 
         assert len({item["interface_name"] for item in grants}) == 2, grants
         assert len({item["client_address"] for item in grants}) == 2, grants
@@ -201,17 +208,44 @@ def run(args):
             assert execute(name, "ip", "link", "show", "dev", "dcvpc0", check=False).returncode == 0
             status = cli(name, "status")["networks"][0]
             assert status["running"] and status["packets_sent"] > 0 and status["packets_received"] > 0, status
+
+        def gateway_counters():
+            metrics = execute(gateway, "curl", "--fail", "--silent", "http://127.0.0.1:9090/metrics").stdout
+            return metrics, dict(line.split() for line in metrics.splitlines()
+                                 if line.startswith("iroh_gateway_ip_"))
+
+        _, before_peer = gateway_counters()
+        for role, name in clients.items():
+            launch(name, "peer-origin", ["python3", "/workspace/iroh-gateway/scripts/connect-ip-local.py", "--origin", "--ipv6"])
+            wait_port(name, 8080, attachments[role]["assigned"])
+        for role, name in clients.items():
+            other_role = next(candidate for candidate in clients if candidate != role)
+            other_name = clients[other_role]
+            destination = attachments[other_role]["assigned"]
+            execute(name, "ping", "-6", "-n", "-c", "3", "-W", "2", destination)
+            response = execute(name, "curl", "--noproxy", "*", "--fail", "--max-time", "5", f"http://[{destination}]:8080/")
+            assert response.stdout.encode() == BODY
+            execute(name, "python3", "/workspace/iroh-gateway/scripts/connect-ip-local.py", "--udp-probe", destination)
+            expected_source = attachments[role]["assigned"]
+            received = execute(other_name, "python3", "-c",
+                               "import json,sys; rows=[json.loads(line) for line in open('/lab/origin-received.log')]; "
+                               "assert any(row['source']==sys.argv[1] for row in rows), rows",
+                               expected_source, check=False)
+            assert received.returncode == 0, received.stdout + received.stderr
+
         for values in attachments.values():
             assert execute(gateway, "ip", "link", "show", "dev", values["interface"], check=False).returncode == 0
-        metrics = execute(gateway, "curl", "--fail", "--silent", "http://127.0.0.1:9090/metrics").stdout
-        counters = dict(line.split() for line in metrics.splitlines() if line.startswith("iroh_gateway_ip_"))
+        metrics, counters = gateway_counters()
         assert int(counters["iroh_gateway_ip_active_sessions"]) == 2, counters
         assert int(counters["iroh_gateway_ip_packets_injected_total"]) > 0
         assert int(counters["iroh_gateway_ip_packets_returned_total"]) > 0
+        for counter in ("iroh_gateway_ip_packets_injected_total", "iroh_gateway_ip_packets_returned_total"):
+            assert counters[counter] == before_peer[counter], (counter, before_peer[counter], counters[counter])
         (artifacts / "grants.json").write_text(json.dumps({"grants": grants}, indent=2))
         (artifacts / "metrics.txt").write_text(metrics)
         print(f"PASS two simultaneous device daemons use distinct gateway TUNs and addresses: {attachments}")
         print("PASS both devices routed ICMP, TCP, and UDP through one real gateway into the IPv6 VPC")
+        print("PASS devices routed ICMP, TCP, and UDP directly through the gateway with their assigned source addresses")
         print(f"Artifacts: {artifacts}")
     finally:
         for name in containers:

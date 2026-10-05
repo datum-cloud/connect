@@ -148,6 +148,10 @@ type ConnectGatewaySpec struct {
 	InstanceType string `json:"instanceType,omitempty"`
 	// RelayURLs pins the gateway to operator-managed iroh relays when set.
 	RelayURLs []string `json:"relayURLs,omitempty"`
+	// PeerRouting allows Connectors attached to this gateway to route directly
+	// to the assigned addresses of the other attached Connectors. It is disabled
+	// by default; VPC routes remain available regardless of this setting.
+	PeerRouting bool `json:"peerRouting,omitempty"`
 }
 
 type ConnectGatewayStatus struct {

@@ -53,6 +53,11 @@ spec:
                 type: string
               networkRef:
                 type: string
+              peerRouting:
+                description: PeerRouting allows Connectors attached to this gateway
+                  to route directly to the assigned addresses of the other attached
+                  Connectors. It is disabled by default.
+                type: boolean
               relayURLs:
                 description: RelayURLs pins the gateway to operator-managed iroh relays
                   when set.

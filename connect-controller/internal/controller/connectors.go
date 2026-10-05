@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"net/url"
@@ -288,10 +289,14 @@ func reconcileGateway(ctx context.Context, c client.Client, project string, obj 
 	status, reason, message := metav1.ConditionUnknown, "Provisioning", "gateway resources are being reconciled"
 	if err := validateGatewaySpec(obj.Spec); err != nil {
 		status, reason, message = metav1.ConditionFalse, "InvalidSpec", err.Error()
-	} else {
-		if err := reconcileGatewayResources(ctx, c, project, obj); err != nil {
+	} else if err := reconcileGatewayResources(ctx, c, project, obj); err != nil {
+		var capacityError *gatewayPeerRouteCapacityError
+		if errors.As(err, &capacityError) {
+			status, reason, message = metav1.ConditionFalse, "PeerRouteCapacityExceeded", capacityError.Error()
+		} else {
 			return err
 		}
+	} else {
 		workload := &unstructured.Unstructured{}
 		workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
 		if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(obj.Name, "workload"), Namespace: obj.Namespace}, workload); err != nil {
@@ -374,35 +379,21 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	seed := secret.Data["key"]
 	publicKey := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
 	endpointID := hex.EncodeToString(publicKey)
-	bindings := &connectv1alpha1.ConnectNetworkBindingList{}
-	if err := c.List(ctx, bindings, client.InNamespace(gateway.Namespace)); err != nil {
+	gateway.Status.EndpointID = endpointID
+	peerGrants, err := readyGatewayGrants(ctx, c, project, gateway, endpointID)
+	if err != nil {
 		return err
 	}
-	grantsByPeer := make(map[string]map[string]interface{}, len(bindings.Items))
-	for i := range bindings.Items {
-		binding := &bindings.Items[i]
-		if binding.Spec.GatewayRef != gateway.Name || binding.DeletionTimestamp != nil {
-			continue
-		}
-		var connector connectv1alpha1.Connector
-		if err := c.Get(ctx, types.NamespacedName{Name: binding.Spec.ConnectorRef, Namespace: binding.Namespace}, &connector); err != nil {
-			continue
-		}
-		if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
-			continue
-		}
-		peer := strings.ToLower(connector.Spec.PublicKey)
-		clientAddress, peerAddress, interfaceName := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, peer, strings.ToLower(endpointID))
-		grantsByPeer[peer] = map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": peer, "client_address": clientAddress + "/128", "gateway_address": peerAddress + "/128", "routes": gateway.Spec.Routes, "interface_name": interfaceName, "mtu": 1280}
+	if gateway.Spec.PeerRouting && len(gateway.Spec.Routes)+max(len(peerGrants)-1, 0) > 32 {
+		return &gatewayPeerRouteCapacityError{vpcRoutes: len(gateway.Spec.Routes), connectors: len(peerGrants)}
 	}
-	peers := make([]string, 0, len(grantsByPeer))
-	for peer := range grantsByPeer {
-		peers = append(peers, peer)
-	}
-	sort.Strings(peers)
-	grants := make([]interface{}, 0, len(peers))
-	for _, peer := range peers {
-		grants = append(grants, grantsByPeer[peer])
+	grants := make([]interface{}, 0, len(peerGrants))
+	for _, peerGrant := range peerGrants {
+		grant := map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": peerGrant.peer, "client_address": peerGrant.clientAddress, "gateway_address": peerGrant.gatewayAddress, "routes": gateway.Spec.Routes, "interface_name": peerGrant.interfaceName, "mtu": 1280}
+		if gateway.Spec.PeerRouting {
+			grant["peer_routes"] = peerRoutes(peerGrants, peerGrant.peer)
+		}
+		grants = append(grants, grant)
 	}
 	grantJSON, err := json.Marshal(map[string]interface{}{"grants": grants})
 	if err != nil {
@@ -453,7 +444,6 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 		}
 	}
 	gateway.Status.WorkloadRef = workload.GetName()
-	gateway.Status.EndpointID = endpointID
 	return nil
 }
 
@@ -479,20 +469,37 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 			binding.Status.AssignedAddress = clientAddress + "/128"
 			binding.Status.PeerAddress = peerAddress + "/128"
 			binding.Status.Routes = append([]string(nil), gateway.Spec.Routes...)
-			binding.Status.RelayURLs = append([]string(nil), gateway.Spec.RelayURLs...)
-			workload := &unstructured.Unstructured{}
-			workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
-			if gateway.Status.WorkloadRef == "" {
-				status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
-			} else if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: gateway.Namespace}, workload); err != nil {
-				if !apierrors.IsNotFound(err) {
-					return err
+			capacityExceeded := false
+			if gateway.Spec.PeerRouting {
+				peerGrants, grantsErr := readyGatewayGrants(ctx, c, project, &gateway, gateway.Status.EndpointID)
+				if grantsErr != nil {
+					return grantsErr
 				}
-				status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
-			} else if !gatewayWorkloadReady(workload) || !gatewayWorkloadConfigApplied(ctx, c, &gateway, workload) || !gatewayConfigIncludesConnector(ctx, c, &gateway, strings.ToLower(connector.Spec.PublicKey)) {
-				status, reason, message = metav1.ConditionUnknown, "GatewayApplyingGrant", "waiting for the gateway Workload to apply this Connector grant and become available"
-			} else {
-				status, reason, message = metav1.ConditionTrue, "Approved", "gateway Workload is available with this Connector approved for its configured routes"
+				connectorPeerRoutes := peerRoutes(peerGrants, strings.ToLower(connector.Spec.PublicKey))
+				if len(binding.Status.Routes)+len(connectorPeerRoutes) > 32 {
+					capacityExceeded = true
+					binding.Status.Routes = nil
+					status, reason, message = metav1.ConditionFalse, "PeerRouteCapacityExceeded", "VPC and peer routes would exceed the 32-route limit"
+				} else {
+					binding.Status.Routes = append(binding.Status.Routes, connectorPeerRoutes...)
+				}
+			}
+			binding.Status.RelayURLs = append([]string(nil), gateway.Spec.RelayURLs...)
+			if !capacityExceeded {
+				workload := &unstructured.Unstructured{}
+				workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
+				if gateway.Status.WorkloadRef == "" {
+					status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
+				} else if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: gateway.Namespace}, workload); err != nil {
+					if !apierrors.IsNotFound(err) {
+						return err
+					}
+					status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
+				} else if !gatewayWorkloadReady(workload) || !gatewayWorkloadConfigApplied(ctx, c, &gateway, workload) || !gatewayConfigIncludesConnector(ctx, c, &gateway, strings.ToLower(connector.Spec.PublicKey)) {
+					status, reason, message = metav1.ConditionUnknown, "GatewayApplyingGrant", "waiting for the gateway Workload to apply this Connector grant and become available"
+				} else {
+					status, reason, message = metav1.ConditionTrue, "Approved", "gateway Workload is available with this Connector approved for its configured routes"
+				}
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
@@ -504,6 +511,73 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 		return nil
 	}
 	return c.Status().Update(ctx, binding)
+}
+
+type gatewayGrant struct {
+	peer           string
+	clientAddress  string
+	gatewayAddress string
+	interfaceName  string
+}
+
+type gatewayPeerRouteCapacityError struct {
+	vpcRoutes  int
+	connectors int
+}
+
+func (e *gatewayPeerRouteCapacityError) Error() string {
+	return fmt.Sprintf("peer routing for %d Connectors plus %d VPC routes would advertise more than 32 routes per Connector; reduce routes or attached Connectors", e.connectors, e.vpcRoutes)
+}
+
+func readyGatewayGrants(ctx context.Context, c client.Client, project string, gateway *connectv1alpha1.ConnectGateway, endpointID string) ([]gatewayGrant, error) {
+	bindings := &connectv1alpha1.ConnectNetworkBindingList{}
+	if err := c.List(ctx, bindings, client.InNamespace(gateway.Namespace)); err != nil {
+		return nil, err
+	}
+	byPeer := make(map[string]gatewayGrant, len(bindings.Items))
+	for i := range bindings.Items {
+		binding := &bindings.Items[i]
+		if binding.Spec.GatewayRef != gateway.Name || binding.DeletionTimestamp != nil {
+			continue
+		}
+		var connector connectv1alpha1.Connector
+		if err := c.Get(ctx, types.NamespacedName{Name: binding.Spec.ConnectorRef, Namespace: binding.Namespace}, &connector); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
+			continue
+		}
+		peer := strings.ToLower(connector.Spec.PublicKey)
+		clientAddress, gatewayAddress, interfaceName := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, peer, strings.ToLower(endpointID))
+		byPeer[peer] = gatewayGrant{peer: peer, clientAddress: clientAddress + "/128", gatewayAddress: gatewayAddress + "/128", interfaceName: interfaceName}
+	}
+	peers := make([]string, 0, len(byPeer))
+	for peer := range byPeer {
+		peers = append(peers, peer)
+	}
+	sort.Strings(peers)
+	grants := make([]gatewayGrant, 0, len(peers))
+	for _, peer := range peers {
+		grants = append(grants, byPeer[peer])
+	}
+	return grants, nil
+}
+
+func peerRoutes(grants []gatewayGrant, localPeer string) []string {
+	capacity := len(grants)
+	if capacity > 0 {
+		capacity--
+	}
+	routes := make([]string, 0, capacity)
+	for _, grant := range grants {
+		if grant.peer != localPeer {
+			routes = append(routes, grant.clientAddress)
+		}
+	}
+	return routes
 }
 
 func gatewayWorkloadReady(workload *unstructured.Unstructured) bool {
