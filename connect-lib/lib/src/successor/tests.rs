@@ -136,7 +136,7 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
     let created_binding = json!({
         "metadata":{"name":binding_name,"uid":"binding-uid","resourceVersion":"1","generation":1},
         "spec":{"gatewayRef":"vpc-gateway","connectorRef":format!("connect-{}", &peer[..40])},
-        "status":{"endpointID":gateway["status"]["endpointID"],"assignedAddress":"fd79::1/128","peerAddress":"fd79::2/128","routes":["fd20:0:27::/48"],"relayURLs":["https://relay.example/"],"conditions":[{"type":"Accepted","status":"False","reason":"ConnectorNotReady","observedGeneration":1}]}
+        "status":{"bindingID":"binding-0123456789abcdef","endpointID":gateway["status"]["endpointID"],"assignedAddress":"fd79::1/128","peerAddress":"fd79::2/128","routes":["fd20:0:27::/48"],"relayURLs":["https://relay.example/"],"conditions":[{"type":"Accepted","status":"False","reason":"ConnectorNotReady","observedGeneration":1}]}
     });
     let mut accepted_binding = created_binding.clone();
     accepted_binding["status"]["conditions"][0]["status"] = json!("True");
@@ -160,6 +160,7 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
         .unwrap()
         .unwrap();
     assert_eq!(result["assignedAddress"], "fd79::1/128");
+    assert_eq!(result["bindingID"], "binding-0123456789abcdef");
     assert_eq!(result["routes"], json!(["fd20:0:27::/48"]));
     assert_eq!(result["bindingName"], binding_name);
     let requests = task.await.unwrap();
@@ -282,7 +283,7 @@ async fn joining_managed_network_waits_for_gateway_readiness_after_a_config_roll
     let created_binding = json!({
         "metadata":{"name":binding_name,"uid":"binding-uid","resourceVersion":"1","generation":1},
         "spec":{"gatewayRef":"vpc-gateway","connectorRef":format!("connect-{}", &peer[..40])},
-        "status":{"endpointID":endpoint_id,"assignedAddress":"fd79::1/128","peerAddress":"fd79::2/128","routes":["fd20:0:27::/48"],"relayURLs":["https://relay.example/"],"conditions":[{"type":"Accepted","status":"True","observedGeneration":1}]}
+        "status":{"bindingID":"binding-fedcba9876543210","endpointID":endpoint_id,"assignedAddress":"fd79::1/128","peerAddress":"fd79::2/128","routes":["fd20:0:27::/48"],"relayURLs":["https://relay.example/"],"conditions":[{"type":"Accepted","status":"True","observedGeneration":1}]}
     });
     let lease = json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"connect-lease","resourceVersion":"4"},"spec":{"leaseDurationSeconds":30}});
     let (base, task) = server(vec![

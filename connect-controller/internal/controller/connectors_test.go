@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -35,7 +36,61 @@ func testClient(t *testing.T, objs ...runtime.Object) *fake.ClientBuilder {
 	}
 	s.AddKnownTypeWithName(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"}, &unstructured.Unstructured{})
 	s.AddKnownTypeWithName(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "WorkloadList"}, &unstructured.UnstructuredList{})
-	return fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objs...).WithStatusSubresource(&connectv1alpha1.Connector{}, &connectv1alpha1.ConnectorClass{}, &connectv1alpha1.ConnectorAdvertisement{}, &connectv1alpha1.ConnectGateway{}, &connectv1alpha1.ConnectNetworkBinding{})
+	return fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objs...).WithStatusSubresource(&connectv1alpha1.Connector{}, &connectv1alpha1.ConnectorClass{}, &connectv1alpha1.ConnectGatewayPool{}, &connectv1alpha1.ConnectorAdvertisement{}, &connectv1alpha1.ConnectGateway{}, &connectv1alpha1.ConnectNetworkBinding{})
+}
+
+func TestSharedGatewayPoolResolvesBindingWithoutComputeWorkload(t *testing.T) {
+	ctx := context.Background()
+	endpointID := strings.Repeat("c", 64)
+	pool := &connectv1alpha1.ConnectGatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "dfw-shared", Generation: 1},
+		Spec: connectv1alpha1.ConnectGatewayPoolSpec{
+			LocationRef: "DFW",
+			Endpoints:   []connectv1alpha1.ConnectGatewayEndpoint{{Name: "gateway-a", EndpointID: endpointID, RelayURLs: []string{"https://relay.example/"}}},
+		},
+	}
+	poolClient := testClient(t, pool).Build()
+	if _, err := (&GatewayPoolReconciler{client: poolClient}).Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: pool.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := poolClient.Get(ctx, types.NamespacedName{Name: pool.Name}, pool); err != nil {
+		t.Fatal(err)
+	}
+	if !meta.IsStatusConditionTrue(pool.Status.Conditions, "Ready") {
+		t.Fatalf("pool should be ready: %#v", pool.Status.Conditions)
+	}
+
+	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
+	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "private-net", Namespace: "project", UID: types.UID("gateway-uid"), Generation: 1}, Spec: connectv1alpha1.ConnectGatewaySpec{PoolRef: pool.Name, NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}}}
+	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-private-net", Namespace: "project", UID: types.UID("binding-uid"), Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
+	projectClient := testClient(t, connector, gateway, binding).Build()
+	if err := reconcileGateway(ctx, projectClient, poolClient, "project-id", gateway); err != nil {
+		t.Fatal(err)
+	}
+	if gateway.Status.WorkloadRef != "" || gateway.Status.PoolRef != pool.Name || gateway.Status.GatewayInstanceRef != "gateway-a" || gateway.Status.EndpointID != endpointID {
+		t.Fatalf("shared gateway assignment was not resolved: %#v", gateway.Status)
+	}
+	if !meta.IsStatusConditionTrue(gateway.Status.Conditions, "Ready") {
+		t.Fatalf("shared gateway should be ready: %#v", gateway.Status.Conditions)
+	}
+	var workloads unstructured.UnstructuredList
+	workloads.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "WorkloadList"})
+	if err := projectClient.List(ctx, &workloads); err != nil {
+		t.Fatal(err)
+	}
+	if len(workloads.Items) != 0 {
+		t.Fatalf("shared gateway created tenant Compute Workloads: %#v", workloads.Items)
+	}
+	if err := reconcileNetworkBinding(ctx, projectClient, "project-id", binding); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(binding.Status.Conditions, "Accepted")
+	if condition == nil || condition.Status != metav1.ConditionUnknown || condition.Reason != "GatewayAdmissionPending" {
+		t.Fatalf("binding must fail closed until serving-cell admission exists: %#v", binding.Status)
+	}
+	if binding.Status.BindingID == "" || binding.Status.EndpointID != endpointID || binding.Status.RelayURLs[0] != "https://relay.example/" {
+		t.Fatalf("binding did not resolve the shared endpoint and immutable identity: %#v", binding.Status)
+	}
 }
 
 func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
@@ -105,7 +160,7 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	secondConnector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "phone", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("b", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}, Image: "ghcr.io/datum-cloud/iroh-gateway:connect-ip", PeerRouting: true}}
 	c := testClient(t, connector, secondConnector, gateway).Build()
-	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+	if err := reconcileGateway(ctx, c, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
 	if gateway.Status.EndpointID == "" || gateway.Status.WorkloadRef == "" {
@@ -186,8 +241,8 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 		t.Fatalf("gateway capabilities=%v, want NET_ADMIN and MKNOD", capabilities["add"])
 	}
 
-	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
-	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "phone-vpc", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: secondConnector.Name}}
+	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc", Namespace: "project", UID: types.UID("laptop-binding-uid"), Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
+	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "phone-vpc", Namespace: "project", UID: types.UID("phone-binding-uid"), Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: secondConnector.Name}}
 	// Create bindings in reverse peer-key order to ensure the rendered grants
 	// are deterministic rather than dependent on API list order.
 	for _, item := range []*connectv1alpha1.ConnectNetworkBinding{secondBinding, binding} {
@@ -200,11 +255,14 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 		if condition := meta.FindStatusCondition(item.Status.Conditions, "Accepted"); condition == nil || condition.Status != metav1.ConditionUnknown || condition.Reason != "GatewayApplyingGrant" || item.Status.AssignedAddress == "" || item.Status.PeerAddress == "" {
 			t.Fatalf("binding should wait for the grant rollout and have addresses: %#v", item.Status)
 		}
+		if item.Status.BindingID == "" {
+			t.Fatalf("binding is missing its immutable CONNECT-IP selector: %#v", item.Status)
+		}
 	}
 	if binding.Status.AssignedAddress == secondBinding.Status.AssignedAddress || binding.Status.PeerAddress == secondBinding.Status.PeerAddress {
 		t.Fatalf("distinct Connectors received overlapping attachment addresses: first=%#v second=%#v", binding.Status, secondBinding.Status)
 	}
-	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+	if err := reconcileGateway(ctx, c, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: "project"}, workload); err != nil {
@@ -242,9 +300,13 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	addresses := map[string]bool{}
 	for _, grant := range config.Grants {
 		peer, _ := grant["peer"].(string)
+		network, _ := grant["network"].(string)
 		interfaceName, _ := grant["interface_name"].(string)
 		clientAddress, _ := grant["client_address"].(string)
 		gatewayAddress, _ := grant["gateway_address"].(string)
+		if !strings.HasPrefix(network, "binding-") {
+			t.Fatalf("grant for %q uses mutable network selector %q", peer, network)
+		}
 		if len(interfaceName) == 0 || len(interfaceName) > 15 || grantInterfaces[interfaceName] {
 			t.Fatalf("grant for %q has invalid or duplicate interface %q: %v", peer, interfaceName, config.Grants)
 		}
@@ -257,11 +319,11 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 		}
 	}
 	originalGrantJSON := configMap.Data["grants.json"]
-	duplicateBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc-alias", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
+	duplicateBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc-alias", Namespace: "project", UID: types.UID("laptop-alias-binding-uid"), Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
 	if err := c.Create(ctx, duplicateBinding); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+	if err := reconcileGateway(ctx, c, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: "project"}, configMap); err != nil {
@@ -300,7 +362,7 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if got, want := secondBinding.Status.Routes, []string{"fd20:0:27::/48", binding.Status.AssignedAddress}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("second binding routes=%v, want VPC and first Connector routes %v", got, want)
 	}
-	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+	if err := reconcileGateway(ctx, c, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
 	if !meta.IsStatusConditionTrue(gateway.Status.Conditions, "Ready") {
@@ -331,10 +393,10 @@ func TestPeerRoutingIsDisabledByDefault(t *testing.T) {
 	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
 	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20::/48"}, Image: "gateway:dev"}}
-	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
-	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
+	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project", UID: types.UID("first-binding-uid")}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
+	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project", UID: types.UID("second-binding-uid")}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
 	c := testClient(t, first, second, gateway, firstBinding, secondBinding).Build()
-	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+	if err := reconcileGateway(ctx, c, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
 	configMap := &corev1.ConfigMap{}
@@ -369,10 +431,10 @@ func TestGatewayReportsPeerRouteCapacityExceeded(t *testing.T) {
 	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
 	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{NetworkRef: "private-net", LocationRef: "DFW", Routes: routes, Image: "gateway:dev", PeerRouting: true}}
-	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
-	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
+	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project", UID: types.UID("first-capacity-binding-uid")}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
+	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project", UID: types.UID("second-capacity-binding-uid")}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
 	c := testClient(t, first, second, gateway, firstBinding, secondBinding).Build()
-	if err := reconcileGateway(ctx, c, "project-id", gateway); err != nil {
+	if err := reconcileGateway(ctx, c, c, "project-id", gateway); err != nil {
 		t.Fatal(err)
 	}
 	condition := meta.FindStatusCondition(gateway.Status.Conditions, "Ready")

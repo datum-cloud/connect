@@ -26,6 +26,7 @@ rules:
 - apiGroups:
   - connect.datumapis.com
   resources:
+  - connectgatewaypools
   - connectgateways
   - connectnetworkbindings
   - connectoradvertisements
@@ -38,6 +39,7 @@ rules:
 - apiGroups:
   - connect.datumapis.com
   resources:
+  - connectgatewaypools/status
   - connectgateways/status
   - connectnetworkbindings/status
   - connectoradvertisements/status

@@ -649,6 +649,7 @@ impl Control for RealControl {
                 return Ok(None);
             };
             let endpoint_id = json_string(&status, "gatewayEndpointID")?;
+            let binding_id = json_string(&status, "bindingID")?;
             let assigned_address = json_string(&status, "assignedAddress")?;
             let peer_address = json_string(&status, "peerAddress")?;
             let routes = status["routes"]
@@ -673,6 +674,7 @@ impl Control for RealControl {
             let binding = crate::local_ip::Binding {
                 project: project.to_owned(),
                 network: network.to_owned(),
+                binding_id: Some(binding_id),
                 gateway: endpoint_id,
                 addresses: vec![],
                 relay_urls: status["relayURLs"]
@@ -997,6 +999,7 @@ impl Control for RealControl {
             .map_err(cloud_error)?
         {
             let endpoint_id = json_string(&status, "gatewayEndpointID")?;
+            let binding_id = json_string(&status, "bindingID")?;
             let assigned_address = json_string(&status, "assignedAddress")?;
             let peer_address = json_string(&status, "peerAddress")?;
             let routes = status["routes"]
@@ -1031,6 +1034,7 @@ impl Control for RealControl {
             let binding = crate::local_ip::Binding {
                 project: project.to_owned(),
                 network: network.to_owned(),
+                binding_id: Some(binding_id),
                 gateway: endpoint_id.clone(),
                 addresses: vec![],
                 relay_urls,

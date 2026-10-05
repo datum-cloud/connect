@@ -42,7 +42,12 @@ pub struct LocalIpConfig {
 #[serde(deny_unknown_fields)]
 pub struct Binding {
     pub project: String,
+    /// Human-facing VPC name used for local intent and status.
     pub network: String,
+    /// Immutable CONNECT-IP selector assigned by the control plane. Static
+    /// configurations omit it and retain the historical network selector.
+    #[serde(default)]
+    pub binding_id: Option<String>,
     pub gateway: String,
     pub addresses: Vec<SocketAddr>,
     /// Relay-only ConnectGateway endpoints are valid when the VPC gateway has
@@ -122,16 +127,16 @@ impl LocalIpConfig {
         for binding in &bindings {
             connect_lib::ProjectId::try_from(binding.project.as_str())
                 .map_err(|_| ApiError::bad_request("Invalid IP binding project"))?;
-            connect_lib::TunnelId::try_from(binding.network.as_str())
-                .map_err(|_| ApiError::bad_request("Invalid IP network name"))?;
-            if binding.network.len() > 63
+            connect_lib::TunnelId::try_from(binding.selector())
+                .map_err(|_| ApiError::bad_request("Invalid CONNECT-IP binding selector"))?;
+            if binding.selector().len() > 63
                 || !binding
-                    .network
+                    .selector()
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || c == b'-')
             {
                 return Err(ApiError::bad_request(
-                    "Local IP network names must use at most 63 letters, digits, or hyphens",
+                    "CONNECT-IP binding selectors must use at most 63 letters, digits, or hyphens",
                 ));
             }
             binding.gateway.parse::<EndpointId>().map_err(|_| {
@@ -299,6 +304,12 @@ impl LocalIpConfig {
             return Ok(Approval::Peer(binding.clone()));
         }
         self.binding(project, network).map(Approval::Gateway)
+    }
+}
+
+impl Binding {
+    fn selector(&self) -> &str {
+        self.binding_id.as_deref().unwrap_or(&self.network)
     }
 }
 
@@ -485,7 +496,7 @@ pub async fn join(
         ip::connect(
             endpoint.clone(),
             peer.clone(),
-            &binding.network,
+            binding.selector(),
             cancel.clone(),
         ),
     )
@@ -501,7 +512,7 @@ pub async fn join(
             stage="connect_ip_setup_failed",
             "local CONNECT-IP setup failed"
         );
-        handshake_error(&binding.network, &connector, error)
+        handshake_error(binding.selector(), &connector, error)
     })?;
     let actual_routes: HashSet<_> = session
         .config
@@ -1332,6 +1343,16 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+    #[test]
+    fn managed_binding_uses_immutable_selector_without_changing_display_name() {
+        let mut value = config();
+        value["bindings"][0]["binding_id"] = json!("binding-0123456789abcdef");
+        let config: LocalIpConfig = serde_json::from_value(value).unwrap();
+        config.validate().unwrap();
+        let binding = &config.bindings[0];
+        assert_eq!(binding.network, "vpc");
+        assert_eq!(binding.selector(), "binding-0123456789abcdef");
     }
     #[tokio::test]
     #[cfg(unix)]

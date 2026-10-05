@@ -53,6 +53,11 @@ spec:
             properties:
               assignedAddress:
                 type: string
+              bindingID:
+                description: |-
+                  BindingID is the immutable CONNECT-IP network selector. Gateways must
+                  authorize the tuple of authenticated Connector key and this value.
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

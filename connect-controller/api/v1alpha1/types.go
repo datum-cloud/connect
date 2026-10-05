@@ -38,6 +38,54 @@ type ConnectorClassList struct {
 	Items           []ConnectorClass `json:"items"`
 }
 
+// ConnectGatewayPool is operator-managed shared gateway capacity in one
+// location. Project-scoped ConnectGateways select an endpoint from a pool;
+// they do not provision tenant Compute Workloads when PoolRef is set.
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Location",type=string,JSONPath=`.spec.locationRef`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+type ConnectGatewayPool struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              ConnectGatewayPoolSpec   `json:"spec,omitempty"`
+	Status            ConnectGatewayPoolStatus `json:"status,omitempty"`
+}
+
+type ConnectGatewayPoolSpec struct {
+	// LocationRef is the location served by every endpoint in this pool.
+	// +kubebuilder:validation:Required
+	LocationRef string `json:"locationRef"`
+	// Endpoints are independently operated members of this shared pool.
+	// +kubebuilder:validation:MinItems=1
+	Endpoints []ConnectGatewayEndpoint `json:"endpoints"`
+}
+
+type ConnectGatewayEndpoint struct {
+	// Name is an operator-stable identity for placement and diagnostics.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+	// EndpointID is the 32-byte iroh public key in hexadecimal form.
+	// +kubebuilder:validation:Pattern=`^[a-fA-F0-9]{64}$`
+	EndpointID string `json:"endpointID"`
+	// RelayURLs are the operator-managed iroh relays for this endpoint.
+	// +kubebuilder:validation:MaxItems=5
+	RelayURLs []string `json:"relayURLs,omitempty"`
+}
+
+type ConnectGatewayPoolStatus struct {
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type ConnectGatewayPoolList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ConnectGatewayPool `json:"items"`
+}
+
 // Connector represents one Connect installation in one project. The public key
 // is the stable iroh identity; private material must never be stored in the API.
 // +kubebuilder:object:root=true
@@ -133,6 +181,9 @@ type ConnectGateway struct {
 }
 
 type ConnectGatewaySpec struct {
+	// PoolRef selects an operator-managed shared gateway pool. When set, the
+	// controller does not provision a Compute Workload for this VPC.
+	PoolRef string `json:"poolRef,omitempty"`
 	// +kubebuilder:validation:Required
 	NetworkRef string `json:"networkRef"`
 	// +kubebuilder:validation:Required
@@ -141,9 +192,9 @@ type ConnectGatewaySpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=32
 	Routes []string `json:"routes,omitempty"`
-	// Image must be a Linux gateway image with Datum CONNECT-IP support.
-	// +kubebuilder:validation:Required
-	Image string `json:"image"`
+	// Image configures the legacy per-VPC Workload path. It must be empty when
+	// PoolRef selects a shared pool.
+	Image string `json:"image,omitempty"`
 	// InstanceType selects the Compute instance size. The platform default is used when empty.
 	InstanceType string `json:"instanceType,omitempty"`
 	// RelayURLs pins the gateway to operator-managed iroh relays when set.
@@ -157,7 +208,10 @@ type ConnectGatewaySpec struct {
 type ConnectGatewayStatus struct {
 	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
 	WorkloadRef        string             `json:"workloadRef,omitempty"`
+	PoolRef            string             `json:"poolRef,omitempty"`
+	GatewayInstanceRef string             `json:"gatewayInstanceRef,omitempty"`
 	EndpointID         string             `json:"endpointID,omitempty"`
+	RelayURLs          []string           `json:"relayURLs,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 }
 
@@ -188,13 +242,16 @@ type ConnectNetworkBindingSpec struct {
 }
 
 type ConnectNetworkBindingStatus struct {
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
-	EndpointID         string             `json:"endpointID,omitempty"`
-	AssignedAddress    string             `json:"assignedAddress,omitempty"`
-	PeerAddress        string             `json:"peerAddress,omitempty"`
-	Routes             []string           `json:"routes,omitempty"`
-	RelayURLs          []string           `json:"relayURLs,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// BindingID is the immutable CONNECT-IP network selector. Gateways must
+	// authorize the tuple of authenticated Connector key and this value.
+	BindingID       string             `json:"bindingID,omitempty"`
+	EndpointID      string             `json:"endpointID,omitempty"`
+	AssignedAddress string             `json:"assignedAddress,omitempty"`
+	PeerAddress     string             `json:"peerAddress,omitempty"`
+	Routes          []string           `json:"routes,omitempty"`
+	RelayURLs       []string           `json:"relayURLs,omitempty"`
+	Conditions      []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -205,5 +262,5 @@ type ConnectNetworkBindingList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &Connector{}, &ConnectorList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{}, &ConnectNetworkBinding{}, &ConnectNetworkBindingList{})
+	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &ConnectGatewayPool{}, &ConnectGatewayPoolList{}, &Connector{}, &ConnectorList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{}, &ConnectNetworkBinding{}, &ConnectNetworkBindingList{})
 }

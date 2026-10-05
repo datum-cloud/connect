@@ -45,8 +45,8 @@ type ConnectReconciler struct {
 	classClient client.Client
 }
 
-// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectors;connectoradvertisements;connectgateways;connectnetworkbindings,verbs=get;list;watch
-// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectnetworkbindings/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectgatewaypools;connectors;connectoradvertisements;connectgateways;connectnetworkbindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectgatewaypools/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectnetworkbindings/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloads,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=configmaps;secrets,verbs=get;create;update;patch
@@ -55,6 +55,9 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	local := mgr.GetLocalManager()
 	if err := builder.ControllerManagedBy(local).Named("connectorclass").For(&connectv1alpha1.ConnectorClass{}).Complete(&ClassReconciler{client: local.GetClient()}); err != nil {
 		return fmt.Errorf("register ConnectorClass controller: %w", err)
+	}
+	if err := builder.ControllerManagedBy(local).Named("connectgatewaypool").For(&connectv1alpha1.ConnectGatewayPool{}).Complete(&GatewayPoolReconciler{client: local.GetClient()}); err != nil {
+		return fmt.Errorf("register ConnectGatewayPool controller: %w", err)
 	}
 	for _, item := range []struct {
 		name string
@@ -125,7 +128,7 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 			}
 			return ctrl.Result{}, err
 		}
-		if err := reconcileGateway(ctx, c, string(req.ClusterName), &obj); err != nil {
+		if err := reconcileGateway(ctx, c, r.classClient, string(req.ClusterName), &obj); err != nil {
 			logger.Error(err, "reconcile ConnectGateway")
 			return ctrl.Result{}, err
 		}
@@ -148,6 +151,29 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 }
 
 type ClassReconciler struct{ client client.Client }
+
+type GatewayPoolReconciler struct{ client client.Client }
+
+func (r *GatewayPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var obj connectv1alpha1.ConnectGatewayPool
+	if err := r.client.Get(ctx, req.NamespacedName, &obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	before := obj.Status.DeepCopy()
+	status, reason, message := metav1.ConditionTrue, "Valid", "gateway pool has usable shared endpoints"
+	if err := validateGatewayPoolSpec(obj.Spec); err != nil {
+		status, reason, message = metav1.ConditionFalse, "InvalidSpec", err.Error()
+	}
+	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Ready", Status: status, Reason: reason, Message: message, ObservedGeneration: obj.Generation})
+	obj.Status.ObservedGeneration = obj.Generation
+	if reflect.DeepEqual(before, &obj.Status) {
+		return ctrl.Result{}, nil
+	}
+	return ctrl.Result{}, r.client.Status().Update(ctx, &obj)
+}
 
 func (r *ClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var obj connectv1alpha1.ConnectorClass
@@ -284,11 +310,30 @@ func reconcileAdvertisement(ctx context.Context, c client.Client, obj *connectv1
 	return c.Status().Update(ctx, obj)
 }
 
-func reconcileGateway(ctx context.Context, c client.Client, project string, obj *connectv1alpha1.ConnectGateway) error {
+func reconcileGateway(ctx context.Context, c, poolClient client.Client, project string, obj *connectv1alpha1.ConnectGateway) error {
 	before := obj.Status.DeepCopy()
 	status, reason, message := metav1.ConditionUnknown, "Provisioning", "gateway resources are being reconciled"
 	if err := validateGatewaySpec(obj.Spec); err != nil {
 		status, reason, message = metav1.ConditionFalse, "InvalidSpec", err.Error()
+	} else if obj.Spec.PoolRef != "" {
+		var pool connectv1alpha1.ConnectGatewayPool
+		if err := poolClient.Get(ctx, types.NamespacedName{Name: obj.Spec.PoolRef}, &pool); apierrors.IsNotFound(err) {
+			status, reason, message = metav1.ConditionFalse, "PoolNotFound", "referenced ConnectGatewayPool does not exist"
+		} else if err != nil {
+			return err
+		} else if pool.Status.ObservedGeneration != pool.Generation || !meta.IsStatusConditionTrue(pool.Status.Conditions, "Ready") {
+			status, reason, message = metav1.ConditionUnknown, "PoolNotReady", "waiting for the shared gateway pool to become ready"
+		} else if pool.Spec.LocationRef != obj.Spec.LocationRef {
+			status, reason, message = metav1.ConditionFalse, "PoolLocationMismatch", "shared gateway pool does not serve the requested location"
+		} else {
+			endpoint := selectGatewayPoolEndpoint(project, obj, pool.Spec.Endpoints)
+			obj.Status.WorkloadRef = ""
+			obj.Status.PoolRef = pool.Name
+			obj.Status.GatewayInstanceRef = endpoint.Name
+			obj.Status.EndpointID = strings.ToLower(endpoint.EndpointID)
+			obj.Status.RelayURLs = append([]string(nil), endpoint.RelayURLs...)
+			status, reason, message = metav1.ConditionTrue, "SharedGatewayAssigned", "an operator-managed shared gateway endpoint is assigned"
+		}
 	} else if err := reconcileGatewayResources(ctx, c, project, obj); err != nil {
 		var capacityError *gatewayPeerRouteCapacityError
 		if errors.As(err, &capacityError) {
@@ -297,6 +342,9 @@ func reconcileGateway(ctx context.Context, c client.Client, project string, obj 
 			return err
 		}
 	} else {
+		obj.Status.PoolRef = ""
+		obj.Status.GatewayInstanceRef = ""
+		obj.Status.RelayURLs = nil
 		workload := &unstructured.Unstructured{}
 		workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
 		if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(obj.Name, "workload"), Namespace: obj.Namespace}, workload); err != nil {
@@ -317,7 +365,13 @@ func reconcileGateway(ctx context.Context, c client.Client, project string, obj 
 }
 
 func validateGatewaySpec(spec connectv1alpha1.ConnectGatewaySpec) error {
-	for name, value := range map[string]string{"networkRef": spec.NetworkRef, "locationRef": spec.LocationRef, "image": spec.Image} {
+	required := map[string]string{"networkRef": spec.NetworkRef, "locationRef": spec.LocationRef}
+	if spec.PoolRef == "" {
+		required["image"] = spec.Image
+	} else if spec.Image != "" || spec.InstanceType != "" || len(spec.RelayURLs) != 0 {
+		return fmt.Errorf("image, instanceType, and relayURLs must be empty when poolRef selects a shared gateway pool")
+	}
+	for name, value := range required {
 		if value == "" {
 			return fmt.Errorf("%s is required", name)
 		}
@@ -328,16 +382,8 @@ func validateGatewaySpec(spec connectv1alpha1.ConnectGatewaySpec) error {
 	if len(spec.RelayURLs) > 5 {
 		return fmt.Errorf("relayURLs cannot contain more than 5 entries")
 	}
-	seenRelays := map[string]bool{}
-	for _, relay := range spec.RelayURLs {
-		parsed, err := url.Parse(relay)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return fmt.Errorf("relay URL %q must be an HTTPS URL without credentials, query, or fragment", relay)
-		}
-		if seenRelays[relay] {
-			return fmt.Errorf("relay URL %q is duplicated", relay)
-		}
-		seenRelays[relay] = true
+	if err := validateRelayURLs(spec.RelayURLs); err != nil {
+		return err
 	}
 	parsed := make([]netip.Prefix, 0, len(spec.Routes))
 	for _, route := range spec.Routes {
@@ -356,6 +402,72 @@ func validateGatewaySpec(spec connectv1alpha1.ConnectGatewaySpec) error {
 		parsed = append(parsed, prefix)
 	}
 	return nil
+}
+
+func validateGatewayPoolSpec(spec connectv1alpha1.ConnectGatewayPoolSpec) error {
+	if spec.LocationRef == "" {
+		return fmt.Errorf("locationRef is required")
+	}
+	if len(spec.Endpoints) == 0 {
+		return fmt.Errorf("at least one endpoint is required")
+	}
+	seenNames := map[string]bool{}
+	seenIDs := map[string]bool{}
+	for _, endpoint := range spec.Endpoints {
+		if errs := validation.IsDNS1123Subdomain(endpoint.Name); len(errs) > 0 {
+			return fmt.Errorf("endpoint name %q must be a DNS subdomain resource name", endpoint.Name)
+		}
+		id := strings.ToLower(endpoint.EndpointID)
+		decoded, err := hex.DecodeString(id)
+		if err != nil || len(decoded) != ed25519.PublicKeySize {
+			return fmt.Errorf("endpoint %q endpointID must be a 32-byte hexadecimal iroh public key", endpoint.Name)
+		}
+		if seenNames[endpoint.Name] || seenIDs[id] {
+			return fmt.Errorf("endpoint names and endpointIDs must be unique")
+		}
+		seenNames[endpoint.Name] = true
+		seenIDs[id] = true
+		if err := validateRelayURLs(endpoint.RelayURLs); err != nil {
+			return fmt.Errorf("endpoint %q: %w", endpoint.Name, err)
+		}
+	}
+	return nil
+}
+
+func validateRelayURLs(relays []string) error {
+	if len(relays) > 5 {
+		return fmt.Errorf("relayURLs cannot contain more than 5 entries")
+	}
+	seen := map[string]bool{}
+	for _, relay := range relays {
+		parsed, err := url.Parse(relay)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return fmt.Errorf("relay URL %q must be an HTTPS URL without credentials, query, or fragment", relay)
+		}
+		if seen[relay] {
+			return fmt.Errorf("relay URL %q is duplicated", relay)
+		}
+		seen[relay] = true
+	}
+	return nil
+}
+
+func selectGatewayPoolEndpoint(project string, gateway *connectv1alpha1.ConnectGateway, endpoints []connectv1alpha1.ConnectGatewayEndpoint) connectv1alpha1.ConnectGatewayEndpoint {
+	// Rendezvous hashing keeps assignments stable as unrelated gateways change
+	// and limits movement when operators add or remove a pool member.
+	key := string(gateway.UID)
+	if key == "" {
+		key = gateway.Namespace + "/" + gateway.Name
+	}
+	best := endpoints[0]
+	bestScore := gatewayDigest("pool-placement-v1", project, key, best.Name)
+	for _, endpoint := range endpoints[1:] {
+		score := gatewayDigest("pool-placement-v1", project, key, endpoint.Name)
+		if string(score[:]) > string(bestScore[:]) {
+			best, bestScore = endpoint, score
+		}
+	}
+	return best
 }
 
 func reconcileGatewayResources(ctx context.Context, c client.Client, project string, gateway *connectv1alpha1.ConnectGateway) error {
@@ -389,7 +501,7 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	}
 	grants := make([]interface{}, 0, len(peerGrants))
 	for _, peerGrant := range peerGrants {
-		grant := map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": peerGrant.peer, "client_address": peerGrant.clientAddress, "gateway_address": peerGrant.gatewayAddress, "routes": gateway.Spec.Routes, "interface_name": peerGrant.interfaceName, "mtu": 1280}
+		grant := map[string]interface{}{"network": peerGrant.bindingID, "peer": peerGrant.peer, "client_address": peerGrant.clientAddress, "gateway_address": peerGrant.gatewayAddress, "routes": gateway.Spec.Routes, "interface_name": peerGrant.interfaceName, "mtu": 1280}
 		if gateway.Spec.PeerRouting {
 			grant["peer_routes"] = peerRoutes(peerGrants, peerGrant.peer)
 		}
@@ -461,10 +573,16 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 			return err
 		} else if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
 			status, reason, message = metav1.ConditionFalse, "ConnectorNotReady", "referenced Connector is not online"
+		} else if gateway.Spec.PoolRef != "" && !meta.IsStatusConditionTrue(gateway.Status.Conditions, "Ready") {
+			status, reason, message = metav1.ConditionUnknown, "GatewayNotReady", "waiting for the referenced ConnectGateway to become ready"
 		} else if gateway.Status.EndpointID == "" {
 			status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway identity to be created"
+		} else if binding.UID == "" {
+			status, reason, message = metav1.ConditionUnknown, "BindingIdentityPending", "waiting for the API server to assign an immutable binding identity"
 		} else {
-			clientAddress, peerAddress, _ := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, strings.ToLower(connector.Spec.PublicKey), strings.ToLower(gateway.Status.EndpointID))
+			bindingID := gatewayBindingID(project, binding.UID)
+			clientAddress, peerAddress, _ := gatewayPeerAddresses(project, bindingID, strings.ToLower(connector.Spec.PublicKey), strings.ToLower(gateway.Status.EndpointID))
+			binding.Status.BindingID = bindingID
 			binding.Status.EndpointID = gateway.Status.EndpointID
 			binding.Status.AssignedAddress = clientAddress + "/128"
 			binding.Status.PeerAddress = peerAddress + "/128"
@@ -484,21 +602,30 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 					binding.Status.Routes = append(binding.Status.Routes, connectorPeerRoutes...)
 				}
 			}
-			binding.Status.RelayURLs = append([]string(nil), gateway.Spec.RelayURLs...)
+			binding.Status.RelayURLs = append([]string(nil), gateway.Status.RelayURLs...)
+			if gateway.Spec.PoolRef == "" {
+				binding.Status.RelayURLs = append([]string(nil), gateway.Spec.RelayURLs...)
+			}
 			if !capacityExceeded {
-				workload := &unstructured.Unstructured{}
-				workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
-				if gateway.Status.WorkloadRef == "" {
-					status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
-				} else if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: gateway.Namespace}, workload); err != nil {
-					if !apierrors.IsNotFound(err) {
-						return err
-					}
-					status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
-				} else if !gatewayWorkloadReady(workload) || !gatewayWorkloadConfigApplied(ctx, c, &gateway, workload) || !gatewayConfigIncludesConnector(ctx, c, &gateway, strings.ToLower(connector.Spec.PublicKey)) {
-					status, reason, message = metav1.ConditionUnknown, "GatewayApplyingGrant", "waiting for the gateway Workload to apply this Connector grant and become available"
+				if gateway.Spec.PoolRef != "" {
+					// Release A resolves the assignment but fails closed until the
+					// serving-cell admission acknowledgement contract is implemented.
+					status, reason, message = metav1.ConditionUnknown, "GatewayAdmissionPending", "shared gateway assignment is resolved; waiting for the serving-cell admission contract"
 				} else {
-					status, reason, message = metav1.ConditionTrue, "Approved", "gateway Workload is available with this Connector approved for its configured routes"
+					workload := &unstructured.Unstructured{}
+					workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
+					if gateway.Status.WorkloadRef == "" {
+						status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
+					} else if err := c.Get(ctx, types.NamespacedName{Name: gateway.Status.WorkloadRef, Namespace: gateway.Namespace}, workload); err != nil {
+						if !apierrors.IsNotFound(err) {
+							return err
+						}
+						status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
+					} else if !gatewayWorkloadReady(workload) || !gatewayWorkloadConfigApplied(ctx, c, &gateway, workload) || !gatewayConfigIncludesConnector(ctx, c, &gateway, strings.ToLower(connector.Spec.PublicKey)) {
+						status, reason, message = metav1.ConditionUnknown, "GatewayApplyingGrant", "waiting for the gateway Workload to apply this Connector grant and become available"
+					} else {
+						status, reason, message = metav1.ConditionTrue, "Approved", "gateway Workload is available with this Connector approved for its configured routes"
+					}
 				}
 			}
 		}
@@ -514,6 +641,8 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 }
 
 type gatewayGrant struct {
+	bindingName    string
+	bindingID      string
 	peer           string
 	clientAddress  string
 	gatewayAddress string
@@ -550,9 +679,16 @@ func readyGatewayGrants(ctx context.Context, c client.Client, project string, ga
 		if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
 			continue
 		}
+		if binding.UID == "" {
+			continue
+		}
 		peer := strings.ToLower(connector.Spec.PublicKey)
-		clientAddress, gatewayAddress, interfaceName := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, peer, strings.ToLower(endpointID))
-		byPeer[peer] = gatewayGrant{peer: peer, clientAddress: clientAddress + "/128", gatewayAddress: gatewayAddress + "/128", interfaceName: interfaceName}
+		bindingID := gatewayBindingID(project, binding.UID)
+		clientAddress, gatewayAddress, interfaceName := gatewayPeerAddresses(project, bindingID, peer, strings.ToLower(endpointID))
+		grant := gatewayGrant{bindingName: binding.Name, bindingID: bindingID, peer: peer, clientAddress: clientAddress + "/128", gatewayAddress: gatewayAddress + "/128", interfaceName: interfaceName}
+		if current, exists := byPeer[peer]; !exists || grant.bindingName < current.bindingName {
+			byPeer[peer] = grant
+		}
 	}
 	peers := make([]string, 0, len(byPeer))
 	for peer := range byPeer {
@@ -706,6 +842,11 @@ func gatewayDigest(parts ...string) [32]byte {
 	var out [32]byte
 	copy(out[:], hash.Sum(nil))
 	return out
+}
+
+func gatewayBindingID(project string, uid types.UID) string {
+	digest := gatewayDigest("binding-id-v1", project, string(uid))
+	return fmt.Sprintf("binding-%x", digest[:16])
 }
 
 func schemeForGateway() *runtime.Scheme {

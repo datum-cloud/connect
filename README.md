@@ -130,9 +130,11 @@ separately; Connect never enables them globally. The client still has one
 approved source address, so this is not arbitrary site-to-site transit.
 Run `scripts/connect-peer-ip-local.py --help`
 for the isolated two-daemon test harness.
-The `connect-controller` module defines project `ConnectGateway` and
-`ConnectNetworkBinding` resources and reconciles each gateway into a Compute
-Workload. Managed VPC joins use these Connect resources. Service publication
+The `connect-controller` module defines operator `ConnectGatewayPool` and
+project `ConnectGateway` and `ConnectNetworkBinding` resources. A gateway can
+select shared operator capacity without creating a tenant Compute Workload;
+the legacy per-VPC Workload path remains during the rollout. Managed VPC joins
+use these Connect resources. Service publication
 and peer discovery still use NSO-backed resources. The VPC controller is a
 staging prototype; validate the gateway-to-instance packet path on each native OS.
 Gateway operators can explicitly enable `spec.peerRouting` to advertise the

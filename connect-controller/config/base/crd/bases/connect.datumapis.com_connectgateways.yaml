@@ -42,8 +42,9 @@ spec:
           spec:
             properties:
               image:
-                description: Image must be a Linux gateway image with Datum CONNECT-IP
-                  support.
+                description: |-
+                  Image configures the legacy per-VPC Workload path. It must be empty when
+                  PoolRef selects a shared pool.
                 type: string
               instanceType:
                 description: InstanceType selects the Compute instance size. The platform
@@ -54,10 +55,16 @@ spec:
               networkRef:
                 type: string
               peerRouting:
-                description: PeerRouting allows Connectors attached to this gateway
-                  to route directly to the assigned addresses of the other attached
-                  Connectors. It is disabled by default.
+                description: |-
+                  PeerRouting allows Connectors attached to this gateway to route directly
+                  to the assigned addresses of the other attached Connectors. It is disabled
+                  by default; VPC routes remain available regardless of this setting.
                 type: boolean
+              poolRef:
+                description: |-
+                  PoolRef selects an operator-managed shared gateway pool. When set, the
+                  controller does not provision a Compute Workload for this VPC.
+                type: string
               relayURLs:
                 description: RelayURLs pins the gateway to operator-managed iroh relays
                   when set.
@@ -71,7 +78,6 @@ spec:
                 minItems: 1
                 type: array
             required:
-            - image
             - locationRef
             - networkRef
             - routes
@@ -136,9 +142,17 @@ spec:
                 type: array
               endpointID:
                 type: string
+              gatewayInstanceRef:
+                type: string
               observedGeneration:
                 format: int64
                 type: integer
+              poolRef:
+                type: string
+              relayURLs:
+                items:
+                  type: string
+                type: array
               workloadRef:
                 type: string
             type: object

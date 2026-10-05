@@ -116,6 +116,7 @@ impl Binding {
         local_ip::Binding {
             project: self.project.clone(),
             network: self.network.clone(),
+            binding_id: None,
             gateway: self.peer.clone(),
             addresses: self.addresses.clone(),
             relay_urls: vec![],

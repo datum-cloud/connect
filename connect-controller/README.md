@@ -13,7 +13,7 @@ of the current NSO ConnectorClass. `Connector`, `ConnectorAdvertisement`, and
 uses `go.miloapis.com/milo/pkg/multicluster-runtime/milo` and registers these
 project controllers with `WithEngageWithLocalCluster(false)`.
 
-The controller provisions the first single-project CONNECT-IP gateway slice:
+The controller provisions the first CONNECT-IP control-plane slices:
 
 - ConnectorClass reports whether its transport configuration is valid.
 - Connector checks its hex public key and resolves its class from the
@@ -22,17 +22,20 @@ The controller provisions the first single-project CONNECT-IP gateway slice:
   while the agent renews that Lease.
 - ConnectorAdvertisement is accepted only when its Connector is ready and its
   service protocol/port fields are valid.
-- ConnectGateway creates a stable private gateway key, a ConfigMap containing
-  the gateway's peer grants, and a one-replica Compute Workload attached to the
-  requested IPv6 Network and Location. Compute creates the NSO NetworkBinding
-  for the Workload interface. The gateway does not create a competing binding.
+- An operator-managed, cluster-scoped ConnectGatewayPool declares shared
+  gateway endpoints in a location. A ConnectGateway with `spec.poolRef`
+  selects one endpoint without creating a tenant Secret, ConfigMap, or Compute
+  Workload. The legacy path remains available when `poolRef` is empty: it
+  creates a stable private key, peer-grant ConfigMap, and one-replica Compute
+  Workload attached to the requested Network and Location.
   Its Prometheus endpoint binds to `127.0.0.1:9090`; the controller does not
   expose a metrics port on the VPC interface.
 - ConnectNetworkBinding attaches one project Connector to a ConnectGateway.
   Project authorization to create the resource is the approval boundary. The
-  controller derives matching `/128` peer addresses and routes, then reconciles
-  an approved peer grant into the gateway ConfigMap. Deleting the binding
-  removes the grant on the next reconciliation.
+  controller derives an immutable binding ID and matching `/128` peer addresses
+  and routes. Legacy gateways receive the approved grant in their ConfigMap.
+  Shared-pool bindings remain fail-closed until the serving-cell admission and
+  acknowledgement contract is implemented.
 - `ConnectGateway.spec.peerRouting` optionally adds every other ready Connector's
   assigned `/128` to each binding and gateway grant. It is disabled by default.
   Peer packets are forwarded between authenticated gateway sessions without
@@ -98,9 +101,11 @@ Connector APIs. No conversion webhook or automatic resource copy exists. Keep
 NSO serving those resources until their remaining consumers migrate.
 
 The Network reference remains a name-only cross-service reference because
-Network is NSO-owned. The controller reconciles a gateway into a Compute
-Workload, and the daemon consumes the resulting binding status. A staging
-deployment needs a gateway image with the matching CONNECT-IP transport and
+Network is NSO-owned; replacing it with an immutable Galactic VPC identity is
+an unresolved cross-repository contract. CONNECT-IP authorization no longer
+uses that mutable name: binding status publishes an opaque ID derived from the
+project cluster and binding UID. The daemon consumes that ID as the tunnel
+selector. Legacy gateways still require a matching CONNECT-IP image and
 Compute runtime support for IPv6 forwarding and `NET_ADMIN`.
 
 For a local multi-device data-plane validation, build the Linux daemon, plugin,
