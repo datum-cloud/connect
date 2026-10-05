@@ -31,9 +31,9 @@ This is deliberately policy lookup, not arbitrary target dialing.
 | Area | Required behavior | State / next work |
 | --- | --- | --- |
 | HTTP/3 endpoint | WebPKI TLS, `h3` ALPN, extended CONNECT and H3 DATAGRAM settings, ordinary DNS authority | Deferred to the gateway/public listener; the shared codec must not depend on iroh identity |
-| CONNECT-UDP request | RFC 9298 URI-template expansion, `:protocol = connect-udp`, Capsule Protocol negotiation, host names and IP literals | Default-template parsing/generation and an explicit target-tuple API are present; configurable non-default URI templates remain |
-| CONNECT-UDP response | 2xx response with Capsule Protocol negotiation and correct stream errors | Success and policy-denied responses are independently tested; expand transport failure status and `Proxy-Status` coverage |
-| HTTP Datagrams | Quarter Stream ID association, context ID zero, unknown-context handling | Independent multi-stream coverage is present, including a patched Quarter Stream ID encoder; add negotiated size and unknown-context cases |
+| CONNECT-UDP request | RFC 9298 URI-template expansion, `:protocol = connect-udp`, Capsule Protocol negotiation, host names and IP literals | Default and configurable path templates, parsing/generation, and an explicit target-tuple API are present |
+| CONNECT-UDP response | 2xx response with Capsule Protocol negotiation and correct stream errors | Success and policy-denied responses are independently tested; failures now have stable HTTP and RFC 9209 `Proxy-Status` mappings |
+| HTTP Datagrams | Quarter Stream ID association, context ID zero, unknown-context handling | Independent multi-stream coverage is present, including a patched Quarter Stream ID encoder; unknown and malformed context IDs are dropped per association without affecting context zero |
 | Capsule fallback | DATAGRAM capsules when QUIC/H3 datagrams are unavailable | Implemented and end-to-end tested in the standards-facing UDP edge with a bounded incremental decoder; extract the existing UDP/IP codecs into one production module |
 | CONNECT-IP | RFC 9484 request plus repeated address/route assignments and withdrawals | Prototype supports the default wildcard path and initial configuration only |
 | Multiplexing | Multiple concurrent CONNECT streams per HTTP/3 connection | Implemented in the standards-facing edge and tested with three tunnels plus an isolated denied stream; the private iroh listener still uses one stream per connection |
@@ -44,9 +44,9 @@ This is deliberately policy lookup, not arbitrary target dialing.
 1. Extract request, capsule, and HTTP Datagram codecs from the iroh session
    lifecycle. Add RFC examples, malformed inputs, fuzz targets, and bounded
    allocation tests.
-2. Add an explicit `(target_host, target_port)` client API and configurable URI
-   templates. Keep Datum destination lookup as an authorization layer outside
-   the wire codec.
+2. Keep Datum destination lookup and the closed-by-default target security
+   policy as authorization layers outside the wire codec. Resolve unlisted DNS
+   names only through a future rebinding-safe resolver.
 3. Serve concurrent request streams and isolate stream errors from connection
    errors. Add cancellation, draining, idle timeout, and overload behavior.
 4. Add reliable DATAGRAM capsules and negotiate either QUIC DATAGRAM or capsule
@@ -102,6 +102,23 @@ denied request reach the origin. It uses an ephemeral self-signed `localhost`
 certificate that is trusted only by the spawned client. Test metadata, the
 certificate, and service logs are left in the printed temporary artifacts
 directory.
+
+The edge applies a closed-by-default exact target allowlist. The reusable
+`TargetSecurityPolicy` additionally supports an explicit public-IP mode while
+blocking loopback, private, link-local, metadata-service, multicast,
+unspecified, benchmarking, shared-address, and documentation ranges by
+default. Individual private targets can be enabled without opening an entire
+address class. Unlisted hostnames are rejected so DNS resolution and rebinding
+controls cannot be bypassed accidentally.
+
+Malformed requests return HTTP 400 with `http_protocol_error`; forbidden
+targets return 403 with `destination_ip_prohibited`; overload and draining
+return 503; backend timeouts return 504; and refused or unavailable
+destinations return 502. Each failure includes a bounded, detail-free
+`Proxy-Status` value. The lab caps concurrent associations at 128 by default;
+`--max-associations` changes that limit, and `--uri-template` accepts a
+path-only template containing exactly one `{target_host}` and one
+`{target_port}` variable.
 
 This lab proves CONNECT-UDP interoperability at the HTTP/3 edge and exercises
 the real Connect UDP transport behind it. It does not yet prove production

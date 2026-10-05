@@ -2,6 +2,7 @@
 
 mod h3_iroh;
 pub mod ip;
+pub mod masque;
 
 use std::{
     collections::{HashMap, HashSet},

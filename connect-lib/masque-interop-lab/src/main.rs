@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, Bytes, BytesMut};
 use connect_transport::{
     Access, DestinationId, DestinationPolicy, Policy, Target, Transport, TransportConfig,
-    standard_connect_udp_target,
+    masque::{ConnectUdpUriTemplate, MasqueFailure, TargetSecurityPolicy},
 };
 use h3::error::Code;
 use h3_datagram::datagram_handler::{HandleDatagramsExt, SendDatagramError};
@@ -26,12 +26,15 @@ use tokio_util::sync::CancellationToken;
 const CAPSULE_PROTOCOL: &str = "capsule-protocol";
 const DATAGRAM_CAPSULE: u64 = 0;
 const MAX_CAPSULE: usize = 64 * 1024;
+const DEFAULT_MAX_ASSOCIATIONS: usize = 128;
 
 struct Options {
     listen: SocketAddr,
     origin: SocketAddr,
     cert_out: PathBuf,
     ready_out: PathBuf,
+    max_associations: usize,
+    uri_template: ConnectUdpUriTemplate,
 }
 
 fn options() -> Result<Options> {
@@ -39,6 +42,8 @@ fn options() -> Result<Options> {
     let mut origin = None;
     let mut cert_out = None;
     let mut ready_out = None;
+    let mut max_associations = DEFAULT_MAX_ASSOCIATIONS;
+    let mut uri_template = ConnectUdpUriTemplate::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args
@@ -49,6 +54,16 @@ fn options() -> Result<Options> {
             "--origin" => origin = Some(value.parse().context("invalid --origin")?),
             "--cert-out" => cert_out = Some(value.into()),
             "--ready-out" => ready_out = Some(value.into()),
+            "--max-associations" => {
+                max_associations = value.parse().context("invalid --max-associations")?;
+                if max_associations == 0 {
+                    bail!("--max-associations must be greater than zero");
+                }
+            }
+            "--uri-template" => {
+                uri_template =
+                    ConnectUdpUriTemplate::parse(value).context("invalid --uri-template")?;
+            }
             _ => bail!("unknown argument {arg}"),
         }
     }
@@ -57,6 +72,8 @@ fn options() -> Result<Options> {
         origin: origin.ok_or_else(|| anyhow!("--origin is required"))?,
         cert_out: cert_out.ok_or_else(|| anyhow!("--cert-out is required"))?,
         ready_out: ready_out.ok_or_else(|| anyhow!("--ready-out is required"))?,
+        max_associations,
+        uri_template,
     })
 }
 
@@ -117,8 +134,9 @@ async fn main() -> Result<()> {
         serde_json::to_vec_pretty(&serde_json::json!({
             "proxy_addr": public_addr.to_string(),
             "proxy_uri_template": format!(
-                "https://localhost:{}/.well-known/masque/udp/{{target_host}}/{{target_port}}/",
-                public_addr.port()
+                "https://localhost:{}{}",
+                public_addr.port(),
+                options.uri_template.as_str(),
             ),
             "allowed_target": options.origin.to_string(),
             "service_endpoint": details.endpoint_id.to_string(),
@@ -128,6 +146,8 @@ async fn main() -> Result<()> {
     println!("MASQUE interop lab ready on {public_addr}");
 
     let cancel = CancellationToken::new();
+    let target_policy = TargetSecurityPolicy::new()
+        .allow_target(options.origin.ip().to_string(), options.origin.port());
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -137,9 +157,12 @@ async fn main() -> Result<()> {
                 let backend_addr = backend_addr.clone();
                 let destination = destination.clone();
                 let allowed = options.origin;
+                let target_policy = target_policy.clone();
+                let max_associations = options.max_associations;
+                let uri_template = options.uri_template.clone();
                 let cancel = cancel.child_token();
                 tokio::spawn(async move {
-                    if let Err(error) = serve_connection(incoming, edge, backend_addr, destination, allowed, cancel).await {
+                    if let Err(error) = serve_connection(incoming, edge, backend_addr, destination, allowed, target_policy, uri_template, max_associations, cancel).await {
                         eprintln!("MASQUE connection failed: {error:#}");
                     }
                 });
@@ -159,6 +182,9 @@ async fn serve_connection(
     backend: EndpointAddr,
     destination: DestinationId,
     allowed: SocketAddr,
+    target_policy: TargetSecurityPolicy,
+    uri_template: ConnectUdpUriTemplate,
+    max_associations: usize,
     cancel: CancellationToken,
 ) -> Result<()> {
     let connection = incoming.await.context("accept QUIC")?;
@@ -180,20 +206,23 @@ async fn serve_connection(
             accepted = h3.accept() => {
                 let Some(resolver) = accepted.context("accept request")? else { break };
                 let (request, mut stream) = resolver.resolve_request().await.context("decode request")?;
-                let target = match standard_connect_udp_target(&request) {
+                if let Some(failure) = admission_failure(associations.len(), max_associations, cancel.is_cancelled()) {
+                    stream.send_response(failure.response()).await?;
+                    stream.finish().await?;
+                    continue;
+                }
+                let target = match uri_template.target(&request) {
                     Ok(target) => target,
                     Err(_) => {
-                        stream.send_response(
-                            Response::builder().status(StatusCode::BAD_REQUEST).body(())?
-                        ).await?;
+                        stream.send_response(MasqueFailure::MalformedRequest.response()).await?;
                         stream.finish().await?;
                         continue;
                     }
                 };
-                if target != (allowed_host.clone(), allowed.port()) {
-                    stream.send_response(
-                        Response::builder().status(StatusCode::FORBIDDEN).body(())?
-                    ).await?;
+                if target_policy.authorize(&target.0, target.1).is_err()
+                    || target != (allowed_host.clone(), allowed.port())
+                {
+                    stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
                     stream.finish().await?;
                     continue;
                 }
@@ -205,9 +234,7 @@ async fn serve_connection(
                     Ok(tunnel) => tunnel,
                     Err(error) => {
                         eprintln!("open Connect service association: {error:#}");
-                        stream.send_response(
-                            Response::builder().status(StatusCode::BAD_GATEWAY).body(())?
-                        ).await?;
+                        stream.send_response(MasqueFailure::from_backend_error(&error).response()).await?;
                         stream.finish().await?;
                         continue;
                     }
@@ -256,7 +283,7 @@ async fn serve_connection(
                         }
                     } else {
                         let mut capsules = BytesMut::new();
-                        loop {
+                        'association: loop {
                             tokio::select! {
                                 _ = association_cancel.cancelled() => break,
                                 incoming = stream.recv_data() => {
@@ -275,8 +302,8 @@ async fn serve_connection(
                                     loop {
                                         match take_capsule(&mut capsules) {
                                             Ok(Some((DATAGRAM_CAPSULE, payload))) => {
-                                                let Some(payload) = payload.strip_prefix(&[0]) else { continue };
-                                                if let Err(error) = tunnel.send(Bytes::copy_from_slice(payload)).await {
+                                                let Some(payload) = context_zero_payload(payload) else { continue };
+                                                if let Err(error) = tunnel.send(payload).await {
                                                     eprintln!("send capsule through Connect service: {error:#}");
                                                     break;
                                                 }
@@ -285,8 +312,7 @@ async fn serve_connection(
                                             Ok(None) => break,
                                             Err(error) => {
                                                 eprintln!("decode capsule: {error:#}");
-                                                capsules.clear();
-                                                break;
+                                                break 'association;
                                             }
                                         }
                                     }
@@ -308,10 +334,9 @@ async fn serve_connection(
             incoming = async { datagram_reader.as_mut().unwrap().read_datagram().await }, if datagram_reader.is_some() => {
                 let datagram = incoming.context("read standard HTTP Datagram")?;
                 let association_id = datagram.stream_id().into_inner();
-                let payload = datagram.into_payload();
-                if payload.first() != Some(&0) { continue; }
+                let Some(payload) = context_zero_payload(datagram.into_payload()) else { continue };
                 if let Some(sender) = associations.get(&association_id) {
-                    let _ = sender.try_send(payload.slice(1..));
+                    let _ = sender.try_send(payload);
                 }
             }
             Some(association_id) = closed_rx.recv() => {
@@ -321,6 +346,16 @@ async fn serve_connection(
     }
     cancel.cancel();
     Ok(())
+}
+
+fn admission_failure(active: usize, maximum: usize, draining: bool) -> Option<MasqueFailure> {
+    if draining {
+        Some(MasqueFailure::Draining)
+    } else if active >= maximum {
+        Some(MasqueFailure::Overloaded)
+    } else {
+        None
+    }
 }
 
 fn encode_varint(value: u64, output: &mut Vec<u8>) {
@@ -355,6 +390,11 @@ fn datagram_capsule(payload: &[u8]) -> Bytes {
     encode_varint(0, &mut capsule);
     capsule.extend_from_slice(payload);
     Bytes::from(capsule)
+}
+
+fn context_zero_payload(payload: Bytes) -> Option<Bytes> {
+    let (context, width) = decode_varint(&payload)?;
+    (context == 0).then(|| payload.slice(width..))
 }
 
 fn take_capsule(buffer: &mut BytesMut) -> Result<Option<(u64, Bytes)>> {
@@ -403,5 +443,31 @@ mod tests {
         encode_varint(DATAGRAM_CAPSULE, &mut header);
         encode_varint((MAX_CAPSULE + 1) as u64, &mut header);
         assert!(take_capsule(&mut BytesMut::from(&header[..])).is_err());
+    }
+
+    #[test]
+    fn unknown_and_malformed_context_ids_are_dropped_without_affecting_zero() {
+        assert_eq!(
+            context_zero_payload(Bytes::from_static(b"\0payload")),
+            Some(Bytes::from_static(b"payload"))
+        );
+        assert_eq!(context_zero_payload(Bytes::new()), None);
+        assert_eq!(context_zero_payload(Bytes::from_static(&[1, 2, 3])), None);
+        // Context 64 is a two-byte QUIC variable-length integer.
+        assert_eq!(
+            context_zero_payload(Bytes::from_static(&[0x40, 0x40, 9])),
+            None
+        );
+    }
+
+    #[test]
+    fn admission_is_bounded_and_draining_wins_over_capacity() {
+        assert_eq!(admission_failure(0, 2, false), None);
+        assert_eq!(
+            admission_failure(2, 2, false),
+            Some(MasqueFailure::Overloaded)
+        );
+        assert_eq!(admission_failure(0, 2, true), Some(MasqueFailure::Draining));
+        assert_eq!(admission_failure(2, 2, true), Some(MasqueFailure::Draining));
     }
 }
