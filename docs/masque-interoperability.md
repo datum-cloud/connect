@@ -32,9 +32,9 @@ This is deliberately policy lookup, not arbitrary target dialing.
 | Area | Required behavior | State / next work |
 | --- | --- | --- |
 | HTTP/3 endpoint | WebPKI TLS, `h3` ALPN, extended CONNECT and H3 DATAGRAM settings, ordinary DNS authority | Reusable edge and opt-in daemon listener accept caller-provisioned certificate/key files; deployed DNS, certificate issuance, and rotation remain operator work |
-| CONNECT-UDP request | RFC 9298 URI-template expansion, `:protocol = connect-udp`, Capsule Protocol negotiation, host names and IP literals | Default-template parsing/generation and an explicit target-tuple API are present; configurable non-default URI templates remain |
-| CONNECT-UDP response | 2xx response with Capsule Protocol negotiation and correct stream errors | Success and policy-denied responses are independently tested; expand transport failure status and `Proxy-Status` coverage |
-| HTTP Datagrams | Quarter Stream ID association, context ID zero, unknown-context handling | Independent multi-stream coverage is present, including a patched Quarter Stream ID encoder; add negotiated size and unknown-context cases |
+| CONNECT-UDP request | RFC 9298 URI-template expansion, `:protocol = connect-udp`, Capsule Protocol negotiation, host names and IP literals | Default and configurable path templates, parsing/generation, and an explicit target-tuple API are present |
+| CONNECT-UDP response | 2xx response with Capsule Protocol negotiation and correct stream errors | Failures have stable HTTP and RFC 9209 `Proxy-Status` mappings without backend detail leakage |
+| HTTP Datagrams | Quarter Stream ID association, context ID zero, unknown-context handling | Independent multi-stream coverage is present, including a patched Quarter Stream ID encoder; unknown and malformed contexts are dropped without affecting context zero |
 | Capsule fallback | DATAGRAM capsules when QUIC/H3 datagrams are unavailable | Implemented in the shared production edge and end-to-end tested with a bounded incremental decoder; CONNECT-IP still needs the same fallback |
 | CONNECT-IP | RFC 9484 request plus repeated address/route assignments and withdrawals | The shared edge and opt-in daemon listener accept exact configured targets, relay through explicitly granted private CONNECT-IP sessions, and publish configured IPv4 route snapshots including withdrawals; dual stack, capsule fallback, and live policy-driven reconfiguration remain |
 | Multiplexing | Multiple concurrent CONNECT streams per HTTP/3 connection | Implemented in the standards-facing edge and tested with three tunnels plus an isolated denied stream; the private iroh listener still uses one stream per connection |
@@ -45,9 +45,9 @@ This is deliberately policy lookup, not arbitrary target dialing.
 1. Extract request, capsule, and HTTP Datagram codecs from the iroh session
    lifecycle. Add RFC examples, malformed inputs, fuzz targets, and bounded
    allocation tests.
-2. Add an explicit `(target_host, target_port)` client API and configurable URI
-   templates. Keep Datum destination lookup as an authorization layer outside
-   the wire codec.
+2. Keep Datum destination lookup and the closed-by-default target security
+   policy as authorization layers outside the wire codec. Resolve unlisted DNS
+   names only through a future rebinding-safe resolver.
 3. Serve concurrent request streams and isolate stream errors from connection
    errors. Add cancellation, draining, idle timeout, and overload behavior.
 4. Add reliable DATAGRAM capsules and negotiate either QUIC DATAGRAM or capsule
@@ -135,6 +135,8 @@ targets, or provide a general UDP proxy.
   "connector_key": "/etc/datum-connect/masque/connector.key",
   "max_connections": 4096,
   "max_associations_per_connection": 128,
+  "connect_udp_uri_template": "/.well-known/masque/udp/{target_host}/{target_port}/",
+  "drain_timeout_seconds": 5,
   "routes": [{
     "target_host": "dns.example.net",
     "target_port": 53,
@@ -181,3 +183,15 @@ is suitable only for services whose ingress policy is public, with the exact
 route table providing the no-open-proxy boundary. Do not use it for private
 services until the gateway has a configured client-authentication mechanism and
 maps authenticated callers to service policy.
+
+The exact `routes` table is also the listener's closed-by-default target
+allowlist, so loopback, private, link-local, and metadata-service addresses are
+reachable only when the operator names that exact host and port. The reusable
+target policy can separately enable unlisted public IPs while continuing to
+block special ranges; unlisted DNS names always require an explicit entry to
+avoid accidental rebinding exposure. Semantic request failures return bounded,
+detail-free RFC 9209 `Proxy-Status` values. Association overload and draining
+return HTTP 503, backend timeouts return 504, and refused or unavailable
+destinations return 502. On shutdown the listener stops admission, cancels
+active associations, and waits up to `drain_timeout_seconds` before aborting
+remaining connection tasks.

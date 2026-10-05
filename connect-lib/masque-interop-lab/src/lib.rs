@@ -8,11 +8,15 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, Bytes, BytesMut};
-use connect_transport::{DestinationId, Transport, ip, standard_connect_udp_target};
+use connect_transport::{
+    DestinationId, Transport, ip,
+    masque::{ConnectUdpUriTemplate, MasqueFailure, TargetSecurityPolicy},
+};
 use h3::error::Code;
 use h3::ext::Protocol;
 use h3_datagram::datagram_handler::{HandleDatagramsExt, SendDatagramError};
@@ -67,6 +71,29 @@ pub struct Server {
     ip_routes: Arc<HashMap<(String, String), IpRoute>>,
     max_connections: usize,
     max_associations_per_connection: usize,
+    connect_udp_uri_template: ConnectUdpUriTemplate,
+    target_policy: TargetSecurityPolicy,
+    drain_timeout: Duration,
+}
+
+/// Limits and protocol shape for one standards-facing listener.
+#[derive(Clone, Debug)]
+pub struct ServerOptions {
+    pub max_connections: usize,
+    pub max_associations_per_connection: usize,
+    pub connect_udp_uri_template: ConnectUdpUriTemplate,
+    pub drain_timeout: Duration,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            max_connections: 1024,
+            max_associations_per_connection: 128,
+            connect_udp_uri_template: ConnectUdpUriTemplate::default(),
+            drain_timeout: Duration::from_secs(5),
+        }
+    }
 }
 
 impl Server {
@@ -76,7 +103,14 @@ impl Server {
         transport: Transport,
         routes: Vec<Route>,
     ) -> Result<Self> {
-        Self::bind_with_limits_and_ip_routes(listen, tls, transport, routes, vec![], 1024, 128)
+        Self::bind_with_options_and_ip_routes(
+            listen,
+            tls,
+            transport,
+            routes,
+            vec![],
+            ServerOptions::default(),
+        )
     }
 
     pub fn bind_with_ip_routes(
@@ -86,7 +120,14 @@ impl Server {
         routes: Vec<Route>,
         ip_routes: Vec<IpRoute>,
     ) -> Result<Self> {
-        Self::bind_with_limits_and_ip_routes(listen, tls, transport, routes, ip_routes, 1024, 128)
+        Self::bind_with_options_and_ip_routes(
+            listen,
+            tls,
+            transport,
+            routes,
+            ip_routes,
+            ServerOptions::default(),
+        )
     }
 
     pub fn bind_with_limits(
@@ -97,14 +138,17 @@ impl Server {
         max_connections: usize,
         max_associations_per_connection: usize,
     ) -> Result<Self> {
-        Self::bind_with_limits_and_ip_routes(
+        Self::bind_with_options_and_ip_routes(
             listen,
             tls,
             transport,
             routes,
             vec![],
-            max_connections,
-            max_associations_per_connection,
+            ServerOptions {
+                max_connections,
+                max_associations_per_connection,
+                ..ServerOptions::default()
+            },
         )
     }
 
@@ -117,11 +161,41 @@ impl Server {
         max_connections: usize,
         max_associations_per_connection: usize,
     ) -> Result<Self> {
-        if max_connections == 0 || max_associations_per_connection == 0 {
+        Self::bind_with_options_and_ip_routes(
+            listen,
+            tls,
+            transport,
+            routes,
+            ip_routes,
+            ServerOptions {
+                max_connections,
+                max_associations_per_connection,
+                ..ServerOptions::default()
+            },
+        )
+    }
+
+    pub fn bind_with_options_and_ip_routes(
+        listen: SocketAddr,
+        tls: rustls::ServerConfig,
+        transport: Transport,
+        routes: Vec<Route>,
+        ip_routes: Vec<IpRoute>,
+        options: ServerOptions,
+    ) -> Result<Self> {
+        if options.max_connections == 0
+            || options.max_associations_per_connection == 0
+            || options.drain_timeout.is_zero()
+        {
             bail!("MASQUE connection and association limits must be nonzero");
         }
         let indexed = index_routes(routes, !ip_routes.is_empty())?;
         let indexed_ip = index_ip_routes(ip_routes, !indexed.is_empty())?;
+        let target_policy = indexed
+            .keys()
+            .fold(TargetSecurityPolicy::new(), |policy, (host, port)| {
+                policy.allow_target(host, *port)
+            });
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(tls).context("build QUIC TLS configuration")?,
         ));
@@ -135,8 +209,11 @@ impl Server {
             transport,
             routes: Arc::new(indexed),
             ip_routes: Arc::new(indexed_ip),
-            max_connections,
-            max_associations_per_connection,
+            max_connections: options.max_connections,
+            max_associations_per_connection: options.max_associations_per_connection,
+            connect_udp_uri_template: options.connect_udp_uri_template,
+            target_policy,
+            drain_timeout: options.drain_timeout,
         })
     }
 
@@ -148,9 +225,11 @@ impl Server {
 
     pub async fn serve(self, cancel: CancellationToken) -> Result<()> {
         let connections = Arc::new(Semaphore::new(self.max_connections));
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
             let permit = tokio::select! {
                 _ = cancel.cancelled() => break,
+                _ = tasks.join_next(), if !tasks.is_empty() => continue,
                 permit = connections.clone().acquire_owned() => permit.expect("server semaphore is never closed"),
             };
             tokio::select! {
@@ -162,10 +241,13 @@ impl Server {
                     let ip_routes = self.ip_routes.clone();
                     let connection_cancel = cancel.child_token();
                     let max_associations = self.max_associations_per_connection;
-                    tokio::spawn(async move {
+                    let uri_template = self.connect_udp_uri_template.clone();
+                    let target_policy = self.target_policy.clone();
+                    tasks.spawn(async move {
                         let _permit = permit;
                         if let Err(error) = serve_connection(
-                            incoming, transport, routes, ip_routes, max_associations, connection_cancel
+                            incoming, transport, routes, ip_routes, uri_template, target_policy,
+                            max_associations, connection_cancel
                         ).await {
                             tracing::warn!(error = %format!("{error:#}"), "masque_connection_failed");
                         }
@@ -174,6 +256,15 @@ impl Server {
             }
         }
         self.endpoint.close(0u32.into(), b"server shutdown");
+        if tokio::time::timeout(self.drain_timeout, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
         Ok(())
     }
 }
@@ -272,6 +363,8 @@ async fn serve_connection(
     transport: Transport,
     routes: Arc<HashMap<(String, u16), Route>>,
     ip_routes: Arc<HashMap<(String, String), IpRoute>>,
+    connect_udp_uri_template: ConnectUdpUriTemplate,
+    target_policy: TargetSecurityPolicy,
     max_associations: usize,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -293,6 +386,15 @@ async fn serve_connection(
             accepted = h3.accept() => {
                 let Some(resolver) = accepted.context("accept request")? else { break };
                 let (request, mut stream) = resolver.resolve_request().await.context("decode request")?;
+                if let Some(failure) = admission_failure(
+                    associations.len(),
+                    max_associations,
+                    cancel.is_cancelled(),
+                ) {
+                    stream.send_response(failure.response()).await?;
+                    stream.finish().await?;
+                    continue;
+                }
                 let is_connect_ip = request.method() == Method::CONNECT
                     && request.extensions().get::<Protocol>() == Some(&Protocol::CONNECT_IP);
                 if is_connect_ip {
@@ -301,23 +403,18 @@ async fn serve_connection(
                         && request.headers().get(CAPSULE_PROTOCOL).and_then(|value| value.to_str().ok()) == Some("?1");
                     let target = connect_ip_target(request.uri().path());
                     if !common_valid || target.is_none() {
-                        stream.send_response(Response::builder().status(StatusCode::BAD_REQUEST).body(())?).await?;
-                        stream.finish().await?;
-                        continue;
-                    }
-                    if associations.len() >= max_associations {
-                        stream.send_response(Response::builder().status(StatusCode::TOO_MANY_REQUESTS).body(())?).await?;
+                        stream.send_response(MasqueFailure::MalformedRequest.response()).await?;
                         stream.finish().await?;
                         continue;
                     }
                     let (target, protocol) = target.expect("checked CONNECT-IP target");
                     let Some(route) = ip_routes.get(&(target.into(), protocol.into())).cloned() else {
-                        stream.send_response(Response::builder().status(StatusCode::FORBIDDEN).body(())?).await?;
+                        stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
                         stream.finish().await?;
                         continue;
                     };
                     if !datagrams_available {
-                        stream.send_response(Response::builder().status(StatusCode::SERVICE_UNAVAILABLE).body(())?).await?;
+                        stream.send_response(MasqueFailure::DestinationUnavailable.response()).await?;
                         stream.finish().await?;
                         continue;
                     }
@@ -330,7 +427,7 @@ async fn serve_connection(
                         Ok(session) => session,
                         Err(error) => {
                             tracing::warn!(target, protocol, error = %error, "masque_ip_backend_connect_failed");
-                            stream.send_response(Response::builder().status(StatusCode::BAD_GATEWAY).body(())?).await?;
+                            stream.send_response(ip_backend_failure(&error).response()).await?;
                             stream.finish().await?;
                             continue;
                         }
@@ -394,22 +491,22 @@ async fn serve_connection(
                     });
                     continue;
                 }
-                let target = match standard_connect_udp_target(&request) {
+                let target = match connect_udp_uri_template.target(&request) {
                     Ok(target) => target,
                     Err(_) => {
-                        stream.send_response(Response::builder().status(StatusCode::BAD_REQUEST).body(())?).await?;
+                        stream.send_response(MasqueFailure::MalformedRequest.response()).await?;
                         stream.finish().await?;
                         continue;
                     }
                 };
-                if associations.len() >= max_associations {
-                    stream.send_response(Response::builder().status(StatusCode::TOO_MANY_REQUESTS).body(())?).await?;
+                if target_policy.authorize(&target.0, target.1).is_err() {
+                    stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
                     stream.finish().await?;
                     continue;
                 }
                 let route_key = (target.0.to_ascii_lowercase(), target.1);
                 let Some(route) = routes.get(&route_key).cloned() else {
-                    stream.send_response(Response::builder().status(StatusCode::FORBIDDEN).body(())?).await?;
+                    stream.send_response(MasqueFailure::ForbiddenTarget.response()).await?;
                     stream.finish().await?;
                     continue;
                 };
@@ -420,7 +517,7 @@ async fn serve_connection(
                     Ok(tunnel) => tunnel,
                     Err(error) => {
                         tracing::warn!(target_host = target.0, target_port = target.1, error = %error, "masque_backend_connect_failed");
-                        stream.send_response(Response::builder().status(StatusCode::BAD_GATEWAY).body(())?).await?;
+                        stream.send_response(MasqueFailure::from_backend_error(&error).response()).await?;
                         stream.finish().await?;
                         continue;
                     }
@@ -460,7 +557,7 @@ async fn serve_connection(
                         }
                     } else {
                         let mut capsules = BytesMut::new();
-                        loop {
+                        'association: loop {
                             tokio::select! {
                                 _ = association_cancel.cancelled() => break,
                                 incoming = stream.recv_data() => {
@@ -475,12 +572,12 @@ async fn serve_connection(
                                     loop {
                                         match take_capsule(&mut capsules) {
                                             Ok(Some((DATAGRAM_CAPSULE, payload))) => {
-                                                let Some(payload) = payload.strip_prefix(&[0]) else { continue };
-                                                if tunnel.send(Bytes::copy_from_slice(payload)).await.is_err() { break; }
+                                                let Some(payload) = context_zero_payload(payload) else { continue };
+                                                if tunnel.send(payload).await.is_err() { break; }
                                             }
                                             Ok(Some(_)) => continue,
                                             Ok(None) => break,
-                                            Err(_) => { capsules.clear(); break; }
+                                            Err(_) => break 'association,
                                         }
                                     }
                                 }
@@ -498,10 +595,9 @@ async fn serve_connection(
             incoming = async { datagram_reader.as_mut().expect("guarded reader").read_datagram().await }, if datagram_reader.is_some() => {
                 let datagram = incoming.context("read standard HTTP Datagram")?;
                 let association_id = datagram.stream_id().into_inner();
-                let payload = datagram.into_payload();
-                if payload.first() != Some(&0) { continue; }
+                let Some(payload) = context_zero_payload(datagram.into_payload()) else { continue };
                 if let Some(sender) = associations.get(&association_id) {
-                    let _ = sender.try_send(payload.slice(1..));
+                    let _ = sender.try_send(payload);
                 }
             }
             Some(association_id) = closed_rx.recv() => {
@@ -511,6 +607,29 @@ async fn serve_connection(
     }
     cancel.cancel();
     Ok(())
+}
+
+fn admission_failure(active: usize, maximum: usize, draining: bool) -> Option<MasqueFailure> {
+    if draining {
+        Some(MasqueFailure::Draining)
+    } else if active >= maximum {
+        Some(MasqueFailure::Overloaded)
+    } else {
+        None
+    }
+}
+
+fn ip_backend_failure(error: &ip::Error) -> MasqueFailure {
+    match error {
+        ip::Error::Timeout => MasqueFailure::ConnectionTimeout,
+        ip::Error::Rejected(status) | ip::Error::RejectedWithReason { status, .. }
+            if *status == StatusCode::GATEWAY_TIMEOUT =>
+        {
+            MasqueFailure::ConnectionTimeout
+        }
+        ip::Error::Configuration(_) | ip::Error::Protocol(_) => MasqueFailure::Internal,
+        _ => MasqueFailure::DestinationUnavailable,
+    }
 }
 
 fn encode_varint(value: u64, output: &mut Vec<u8>) {
@@ -545,6 +664,11 @@ fn datagram_capsule(payload: &[u8]) -> Bytes {
     encode_varint(0, &mut capsule);
     capsule.extend_from_slice(payload);
     Bytes::from(capsule)
+}
+
+fn context_zero_payload(payload: Bytes) -> Option<Bytes> {
+    let (context, width) = decode_varint(&payload)?;
+    (context == 0).then(|| payload.slice(width..))
 }
 
 fn connect_ip_target(path: &str) -> Option<(&str, &str)> {
@@ -661,6 +785,43 @@ mod tests {
         encode_varint(0, &mut header);
         encode_varint((MAX_CAPSULE + 1) as u64, &mut header);
         assert!(take_capsule(&mut BytesMut::from(&header[..])).is_err());
+    }
+
+    #[test]
+    fn unknown_and_malformed_context_ids_are_dropped_without_affecting_zero() {
+        assert_eq!(
+            context_zero_payload(Bytes::from_static(b"\0payload")),
+            Some(Bytes::from_static(b"payload"))
+        );
+        assert_eq!(context_zero_payload(Bytes::new()), None);
+        assert_eq!(context_zero_payload(Bytes::from_static(&[1, 2, 3])), None);
+        assert_eq!(
+            context_zero_payload(Bytes::from_static(&[0x40, 0x40, 9])),
+            None
+        );
+    }
+
+    #[test]
+    fn admission_is_bounded_and_draining_wins_over_capacity() {
+        assert_eq!(admission_failure(0, 2, false), None);
+        assert_eq!(
+            admission_failure(2, 2, false),
+            Some(MasqueFailure::Overloaded)
+        );
+        assert_eq!(admission_failure(0, 2, true), Some(MasqueFailure::Draining));
+        assert_eq!(admission_failure(2, 2, true), Some(MasqueFailure::Draining));
+    }
+
+    #[test]
+    fn connect_ip_backend_timeout_has_gateway_timeout_status() {
+        assert_eq!(
+            ip_backend_failure(&ip::Error::Timeout),
+            MasqueFailure::ConnectionTimeout
+        );
+        assert_eq!(
+            ip_backend_failure(&ip::Error::Protocol("bad")),
+            MasqueFailure::Internal
+        );
     }
 
     #[test]

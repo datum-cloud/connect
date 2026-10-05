@@ -7,10 +7,11 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-use connect_masque_edge::{IpRoute, Ipv4RouteRange, Route, Server};
-use connect_transport::{DestinationId, Transport, TransportConfig};
+use connect_masque_edge::{IpRoute, Ipv4RouteRange, Route, Server, ServerOptions};
+use connect_transport::{DestinationId, Transport, TransportConfig, masque::ConnectUdpUriTemplate};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde::Deserialize;
 use tokio::task::JoinHandle;
@@ -29,6 +30,10 @@ struct Config {
     max_connections: usize,
     #[serde(default = "default_max_associations")]
     max_associations_per_connection: usize,
+    #[serde(default = "default_connect_udp_uri_template")]
+    connect_udp_uri_template: String,
+    #[serde(default = "default_drain_timeout_seconds")]
+    drain_timeout_seconds: u64,
     #[serde(default)]
     routes: Vec<RouteConfig>,
     #[serde(default)]
@@ -83,6 +88,15 @@ impl Runtime {
         let config: Config = serde_json::from_slice(&bytes)
             .map_err(|_| ApiError::bad_request("Invalid MASQUE configuration JSON"))?;
         config.validate()?;
+        let server_options = ServerOptions {
+            max_connections: config.max_connections,
+            max_associations_per_connection: config.max_associations_per_connection,
+            connect_udp_uri_template: ConnectUdpUriTemplate::parse(
+                config.connect_udp_uri_template.clone(),
+            )
+            .map_err(|_| ApiError::bad_request("Invalid MASQUE CONNECT-UDP URI template"))?,
+            drain_timeout: Duration::from_secs(config.drain_timeout_seconds),
+        };
 
         let certificate_chain =
             read_file(&config.certificate_chain, "MASQUE certificate chain", false).await?;
@@ -109,14 +123,13 @@ impl Runtime {
             .map_err(|error| {
                 ApiError::internal(format!("binding MASQUE Connect transport: {error}"))
             })?;
-        let server = match Server::bind_with_limits_and_ip_routes(
+        let server = match Server::bind_with_options_and_ip_routes(
             config.listen,
             tls,
             transport.clone(),
             routes,
             ip_routes,
-            config.max_connections,
-            config.max_associations_per_connection,
+            server_options,
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -162,11 +175,15 @@ impl Config {
             || self.max_connections > 100_000
             || self.max_associations_per_connection == 0
             || self.max_associations_per_connection > 4096
+            || self.drain_timeout_seconds == 0
+            || self.drain_timeout_seconds > 300
         {
             return Err(ApiError::bad_request(
                 "MASQUE connection limits are outside supported bounds",
             ));
         }
+        ConnectUdpUriTemplate::parse(self.connect_udp_uri_template.clone())
+            .map_err(|_| ApiError::bad_request("Invalid MASQUE CONNECT-UDP URI template"))?;
         if self.routes.len() + self.ip_routes.len() == 0
             || self.routes.len() + self.ip_routes.len() > 1024
         {
@@ -244,6 +261,12 @@ const fn default_max_connections() -> usize {
 }
 const fn default_max_associations() -> usize {
     128
+}
+fn default_connect_udp_uri_template() -> String {
+    "/.well-known/masque/udp/{target_host}/{target_port}/".into()
+}
+const fn default_drain_timeout_seconds() -> u64 {
+    5
 }
 
 impl RouteConfig {
@@ -376,6 +399,8 @@ mod tests {
             connector_key: "/tmp/connector.key".into(),
             max_connections: default_max_connections(),
             max_associations_per_connection: default_max_associations(),
+            connect_udp_uri_template: default_connect_udp_uri_template(),
+            drain_timeout_seconds: default_drain_timeout_seconds(),
             routes: vec![],
             ip_routes: vec![],
         };
@@ -407,6 +432,8 @@ mod tests {
             connector_key: "/tmp/connector.key".into(),
             max_connections: default_max_connections(),
             max_associations_per_connection: default_max_associations(),
+            connect_udp_uri_template: default_connect_udp_uri_template(),
+            drain_timeout_seconds: default_drain_timeout_seconds(),
             routes: vec![],
             ip_routes: vec![IpRouteConfig {
                 target: "ip.example".into(),
@@ -426,6 +453,35 @@ mod tests {
         assert!(config.validate().is_ok());
 
         config.ip_routes[0].route_updates[0][0].start = "10.30.0.10".parse().unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_validates_uri_template_and_drain_timeout() {
+        let mut config = Config {
+            listen: "127.0.0.1:4433".parse().unwrap(),
+            certificate_chain: "/tmp/cert.pem".into(),
+            private_key: "/tmp/key.pem".into(),
+            connector_key: "/tmp/connector.key".into(),
+            max_connections: default_max_connections(),
+            max_associations_per_connection: default_max_associations(),
+            connect_udp_uri_template: "/tenant/{target_host}/udp/{target_port}/".into(),
+            drain_timeout_seconds: 5,
+            routes: vec![RouteConfig {
+                target_host: "target.example".into(),
+                target_port: 53,
+                backend_endpoint_id: "validated when materialized".into(),
+                backend_addresses: vec!["127.0.0.1:7777".parse().unwrap()],
+                backend_relay_url: None,
+                destination_port: 53,
+            }],
+            ip_routes: vec![],
+        };
+        assert!(config.validate().is_ok());
+        config.connect_udp_uri_template = "/missing/{target_host}/".into();
+        assert!(config.validate().is_err());
+        config.connect_udp_uri_template = default_connect_udp_uri_template();
+        config.drain_timeout_seconds = 0;
         assert!(config.validate().is_err());
     }
 
