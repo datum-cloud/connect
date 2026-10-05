@@ -187,12 +187,15 @@ not, investigate the QUIC path or local adapter. These counters locate the
 failing segment; they do not identify which VPC firewall or workload rule
 blocked a packet.
 
-Attachments do not persist across daemon restarts. `leave`, `down`, lost
+Live attachment sessions and interfaces do not persist across daemon restarts.
+Managed VPC desired state does persist and is reconciled after project resume;
+direct-peer and static attachments remain ephemeral. `leave`, `down`, lost
 Connector authorization, session failure, and daemon shutdown close the owned
 TUN descriptor and remove its interface and routes. Rejected packets increment
 drop counters without terminating a healthy session. The normal project
 enrollment, token roles, and project scopes still apply. `ping` retains its
-Connector-probe meaning; use your operating system's `ping` command for an approved VPC address.
+Connector-probe meaning; use your operating system's `ping` command for an
+approved VPC address.
 
 If path capacity shrinks below the approved MTU during a session, the transport
 pauses outgoing packets for up to three seconds while iroh probes new paths.

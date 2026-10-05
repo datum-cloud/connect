@@ -292,8 +292,8 @@ project-wide transport diagnostics.
 
 | Area | Current behavior | Required follow-up |
 | --- | --- | --- |
-| Enrollment | Requires exactly one ConnectorClass annotated `connect.datum.net/transport=masque-v1` | Deploy and validate a MASQUE-aware class/controller |
-| Public ingress | Requires approved gateway Connector identities in the class's `connect.datum.net/gateway-connectors` JSON-array annotation | Implement and deploy the gateway; certify HTTPProxy readiness |
+| Enrollment | Requires exactly one Ready Connect `ConnectorClass` whose `spec.transports` includes `masque-v1` | Deploy and validate the Connect class and controller |
+| Public ingress | Requires approved gateway Connector identities in the class's `connect.datum.net/gateway-connectors` JSON-array annotation | Deploy the implemented edge in the production topology and certify HTTPProxy readiness |
 | Credentials | Uses a pinned host login session through `datumctl auth get-token`, or imports renewable OAuth/service-account JSON with in-process refresh | Issue least-privilege, per-Connector credentials; host-session mode currently uses user permissions |
 | Identity rotation | Restart and `up` refuse to recreate a revoked enrollment | Add an explicit administrator leave/rejoin workflow that rotates the key |
 | VPC | Managed joins use `ConnectGateway` and `ConnectNetworkBinding`; the local adapter installs approved routes for the assigned address | Validate routing and packet forwarding on each supported host; the gateway and VPC firewall must allow the traffic |

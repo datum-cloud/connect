@@ -119,8 +119,8 @@ in the matching source release for Windows requirements.
 
 4. Test with a teammate
 
-   Both peers need access to the SAME Datum project. Enrollment still requires
-   exactly one ConnectorClass advertising connect.datum.net/transport=masque-v1.
+   Both peers need access to the SAME Datum project. Enrollment requires exactly
+   one Ready Connect ConnectorClass whose spec.transports includes masque-v1.
    A deployed MASQUE gateway is not needed for direct peer traffic, but --public
    requires a compatible gateway. The bundle does not modify your control plane.
 

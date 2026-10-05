@@ -1,0 +1,163 @@
+# Connect Service Architecture
+
+Datum Connect lets a device publish a local TCP or UDP service, reach a service
+on another Connector, or attach to an approved project network. A small CLI
+plugin presents the user interface while a persistent local daemon owns device
+identity, durable intent, transports, and local networking.
+
+Connect is a preview. Device identity, service advertisements, and managed VPC
+attachment use `connect.datumapis.com/v1alpha1`. Public ingress still uses the
+NSO-owned HTTPProxy API. This documentation describes that split as it exists
+today.
+
+## How It Works
+
+The `datumctl connect` plugin sends authenticated requests to a loopback-only
+daemon. The daemon enrolls one Connector identity per project, reconciles cloud
+resources, and keeps the data-plane endpoints alive. Depending on the command,
+it then creates one of three paths:
+
+- **Service publication**: `serve` forwards a private TCP or UDP service to
+  approved Connectors, or requests an HTTPProxy for explicit public ingress.
+- **Service dialing**: `dial` binds a loopback port and forwards connections or
+  datagrams to a pinned Connector key and remote port.
+- **Network attachment**: `join` establishes CONNECT-IP to a peer or managed
+  gateway and installs only the address and routes approved for that attachment.
+
+The control plane communicates desired state and authorization. Application
+bytes and IP packets travel directly or through an iroh relay; they do not pass
+through the Connect controller.
+
+## System Context
+
+```mermaid
+flowchart LR
+    user[User or automation]
+    cli[datumctl Connect plugin]
+    daemon[Connect daemon]
+    helper[Privileged network helper]
+    api[Project control plane]
+    controller[Connect controller]
+    compute[Compute service]
+    gateway[CONNECT-IP gateway]
+    peer[Peer Connector]
+    relay[iroh relay]
+    vpc[Project VPC]
+    app[Local application]
+
+    user --> cli
+    cli -->|loopback HTTP API| daemon
+    daemon -->|serve and dial| app
+    daemon -->|Connector resources| api
+    controller -->|watch and reconcile| api
+    controller -->|gateway Workload| compute
+    compute --> gateway
+    daemon -->|approved adapter request| helper
+    helper -->|TUN or utun| daemon
+    daemon <-->|HTTP/3 over QUIC| peer
+    daemon <-->|CONNECT-IP| gateway
+    daemon -.-> relay
+    peer -.-> relay
+    gateway --> vpc
+```
+
+The CLI is intentionally stateless. The daemon is the local control point and
+persists desired state before applying it. The project API stores shared
+identity, discovery, and attachment resources. The controller turns gateway
+and binding resources into Compute workloads and gateway grants. A separate
+privileged helper limits native interface changes to pre-approved plans.
+
+## Core Concepts
+
+### Connector Identity
+
+Each enrolled project has a Connector resource and an iroh public key. The
+private key remains on the device. Names are for discovery and display; saved
+allowlists and dials pin the resolved public key so name reuse cannot silently
+redirect an existing grant.
+
+### Desired and Observed State
+
+The daemon stores project, service, dial, token, and managed-network intent in
+a private versioned state file. A successful mutation is persisted atomically
+before it becomes visible in memory. Reconciliation restores projects,
+services, dials, and managed VPC attachments after restart. Direct-peer and
+static CONNECT-IP attachments are deliberately ephemeral.
+
+See [Enrollment and Reconciliation](./enrollment-and-reconciliation.md).
+
+### Control Plane and Data Plane
+
+Control-plane resources answer who a Connector is, what it advertises, and
+which network it may join. The transport establishes authenticated HTTP/3
+sessions between endpoint keys. TCP and UDP services use CONNECT requests;
+network attachments carry complete IP packets in QUIC DATAGRAM frames.
+
+### Fail-Closed Local Networking
+
+The user daemon cannot ask the networking helper for arbitrary routes. The
+helper stores an administrator-approved address, interface, MTU, and route set,
+then accepts only an exact matching plan. Connect never changes a default
+route, global forwarding, or the host firewall.
+
+## Technology Stack
+
+| Component | Technology | Purpose |
+| --- | --- | --- |
+| CLI plugin | Go, Cobra, `datumctl` plugin protocol | User workflow and loopback daemon client |
+| Local daemon | Rust, Tokio, Axum | Durable intent, reconciliation, local API, and transports |
+| Peer transport | iroh 1.0, QUIC, HTTP/3, MASQUE | Authenticated TCP, UDP, and IP forwarding |
+| Network adapter | Rust with Linux TUN, macOS utun, or Wintun | Native packet delivery and exact routes |
+| Network helper | Privileged Rust service | Applies only administrator-approved adapter plans |
+| Connect controller | Go, controller-runtime, Milo multicluster runtime | Reconciles project resources, gateways, and bindings |
+| Managed gateway | Linux, iroh-gateway | Terminates CONNECT-IP and forwards approved VPC traffic |
+| Gateway runtime | Datum Compute Workload | Places one gateway interface in the requested VPC |
+
+## API Resources
+
+The Connect controller serves these resources under
+`connect.datumapis.com/v1alpha1`:
+
+| Resource | Scope | Description |
+| --- | --- | --- |
+| `ConnectorClass` | Cluster | Permitted transports and capabilities |
+| `Connector` | Project | Device public identity, endpoint, relays, and readiness |
+| `ConnectorAdvertisement` | Project | TCP and UDP services published by one Connector |
+| `ConnectGateway` | Project | Desired managed gateway Workload and VPC attachment |
+| `ConnectNetworkBinding` | Project | Approval for one Connector to attach to one gateway |
+
+Public ingress still creates an NSO-owned
+`networking.datumapis.com/v1alpha` HTTPProxy. Connector identity, peer
+discovery, advertisements, gateways, and bindings are Connect-owned. There is
+no conversion webhook or automatic copy from legacy Connector resources.
+
+## Learn More
+
+- [Enrollment and Reconciliation](./enrollment-and-reconciliation.md) — local
+  durable intent and cloud enrollment
+- [Service Publication](./service-publication.md) — private and public service
+  paths, allowlists, and dials
+- [Managed VPC Attachment](./managed-vpc-attachment.md) — gateway and binding
+  reconciliation
+- [CONNECT-IP Data Plane](./connect-ip-data-plane.md) — packet path, policy,
+  MTU, and recovery
+- [Identity and Authorization](./identity-and-authorization.md) — credentials,
+  keys, daemon roles, and approval boundaries
+- [Resource Model](./resource-model.md) — API and local state ownership
+- [Multi-Tenancy](./multi-tenancy.md) — project isolation and cross-scope rules
+- [Observability](./observability.md) — logs, counters, traces, and diagnostics
+- [Daemon Architecture](../components/daemon-architecture.md) — local control
+  plane internals
+- [Controller Architecture](../components/controller-architecture.md) —
+  multicluster reconciliation internals
+- [Network Helper Architecture](../components/network-helper-architecture.md) —
+  privileged boundary and adapter lifecycle
+
+## References
+
+- [HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110)
+- [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114)
+- [QUIC DATAGRAM](https://www.rfc-editor.org/rfc/rfc9221)
+- [CONNECT-UDP](https://www.rfc-editor.org/rfc/rfc9298)
+- [CONNECT-IP](https://www.rfc-editor.org/rfc/rfc9484)
+- [iroh documentation](https://www.iroh.computer/docs)

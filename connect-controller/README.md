@@ -93,9 +93,11 @@ non-root user with a read-only root filesystem and leader election enabled.
 This is a new API group, not an in-place change to NSO's
 `networking.datumapis.com` resources. `datumctl connect join` now discovers a
 ready `ConnectGateway` and creates or reuses a `ConnectNetworkBinding` for the
-current Connector. Service publication and peer discovery still use NSO's
-Connector APIs. No conversion webhook or automatic resource copy exists. Keep
-NSO serving those resources until their remaining consumers migrate.
+current Connector. Enrollment, peer discovery, and service advertisements use
+Connect `Connector` and `ConnectorAdvertisement` resources. Explicit public
+ingress still uses NSO's HTTPProxy API. No conversion webhook or automatic
+resource copy exists; keep the NSO Network and HTTPProxy APIs available for
+those remaining cross-service contracts.
 
 The Network reference remains a name-only cross-service reference because
 Network is NSO-owned. The controller reconciles a gateway into a Compute

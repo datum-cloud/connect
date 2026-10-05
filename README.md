@@ -133,8 +133,10 @@ for the isolated two-daemon test harness.
 The `connect-controller` module defines project `ConnectGateway` and
 `ConnectNetworkBinding` resources and reconciles each gateway into a Compute
 Workload. Managed VPC joins use these Connect resources. Service publication
-and peer discovery still use NSO-backed resources. The VPC controller is a
-staging prototype; validate the gateway-to-instance packet path on each native OS.
+and peer discovery use Connect-owned Connector and ConnectorAdvertisement
+resources; only explicit public ingress still creates an NSO-owned HTTPProxy.
+The VPC controller is a staging prototype; validate the gateway-to-instance
+packet path on each native OS.
 Gateway operators can explicitly enable `spec.peerRouting` to advertise the
 assigned `/128` addresses of other ready bindings. The gateway then forwards
 device traffic directly between authenticated sessions; this is disabled by
@@ -176,15 +178,22 @@ services, token scopes, diagnostics, platform requirements, and test limits.
 
 ## Architecture
 
+Start with the [architecture documentation](docs/architecture/README.md) for
+system context, end-to-end flows, resource ownership, security boundaries, and
+component internals.
+
 | Component | Responsibility |
 | --- | --- |
 | `connect-plugin/commands` | Flat CLI commands and daemon HTTP requests |
 | `connect-plugin/internal/daemonservice` | Native service installation and lifecycle |
+| `connect-controller` | Connect APIs, project reconciliation, and managed gateway Workloads |
 | `connect-lib/daemon` | Loopback API, authorization, durable intent, reconciliation, and diagnostics |
 | `connect-lib/transport` | iroh 1.0, HTTP/3 CONNECT, CONNECT-UDP, local CONNECT-IP, and peer access policy |
 | `connect-lib/network-helper` | Separate privileged service executable; no cloud credentials or Connector keys |
 | `connect-lib/ip-adapter` | Native interfaces, authenticated helper IPC, and exact host-route enforcement |
 | `connect-lib/lib/src/successor` | Host-session or in-process file credentials and Connector-owned control-plane resources |
+| `connect-lib/masque-interop-lab` | Reusable standards-facing MASQUE edge plus interoperability lab binary |
+| external `iroh-gateway` | Managed CONNECT-IP termination and approved VPC forwarding |
 
 The Rust workspace retains historical library code and the `connect-lib/bin`
 development harness. The CLI does not invoke that harness. Product builds and
