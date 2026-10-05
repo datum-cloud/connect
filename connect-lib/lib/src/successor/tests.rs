@@ -219,6 +219,45 @@ async fn liveness_renewal_updates_only_the_connect_connector_lease() {
 }
 
 #[tokio::test]
+async fn lease_renewal_retries_resource_version_conflicts() {
+    let public = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let connector = json!({
+        "metadata":{"name":format!("connect-{}", &public[..40])},
+        "spec":{"publicKey":public},
+        "status":{"leaseRef":"connect-lease"}
+    });
+    let lease = |resource_version| {
+        json!({
+            "apiVersion":"coordination.k8s.io/v1",
+            "kind":"Lease",
+            "metadata":{"name":"connect-lease","resourceVersion":resource_version},
+            "spec":{"leaseDurationSeconds":30}
+        })
+    };
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, connector),
+        Reply::Json(200, lease("4")),
+        Reply::Json(409, json!({"message":"resourceVersion conflict"})),
+        Reply::Json(200, lease("5")),
+        Reply::EchoCreated,
+    ])
+    .await;
+
+    let cloud = client(&base);
+    cloud.renew_connect_connector_liveness().await.unwrap();
+
+    let requests = task.await.unwrap();
+    let lease_writes: Vec<_> = requests
+        .iter()
+        .filter(|(line, _)| line.starts_with("PUT ") && line.contains("/leases/connect-lease"))
+        .collect();
+    assert_eq!(lease_writes.len(), 2);
+    assert_eq!(lease_writes[0].1["metadata"]["resourceVersion"], "4");
+    assert_eq!(lease_writes[1].1["metadata"]["resourceVersion"], "5");
+}
+
+#[tokio::test]
 async fn joining_managed_network_waits_for_gateway_readiness_after_a_config_rollout() {
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connect_connector = json!({

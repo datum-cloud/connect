@@ -133,6 +133,10 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if !ok || selector["matchLabels"].(map[string]interface{})["topology.datum.net/city-code"] != "DFW" {
 		t.Fatalf("locationSelector=%v, want DFW city-code selector", placement["locationSelector"])
 	}
+	scaleSettings, ok := placement["scaleSettings"].(map[string]interface{})
+	if !ok || scaleSettings["instanceManagementPolicy"] != "OrderedReady" {
+		t.Fatalf("scaleSettings=%v, want explicitly declared OrderedReady policy", placement["scaleSettings"])
+	}
 	if scale, ok := placement["scaleSettings"].(map[string]interface{}); !ok || scale["minReplicas"] != int64(1) || scale["maxReplicas"] != nil {
 		t.Fatalf("scaleSettings=%v, want minReplicas=1 without maxReplicas", placement["scaleSettings"])
 	}

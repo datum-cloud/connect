@@ -9,7 +9,7 @@ use credentials::TokenProvider;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashSet, net::SocketAddr, time::Duration};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 pub type Result<T> = std::result::Result<T, Error>;
 const GROUP: &str = "networking.datumapis.com/v1alpha1";
@@ -87,6 +87,7 @@ pub struct CloudConnector {
     base: String,
     name: String,
     public_key: String,
+    lease_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub(crate) fn validate_url(value: &str) -> Result<url::Url> {
@@ -151,6 +152,7 @@ impl CloudConnector {
             base: base.to_string(),
             name,
             public_key,
+            lease_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -399,14 +401,27 @@ impl CloudConnector {
             return Ok(());
         };
         validate_name(name)?;
+        // Liveness, authorization refresh, and gateway setup can all renew the
+        // same Lease concurrently. Serialize updates and retry resourceVersion
+        // conflicts so a harmless race cannot fail-close the Connector.
+        let _lease_guard = self.lease_lock.lock().await;
         let url = format!(
             "{}/apis/coordination.k8s.io/v1/namespaces/default/leases/{name}",
             self.base
         );
-        if let Some(mut lease) = self.request(Method::GET, &url, None).await? {
+        for attempt in 0..4 {
+            let Some(mut lease) = self.request(Method::GET, &url, None).await? else {
+                return Ok(());
+            };
             lease["spec"]["renewTime"] =
                 json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
-            self.request(Method::PUT, &url, Some(&lease)).await?;
+            match self.request(Method::PUT, &url, Some(&lease)).await {
+                Ok(_) => return Ok(()),
+                Err(Error::Api(409)) if attempt < 3 => {
+                    tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -883,24 +898,6 @@ impl CloudConnector {
             )
             .await?
             .ok_or(Error::Api(500))?;
-        if let Some(lease) = updated
-            .pointer("/status/leaseRef/name")
-            .and_then(Value::as_str)
-        {
-            validate_name(lease)?;
-            let lease_url = format!(
-                "{}/apis/coordination.k8s.io/v1/namespaces/default/leases/{lease}",
-                self.base
-            );
-            if let Some(mut resource) = self.request(Method::GET, &lease_url, None).await? {
-                // Kubernetes Lease uses metav1.MicroTime, whose decoder requires
-                // exactly six fractional digits rather than RFC3339 nanoseconds.
-                resource["spec"]["renewTime"] =
-                    json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
-                self.request(Method::PUT, &lease_url, Some(&resource))
-                    .await?;
-            }
-        }
         if let Some(connector) = self.connect_get("connectors", &self.name).await? {
             if connector.pointer("/spec/publicKey").and_then(Value::as_str)
                 != Some(self.public_key.as_str())

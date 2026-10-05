@@ -555,7 +555,7 @@ func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, se
 		container["env"] = []interface{}{map[string]interface{}{"name": "IROH_GATEWAY_RELAY_URLS", "value": strings.Join(spec.RelayURLs, ",")}}
 	}
 	return map[string]interface{}{
-		"placements": []interface{}{map[string]interface{}{"name": "gateway", "locationSelector": map[string]interface{}{"matchLabels": map[string]interface{}{"topology.datum.net/city-code": spec.LocationRef}}, "scaleSettings": map[string]interface{}{"minReplicas": int64(1)}}},
+		"placements": []interface{}{map[string]interface{}{"name": "gateway", "locationSelector": map[string]interface{}{"matchLabels": map[string]interface{}{"topology.datum.net/city-code": spec.LocationRef}}, "scaleSettings": map[string]interface{}{"minReplicas": int64(1), "instanceManagementPolicy": "OrderedReady"}}},
 		"template": map[string]interface{}{"spec": map[string]interface{}{
 			"networkInterfaces": []interface{}{map[string]interface{}{"name": "eth0", "network": map[string]interface{}{"name": spec.NetworkRef}, "ipFamilies": []interface{}{"IPv6"}}},
 			"runtime": map[string]interface{}{"class": "general-purpose", "resources": map[string]interface{}{"instanceType": instanceType}, "sandbox": map[string]interface{}{
