@@ -431,10 +431,18 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	// the new file when it starts.
 	receipt, _ := json.Marshal(helperReceipt{Executable: target, SHA256: digest})
 	var restore func() error
+	// An OS image update can remove the previous helper, for example after the
+	// install directory moves off a read-only /usr. That service cannot run
+	// again, so only the approvals file is restorable.
+	previousMissing := false
 	if replacing {
-		if err := validatePrivilegedExecutable(old.Executable); err != nil {
+		if _, err := os.Lstat(old.Executable); errors.Is(err, os.ErrNotExist) {
+			previousMissing = true
+		} else if err := validatePrivilegedExecutable(old.Executable); err != nil {
 			return err
 		}
+	}
+	if replacing && !previousMissing {
 		previous, err := service.New(nil, helperServiceConfig(requested.AllowedUID, old.Executable))
 		if err != nil {
 			return err
@@ -461,7 +469,7 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 			}
 			return errors.Join(failures...)
 		}
-	} else if approvalChanged {
+	} else if approvalChanged || previousMissing {
 		restore = func() error {
 			if len(existingBytes) == 0 {
 				return nil

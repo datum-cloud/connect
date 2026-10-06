@@ -46,8 +46,8 @@ On Linux, Connect keeps approval state and the Unix socket in
 `/usr/libexec/datum-connect/<uid>`. When `/usr` is read-only, as on Fedora
 Silverblue and other image-based systems, Connect uses
 `/usr/local/sbin/datum-connect/<uid>` instead, with symlinks resolved (for
-example `/var/usrlocal/sbin/...`) because the helper refuses symlinked parent
-directories. The executable must not live in `/var/lib`:
+example `/var/usrlocal/sbin/...`, or `/var/usrlocal/bin/...` where `sbin` is
+merged into `bin`) because the helper refuses symlinked parent directories. The executable must not live in `/var/lib`:
 SELinux labels that directory as state, not executable code. When SELinux is
 enabled, installation runs `restorecon` on the helper path so the system policy
 assigns its expected executable label. If `restorecon` is unavailable or fails,
