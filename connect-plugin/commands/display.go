@@ -411,7 +411,14 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			fmt.Fprintf(&out, "Connected to %s.\n", network.Network)
 		}
 		if len(network.Routes) > 0 {
-			fmt.Fprintf(&out, "Route: %s\n", strings.Join(network.Routes, ", "))
+			if len(network.Routes) == 1 {
+				fmt.Fprintf(&out, "Route: %s\n", network.Routes[0])
+			} else {
+				out.WriteString("Routes:\n")
+				for _, route := range network.Routes {
+					fmt.Fprintf(&out, "  - %s\n", route)
+				}
+			}
 		}
 		if len(network.AdvertiseRoutes) > 0 {
 			fmt.Fprintf(&out, "Shared with peer: %s\n", strings.Join(network.AdvertiseRoutes, ", "))

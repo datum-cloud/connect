@@ -260,6 +260,20 @@ async fn managed_peer_plans_are_setup_scoped_durable_and_do_not_grant_privileges
         "preparation must not open a network"
     );
     assert_eq!(control.network_calls.load(Ordering::SeqCst), 0);
+    let setup_plan: Value = client
+        .post(format!("{base}/v1/networks/friend/setup?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(matches!(
+        setup_plan["approval_action"].as_str(),
+        Some("install" | "add")
+    ));
+    assert_eq!(setup_plan["approval_changes"], json!([]));
     assert_eq!(
         client
             .post(format!("{base}/v1/networks/friend/setup?project=alpha"))

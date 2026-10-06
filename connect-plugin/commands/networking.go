@@ -25,6 +25,8 @@ var ensureNetworking = daemonservice.EnsureNetworking
 type networkPlan struct {
 	Network         string                           `json:"network"`
 	ManagedGateway  bool                             `json:"managed_gateway"`
+	ApprovalAction  string                           `json:"approval_action"`
+	ApprovalChanges []string                         `json:"approval_changes"`
 	HelperConfig    daemonservice.HelperApprovals    `json:"helper_config"`
 	ManagedApproval *daemonservice.InterfaceApproval `json:"managed_approval,omitempty"`
 	Binding         struct {
@@ -94,17 +96,25 @@ func displayPeer(peer string) string {
 }
 
 func writeNetworkApproval(out io.Writer, plan networkPlan, peer string) {
-	fmt.Fprintf(out, "Connect IP: %s\n", plan.Network)
+	fmt.Fprintln(out, "\nNetwork access")
+	fmt.Fprintf(out, "  Network: %s\n", plan.Network)
 	peerLabel := displayPeer(peer)
 	if peerLabel == "" {
 		peerLabel = displayPeer(plan.Binding.Peer)
 	}
 	if peerLabel != "" {
-		fmt.Fprintf(out, "Peer: %s\n", peerLabel)
+		label := "Peer"
+		if plan.ManagedGateway {
+			label = "Gateway"
+		}
+		fmt.Fprintf(out, "  %s: %s\n", label, peerLabel)
 	}
 	if plan.ManagedGateway {
 		if len(plan.Binding.Routes) > 0 {
-			fmt.Fprintf(out, "Routes through VPC gateway: %s\n", strings.Join(plan.Binding.Routes, ", "))
+			fmt.Fprintln(out, "  Routes through the VPC gateway:")
+			for _, route := range plan.Binding.Routes {
+				fmt.Fprintf(out, "    - %s\n", route)
+			}
 		}
 		policy := plan.HelperConfig.ManagedPolicy
 		if policy != nil {
@@ -116,21 +126,34 @@ func writeNetworkApproval(out io.Writer, plan networkPlan, peer string) {
 			fmt.Fprintln(out, "  Interfaces: ephemeral Datum-managed clients; no route advertisement")
 			fmt.Fprintln(out, "Later compliant managed VPC joins will not ask for an administrator password.")
 		}
-		fmt.Fprintln(out, "VPC firewall rules still control access to workloads.")
+		fmt.Fprintln(out, "  VPC firewall rules still control access to workloads.")
+		writeApprovalChange(out, plan)
 		return
 	}
 	if len(plan.Binding.Routes) > 0 {
-		fmt.Fprintf(out, "Route via peer: %s\n", strings.Join(plan.Binding.Routes, ", "))
-		fmt.Fprintf(out, "Traffic to peer: %s\n", formatNetworkRules(plan.Binding.Outbound))
+		fmt.Fprintf(out, "  Route via peer: %s\n", strings.Join(plan.Binding.Routes, ", "))
+		fmt.Fprintf(out, "  Traffic to peer: %s\n", formatNetworkRules(plan.Binding.Outbound))
 	}
 	if len(plan.Binding.AdvertiseRoutes) > 0 {
-		fmt.Fprintf(out, "Route shared with peer: %s\n", strings.Join(plan.Binding.AdvertiseRoutes, ", "))
-		fmt.Fprintf(out, "Traffic from peer: %s\n", formatNetworkRules(plan.Binding.Inbound))
-		fmt.Fprintln(out, "Forwarding must already be configured on this device.")
+		fmt.Fprintf(out, "  Route shared with peer: %s\n", strings.Join(plan.Binding.AdvertiseRoutes, ", "))
+		fmt.Fprintf(out, "  Traffic from peer: %s\n", formatNetworkRules(plan.Binding.Inbound))
+		fmt.Fprintln(out, "  Forwarding must already be configured on this device.")
 	}
 	if len(plan.Binding.Routes) == 0 && len(plan.Binding.AdvertiseRoutes) == 0 {
-		fmt.Fprintf(out, "Traffic to peer: %s\n", formatNetworkRules(plan.Binding.Outbound))
+		fmt.Fprintf(out, "  Traffic to peer: %s\n", formatNetworkRules(plan.Binding.Outbound))
 	}
+	writeApprovalChange(out, plan)
+}
+
+func writeApprovalChange(out io.Writer, plan networkPlan) {
+	if plan.ApprovalAction != "replace" {
+		return
+	}
+	if len(plan.ApprovalChanges) == 0 {
+		fmt.Fprintln(out, "  Approval: update required")
+		return
+	}
+	fmt.Fprintf(out, "  Approval: update required (%s changed)\n", strings.Join(plan.ApprovalChanges, ", "))
 }
 
 func waitForPeer(ctx context.Context, client *connectapi.Client, project, network string, timeout time.Duration) (json.RawMessage, bool, error) {
@@ -317,19 +340,22 @@ func newJoin(opts *options) *cobra.Command {
 				return err
 			}
 			writeNetworkApproval(cmd.ErrOrStderr(), plan, peer)
+			replaceRequested := replaceApproval || plan.ApprovalAction == "replace"
 			question := "Install the privileged helper and approve managed VPC networking for this user?"
 			if !plan.ManagedGateway {
 				question = "Install the privileged helper and approve this exact attachment?"
 			}
 			if upgrade {
 				question = "Upgrade the helper? Active IP attachments will disconnect; services and local ports stay running."
-			} else if replaceApproval {
-				question = "Replace this interface's administrator approval if it changed? Replacement disconnects active IP attachments; services and local ports stay running."
+			} else if replaceRequested {
+				question = "Approve this updated network access? The current IP attachment will reconnect; services and local ports stay running."
+			} else if plan.ApprovalAction == "add" {
+				question = "Approve this network access?"
 			}
 			if err := confirmSetup(cmd, question); err != nil {
 				return err
 			}
-			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, upgrade, replaceApproval); err != nil {
+			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, upgrade, replaceRequested); err != nil {
 				return err
 			}
 			// launchd/systemd acknowledging Start is not yet helper readiness.
