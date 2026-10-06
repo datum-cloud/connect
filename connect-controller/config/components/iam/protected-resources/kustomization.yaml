@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- connect-gateway-classes.yaml
+- connect-gateways.yaml
+- connect-network-bindings.yaml
+- connector-advertisements.yaml
+- connector-classes.yaml
+- connectors.yaml
