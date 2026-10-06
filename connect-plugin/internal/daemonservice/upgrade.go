@@ -22,6 +22,13 @@ import (
 
 var launchdProgramArguments = regexp.MustCompile(`(?s)(<key>ProgramArguments</key>\s*<array>\s*<string>)(.*?)(</string>)`)
 
+// skipAutomaticUpgrade leaves the running daemon alone for local builds, such
+// as Taskfile's 0.1.0+<commit>, which have no release to download. An explicit
+// executable or a forced upgrade still proceeds. version has no "v" prefix.
+func skipAutomaticUpgrade(version, executable string, force bool) bool {
+	return executable == "" && !force && !daemoninstall.PublishedRelease("v"+version)
+}
+
 // EnsureCurrentUser upgrades an installed standard user service when its
 // daemon version differs from the plugin release. It does not install a
 // missing service and it skips unpublished development plugin versions.
@@ -30,8 +37,7 @@ func EnsureCurrentUser(ctx context.Context, version, executable string, timeout 
 		return false, false, nil
 	}
 	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
-	// Local builds have no release to download; leave the running daemon alone.
-	if executable == "" && !daemoninstall.PublishedRelease("v"+version) && !force {
+	if skipAutomaticUpgrade(version, executable, force) {
 		return false, false, nil
 	}
 	if err := validatePlatformScope(false); err != nil {
