@@ -1,4 +1,4 @@
-use std::{future::IntoFuture, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, future::IntoFuture, path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use datum_connect_daemon::{
@@ -9,9 +9,15 @@ use datum_connect_daemon::{
     runtime::RealControl,
     store::Store,
 };
-use opentelemetry::{KeyValue, trace::TracerProvider as _};
+use opentelemetry::{KeyValue, Value, trace::TracerProvider as _};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
+use opentelemetry_sdk::{
+    Resource,
+    error::{OTelSdkError, OTelSdkResult},
+    propagation::TraceContextPropagator,
+    trace::{SdkTracerProvider, SpanData, SpanExporter as SdkSpanExporter},
+};
+use prost::Message;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{
     EnvFilter, Layer, Registry, layer::SubscriberExt, util::SubscriberInitExt,
@@ -312,36 +318,161 @@ fn init_otel(
                 .filter(|value| !value.trim().is_empty())
                 .map(|value| otlp_traces_endpoint(&value))
         });
-    let Some(endpoint) = endpoint else {
+    let resource = Resource::builder()
+        .with_service_name(service_name)
+        .with_attributes([KeyValue::new("service.namespace", "datum")])
+        .build();
+    let provider = if let Some(endpoint) = endpoint {
+        let exporter = match SpanExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .with_timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            Ok(exporter) => exporter,
+            Err(error) => {
+                eprintln!("OpenTelemetry exporter disabled: {error}");
+                return (None, OtelGuard(None));
+            }
+        };
+        SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(resource)
+            .build()
+    } else if in_band_telemetry_enabled() {
+        SdkTracerProvider::builder()
+            .with_batch_exporter(InBandSpanExporter::default())
+            .with_resource(resource)
+            .build()
+    } else {
         return (None, OtelGuard(None));
     };
-    let exporter = match SpanExporter::builder()
-        .with_http()
-        .with_endpoint(endpoint)
-        .with_timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        Ok(exporter) => exporter,
-        Err(error) => {
-            eprintln!("OpenTelemetry exporter disabled: {error}");
-            return (None, OtelGuard(None));
-        }
-    };
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(
-            Resource::builder()
-                .with_service_name(service_name)
-                .with_attributes([KeyValue::new("service.namespace", "datum")])
-                .build(),
-        )
-        .build();
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
     opentelemetry::global::set_tracer_provider(provider.clone());
     let layer = tracing_opentelemetry::layer()
         .with_tracer(provider.tracer(service_name))
         .boxed();
     (Some(layer), OtelGuard(Some(provider)))
+}
+
+fn in_band_telemetry_enabled() -> bool {
+    let direct = [
+        "DATUM_CONNECT_OTEL_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+    ]
+    .iter()
+    .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+    !direct
+        && std::env::var("DATUM_CONNECT_IN_BAND_TELEMETRY")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+}
+
+#[derive(Debug)]
+struct InBandSpanExporter {
+    resource: Resource,
+}
+
+impl Default for InBandSpanExporter {
+    fn default() -> Self {
+        Self {
+            resource: Resource::builder_empty().build(),
+        }
+    }
+}
+
+impl SdkSpanExporter for InBandSpanExporter {
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        let resource = self.resource.clone();
+        async move {
+            use opentelemetry_proto::{
+                tonic::collector::trace::v1::ExportTraceServiceRequest,
+                transform::{
+                    common::tonic::ResourceAttributesWithSchema,
+                    trace::tonic::group_spans_by_resource_and_scope,
+                },
+            };
+            let mut by_project = HashMap::<String, Vec<SpanData>>::new();
+            for mut span in batch {
+                if !matches!(
+                    span.name.as_ref(),
+                    "connect_ip.client_session"
+                        | "connect_ip.health_snapshot"
+                        | "connect_ip.attachment"
+                ) {
+                    continue;
+                }
+                let project = span.attributes.iter().find_map(|attribute| {
+                    matches!(attribute.key.as_str(), "project" | "datum.project")
+                        .then(|| match &attribute.value {
+                            Value::String(value) => Some(value.to_string()),
+                            _ => None,
+                        })
+                        .flatten()
+                });
+                if let Some(project) = project {
+                    span.attributes.retain(|attribute| {
+                        matches!(
+                            attribute.key.as_str(),
+                            "project"
+                                | "datum.project"
+                                | "network"
+                                | "gateway"
+                                | "session_id"
+                                | "connector"
+                        )
+                    });
+                    span.events = Default::default();
+                    span.links = Default::default();
+                    span.status = opentelemetry::trace::Status::Unset;
+                    by_project.entry(project).or_default().push(span);
+                }
+            }
+            let resource: ResourceAttributesWithSchema = (&resource).into();
+            for (project, spans) in by_project {
+                let Some(session) = datum_connect_daemon::local_ip::in_band_session(&project)
+                else {
+                    continue;
+                };
+                if !session.telemetry_policy().traces {
+                    continue;
+                }
+                let request = ExportTraceServiceRequest {
+                    resource_spans: group_spans_by_resource_and_scope(spans, &resource),
+                };
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    session.export_telemetry(
+                        connect_transport::ip::TelemetrySignal::Traces,
+                        bytes::Bytes::from(request.encode_to_vec()),
+                    ),
+                )
+                .await
+                .map_err(|_| OTelSdkError::Timeout(std::time::Duration::from_secs(3)))?
+                .map_err(|error| OTelSdkError::InternalFailure(error.to_string()))?;
+                if !response.status.is_success() {
+                    return Err(OTelSdkError::InternalFailure(format!(
+                        "gateway returned {}",
+                        response.status
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.resource = resource.clone();
+    }
 }
 
 fn otlp_traces_endpoint(endpoint: &str) -> String {

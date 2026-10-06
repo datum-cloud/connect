@@ -104,6 +104,7 @@ async fn main() -> Result<()> {
                 address,
                 routes: vec![route.parse()?],
                 mtu: 1280,
+                telemetry: ip::TelemetryPolicy::default(),
             })
             .await
             .context("install test CONNECT-IP grant")?;

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/netip"
 	"net/url"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -592,6 +593,13 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	grants := make([]interface{}, 0, len(peerGrants))
 	for _, peerGrant := range peerGrants {
 		grant := map[string]interface{}{"network": gateway.Spec.NetworkRef, "peer": peerGrant.peer, "client_address": peerGrant.clientAddress, "gateway_address": peerGrant.gatewayAddress, "routes": gateway.Spec.Routes, "interface_name": peerGrant.interfaceName, "mtu": 1280}
+		if peerGrant.telemetry != nil && (peerGrant.telemetry.Traces || peerGrant.telemetry.Metrics) {
+			grant["telemetry"] = map[string]interface{}{
+				"traces": peerGrant.telemetry.Traces, "metrics": peerGrant.telemetry.Metrics,
+				"project_id": project, "connector_id": peerGrant.connectorID,
+				"binding_id": peerGrant.bindingID, "gateway_id": string(gateway.UID),
+			}
+		}
 		if gateway.Spec.PeerRouting {
 			grant["peer_routes"] = peerRoutes(peerGrants, peerGrant.peer)
 		}
@@ -781,6 +789,9 @@ type gatewayGrant struct {
 	clientAddress  string
 	gatewayAddress string
 	interfaceName  string
+	connectorID    string
+	bindingID      string
+	telemetry      *connectv1alpha1.ConnectTelemetryPolicy
 }
 
 type gatewayPeerRouteCapacityError struct {
@@ -797,6 +808,7 @@ func readyGatewayGrants(ctx context.Context, c client.Client, project string, ga
 	if err := c.List(ctx, bindings, client.InNamespace(gateway.Namespace)); err != nil {
 		return nil, err
 	}
+	sortGatewayBindings(bindings.Items)
 	byPeer := make(map[string]gatewayGrant, len(bindings.Items))
 	for i := range bindings.Items {
 		binding := &bindings.Items[i]
@@ -821,7 +833,13 @@ func readyGatewayGrants(ctx context.Context, c client.Client, project string, ga
 		}
 		peer := strings.ToLower(connector.Spec.PublicKey)
 		clientAddress, gatewayAddress, interfaceName := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, peer, strings.ToLower(endpointID))
-		byPeer[peer] = gatewayGrant{peer: peer, clientAddress: clientAddress + "/128", gatewayAddress: gatewayAddress + "/128", interfaceName: interfaceName}
+		if _, exists := byPeer[peer]; exists {
+			continue
+		}
+		byPeer[peer] = gatewayGrant{
+			peer: peer, clientAddress: clientAddress + "/128", gatewayAddress: gatewayAddress + "/128", interfaceName: interfaceName,
+			connectorID: string(connector.UID), bindingID: string(binding.UID), telemetry: binding.Spec.Telemetry,
+		}
 	}
 	peers := make([]string, 0, len(byPeer))
 	for peer := range byPeer {
@@ -900,8 +918,15 @@ func gatewayConfigIncludesConnector(ctx context.Context, c client.Client, gatewa
 func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, class gatewayClassConfig, configName, secretName string) map[string]interface{} {
 	container := map[string]interface{}{"name": "connect-gateway", "image": class.image, "command": []interface{}{"/bin/sh", "-ec"}, "args": []interface{}{"mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && install -D -m 600 /etc/connect/key/key /run/connect-inputs/key && install -D -m 600 /etc/connect/gateway/gateway.yaml /run/connect-inputs/gateway.yaml && install -D -m 600 /etc/connect/gateway/grants.json /run/connect-inputs/grants.json && exec /usr/local/bin/iroh-gateway --config-file=/run/connect-inputs/gateway.yaml --key-file=/run/connect-inputs/key"}, "securityContext": map[string]interface{}{"capabilities": map[string]interface{}{"add": []interface{}{"NET_ADMIN", "MKNOD"}}}, "volumeAttachments": []interface{}{map[string]interface{}{"name": "connect-config", "mountPath": "/etc/connect/gateway"}, map[string]interface{}{"name": "connect-key", "mountPath": "/etc/connect/key"}}}
 	container["args"] = []interface{}{"mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && install -D -m 600 /etc/connect/key/key /run/connect-inputs/key && install -D -m 600 /etc/connect/gateway/gateway.yaml /run/connect-inputs/gateway.yaml && install -D -m 600 /etc/connect/gateway/grants.json /run/connect-inputs/grants.json && exec /usr/local/bin/iroh-gateway --config-file=/run/connect-inputs/gateway.yaml --key-file=/run/connect-inputs/key --ip-config=/run/connect-inputs/grants.json --metrics-addr=127.0.0.1 --metrics-port=9090"}
+	environment := make([]interface{}, 0, 2)
 	if len(spec.RelayURLs) > 0 {
-		container["env"] = []interface{}{map[string]interface{}{"name": "IROH_GATEWAY_RELAY_URLS", "value": strings.Join(spec.RelayURLs, ",")}}
+		environment = append(environment, map[string]interface{}{"name": "IROH_GATEWAY_RELAY_URLS", "value": strings.Join(spec.RelayURLs, ",")})
+	}
+	if endpoint := strings.TrimSpace(os.Getenv("DATUM_CONNECT_IN_BAND_OTLP_ENDPOINT")); endpoint != "" {
+		environment = append(environment, map[string]interface{}{"name": "DATUM_CONNECT_IN_BAND_OTLP_ENDPOINT", "value": endpoint})
+	}
+	if len(environment) > 0 {
+		container["env"] = environment
 	}
 	return map[string]interface{}{
 		"placements": []interface{}{map[string]interface{}{"name": "gateway", "locations": []interface{}{map[string]interface{}{"name": spec.LocationRef}}, "scaleSettings": map[string]interface{}{"minReplicas": int64(1), "instanceManagementPolicy": "OrderedReady"}}},

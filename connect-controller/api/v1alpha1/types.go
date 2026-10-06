@@ -254,6 +254,16 @@ type ConnectNetworkBindingSpec struct {
 	GatewayRef string `json:"gatewayRef"`
 	// +kubebuilder:validation:Required
 	ConnectorRef string `json:"connectorRef"`
+	// Telemetry is an explicit project-side grant for Connector operational
+	// telemetry. It is disabled when omitted and still requires local consent.
+	Telemetry *ConnectTelemetryPolicy `json:"telemetry,omitempty"`
+}
+
+type ConnectTelemetryPolicy struct {
+	// Traces permits curated Connect lifecycle traces.
+	Traces bool `json:"traces,omitempty"`
+	// Metrics permits curated Connect health metrics.
+	Metrics bool `json:"metrics,omitempty"`
 }
 
 type ConnectNetworkBindingStatus struct {

@@ -153,6 +153,8 @@ no conversion webhook or automatic copy from legacy Connector resources.
 - [Resource Model](./resource-model.md) — API and local state ownership
 - [Multi-Tenancy](./multi-tenancy.md) — project isolation and cross-scope rules
 - [Observability](./observability.md) — logs, counters, traces, and diagnostics
+- [In-Band Connector Observability](./in-band-observability.md) — opt-in OTLP
+  forwarding over an authenticated gateway connection
 
 ## References
 

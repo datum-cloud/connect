@@ -3,14 +3,15 @@ use crate::error::ApiError;
 use connect_ip_adapter::{IpNet, PacketDevice};
 use connect_transport::ip;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
+use prost::Message;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -427,11 +428,33 @@ pub struct Attachment {
     session: Arc<RwLock<Arc<ip::IpSession>>>,
 }
 
+static IN_BAND_SESSIONS: OnceLock<StdMutex<HashMap<String, Weak<ip::IpSession>>>> = OnceLock::new();
+
+fn register_in_band_session(project: &str, session: &Arc<ip::IpSession>) {
+    if session.telemetry_policy() != ip::TelemetryPolicy::default() {
+        IN_BAND_SESSIONS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(project.to_owned(), Arc::downgrade(session));
+    }
+}
+
+pub fn in_band_session(project: &str) -> Option<Arc<ip::IpSession>> {
+    IN_BAND_SESSIONS
+        .get()?
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(project)?
+        .upgrade()
+}
+
 impl Attachment {
     pub async fn status(&self) -> Value {
         let session = self.session.read().await.clone();
         let state = *self.state.read().await;
         let transport = session.stats();
+        let telemetry = session.telemetry_policy();
         let last_transport_error = session.last_error();
         json!({"network":self.binding.network,"project":self.binding.project,"gateway":self.binding.gateway,"mode":"gateway","session_id":session.session_id,
             "assigned_address":self.binding.assigned_address,"routes":self.binding.routes,"interface_name":self.interface_name,
@@ -446,6 +469,7 @@ impl Attachment {
             "delivery_mode":transport.delivery_mode,"effective_datagram_ip_capacity":transport.effective_datagram_ip_capacity,
             "mtu_errors":transport.mtu_errors,"last_transport_error":last_transport_error,
             "transport":transport_status(transport, last_transport_error.clone()),
+            "telemetry":{"requested":in_band_telemetry_enabled(),"active":telemetry.traces||telemetry.metrics,"traces":telemetry.traces,"metrics":telemetry.metrics},
             "last_error":self.failure.lock().await.clone()})
     }
     pub async fn stop(self) {
@@ -482,11 +506,14 @@ pub async fn join(
     }
     let session = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        ip::connect(
+        ip::connect_with_options(
             endpoint.clone(),
             peer.clone(),
             &binding.network,
             cancel.clone(),
+            ip::ConnectOptions {
+                telemetry: in_band_telemetry_enabled(),
+            },
         ),
     )
     .await
@@ -554,6 +581,7 @@ pub async fn join(
     let last_sent_at_ms = Arc::new(AtomicU64::new(0));
     let last_received_at_ms = Arc::new(AtomicU64::new(0));
     let session = Arc::new(session);
+    register_in_band_session(&binding.project, &session);
     let active_session = Arc::new(RwLock::new(session.clone()));
     let connection_state = Arc::new(RwLock::new("connected"));
     let task_active_session = active_session.clone();
@@ -615,6 +643,19 @@ pub async fn join(
                             last_packet_sent_at_unix_ms=nonzero(task_last_sent.load(Ordering::Relaxed)),
                             last_packet_received_at_unix_ms=nonzero(task_last_received.load(Ordering::Relaxed)),
                             stage="connect_ip_health", "CONNECT-IP directional health snapshot"));
+                        if session.telemetry_policy().metrics {
+                            let export_session = session.clone();
+                            let body = encode_health_metrics(&project, &network, &session_id, stats);
+                            tokio::spawn(async move {
+                                let result = tokio::time::timeout(std::time::Duration::from_secs(3), export_session.export_telemetry(ip::TelemetrySignal::Metrics, body)).await;
+                                match result {
+                                    Ok(Ok(response)) if response.status.is_success() => {}
+                                    Ok(Ok(response)) => tracing::warn!(status=%response.status, stage="in_band_telemetry_export", "gateway rejected in-band health metrics"),
+                                    Ok(Err(error)) => tracing::warn!(%error, stage="in_band_telemetry_export", "in-band health metrics export failed"),
+                                    Err(_) => tracing::warn!(stage="in_band_telemetry_export", "in-band health metrics export timed out"),
+                                }
+                            });
+                        }
                     },
                     packet = session.recv() => {
                         let Some(packet) = packet else {
@@ -684,7 +725,7 @@ pub async fn join(
                 }
                 let attempt = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
-                    ip::connect(task_endpoint.clone(), task_peer.clone(), &task_network, task_cancel.clone()),
+                    ip::connect_with_options(task_endpoint.clone(), task_peer.clone(), &task_network, task_cancel.clone(), ip::ConnectOptions { telemetry: in_band_telemetry_enabled() }),
                 ).await;
                 let replacement = match attempt {
                     Ok(Ok(replacement)) => {
@@ -728,6 +769,7 @@ pub async fn join(
                     }
                 };
                 *task_active_session.write().await = replacement.clone();
+                register_in_band_session(&project, &replacement);
                 *task_state.write().await = "connected";
                 *task_failure.lock().await = None;
                 tracing::info!(%project, %network, %gateway, session_id=%replacement.session_id,
@@ -765,6 +807,106 @@ pub async fn join(
         session: active_session,
         state: connection_state,
     })
+}
+
+fn in_band_telemetry_enabled() -> bool {
+    let direct = [
+        "DATUM_CONNECT_OTEL_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+    ]
+    .iter()
+    .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+    !direct
+        && std::env::var("DATUM_CONNECT_IN_BAND_TELEMETRY")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+}
+
+fn encode_health_metrics(
+    project: &str,
+    network: &str,
+    session_id: &str,
+    stats: ip::Stats,
+) -> bytes::Bytes {
+    use opentelemetry_proto::tonic::{
+        collector::metrics::v1::ExportMetricsServiceRequest,
+        common::v1::{AnyValue, KeyValue, any_value},
+        metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+            number_data_point,
+        },
+        resource::v1::Resource,
+    };
+    let string_attribute = |key: &str, value: &str| KeyValue {
+        key: key.to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_owned())),
+        }),
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
+    let gauge = |name: &str, value: u64| Metric {
+        name: name.to_owned(),
+        description: String::new(),
+        unit: "1".into(),
+        metadata: Vec::new(),
+        data: Some(metric::Data::Gauge(Gauge {
+            data_points: vec![NumberDataPoint {
+                attributes: Vec::new(),
+                start_time_unix_nano: 0,
+                time_unix_nano: timestamp,
+                exemplars: Vec::new(),
+                flags: 0,
+                value: Some(number_data_point::Value::AsInt(
+                    value.min(i64::MAX as u64) as i64
+                )),
+            }],
+        })),
+    };
+    let request = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![
+                    string_attribute("service.name", "datum-connect-daemon"),
+                    string_attribute("datum.project", project),
+                    string_attribute("datum.network", network),
+                    string_attribute("datum.session_id", session_id),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![
+                    gauge("datum.connect.quic.datagrams.sent", stats.datagrams_sent),
+                    gauge(
+                        "datum.connect.quic.datagrams.received",
+                        stats.datagrams_received,
+                    ),
+                    gauge("datum.connect.packets.sent", stats.packets_sent),
+                    gauge("datum.connect.packets.received", stats.packets_received),
+                    gauge("datum.connect.packets.dropped", stats.packets_dropped),
+                    gauge("datum.connect.protocol.errors", stats.protocol_errors),
+                    gauge(
+                        "datum.connect.path.ip_capacity",
+                        stats.effective_datagram_ip_capacity as u64,
+                    ),
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    bytes::Bytes::from(request.encode_to_vec())
 }
 
 fn retryable_connect_error(error: &ip::Error) -> bool {
@@ -846,6 +988,35 @@ fn handshake_error(network: &str, connector: &str, error: ip::Error) -> ApiError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_metrics_are_bounded_standard_otlp() {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        let body = encode_health_metrics(
+            "project",
+            "network",
+            "session",
+            ip::Stats {
+                delivery_mode: "quic_datagram",
+                datagrams_sent: 3,
+                packets_received: 5,
+                ..Default::default()
+            },
+        );
+        assert!(body.len() < 16 * 1024);
+        let request = ExportMetricsServiceRequest::decode(body).unwrap();
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "datum.connect.quic.datagrams.sent")
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "datum.connect.packets.received")
+        );
+    }
 
     #[test]
     fn reconnect_retries_transient_failures_but_stops_on_configuration_rejections() {

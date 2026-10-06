@@ -398,7 +398,7 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 		t.Fatalf("gateway capabilities=%v, want NET_ADMIN and MKNOD", capabilities["add"])
 	}
 
-	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name}}
+	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc", Namespace: "project", UID: types.UID("binding-uid"), Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name, Telemetry: &connectv1alpha1.ConnectTelemetryPolicy{Traces: true}}}
 	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "phone-vpc", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: secondConnector.Name}}
 	// Create bindings in reverse peer-key order to ensure the rendered grants
 	// are deterministic rather than dependent on API list order.
@@ -439,6 +439,13 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	}
 	if config.Grants[0]["peer"] != connector.Spec.PublicKey || config.Grants[1]["peer"] != secondConnector.Spec.PublicKey {
 		t.Fatalf("grants are not sorted by peer identity: %v", config.Grants)
+	}
+	telemetry, ok := config.Grants[0]["telemetry"].(map[string]interface{})
+	if !ok || telemetry["traces"] != true || telemetry["metrics"] != false || telemetry["project_id"] != "project-id" || telemetry["binding_id"] != "binding-uid" {
+		t.Fatalf("first grant telemetry=%v, want explicit trace-only tenant policy", config.Grants[0]["telemetry"])
+	}
+	if _, present := config.Grants[1]["telemetry"]; present {
+		t.Fatalf("second grant must omit telemetry when not opted in: %v", config.Grants[1])
 	}
 	firstPeerRoutes, ok := config.Grants[0]["peer_routes"].([]interface{})
 	if !ok || len(firstPeerRoutes) != 1 || firstPeerRoutes[0] != config.Grants[1]["client_address"] {

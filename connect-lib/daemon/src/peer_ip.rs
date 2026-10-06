@@ -409,6 +409,7 @@ pub async fn join(
                     address: remote.addr(),
                     routes: expected.routes.clone(),
                     mtu: binding.mtu,
+                    telemetry: ip::TelemetryPolicy::default(),
                 })
                 .await
                 .map_err(|e| ApiError::internal(format!("Cannot approve peer IP listener: {e}")))?,

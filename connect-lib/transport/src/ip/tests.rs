@@ -71,6 +71,7 @@ async fn joined_grants_share_one_endpoint_with_tcp_udp_and_revoke_independently(
         address: config.address,
         routes: vec!["10.30.0.9/32".parse().unwrap()],
         mtu: 1280,
+        telemetry: TelemetryPolicy::default(),
     };
     let mut registration = server.register_ip_grant(grant.clone()).await.unwrap();
     assert!(server.register_ip_grant(grant.clone()).await.is_err());
@@ -512,6 +513,7 @@ async fn ipv6_and_cross_family_quic_roundtrips_preserve_packets() {
             address: config.address,
             routes: config.routes.clone(),
             mtu: config.mtu,
+            telemetry: TelemetryPolicy::default(),
         };
         let cancel = CancellationToken::new();
         let (incoming, mut accepted) = mpsc::channel(4);
@@ -584,6 +586,7 @@ async fn real_iroh_assignment_packets_and_revocation() {
         address: config.address,
         routes: config.routes.clone(),
         mtu: config.mtu,
+        telemetry: TelemetryPolicy::default(),
     };
     let (incoming, mut accepted) = mpsc::channel(4);
     let serving = tokio::spawn(serve(server.clone(), vec![grant], incoming, cancel.clone()));
@@ -675,6 +678,121 @@ async fn real_iroh_assignment_packets_and_revocation() {
 }
 
 #[tokio::test]
+async fn in_band_telemetry_requires_both_sides_and_uses_reliable_request_stream() {
+    let _permit = NETWORK_TESTS.acquire().await.unwrap();
+    let server = endpoint().await;
+    let client = endpoint().await;
+    let config = config();
+    let cancel = CancellationToken::new();
+    let grant = Grant {
+        peer: client.id(),
+        network: "test".into(),
+        address: config.address,
+        routes: config.routes.clone(),
+        mtu: config.mtu,
+        telemetry: TelemetryPolicy {
+            traces: true,
+            metrics: false,
+        },
+    };
+    let (incoming, mut accepted) = mpsc::channel(4);
+    let serving = tokio::spawn(serve(server.clone(), vec![grant], incoming, cancel.clone()));
+    let connecting = tokio::spawn(connect_with_options(
+        client.clone(),
+        server.addr(),
+        "test",
+        CancellationToken::new(),
+        ConnectOptions { telemetry: true },
+    ));
+    let mut incoming = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    incoming.ready.send(true).unwrap();
+    let session = connecting.await.unwrap().unwrap();
+    assert_eq!(
+        session.telemetry_policy(),
+        TelemetryPolicy {
+            traces: true,
+            metrics: false
+        }
+    );
+
+    let export = tokio::spawn(async move {
+        session
+            .export_telemetry(TelemetrySignal::Traces, Bytes::from_static(b"otlp"))
+            .await
+    });
+    let batch = tokio::time::timeout(Duration::from_secs(5), incoming.telemetry.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.signal, TelemetrySignal::Traces);
+    assert_eq!(batch.body, Bytes::from_static(b"otlp"));
+    batch.respond(StatusCode::OK, Bytes::from_static(b"accepted"));
+    let response = export.await.unwrap().unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body, Bytes::from_static(b"accepted"));
+
+    incoming.session.cancel();
+    cancel.cancel();
+    serving.await.unwrap().unwrap();
+    client.close().await;
+    server.close().await;
+}
+
+#[tokio::test]
+async fn in_band_telemetry_stays_disabled_without_both_opt_ins() {
+    let _permit = NETWORK_TESTS.acquire().await.unwrap();
+    for (local_opt_in, gateway_opt_in) in [(false, true), (true, false)] {
+        let server = endpoint().await;
+        let client = endpoint().await;
+        let config = config();
+        let cancel = CancellationToken::new();
+        let grant = Grant {
+            peer: client.id(),
+            network: "test".into(),
+            address: config.address,
+            routes: config.routes.clone(),
+            mtu: config.mtu,
+            telemetry: TelemetryPolicy {
+                traces: gateway_opt_in,
+                metrics: gateway_opt_in,
+            },
+        };
+        let (incoming, mut accepted) = mpsc::channel(1);
+        let serving = tokio::spawn(serve(server.clone(), vec![grant], incoming, cancel.clone()));
+        let connecting = tokio::spawn(connect_with_options(
+            client.clone(),
+            server.addr(),
+            "test",
+            CancellationToken::new(),
+            ConnectOptions {
+                telemetry: local_opt_in,
+            },
+        ));
+        let incoming = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        incoming.ready.send(true).unwrap();
+        let session = connecting.await.unwrap().unwrap();
+        assert_eq!(session.telemetry_policy(), TelemetryPolicy::default());
+        assert!(matches!(
+            session
+                .export_telemetry(TelemetrySignal::Traces, Bytes::new())
+                .await,
+            Err(Error::Configuration(_))
+        ));
+        session.cancel();
+        cancel.cancel();
+        serving.await.unwrap().unwrap();
+        client.close().await;
+        server.close().await;
+    }
+}
+
+#[tokio::test]
 async fn unauthorized_peer_and_failed_readiness_never_join() {
     let _permit = NETWORK_TESTS.acquire().await.unwrap();
     let server = endpoint().await;
@@ -688,6 +806,7 @@ async fn unauthorized_peer_and_failed_readiness_never_join() {
         address: config.address,
         routes: config.routes,
         mtu: config.mtu,
+        telemetry: TelemetryPolicy::default(),
     };
     let (incoming, mut accepted) = mpsc::channel(4);
     let serving = tokio::spawn(serve(server.clone(), vec![grant], incoming, cancel.clone()));
@@ -794,6 +913,7 @@ async fn invalid_wire_packets_drop_and_full_receiver_does_not_block_cancel() {
         #[cfg(feature = "otel")]
         opentelemetry::Context::new(),
         cancel.clone(),
+        None,
     );
     let counters = session.counters.clone();
     let (_wire, io) = tokio::io::duplex(64 * 1024);
@@ -998,6 +1118,7 @@ async fn constrained_mtu_rejects_before_gateway_admission() {
         address: config.address,
         routes: config.routes,
         mtu: config.mtu,
+        telemetry: TelemetryPolicy::default(),
     };
     let (incoming, mut accepted) = mpsc::channel(4);
     let serving = tokio::spawn(serve(server.clone(), vec![grant], incoming, cancel.clone()));
@@ -1041,6 +1162,7 @@ async fn path_capacity_failure_records_reason_before_close() {
         #[cfg(feature = "otel")]
         opentelemetry::Context::new(),
         cancel.clone(),
+        None,
     );
     let counters = session.counters.clone();
     let (_wire, io) = tokio::io::duplex(1024);
@@ -1097,6 +1219,7 @@ async fn reliable_packet_fallback_is_rejected_and_remote_mtu_reason_is_safe() {
             #[cfg(feature = "otel")]
             opentelemetry::Context::new(),
             cancel.clone(),
+            None,
         );
         let counters = session.counters.clone();
         let (mut wire, io) = tokio::io::duplex(2048);

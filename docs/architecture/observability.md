@@ -69,6 +69,11 @@ continues the trace and both sides emit setup, session, and periodic health
 snapshot spans. Connect does not create one span per packet. Collector failure
 does not stop forwarding; it is reported separately in logs.
 
+The optional platform-managed path forwards curated Connector telemetry on
+reliable HTTP/3 streams within an authenticated gateway connection. It is
+disabled by default and requires both project policy and explicit local consent.
+See [In-Band Connector Observability](./in-band-observability.md).
+
 Trace attributes can include project/network names, peer identifiers, and
 connection diagnostics. Collectors therefore need the same retention and
 access care as other infrastructure telemetry.

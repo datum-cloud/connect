@@ -45,6 +45,16 @@ spec:
                 type: string
               gatewayRef:
                 type: string
+              telemetry:
+                description: Telemetry is an explicit project-side grant for Connector operational telemetry. It is disabled when omitted and still requires local consent.
+                properties:
+                  metrics:
+                    description: Metrics permits curated Connect health metrics.
+                    type: boolean
+                  traces:
+                    description: Traces permits curated Connect lifecycle traces.
+                    type: boolean
+                type: object
             required:
             - connectorRef
             - gatewayRef

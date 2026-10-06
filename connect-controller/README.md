@@ -61,6 +61,13 @@ totals in each direction. Structured gateway logs include the client-provided
 `DATUM_CONNECT_OTEL_ENDPOINT` on the gateway process to export correlated
 OpenTelemetry traces to a trusted OTLP/HTTP collector.
 
+Connector telemetry forwarding is a separate opt-in path. A project
+administrator enables `spec.telemetry.traces` and/or `spec.telemetry.metrics`
+on a `ConnectNetworkBinding`; omission keeps it disabled. The controller passes
+its `DATUM_CONNECT_IN_BAND_OTLP_ENDPOINT` value to managed gateway Workloads as
+the platform ingestion target. The Connector must also enable local consent;
+the binding alone never causes collection.
+
 The gateway private key is stored in a project Secret and mounted read-only in
 the Compute Workload; status exposes only its public endpoint ID. The Connect
 agent must be authorized to renew the Connector's project Lease. Connector

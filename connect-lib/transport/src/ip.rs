@@ -9,7 +9,7 @@
 
 pub mod peer_policy;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use h3::{ConnectionState, ext::Protocol};
 use h3_datagram::datagram_handler::HandleDatagramsExt;
 use http::{Method, Request, Response, StatusCode};
@@ -41,7 +41,11 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CAPSULE: usize = 16 * 1024;
 const MAX_ROUTES: usize = 32;
 const MAX_SESSIONS: usize = 128;
+const MAX_TELEMETRY_BODY: usize = 256 * 1024;
 const PATH: &str = "/.well-known/masque/ip/*/*/";
+const TELEMETRY_TRACES_PATH: &str = "/v1/traces";
+const TELEMETRY_METRICS_PATH: &str = "/v1/metrics";
+const TELEMETRY_HEADER: &str = "x-datum-telemetry";
 const IP_ERROR_HEADER: &str = "x-datum-ip-error";
 const MTU_CLOSE_CODE: u32 = 0x4443_4950;
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -297,6 +301,8 @@ pub struct Grant {
     pub address: IpAddr,
     pub routes: Vec<IpPrefix>,
     pub mtu: u16,
+    /// Signals this peer may forward after CONNECT-IP admission. Disabled by default.
+    pub telemetry: TelemetryPolicy,
 }
 impl Grant {
     fn config(&self) -> Result<SessionConfig> {
@@ -310,6 +316,104 @@ impl Grant {
         config.validate()?;
         Ok(config)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TelemetryPolicy {
+    pub traces: bool,
+    pub metrics: bool,
+}
+
+impl TelemetryPolicy {
+    fn permits(self, signal: TelemetrySignal) -> bool {
+        match signal {
+            TelemetrySignal::Traces => self.traces,
+            TelemetrySignal::Metrics => self.metrics,
+        }
+    }
+
+    fn wire(self) -> String {
+        let mut enabled = Vec::new();
+        if self.traces {
+            enabled.push("traces");
+        }
+        if self.metrics {
+            enabled.push("metrics");
+        }
+        enabled.join(",")
+    }
+
+    fn from_wire(value: Option<&str>) -> Self {
+        let mut policy = Self::default();
+        for signal in value.unwrap_or_default().split(',') {
+            match signal.trim() {
+                "traces" => policy.traces = true,
+                "metrics" => policy.metrics = true,
+                _ => {}
+            }
+        }
+        policy
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TelemetrySignal {
+    Traces,
+    Metrics,
+}
+
+impl TelemetrySignal {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Traces => TELEMETRY_TRACES_PATH,
+            Self::Metrics => TELEMETRY_METRICS_PATH,
+        }
+    }
+
+    fn from_path(path: &str) -> Option<Self> {
+        match path {
+            TELEMETRY_TRACES_PATH => Some(Self::Traces),
+            TELEMETRY_METRICS_PATH => Some(Self::Metrics),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TelemetryBatch {
+    pub signal: TelemetrySignal,
+    pub body: Bytes,
+    response: oneshot::Sender<TelemetryReply>,
+}
+
+impl TelemetryBatch {
+    pub fn respond(self, status: StatusCode, body: Bytes) {
+        let _ = self.response.send(TelemetryReply { status, body });
+    }
+}
+
+#[derive(Clone)]
+struct TelemetryClient {
+    peer: EndpointId,
+    sender: Arc<Mutex<h3::client::SendRequest<crate::h3_iroh::OpenStreams, Bytes>>>,
+    policy: TelemetryPolicy,
+}
+
+#[derive(Debug)]
+struct TelemetryReply {
+    status: StatusCode,
+    body: Bytes,
+}
+
+#[derive(Clone, Debug)]
+pub struct TelemetryResponse {
+    pub status: StatusCode,
+    pub body: Bytes,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConnectOptions {
+    pub telemetry: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -360,6 +464,7 @@ pub struct IpSession {
     receiver: Mutex<mpsc::Receiver<Bytes>>,
     cancellation: CancellationToken,
     counters: Arc<Counters>,
+    telemetry: Option<TelemetryClient>,
 }
 impl IpSession {
     pub async fn send(&self, payload: impl Into<Bytes>) -> Result<()> {
@@ -377,6 +482,53 @@ impl IpSession {
     }
     pub fn cancel(&self) {
         self.cancellation.cancel();
+    }
+    pub fn telemetry_policy(&self) -> TelemetryPolicy {
+        self.telemetry
+            .as_ref()
+            .map(|client| client.policy)
+            .unwrap_or_default()
+    }
+    pub async fn export_telemetry(
+        &self,
+        signal: TelemetrySignal,
+        body: Bytes,
+    ) -> Result<TelemetryResponse> {
+        let Some(client) = &self.telemetry else {
+            return Err(Error::Configuration("in-band telemetry is not enabled"));
+        };
+        if !client.policy.permits(signal) {
+            return Err(Error::Configuration("telemetry signal is not approved"));
+        }
+        if body.len() > MAX_TELEMETRY_BODY {
+            return Err(Error::Configuration("telemetry batch exceeds 256 KiB"));
+        }
+        let mut sender = client.sender.lock().await;
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("https://{}{}", client.peer, signal.path()))
+            .header(http::header::CONTENT_TYPE, "application/x-protobuf")
+            .body(())
+            .map_err(|_| Error::Configuration("invalid telemetry request"))?;
+        let mut stream = sender
+            .send_request(request)
+            .await
+            .map_err(|_| Error::Transport)?;
+        stream.send_data(body).await.map_err(|_| Error::Transport)?;
+        stream.finish().await.map_err(|_| Error::Transport)?;
+        let response = stream.recv_response().await.map_err(|_| Error::Transport)?;
+        let mut response_body = BytesMut::new();
+        while let Some(mut chunk) = stream.recv_data().await.map_err(|_| Error::Transport)? {
+            if response_body.len().saturating_add(chunk.remaining()) > MAX_TELEMETRY_BODY {
+                return Err(Error::Protocol("telemetry response too large"));
+            }
+            let bytes = chunk.copy_to_bytes(chunk.remaining());
+            response_body.extend_from_slice(&bytes);
+        }
+        Ok(TelemetryResponse {
+            status: response.status(),
+            body: response_body.freeze(),
+        })
     }
     pub fn stats(&self) -> Stats {
         Stats {
@@ -415,6 +567,8 @@ pub struct Incoming {
     #[cfg(feature = "otel")]
     pub trace_context: opentelemetry::Context,
     pub session: IpSession,
+    /// Approved OTLP requests on this authenticated HTTP/3 connection.
+    pub telemetry: mpsc::Receiver<TelemetryBatch>,
     pub ready: oneshot::Sender<bool>,
 }
 
@@ -455,6 +609,7 @@ impl Drop for Registration {
 #[derive(Clone)]
 struct Admission {
     config: SessionConfig,
+    telemetry: TelemetryPolicy,
     incoming: mpsc::Sender<Incoming>,
     cancel: CancellationToken,
     generation: u64,
@@ -503,6 +658,7 @@ impl Registry {
             (grant.peer, grant.network),
             Admission {
                 config,
+                telemetry: grant.telemetry,
                 incoming,
                 cancel: cancel.clone(),
                 generation,
@@ -538,6 +694,7 @@ fn session_parts(
     session_id: String,
     #[cfg(feature = "otel")] trace_context: opentelemetry::Context,
     cancel: CancellationToken,
+    telemetry: Option<TelemetryClient>,
 ) -> (IpSession, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>) {
     let (sender, outgoing) = mpsc::channel(64);
     let (incoming, receiver) = mpsc::channel(64);
@@ -552,6 +709,7 @@ fn session_parts(
         receiver: Mutex::new(receiver),
         cancellation: cancel,
         counters: Arc::new(Counters::default()),
+        telemetry,
     };
     (session, outgoing, incoming)
 }
@@ -561,6 +719,16 @@ pub async fn connect(
     peer: EndpointAddr,
     network: &str,
     cancel: CancellationToken,
+) -> Result<IpSession> {
+    connect_with_options(endpoint, peer, network, cancel, ConnectOptions::default()).await
+}
+
+pub async fn connect_with_options(
+    endpoint: Endpoint,
+    peer: EndpointAddr,
+    network: &str,
+    cancel: CancellationToken,
+    options: ConnectOptions,
 ) -> Result<IpSession> {
     valid_network(network)?;
     let local = cancel.child_token();
@@ -584,7 +752,9 @@ pub async fn connect(
                 tracing::warn!(peer=%peer.id, %network, %session_id, %error, stage="http3_client", "CONNECT-IP HTTP/3 client setup failed");
                 Error::Transport
             })?;
-            let mut request = Request::builder().method(Method::CONNECT).uri(format!("https://{}{PATH}", peer.id)).header("capsule-protocol", "?1").header("x-datum-network", network).header("x-datum-connect-session", &session_id).body(()).map_err(|_| Error::Configuration("invalid network request"))?;
+            let mut request = Request::builder().method(Method::CONNECT).uri(format!("https://{}{PATH}", peer.id)).header("capsule-protocol", "?1").header("x-datum-network", network).header("x-datum-connect-session", &session_id);
+            if options.telemetry { request = request.header(TELEMETRY_HEADER, "?1"); }
+            let mut request = request.body(()).map_err(|_| Error::Configuration("invalid network request"))?;
             #[cfg(feature = "otel")]
             for (name, value) in inject_trace_context() {
                 if let (Ok(name), Ok(value)) = (
@@ -634,6 +804,7 @@ pub async fn connect(
             let capacity = wait_datagram_capacity(&conn, stream_id, mtu).await?;
             let (mut io, bridge) = tokio::io::duplex(64 * 1024);
             let bridge_cancel = local.clone();
+            let telemetry_request_sender = sender.clone();
             let bridge_guard = crate::AbortTask::new(tokio::spawn(async move {
                 let _sender = sender; let _driver = driver_guard;
                 crate::bridge_tcp_h3(bridge, stream, bridge_cancel, &crate::Metrics::default()).await;
@@ -648,7 +819,9 @@ pub async fn connect(
             tracing::info!(peer=%peer.id, %network, %session_id, assigned_address=%config.address, routes=?config.routes, mtu=config.mtu, datagram_capacity=capacity, stage="ip_ready", "CONNECT-IP session negotiated");
             #[cfg(feature = "otel")]
             let trace_context = setup_span.context();
-            let (session, outgoing, incoming) = session_parts(config.clone(), Role::Client, session_id.clone(), #[cfg(feature = "otel")] trace_context, local.clone());
+            let telemetry_policy = if options.telemetry { TelemetryPolicy::from_wire(one_header(response.headers(), TELEMETRY_HEADER)) } else { TelemetryPolicy::default() };
+            let telemetry = (telemetry_policy != TelemetryPolicy::default()).then(|| TelemetryClient { peer: peer.id, sender: Arc::new(Mutex::new(telemetry_request_sender)), policy: telemetry_policy });
+            let (session, outgoing, incoming) = session_parts(config.clone(), Role::Client, session_id.clone(), #[cfg(feature = "otel")] trace_context, local.clone(), telemetry);
             session.counters.capacity.store(capacity, Ordering::Relaxed);
             let counters = session.counters.clone(); let task_cancel = local.clone();
             let session_network = network.to_owned();
@@ -831,10 +1004,17 @@ pub(crate) async fn serve_connection(
         };
         let Admission {
             config,
+            telemetry: approved_telemetry,
             incoming,
             cancel: membership,
             ..
         } = admission;
+        let telemetry_requested = one_header(request.headers(), TELEMETRY_HEADER) == Some("?1");
+        let telemetry_policy = if telemetry_requested {
+            approved_telemetry
+        } else {
+            TelemetryPolicy::default()
+        };
         tracing::info!(peer=%peer, network=%network.unwrap(), %session_id, assigned_address=%config.address, routes=?config.routes, mtu=config.mtu, stage="connect_admission", "CONNECT-IP peer and network approved");
         let membership_lifetime = membership.clone();
         let connection_cancel = cancel.clone();
@@ -846,8 +1026,112 @@ pub(crate) async fn serve_connection(
         let mut settings = h3.get_datagram_sender(stream.id());
         // Continue polling control streams after accepting the CONNECT. SETTINGS
         // can arrive later than the request. This connection permits one session.
+        let (telemetry_sender, telemetry_receiver) = mpsc::channel::<TelemetryBatch>(8);
+        let telemetry_cancel = cancel.clone();
         let driver_guard = crate::AbortTask::new(tokio::spawn(async move {
-            let _ = h3.accept().await;
+            loop {
+                let resolver = tokio::select! {
+                    _ = telemetry_cancel.cancelled() => break,
+                    request = h3.accept() => match request { Ok(Some(request)) => request, _ => break },
+                };
+                let Ok((request, mut stream)) = resolver.resolve_request().await else {
+                    continue;
+                };
+                let signal = TelemetrySignal::from_path(request.uri().path());
+                let valid = request.method() == Method::POST
+                    && request.uri().scheme_str() == Some("https")
+                    && request.uri().query().is_none()
+                    && one_header(request.headers(), http::header::CONTENT_TYPE.as_str())
+                        == Some("application/x-protobuf");
+                let Some(signal) =
+                    signal.filter(|signal| valid && telemetry_policy.permits(*signal))
+                else {
+                    let _ = stream
+                        .send_response(
+                            Response::builder()
+                                .status(StatusCode::FORBIDDEN)
+                                .body(())
+                                .unwrap(),
+                        )
+                        .await;
+                    let _ = stream.finish().await;
+                    continue;
+                };
+                let mut body = BytesMut::new();
+                let mut rejected = false;
+                loop {
+                    match stream.recv_data().await {
+                        Ok(Some(mut chunk))
+                            if body.len().saturating_add(chunk.remaining())
+                                <= MAX_TELEMETRY_BODY =>
+                        {
+                            let bytes = chunk.copy_to_bytes(chunk.remaining());
+                            body.extend_from_slice(&bytes);
+                        }
+                        Ok(None) => break,
+                        _ => {
+                            rejected = true;
+                            break;
+                        }
+                    }
+                }
+                if rejected {
+                    let _ = stream
+                        .send_response(
+                            Response::builder()
+                                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                                .body(())
+                                .unwrap(),
+                        )
+                        .await;
+                    let _ = stream.finish().await;
+                    continue;
+                }
+                let (response, receiver) = oneshot::channel();
+                if telemetry_sender
+                    .try_send(TelemetryBatch {
+                        signal,
+                        body: body.freeze(),
+                        response,
+                    })
+                    .is_err()
+                {
+                    let _ = stream
+                        .send_response(
+                            Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .body(())
+                                .unwrap(),
+                        )
+                        .await;
+                    let _ = stream.finish().await;
+                    continue;
+                }
+                let reply = tokio::time::timeout(Duration::from_secs(3), receiver)
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok)
+                    .unwrap_or(TelemetryReply {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body: Bytes::new(),
+                    });
+                if stream
+                    .send_response(
+                        Response::builder()
+                            .status(reply.status)
+                            .header(http::header::CONTENT_TYPE, "application/x-protobuf")
+                            .body(())
+                            .unwrap(),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    if !reply.body.is_empty() {
+                        let _ = stream.send_data(reply.body).await;
+                    }
+                    let _ = stream.finish().await;
+                }
+            }
         }));
         let supported = async {
             wait_h3_datagrams(&mut settings).await?;
@@ -890,6 +1174,7 @@ pub(crate) async fn serve_connection(
             #[cfg(feature = "otel")]
             trace_context.clone(),
             session_cancel.clone(),
+            None,
         );
         let counters = session.counters.clone();
         counters.capacity.store(capacity, Ordering::Relaxed);
@@ -902,6 +1187,7 @@ pub(crate) async fn serve_connection(
                 #[cfg(feature = "otel")]
                 trace_context,
                 session,
+                telemetry: telemetry_receiver,
                 ready,
             })
             .is_ok();
@@ -915,14 +1201,16 @@ pub(crate) async fn serve_connection(
             return Err(Error::Rejected(StatusCode::SERVICE_UNAVAILABLE));
         }
         stream
-            .send_response(
-                Response::builder()
+            .send_response({
+                let mut response = Response::builder()
                     .status(200)
                     .header("capsule-protocol", "?1")
-                    .header("x-datum-ip-mtu", config.mtu.to_string())
-                    .body(())
-                    .unwrap(),
-            )
+                    .header("x-datum-ip-mtu", config.mtu.to_string());
+                if telemetry_policy != TelemetryPolicy::default() {
+                    response = response.header(TELEMETRY_HEADER, telemetry_policy.wire());
+                }
+                response.body(()).unwrap()
+            })
             .await
             .map_err(|_| Error::Transport)?;
         let (io, bridge) = tokio::io::duplex(64 * 1024);

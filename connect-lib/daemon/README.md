@@ -27,6 +27,14 @@ The exporter uses HTTP/protobuf and gives each export request a three-second
 timeout. Export is batched. A collector outage does not stop packet forwarding;
 check the process logs for exporter shutdown or delivery errors.
 
+For the optional platform-managed path, set
+`DATUM_CONNECT_IN_BAND_TELEMETRY=true` on the daemon service and restart it.
+This is local consent only: the project binding must separately approve traces
+or metrics. When an explicit direct OTLP endpoint above is also configured, it
+takes precedence. In-band export uses reliable HTTP/3 request streams on the
+existing authenticated gateway connection and never blocks CONNECT-IP packet
+forwarding.
+
 This guide covers native adapters and low-level local CONNECT-IP tests. For
 managed VPC access, run `datumctl connect join NETWORK` against a deployed
 `ConnectGateway`; see the [controller guide](../../connect-controller/README.md).
