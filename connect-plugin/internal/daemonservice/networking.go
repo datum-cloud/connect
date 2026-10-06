@@ -124,10 +124,19 @@ func EnsureNetworking(cmd *cobra.Command, version, executable string, config Hel
 	}
 	child := exec.CommandContext(cmd.Context(), "/usr/bin/sudo", args...)
 	// sudo reads the administrator password from /dev/tty, not plan stdin.
-	child.Stdin, child.Stdout, child.Stderr = bytes.NewReader(data), cmd.ErrOrStderr(), cmd.ErrOrStderr()
+	var output bytes.Buffer
+	child.Stdin, child.Stdout, child.Stderr = bytes.NewReader(data), &output, &output
 	child.Env = []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
 	if err := child.Run(); err != nil {
-		return fmt.Errorf("networking approval did not complete; your user daemon and login are unchanged: %w", err)
+		message := strings.TrimSpace(output.String())
+		message = strings.TrimSpace(strings.TrimPrefix(message, "Error:"))
+		if message != "" {
+			return fmt.Errorf("networking approval failed: %s", message)
+		}
+		return fmt.Errorf("networking approval failed; your user daemon and login are unchanged: %w", err)
+	}
+	if output.Len() > 0 {
+		_, _ = io.Copy(cmd.ErrOrStderr(), &output)
 	}
 	return nil
 }

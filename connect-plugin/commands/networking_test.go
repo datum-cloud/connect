@@ -210,7 +210,11 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 					}
 					io.WriteString(w, `{}`)
 				case "/v1/networks/friend/setup":
-					io.WriteString(w, `{"network":"friend","binding":{"peer":"pinned-key","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","interface_name":"dcfriend","mtu":1280},"helper_config":{"allowed_uid":501,"approvals":[{"interface_name":"dcfriend","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","mtu":1280}]}}`)
+					action := "install"
+					if test.replace {
+						action = "replace"
+					}
+					fmt.Fprintf(w, `{"network":"friend","approval_action":%q,"approval_changes":["routes"],"binding":{"peer":"pinned-key","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","interface_name":"dcfriend","mtu":1280},"helper_config":{"allowed_uid":501,"approvals":[{"interface_name":"dcfriend","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","mtu":1280}]}}`, action)
 				case "/v1/networks":
 					joins++
 					if !test.ready && approvals == 0 {
@@ -232,9 +236,6 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 			cmd.SetErr(io.Discard)
 			cmd.SetIn(strings.NewReader(test.input))
 			args := []string{"friend", "--peer", "friend-mac", "--allow-tcp", "8080", "--allow-ping"}
-			if test.replace {
-				args = append(args, "--replace-helper-approval")
-			}
 			cmd.SetArgs(args)
 			err := cmd.Execute()
 			if (err == nil) != test.success || approvals != test.prompts || prepared != 1 || joins < 1 {
@@ -382,7 +383,7 @@ func TestNetworkApprovalShowsOnlyActionableAccess(t *testing.T) {
 	plan.Binding.Outbound = []networkRule{{Protocol: "tcp", Ports: []uint16{8080}}, {Protocol: "udp", Ports: []uint16{5353}}, {Protocol: "icmp_echo"}}
 	var output bytes.Buffer
 	writeNetworkApproval(&output, plan, "connect-subnet-lab-router")
-	want := "Connect IP: staging-vpc-mac\nPeer: connect-subnet-lab-router\nRoute via peer: fd20:0:27::/48\nTraffic to peer: TCP 8080, UDP 5353, ping\n"
+	want := "\nNetwork access\n  Network: staging-vpc-mac\n  Peer: connect-subnet-lab-router\n  Route via peer: fd20:0:27::/48\n  Traffic to peer: TCP 8080, UDP 5353, ping\n"
 	if output.String() != want {
 		t.Fatalf("approval output:\n%s\nwant:\n%s", output.String(), want)
 	}
@@ -399,13 +400,25 @@ func TestManagedGatewayApprovalExplainsRouteAndFirewallBoundary(t *testing.T) {
 	plan.Binding.Routes = []string{"fd20:0:27::/48"}
 	var output bytes.Buffer
 	writeNetworkApproval(&output, plan, "")
-	for _, want := range []string{"VPC gateway: connect-vpc-iad (IAD)", "Routes through VPC gateway: fd20:0:27::/48", "VPC firewall rules still control access"} {
+	for _, want := range []string{"VPC gateway: connect-vpc-iad (IAD)", "Routes through the VPC gateway:\n    - fd20:0:27::/48", "VPC firewall rules still control access"} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("approval output %q does not contain %q", output.String(), want)
 		}
 	}
 	if strings.Contains(output.String(), "Traffic to peer: deny all") {
 		t.Fatalf("managed VPC route was misleadingly described as denied: %s", output.String())
+	}
+}
+
+func TestChangedApprovalExplainsWhyReplacementIsNeeded(t *testing.T) {
+	plan := networkPlan{Network: "staging-vpc", ManagedGateway: true, ApprovalAction: "replace", ApprovalChanges: []string{"routes"}}
+	plan.Binding.Routes = []string{"fd20:0:27::1:0:0/128", "fd4d:8c3a:4d97:5fde:a69f:3932:a462:49ec/128"}
+	var output bytes.Buffer
+	writeNetworkApproval(&output, plan, "")
+	for _, want := range []string{"\n    - fd20:0:27::1:0:0/128", "\n    - fd4d:8c3a:4d97:5fde:a69f:3932:a462:49ec/128", "Approval: update required (routes changed)"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("approval output %q does not contain %q", output.String(), want)
+		}
 	}
 }
 

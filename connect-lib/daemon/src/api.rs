@@ -1118,14 +1118,85 @@ async fn network_setup(
     authorized(&state, &headers, &query.project)
         .await?
         .require_setup()?;
-    if let Some(plan) = state
+    let plan = if let Some(plan) = state
         .control
         .managed_network_setup(&query.project, &network)
         .await?
     {
-        return Ok(Json(plan));
-    }
-    setup_plan(&state.store.snapshot().await, &query.project, &network).map(Json)
+        plan
+    } else {
+        setup_plan(&state.store.snapshot().await, &query.project, &network)?
+    };
+    Ok(Json(describe_helper_approval(plan).await?))
+}
+
+#[cfg(unix)]
+async fn describe_helper_approval(mut plan: Value) -> Result<Value, ApiError> {
+    let expected: connect_ip_adapter::helper::Config = serde_json::from_value(
+        plan.get("helper_config")
+            .cloned()
+            .ok_or_else(|| ApiError::internal("Network setup plan lacks helper_config"))?,
+    )
+    .map_err(|_| ApiError::internal("Network setup plan has invalid helper_config"))?;
+    let current = connect_ip_adapter::helper::inspect(&crate::networking::helper_socket()?).await;
+    let (action, changes) = if let Some(requested_policy) = expected.managed_policy.as_ref() {
+        match current {
+            Ok(current) if current.managed_policy.as_ref() == Some(requested_policy) => {
+                ("unchanged", Vec::new())
+            }
+            Ok(current) if current.managed_policy.is_some() => {
+                ("replace", vec!["managed VPC policy"])
+            }
+            Ok(_) => ("add", Vec::new()),
+            Err(_) => ("install", Vec::new()),
+        }
+    } else {
+        let requested = expected
+            .approvals
+            .first()
+            .ok_or_else(|| ApiError::internal("Network setup plan has no helper approval"))?;
+        match current {
+            Ok(current) => match current
+                .approvals
+                .iter()
+                .find(|approval| approval.interface_name == requested.interface_name)
+            {
+                Some(previous) if previous == requested => ("unchanged", Vec::new()),
+                Some(previous) => {
+                    let mut changes = Vec::new();
+                    if previous.assigned_address != requested.assigned_address {
+                        changes.push("local address");
+                    }
+                    if previous.peer_address != requested.peer_address {
+                        changes.push("gateway address");
+                    }
+                    if previous.mtu != requested.mtu {
+                        changes.push("MTU");
+                    }
+                    if previous.routes != requested.routes {
+                        changes.push("routes");
+                    }
+                    if previous.advertise_routes != requested.advertise_routes {
+                        changes.push("shared routes");
+                    }
+                    ("replace", changes)
+                }
+                None => ("add", Vec::new()),
+            },
+            Err(_) => ("install", Vec::new()),
+        }
+    };
+    let object = plan
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("Network setup plan is not an object"))?;
+    object.insert("approval_action".into(), serde_json::json!(action));
+    object.insert("approval_changes".into(), serde_json::json!(changes));
+    Ok(plan)
+}
+
+#[cfg(not(unix))]
+async fn describe_helper_approval(plan: Value) -> Result<Value, ApiError> {
+    Ok(plan)
 }
 
 fn setup_plan(state: &DaemonState, project: &str, network: &str) -> Result<Value, ApiError> {
