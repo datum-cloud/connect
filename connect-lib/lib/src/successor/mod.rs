@@ -213,15 +213,25 @@ impl CloudConnector {
         } else {
             GROUP
         };
+        let suffix = if name.is_empty() {
+            String::new()
+        } else {
+            format!("/{name}")
+        };
         format!(
-            "{}/apis/{group}/namespaces/default/{plural}/{name}",
+            "{}/apis/{group}/namespaces/default/{plural}{suffix}",
             self.base.trim_end_matches('/')
         )
     }
 
     fn connect_resource(&self, plural: &str, name: &str) -> String {
+        let suffix = if name.is_empty() {
+            String::new()
+        } else {
+            format!("/{name}")
+        };
         format!(
-            "{}/apis/{CONNECT_GROUP}/namespaces/default/{plural}/{name}",
+            "{}/apis/{CONNECT_GROUP}/namespaces/default/{plural}{suffix}",
             self.base.trim_end_matches('/')
         )
     }

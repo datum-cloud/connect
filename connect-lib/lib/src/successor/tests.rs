@@ -105,8 +105,14 @@ fn connect_connector() -> Value {
 fn project_connect_resources_use_the_connect_api_group() {
     let client = client("https://api.example");
     assert!(client
+        .connect_resource("connectgateways", "")
+        .ends_with("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectgateways"));
+    assert!(client
         .connect_resource("connectgateways", "vpc-gateway")
         .ends_with("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectgateways/vpc-gateway"));
+    assert!(client
+        .resource("networks", "")
+        .ends_with("/apis/networking.datumapis.com/v1alpha1/namespaces/default/networks"));
     assert!(
         client
             .connect_resource("connectnetworkbindings", "binding")
@@ -451,7 +457,7 @@ async fn connect_enrollment_uses_only_the_connect_api() {
     let requests = task.await.unwrap();
     assert!(requests.iter().any(|(line, body)| {
         line.starts_with("POST ")
-            && line.contains("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectors/")
+            && line.contains("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectors ")
             && body["spec"]["classRef"] == "masque-class"
     }));
     assert!(
