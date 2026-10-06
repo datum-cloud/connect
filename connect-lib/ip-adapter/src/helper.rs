@@ -20,7 +20,7 @@ use tokio::{
 };
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const MAX_CONTROL: usize = 65535;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -34,6 +34,148 @@ pub struct Approval {
     pub routes: Vec<IpNet>,
     #[serde(default)]
     pub advertise_routes: Vec<IpNet>,
+}
+
+/// Root-owned capability for future managed VPC client attachments. Callers
+/// still submit a typed attachment plan; every field is bounded here.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPolicy {
+    pub client_only: bool,
+    pub address_ranges: Vec<IpNet>,
+    pub route_ranges: Vec<IpNet>,
+    pub minimum_route_prefix: u8,
+    pub minimum_mtu: u16,
+    pub maximum_mtu: u16,
+    pub interface_prefix: String,
+    pub interface_behavior: String,
+    pub maximum_active_attachments: u8,
+    pub maximum_routes_per_attachment: u8,
+    pub deny_connect_route_overlap: bool,
+}
+
+impl ManagedPolicy {
+    /// Conservative cross-project default for Datum-managed IPv6 VPC clients.
+    /// Direct peers and route advertisement never use this policy.
+    pub fn managed_vpc_default() -> Self {
+        Self {
+            client_only: true,
+            address_ranges: vec!["fc00::/7".parse().expect("valid ULA range")],
+            route_ranges: vec!["fc00::/7".parse().expect("valid ULA range")],
+            minimum_route_prefix: 16,
+            minimum_mtu: 1280,
+            maximum_mtu: 1500,
+            interface_prefix: "dc".into(),
+            interface_behavior: "ephemeral_exclusive".into(),
+            maximum_active_attachments: 8,
+            maximum_routes_per_attachment: 32,
+            deny_connect_route_overlap: true,
+        }
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        if !self.client_only
+            || !self.deny_connect_route_overlap
+            || self.interface_behavior != "ephemeral_exclusive"
+            || self.interface_prefix != "dc"
+            || self.address_ranges.is_empty()
+            || self.address_ranges.len() > 8
+            || self.route_ranges.is_empty()
+            || self.route_ranges.len() > 8
+            || self.minimum_route_prefix < 8
+            || self.minimum_mtu < 1280
+            || self.maximum_mtu < self.minimum_mtu
+            || self.maximum_mtu > 1500
+            || self.maximum_active_attachments == 0
+            || self.maximum_active_attachments > 16
+            || self.maximum_routes_per_attachment == 0
+            || self.maximum_routes_per_attachment > 32
+        {
+            return Err(invalid(
+                "managed policy must describe bounded, ephemeral client-only networking",
+            ));
+        }
+        let ula: IpNet = "fc00::/7".parse().expect("valid ULA range");
+        if self
+            .address_ranges
+            .iter()
+            .chain(&self.route_ranges)
+            .any(|range| {
+                range.addr().is_ipv4()
+                    || range.prefix_len() < ula.prefix_len()
+                    || range.network() != range.addr()
+                    || !ula.contains(&range.network())
+            })
+        {
+            return Err(invalid(
+                "managed policy ranges must be canonical IPv6 ULA prefixes",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn approve(&self, approval: &Approval) -> io::Result<()> {
+        self.validate()?;
+        Config {
+            allowed_uid: 1,
+            approvals: vec![approval.clone()],
+            managed_policy: None,
+        }
+        .validate()?;
+        if !approval.advertise_routes.is_empty() {
+            return Err(invalid(
+                "managed VPC policy permits client attachments only; advertised routes require exact approval",
+            ));
+        }
+        if approval.interface_name.len() != 12
+            || !approval.interface_name.starts_with(&self.interface_prefix)
+            || !approval.interface_name[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(invalid(
+                "managed VPC interface name is outside administrator-approved behavior",
+            ));
+        }
+        if approval.assigned_address.addr().is_ipv4()
+            || approval.assigned_address.prefix_len() != 128
+            || approval.peer_address.addr().is_ipv4()
+            || approval.peer_address.prefix_len() != 128
+            || !self
+                .address_ranges
+                .iter()
+                .any(|range| range.contains(&approval.assigned_address.addr()))
+            || !self
+                .address_ranges
+                .iter()
+                .any(|range| range.contains(&approval.peer_address.addr()))
+        {
+            return Err(invalid(
+                "managed VPC host addresses are outside administrator-approved ranges",
+            ));
+        }
+        if approval.mtu < self.minimum_mtu || approval.mtu > self.maximum_mtu {
+            return Err(invalid(
+                "managed VPC MTU is outside administrator-approved limits",
+            ));
+        }
+        if approval.routes.len() > usize::from(self.maximum_routes_per_attachment) {
+            return Err(invalid("managed VPC plan has too many routes"));
+        }
+        for route in &approval.routes {
+            if route.addr().is_ipv4()
+                || route.prefix_len() < self.minimum_route_prefix
+                || !self.route_ranges.iter().any(|range| {
+                    route.prefix_len() >= range.prefix_len() && range.contains(&route.network())
+                })
+            {
+                return Err(invalid(
+                    "managed VPC route is outside administrator-approved ranges or prefix limits",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Approval {
@@ -95,19 +237,25 @@ fn routes_conflict(left: &Approval, right: &Approval) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub allowed_uid: u32,
+    #[serde(default)]
     pub approvals: Vec<Approval>,
+    #[serde(default)]
+    pub managed_policy: Option<ManagedPolicy>,
 }
 
 impl Config {
     pub fn validate(&self) -> io::Result<()> {
         if self.allowed_uid == 0
             || self.allowed_uid == u32::MAX
-            || self.approvals.is_empty()
+            || (self.approvals.is_empty() && self.managed_policy.is_none())
             || self.approvals.len() > 16
         {
             return Err(invalid(
-                "helper requires a non-root user and 1..16 explicit interface approvals",
+                "helper requires a non-root user and an explicit approval or managed VPC policy",
             ));
+        }
+        if let Some(policy) = &self.managed_policy {
+            policy.validate()?;
         }
         let mut names = HashSet::new();
         let mut addresses = HashSet::new();
@@ -223,6 +371,8 @@ struct Request {
     #[serde(default)]
     approval: Option<Approval>,
     #[serde(default)]
+    managed: bool,
+    #[serde(default)]
     inspect: bool,
 }
 #[derive(Deserialize, Serialize)]
@@ -233,12 +383,15 @@ struct Response {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approvals: Option<Vec<Approval>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_policy: Option<ManagedPolicy>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Status {
     pub version: u8,
     pub approvals: Vec<Approval>,
+    pub managed_policy: Option<ManagedPolicy>,
 }
 
 /// Authenticate the privileged service and read approvals without creating an interface.
@@ -247,10 +400,10 @@ pub async fn inspect(socket: &Path) -> io::Result<Status> {
         let stream = UnixStream::connect(socket).await?;
         if stream.peer_cred()?.uid() != 0 { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "network helper is not root-owned")); }
         let (read, mut write) = tokio::io::split(stream);
-        send_frame(&mut write, &serde_json::to_vec(&Request { version:VERSION, approval:None, inspect:true })?).await?;
+        send_frame(&mut write, &serde_json::to_vec(&Request { version:VERSION, approval:None, managed:false, inspect:true })?).await?;
         let response: Response = serde_json::from_slice(&receive(&mut reader(read, MAX_CONTROL)).await?)?;
         if response.version != VERSION { return Err(invalid("network helper protocol mismatch; upgrade the helper with the matching Connect release")); }
-        Ok(Status { version:response.version, approvals:response.approvals.ok_or_else(|| invalid("network helper needs an upgrade; approval inspection is unavailable"))? })
+        Ok(Status { version:response.version, approvals:response.approvals.ok_or_else(|| invalid("network helper needs an upgrade; approval inspection is unavailable"))?, managed_policy:response.managed_policy })
     }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "network helper did not respond"))?
 }
 
@@ -311,6 +464,14 @@ impl Client {
     }
 
     pub async fn connect_approved(socket: &Path, approval: Approval) -> io::Result<Self> {
+        Self::connect_request(socket, approval, false).await
+    }
+
+    pub async fn connect_managed(socket: &Path, approval: Approval) -> io::Result<Self> {
+        Self::connect_request(socket, approval, true).await
+    }
+
+    async fn connect_request(socket: &Path, approval: Approval, managed: bool) -> io::Result<Self> {
         let mtu = approval.mtu;
         let stream = UnixStream::connect(socket).await.map_err(|e| {
             io::Error::new(
@@ -335,6 +496,7 @@ impl Client {
                 &serde_json::to_vec(&Request {
                     version: VERSION,
                     approval: Some(approval),
+                    managed,
                     inspect: false,
                 })?,
             )
@@ -518,7 +680,11 @@ async fn session(
     })
     .await
     .map_err(|_| invalid("helper request timed out"))??;
-    if request.version == VERSION && request.inspect && request.approval.is_none() {
+    if request.version == VERSION
+        && request.inspect
+        && request.approval.is_none()
+        && !request.managed
+    {
         return send_frame(
             &mut write,
             &serde_json::to_vec(&Response {
@@ -526,6 +692,7 @@ async fn session(
                 interface_name: None,
                 error: None,
                 approvals: Some(config.approvals.clone()),
+                managed_policy: config.managed_policy.clone(),
             })?,
         )
         .await;
@@ -536,19 +703,47 @@ async fn session(
     let approval = request
         .approval
         .ok_or_else(|| invalid("missing interface approval"))?;
-    let approved = request.version == VERSION && config.approvals.contains(&approval);
+    let approved = request.version == VERSION
+        && if request.managed {
+            config
+                .managed_policy
+                .as_ref()
+                .is_some_and(|policy| policy.approve(&approval).is_ok())
+        } else {
+            config.approvals.contains(&approval)
+        };
     let mut active_set = active.lock().await;
     let conflict = active_set
         .values()
         .any(|other| routes_conflict(&approval, other));
-    if !approved || active_set.contains_key(&approval.interface_name) || conflict {
+    let capacity_reached = request.managed
+        && config.managed_policy.as_ref().is_some_and(|policy| {
+            active_set.len() >= usize::from(policy.maximum_active_attachments)
+        });
+    if !approved
+        || capacity_reached
+        || active_set.contains_key(&approval.interface_name)
+        || conflict
+    {
         let message = if conflict {
             "Another active Connect IP attachment owns an overlapping route; leave it before joining this network".into()
+        } else if capacity_reached {
+            "Managed VPC attachment limit is reached; leave another network or ask an administrator to update the policy".into()
+        } else if request.managed {
+            config
+                .managed_policy
+                .as_ref()
+                .and_then(|policy| policy.approve(&approval).err())
+                .map(|error| {
+                    format!("Managed VPC plan is outside administrator-approved policy: {error}")
+                })
+                .unwrap_or_else(|| "Managed VPC networking is not administrator-approved".into())
         } else {
             "Interface configuration is not approved or is already active".into()
         };
         let response = Response {
             approvals: None,
+            managed_policy: None,
             version: VERSION,
             interface_name: None,
             error: Some(message),
@@ -578,6 +773,7 @@ async fn session_approved(
     .await?;
     let response = Response {
         approvals: None,
+        managed_policy: None,
         version: VERSION,
         interface_name: Some(tun.name().into()),
         error: None,
@@ -685,6 +881,7 @@ mod tests {
             interface_name: None,
             error: None,
             approvals: Some(approvals),
+            managed_policy: None,
         };
         assert!(serde_json::to_vec(&response).unwrap().len() <= MAX_CONTROL);
     }
@@ -699,6 +896,7 @@ mod tests {
                 advertise_routes: vec![],
                 mtu: 1280,
             }],
+            managed_policy: None,
         }
     }
     #[test]
@@ -738,6 +936,7 @@ mod tests {
         Config {
             allowed_uid: 501,
             approvals: vec![old.clone(), new.clone()],
+            managed_policy: None,
         }
         .validate()
         .expect("inactive approvals must not block setup for another network");
@@ -776,12 +975,14 @@ mod tests {
         Config {
             allowed_uid: 501,
             approvals: vec![client.clone()],
+            managed_policy: None,
         }
         .validate()
         .unwrap();
         Config {
             allowed_uid: 501,
             approvals: vec![router.clone()],
+            managed_policy: None,
         }
         .validate()
         .unwrap();
@@ -805,11 +1006,38 @@ mod tests {
         assert!(
             Config {
                 allowed_uid: 501,
-                approvals: vec![client]
+                approvals: vec![client],
+                managed_policy: None,
             }
             .validate()
             .is_err()
         );
+    }
+    #[test]
+    fn managed_policy_is_client_only_and_bounded() {
+        let policy = ManagedPolicy::managed_vpc_default();
+        let approval = Approval {
+            interface_name: "dc0123456789".into(),
+            assigned_address: "fd60::10/128".parse().unwrap(),
+            peer_address: "fd60::1/128".parse().unwrap(),
+            mtu: 1280,
+            routes: vec!["fd20:27::/48".parse().unwrap()],
+            advertise_routes: vec![],
+        };
+        policy.approve(&approval).unwrap();
+
+        let mut public_route = approval.clone();
+        public_route.routes = vec!["2001:db8::/32".parse().unwrap()];
+        assert!(policy.approve(&public_route).is_err());
+        let mut default_route = approval.clone();
+        default_route.routes = vec!["::/0".parse().unwrap()];
+        assert!(policy.approve(&default_route).is_err());
+        let mut router = approval.clone();
+        router.advertise_routes = vec!["fd30::/48".parse().unwrap()];
+        assert!(policy.approve(&router).is_err());
+        let mut arbitrary_interface = approval;
+        arbitrary_interface.interface_name = "en0".into();
+        assert!(policy.approve(&arbitrary_interface).is_err());
     }
     #[tokio::test]
     async fn framing_survives_cancelled_read_and_rejects_oversized_frames() {

@@ -422,7 +422,8 @@ claim to exercise OS authorization or production cloud membership.
 
 ## Configure the networking helper manually
 
-The helper owns only administrator-approved interfaces and exact peer host routes.
+The helper owns only administrator-approved interfaces: exact peer/router plans
+or managed VPC client plans bounded by the root-owned one-time policy.
 Your existing user daemon retains its OIDC session, Connector keys, authorization,
 iroh endpoint, and packet policy. The helper receives neither credentials nor keys.
 This feature requires matching newly built plugin, daemon, and helper binaries;

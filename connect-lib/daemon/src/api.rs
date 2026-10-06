@@ -1263,6 +1263,13 @@ async fn join_network(
             .map_err(|_| {
                 ApiError::internal("Managed network setup plan has invalid helper_config")
             })?;
+        let approval: connect_ip_adapter::helper::Approval =
+            serde_json::from_value(plan.get("managed_approval").cloned().ok_or_else(|| {
+                ApiError::internal("Managed network setup plan lacks managed_approval")
+            })?)
+            .map_err(|_| {
+                ApiError::internal("Managed network setup plan has invalid managed_approval")
+            })?;
         let helper =
             connect_ip_adapter::helper::inspect(&crate::networking::helper_socket()?).await;
         if !helper.is_ok_and(|helper| {
@@ -1270,8 +1277,12 @@ async fn join_network(
                 .approvals
                 .iter()
                 .all(|approval| helper.approvals.contains(approval))
+                && helper
+                    .managed_policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.approve(&approval).is_ok())
         }) {
-            return Err(ApiError::new(StatusCode::CONFLICT, "Administrator approval is required for this VPC attachment. Run connect join interactively on this device to approve the exact address and routes.").with_code("network_setup_required"));
+            return Err(ApiError::new(StatusCode::CONFLICT, "One-time administrator approval is required for managed VPC networking. Run connect join interactively on this device; later compliant VPC joins will not prompt.").with_code("network_setup_required"));
         }
     }
     let result = state
