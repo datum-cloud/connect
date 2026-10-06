@@ -84,7 +84,12 @@ async fn request_trace(request: Request<Body>, next: Next) -> Response {
 }
 
 async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+    Json(json!({
+        "status": "ok",
+        // The plugin reports this so users can identify a daemon left behind
+        // by an earlier release. Development builds report `unknown`.
+        "release_version": option_env!("DATUM_CONNECT_RELEASE_VERSION").unwrap_or("unknown"),
+    }))
 }
 
 #[derive(Debug, Deserialize)]

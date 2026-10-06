@@ -26,6 +26,7 @@ release:
     Compute instance by its VPC address. The Network must already exist, and an
     administrator must configure a default ConnectGatewayClass. The join command
     creates the gateway in the nearest Datum location.
+    Run `datumctl connect health` to confirm which daemon release is active.
     Checksums are not publisher signatures. macOS notarization is not included.
   extra_files:
     - glob: ../docs/INSTALL.txt

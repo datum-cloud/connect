@@ -486,6 +486,23 @@ async fn setup(
     (format!("http://{address}"), reqwest::Client::new(), task)
 }
 
+#[tokio::test]
+async fn health_reports_a_release_version_for_client_compatibility_checks() {
+    let repo = tempfile::tempdir().unwrap();
+    let (base, client, server) = setup(repo.path(), Arc::new(MockControl::default())).await;
+    let response: Value = client
+        .get(format!("{base}/v1/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["status"], "ok");
+    assert!(response["release_version"].as_str().is_some());
+    server.abort();
+}
+
 async fn enroll_test_project(base: &str, client: &reqwest::Client, repo: &Path) -> String {
     let token = tokio::fs::read_to_string(repo.join("daemon_auth/setup.token"))
         .await

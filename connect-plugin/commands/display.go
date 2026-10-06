@@ -78,13 +78,19 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 	switch cmd.Name() {
 	case "health":
 		var value struct {
-			Status string `json:"status"`
+			Status         string `json:"status"`
+			ReleaseVersion string `json:"release_version"`
 		}
 		if err := json.Unmarshal(data, &value); err != nil {
 			return err
 		}
 		if value.Status == "ok" {
 			out.WriteString("Connect daemon is reachable.\n")
+			if value.ReleaseVersion != "" && value.ReleaseVersion != "unknown" {
+				fmt.Fprintf(&out, "Daemon version: %s\n", value.ReleaseVersion)
+			} else {
+				out.WriteString("Daemon version: unknown (this daemon predates version reporting).\n")
+			}
 		} else {
 			fmt.Fprintf(&out, "Connect daemon health: %s\n", value.Status)
 		}

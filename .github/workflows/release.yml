@@ -46,6 +46,8 @@ jobs:
       - name: Build Rust binary
         run: cargo build --locked --release -p datum-connect-daemon -p datum-connect-network-helper --target ${{ matrix.target }}
         working-directory: connect-lib
+        env:
+          DATUM_CONNECT_RELEASE_VERSION: ${{ github.ref_name }}
       - name: Rename binary with platform suffix
         run: |
           mkdir -p dist/rust-bin
