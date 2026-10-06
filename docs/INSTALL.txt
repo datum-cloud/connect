@@ -1,4 +1,4 @@
-Datum Connect v1.0.0-preview.15: manual installation with datumctl
+Datum Connect v1.0.0-preview.19: manual installation with datumctl
 ==============================================================
 
 This archive includes the datumctl plugin and its matching daemon. Install
@@ -20,7 +20,7 @@ in the matching source release for Windows requirements.
    Example download for an Apple Silicon Mac. Change CONNECT_ARCHIVE for another
    platform. Check each command succeeds before continuing:
 
-     CONNECT_VERSION=v1.0.0-preview.15
+     CONNECT_VERSION=v1.0.0-preview.19
      CONNECT_ARCHIVE=datumctl-connect_Darwin_arm64.tar.gz
      CONNECT_RELEASE_URL="https://github.com/datum-cloud/connect/releases/download/$CONNECT_VERSION"
      CONNECT_DOWNLOAD_DIR=$(mktemp -d)
@@ -56,12 +56,12 @@ in the matching source release for Windows requirements.
      export DATUMCTL_PLUGINS_DIR="$CONNECT_PREVIEW_DIR/plugin-registry"
      command -v datumctl-connect
      datumctl plugin trust connect
-     datumctl connect --version
+     datumctl connect health
      datumctl connect serve --help
 
-   Expected output: "connect version v1.0.0-preview.15". Check that the trust
-   command identifies the executable inside CONNECT_PREVIEW_DIR.
-   The daemon currently reports its crate version (0.1.0), not the preview tag.
+   Expected health output includes "Daemon version: v1.0.0-preview.19". Check
+   that the trust command identifies the executable inside CONNECT_PREVIEW_DIR.
+   `datumctl connect health` reports the running daemon, not just the plugin.
    Keep the two binaries from the same archive together.
    The separate plugin registry keeps this preview's trust record isolated from
    your normal plugins. Repeat both exports when using a new terminal. Without
@@ -73,7 +73,7 @@ in the matching source release for Windows requirements.
    To keep using this preview in new terminals, repeat these exports or add them
    to your shell startup file (~/.zshrc on macOS or ~/.bashrc on Linux):
 
-     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.15"
+     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.19"
      export PATH="$CONNECT_PREVIEW_DIR:$PATH"
      export DATUMCTL_PLUGINS_DIR="$CONNECT_PREVIEW_DIR/plugin-registry"
 
@@ -272,7 +272,7 @@ in the matching source release for Windows requirements.
    protected executable location, and renewable credential-file authentication.
    Follow the matching version's Windows platform guide:
 
-   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.15/docs/headless-preview.md
+   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.19/docs/headless-preview.md
 
 Local build qualification
 -------------------------
