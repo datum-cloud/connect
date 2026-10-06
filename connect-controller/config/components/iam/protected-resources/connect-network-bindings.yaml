@@ -4,7 +4,7 @@ metadata:
   name: connect.datumapis.com-connectnetworkbinding
 spec:
   serviceRef:
-    name: connect.datumapis.com
+    name: connect-datumapis-com
   kind: ConnectNetworkBinding
   plural: connectnetworkbindings
   singular: connectnetworkbinding

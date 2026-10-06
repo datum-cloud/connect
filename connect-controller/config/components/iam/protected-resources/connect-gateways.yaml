@@ -4,7 +4,7 @@ metadata:
   name: connect.datumapis.com-connectgateway
 spec:
   serviceRef:
-    name: connect.datumapis.com
+    name: connect-datumapis-com
   kind: ConnectGateway
   plural: connectgateways
   singular: connectgateway

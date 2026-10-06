@@ -1,7 +1,7 @@
 apiVersion: services.miloapis.com/v1alpha1
 kind: Service
 metadata:
-  name: connect.datumapis.com
+  name: connect-datumapis-com
 spec:
   serviceName: connect.datumapis.com
   phase: Published

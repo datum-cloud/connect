@@ -1,10 +1,10 @@
 apiVersion: services.miloapis.com/v1alpha1
 kind: ServiceConfiguration
 metadata:
-  name: connect.datumapis.com
+  name: connect-datumapis-com
 spec:
   serviceRef:
-    name: connect.datumapis.com
+    name: connect-datumapis-com
   phase: Published
   locations:
     supportedClasses:
