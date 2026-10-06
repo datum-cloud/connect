@@ -67,6 +67,53 @@ identity, discovery, and attachment resources. The controller turns gateway
 and binding resources into Compute workloads and gateway grants. A separate
 privileged helper limits native interface changes to pre-approved plans.
 
+## Deployment Topology
+
+```mermaid
+flowchart LR
+    subgraph device[User device]
+        cli[datumctl-connect<br/>per command]
+        daemon[datum-connect-daemon<br/>persistent user service]
+        helper[network helper<br/>optional root service]
+        cli -->|loopback HTTP| daemon
+        daemon -->|local IPC| helper
+    end
+
+    subgraph management[Milo management cluster]
+        controller[connect-controller<br/>Kubernetes Deployment]
+    end
+
+    subgraph project[Project control plane]
+        api[Project API and Connect resources]
+    end
+
+    subgraph worker[Compute worker and project VPC]
+        gateway[iroh-gateway<br/>Compute Workload]
+        vpc[Project VPC]
+        gateway --> vpc
+    end
+
+    subgraph relays[Relay infrastructure]
+        relay[iroh relay]
+    end
+
+    daemon -->|control-plane API| api
+    controller -->|watch and reconcile| api
+    api -->|Compute schedules Workload| gateway
+    daemon <-->|CONNECT-IP data path| gateway
+    daemon -.->|optional QUIC relay path| relay
+    gateway -.->|optional QUIC relay path| relay
+```
+
+The user-facing plugin runs only for a command. The daemon persists on the user
+device. The controller runs centrally in the Milo management cluster and
+reconciles remote project APIs. Each managed gateway runs as a separate Compute
+Workload on a worker attached to the selected project VPC. Relays are shared
+infrastructure outside the Connect controller deployment.
+
+See [Deployment Topology](./deployment-topology.md) for the complete process
+inventory, platform variants, privilege boundaries, and byte paths.
+
 ## Core Concepts
 
 ### Connector Identity
@@ -133,6 +180,8 @@ no conversion webhook or automatic copy from legacy Connector resources.
 
 ## Learn More
 
+- [Deployment Topology](./deployment-topology.md) — process placement,
+  ownership, privilege, and network boundaries
 - [Enrollment and Reconciliation](./enrollment-and-reconciliation.md) — local
   durable intent and cloud enrollment
 - [Service Publication](./service-publication.md) — private and public service

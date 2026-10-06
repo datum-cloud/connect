@@ -11,6 +11,9 @@ Use these guides to install, operate, and develop Datum Connect.
 ## Understand Connect
 
 - Start with the [architecture overview](architecture/README.md).
+- See the [deployment topology](architecture/deployment-topology.md) for the
+  process placement across user devices, Milo, project control planes, Compute
+  workers, VPCs, and relay infrastructure.
 - Follow the focused design documents for
   [enrollment and reconciliation](architecture/enrollment-and-reconciliation.md),
   [service publication](architecture/service-publication.md),
