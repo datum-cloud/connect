@@ -1,0 +1,42 @@
+@startuml deployment-topology
+!$NEW_C4_STYLE = 1
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+!include datum-theme.puml
+
+LAYOUT_LEFT_RIGHT()
+
+Deployment_Node(device, "User Device", "macOS, Linux, or Windows") {
+    Container(cli, "datumctl-connect", "Go CLI plugin", "Runs for each command")
+    Container(daemon, "datum-connect-daemon", "Rust service", "Owns identity, durable intent, and transport sessions")
+    Container(helper, "Network Helper", "Privileged local service", "Optionally owns approved interfaces and routes")
+}
+
+Deployment_Node(management, "Milo Management Cluster", "Kubernetes") {
+    Container(controller, "connect-controller", "Go controller", "Reconciles Connect resources across project control planes")
+}
+
+Deployment_Node(project, "Project Control Plane", "Kubernetes-compatible API") {
+    Container(project_api, "Connect Resources", "API resources", "Identity, advertisements, gateways, bindings, and status")
+}
+
+Deployment_Node(compute, "Compute Worker", "Attached to the project VPC") {
+    Container(gateway, "iroh-gateway", "Compute Workload", "Terminates CONNECT-IP and forwards approved packets")
+    Container(vpc, "Project VPC", "Virtual network", "Contains the destinations reached through the gateway")
+}
+
+Deployment_Node(relay_infra, "Shared Relay Infrastructure", "Operator managed") {
+    Container_Ext(relay, "iroh Relay", "Relay service", "Assists encrypted QUIC connectivity")
+}
+
+Rel(cli, daemon, "Calls", "Loopback HTTP")
+Rel(daemon, helper, "Activates approved networking", "Authenticated local IPC")
+Rel(daemon, project_api, "Reconciles identity and intent", "HTTPS")
+Rel(controller, project_api, "Watches and reconciles", "Kubernetes API")
+Rel(project_api, gateway, "Declares and configures", "Compute Workload")
+Rel(gateway, vpc, "Forwards approved packets")
+Rel(daemon, gateway, "Managed network attachment", "CONNECT-IP")
+Rel(daemon, relay, "Uses when direct path is unavailable", "Encrypted QUIC")
+Rel(gateway, relay, "Uses when direct path is unavailable", "Encrypted QUIC")
+
+SHOW_LEGEND()
+@enduml

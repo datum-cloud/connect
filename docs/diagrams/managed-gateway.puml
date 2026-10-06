@@ -1,0 +1,33 @@
+@startuml managed-gateway
+!$NEW_C4_STYLE = 1
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+!include datum-theme.puml
+
+LAYOUT_LEFT_RIGHT()
+
+System_Ext(client, "Client Device Daemon", "Authenticates with its Connector endpoint key")
+System_Ext(project_api, "Project Control Plane", "Stores gateway, binding, identity, and grant configuration")
+System_Ext(controller, "Connect Controller", "Reconciles the Workload and effective peer grants")
+
+System_Boundary(workload, "Gateway Compute Workload") {
+    Container(gateway, "iroh-gateway", "Linux process", "Terminates CONNECT-IP and enforces the Connector grant")
+    Container(tun, "Gateway TUN", "Kernel interface", "Carries approved packets between the session and worker networking")
+}
+
+System_Ext(vpc, "Project VPC", "Network containing approved destinations")
+
+Lay_R(controller, project_api)
+Lay_D(controller, client)
+Lay_D(project_api, gateway)
+Lay_R(client, gateway)
+Lay_R(gateway, tun)
+Lay_R(tun, vpc)
+
+Rel(controller, project_api, "Writes status and gateway configuration", "Kubernetes API")
+Rel(project_api, gateway, "Provides identity and peer grants", "Secret and ConfigMap")
+Rel(client, gateway, "Opens authenticated packet session", "CONNECT-IP over QUIC DATAGRAM")
+Rel(gateway, tun, "Injects and receives approved packets")
+Rel(tun, vpc, "Forwards through worker networking")
+
+SHOW_LEGEND()
+@enduml

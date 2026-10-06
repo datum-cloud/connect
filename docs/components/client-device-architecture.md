@@ -12,29 +12,7 @@ long-running processes in greater detail.
 
 ## Overview
 
-```mermaid
-flowchart LR
-    user[User or automation]
-
-    subgraph device[Client device]
-        cli[datumctl and<br/>datumctl-connect]
-        daemon[datum-connect-daemon]
-        app[Local application<br/>or client]
-        helper[Optional privileged<br/>network helper]
-        adapter[TUN, utun,<br/>or Wintun]
-
-        cli -->|loopback HTTP| daemon
-        daemon <--> app
-        daemon -->|approved plan and packets| helper
-        helper --> adapter
-    end
-
-    cloud[Project control plane]
-    peer[Peer daemon or<br/>managed gateway]
-
-    daemon -->|resources and Lease| cloud
-    daemon <-->|authenticated HTTP/3| peer
-```
+![Client device architecture](../diagrams/client-device.png)
 
 `datumctl-connect` runs only for the duration of a command. The daemon persists
 independently as the device's local control plane. The helper is installed only

@@ -6,47 +6,7 @@ document shows where each process runs and which team or user operates it.
 
 ## Deployment at a Glance
 
-```mermaid
-flowchart LR
-    subgraph devices[User devices]
-        cli[datumctl-connect<br/>runs for each command]
-        daemon[datum-connect-daemon<br/>persistent service]
-        helper[network helper<br/>optional privileged service]
-        peer[peer datum-connect-daemon]
-
-        cli --> daemon
-        daemon -.-> helper
-    end
-
-    subgraph management[Milo management cluster]
-        controller[connect-controller]
-    end
-
-    subgraph project[Project control plane]
-        project_api[Connect resources]
-    end
-
-    subgraph compute[Compute worker and project VPC]
-        gateway[iroh-gateway<br/>Compute Workload]
-        vpc[Project VPC]
-        gateway --> vpc
-    end
-
-    subgraph shared[Shared relay infrastructure]
-        relay[iroh relay]
-    end
-
-    daemon -->|control plane| project_api
-    peer -->|control plane| project_api
-    controller -->|reconciles| project_api
-    project_api -->|declares gateway| gateway
-
-    daemon <-->|private services| peer
-    daemon <-->|CONNECT-IP| gateway
-    daemon -.-> relay
-    peer -.-> relay
-    gateway -.-> relay
-```
+![Connect deployment topology](../diagrams/deployment-topology.png)
 
 The plugin and daemon run on each user device. The controller runs once in the
 Milo management cluster. Project resources live in the project control plane,

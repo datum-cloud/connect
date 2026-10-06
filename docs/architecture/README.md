@@ -30,36 +30,7 @@ through the Connect controller.
 
 ## System Context
 
-```mermaid
-flowchart LR
-    user[User or automation]
-    cli[datumctl Connect plugin]
-    daemon[Connect daemon]
-    helper[Privileged network helper]
-    api[Project control plane]
-    controller[Connect controller]
-    compute[Compute service]
-    gateway[CONNECT-IP gateway]
-    peer[Peer Connector]
-    relay[iroh relay]
-    vpc[Project VPC]
-    app[Local application]
-
-    user --> cli
-    cli -->|loopback HTTP API| daemon
-    daemon -->|serve and dial| app
-    daemon -->|Connector resources| api
-    controller -->|watch and reconcile| api
-    controller -->|gateway Workload| compute
-    compute --> gateway
-    daemon -->|approved adapter request| helper
-    helper -->|TUN or utun| daemon
-    daemon <-->|HTTP/3 over QUIC| peer
-    daemon <-->|CONNECT-IP| gateway
-    daemon -.-> relay
-    peer -.-> relay
-    gateway --> vpc
-```
+![Connect system context](../diagrams/system-overview.png)
 
 The CLI is intentionally stateless. The daemon is the local control point and
 persists desired state before applying it. The project API stores shared
@@ -69,41 +40,7 @@ privileged helper limits native interface changes to pre-approved plans.
 
 ## Deployment Topology
 
-```mermaid
-flowchart LR
-    subgraph device[User device]
-        cli[datumctl-connect<br/>per command]
-        daemon[datum-connect-daemon<br/>persistent user service]
-        helper[network helper<br/>optional root service]
-        cli -->|loopback HTTP| daemon
-        daemon -->|local IPC| helper
-    end
-
-    subgraph management[Milo management cluster]
-        controller[connect-controller<br/>Kubernetes Deployment]
-    end
-
-    subgraph project[Project control plane]
-        api[Project API and Connect resources]
-    end
-
-    subgraph worker[Compute worker and project VPC]
-        gateway[iroh-gateway<br/>Compute Workload]
-        vpc[Project VPC]
-        gateway --> vpc
-    end
-
-    subgraph relays[Relay infrastructure]
-        relay[iroh relay]
-    end
-
-    daemon -->|control-plane API| api
-    controller -->|watch and reconcile| api
-    api -->|Compute schedules Workload| gateway
-    daemon <-->|CONNECT-IP data path| gateway
-    daemon -.->|optional QUIC relay path| relay
-    gateway -.->|optional QUIC relay path| relay
-```
+![Connect deployment topology](../diagrams/deployment-topology.png)
 
 The user-facing plugin runs only for a command. The daemon persists on the user
 device. The controller runs centrally in the Milo management cluster and

@@ -11,22 +11,7 @@ routing; it does not implement the public HTTPProxy control plane.
 
 ## Overview
 
-```mermaid
-flowchart LR
-    daemon[Client device daemon]
-
-    subgraph workload[Gateway Compute Workload]
-        gateway[iroh-gateway]
-        tun[Gateway TUN]
-        gateway --> tun
-    end
-
-    vpc[Project VPC]
-    destination[VPC destination]
-
-    daemon <-->|authenticated CONNECT-IP| gateway
-    tun --> vpc --> destination
-```
+![Managed gateway architecture](../diagrams/managed-gateway.png)
 
 The gateway process is the only Connect-managed cloud component in the packet
 path. The Connect controller and project API prepare its identity and grants but

@@ -1,0 +1,32 @@
+@startuml client-device
+!$NEW_C4_STYLE = 1
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+!include datum-theme.puml
+
+LAYOUT_LEFT_RIGHT()
+
+Person(user, "User or Automation", "Runs Connect commands and local applications")
+
+System_Boundary(device, "Client Device") {
+    Container(cli, "datumctl-connect", "Go CLI plugin", "Runs for one command and calls the daemon")
+    Container(daemon, "datum-connect-daemon", "Rust service", "Persists intent and owns identity, reconciliation, listeners, and transports")
+    Container(helper, "Network Helper", "Privileged local service", "Optionally owns approved interfaces and routes")
+    Container(adapter, "Native IP Adapter", "TUN, utun, or Wintun", "Connects approved host routes to CONNECT-IP")
+    Container_Ext(app, "Local Application", "TCP, UDP, or IP", "Application published through or connected by Connect")
+}
+
+System_Ext(project_api, "Project Control Plane", "Stores shared identity, discovery, and attachment resources")
+System_Ext(remote, "Peer or Managed Gateway", "Authenticated transport endpoint")
+
+Rel(user, cli, "Runs")
+Rel(user, app, "Uses")
+Rel(cli, daemon, "Sends authenticated commands", "Loopback HTTP")
+Rel(daemon, app, "Forwards local traffic", "TCP or UDP")
+Rel(daemon, helper, "Requests an exact approved plan", "Authenticated local IPC")
+Rel(helper, adapter, "Creates and owns")
+Rel(daemon, adapter, "Exchanges IP packets")
+Rel(daemon, project_api, "Reconciles Connector resources", "HTTPS")
+Rel(daemon, remote, "Carries private services or IP packets", "HTTP/3 over QUIC")
+
+SHOW_LEGEND()
+@enduml
