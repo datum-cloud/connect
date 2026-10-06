@@ -353,6 +353,24 @@ func TestApprovalPlanCannotHideAdditionalHostPairs(t *testing.T) {
 	}
 }
 
+func TestManagedPlanRequiresDisplayedExactPlanAndOneTimePolicy(t *testing.T) {
+	plan := networkPlan{Network: "vpc", ManagedGateway: true}
+	plan.Binding.Interface = "dc0123456789"
+	plan.Binding.Address = "fd60::10/128"
+	plan.Binding.PeerAddress = "fd60::1/128"
+	plan.Binding.MTU = 1280
+	plan.Binding.Routes = []string{"fd20:27::/48"}
+	plan.ManagedApproval = &daemonservice.InterfaceApproval{InterfaceName: plan.Binding.Interface, AssignedAddress: plan.Binding.Address, PeerAddress: plan.Binding.PeerAddress, MTU: plan.Binding.MTU, Routes: plan.Binding.Routes}
+	plan.HelperConfig.ManagedPolicy = &daemonservice.ManagedPolicy{ClientOnly: true}
+	if err := validateNetworkPlan(plan, "vpc"); err != nil {
+		t.Fatal(err)
+	}
+	plan.ManagedApproval.Routes = []string{"fd20::/16"}
+	if validateNetworkPlan(plan, "vpc") == nil {
+		t.Fatal("accepted a managed plan that hid a broader route")
+	}
+}
+
 func TestNetworkApprovalShowsOnlyActionableAccess(t *testing.T) {
 	plan := networkPlan{}
 	plan.Network = "staging-vpc-mac"

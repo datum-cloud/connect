@@ -61,7 +61,7 @@ impl PacketDevice {
         validate(name, address, mtu, routes)?;
         if let Some(socket) = helper {
             #[cfg(unix)]
-            return helper::Client::connect_approved(
+            return helper::Client::connect_managed(
                 socket,
                 helper::Approval {
                     interface_name: name.into(),

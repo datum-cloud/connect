@@ -156,10 +156,15 @@ the explicit packet rules. Interactive `join` offers administrator-approved
 installation of the separate networking helper. Later, use `join friend` to
 reuse the saved configuration. Direct peer attachments remain ephemeral. A
 successful managed VPC join persists attachment intent and automatically
-recreates its CONNECT-IP session when the daemon or project resumes. The helper
-still enforces the exact administrator-approved address and routes; changed or
-missing approval fails closed and requires an interactive join. `connect doctor`
-checks helper readiness without opening an interface.
+recreates its CONNECT-IP session when the daemon or project resumes. On the
+first managed VPC join, the administrator approves a root-owned, client-only
+networking policy for the user. Later managed joins within its IPv6 ULA address
+and route ranges, route-width and MTU limits, ephemeral interface behavior, and
+active-attachment limits do not prompt. Plans outside that policy fail closed.
+Direct peers and route advertisement continue to require exact approvals. The
+helper receives typed plans over local IPC, never cloud credentials, URLs,
+commands, or arbitrary interface operations. `connect doctor` checks helper
+readiness without opening an interface.
 `ping`
 currently probes a Connector, not an arbitrary VPC address. Native adapters use
 Linux TUN, macOS utun, and Windows Wintun. On macOS/Linux, the optional

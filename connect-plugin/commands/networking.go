@@ -23,11 +23,12 @@ import (
 var ensureNetworking = daemonservice.EnsureNetworking
 
 type networkPlan struct {
-	Network         string                        `json:"network"`
-	ManagedGateway  bool                          `json:"managed_gateway"`
-	Gateway         string                        `json:"gateway_resource"`
-	GatewayLocation string                        `json:"gateway_location"`
-	HelperConfig    daemonservice.HelperApprovals `json:"helper_config"`
+	Network         string                           `json:"network"`
+	ManagedGateway  bool                             `json:"managed_gateway"`
+	Gateway         string                           `json:"gateway_resource"`
+	GatewayLocation string                           `json:"gateway_location"`
+	HelperConfig    daemonservice.HelperApprovals    `json:"helper_config"`
+	ManagedApproval *daemonservice.InterfaceApproval `json:"managed_approval,omitempty"`
 	Binding         struct {
 		Peer            string        `json:"peer"`
 		Address         string        `json:"assigned_address"`
@@ -110,7 +111,17 @@ func writeNetworkApproval(out io.Writer, plan networkPlan, peer string) {
 		if len(plan.Binding.Routes) > 0 {
 			fmt.Fprintf(out, "Routes through VPC gateway: %s\n", strings.Join(plan.Binding.Routes, ", "))
 		}
-		fmt.Fprintln(out, "This approves the local interface and these routes. VPC firewall rules still control access to workloads.")
+		policy := plan.HelperConfig.ManagedPolicy
+		if policy != nil {
+			fmt.Fprintln(out, "\nOne-time managed VPC networking approval:")
+			fmt.Fprintf(out, "  User: current user (uid %d)\n", plan.HelperConfig.AllowedUID)
+			fmt.Fprintf(out, "  Addresses: %s\n", strings.Join(policy.AddressRanges, ", "))
+			fmt.Fprintf(out, "  Routes: %s (/%d or narrower)\n", strings.Join(policy.RouteRanges, ", "), policy.MinimumRoutePrefix)
+			fmt.Fprintf(out, "  MTU: %d-%d; active VPCs: up to %d\n", policy.MinimumMTU, policy.MaximumMTU, policy.MaximumActiveAttachments)
+			fmt.Fprintln(out, "  Interfaces: ephemeral Datum-managed clients; no route advertisement")
+			fmt.Fprintln(out, "Later compliant managed VPC joins will not ask for an administrator password.")
+		}
+		fmt.Fprintln(out, "VPC firewall rules still control access to workloads.")
 		return
 	}
 	if len(plan.Binding.Routes) > 0 {
@@ -166,7 +177,20 @@ func waitForPeer(ctx context.Context, client *connectapi.Client, project, networ
 }
 
 func validateNetworkPlan(plan networkPlan, network string) error {
-	if plan.Network != network || len(plan.HelperConfig.Approvals) != 1 {
+	if plan.Network != network {
+		return fmt.Errorf("daemon returned an ambiguous networking approval plan")
+	}
+	if plan.ManagedGateway {
+		if len(plan.HelperConfig.Approvals) != 0 || plan.HelperConfig.ManagedPolicy == nil || plan.ManagedApproval == nil {
+			return fmt.Errorf("daemon returned an ambiguous managed networking policy")
+		}
+		approval := *plan.ManagedApproval
+		if approval.InterfaceName != plan.Binding.Interface || approval.AssignedAddress != plan.Binding.Address || approval.PeerAddress != plan.Binding.PeerAddress || approval.MTU != plan.Binding.MTU || !slices.Equal(approval.Routes, plan.Binding.Routes) || len(approval.AdvertiseRoutes) != 0 {
+			return fmt.Errorf("daemon managed approval differs from displayed attachment; nothing was elevated")
+		}
+		return nil
+	}
+	if len(plan.HelperConfig.Approvals) != 1 || plan.HelperConfig.ManagedPolicy != nil {
 		return fmt.Errorf("daemon returned an ambiguous networking approval plan")
 	}
 	approval := plan.HelperConfig.Approvals[0]
@@ -200,7 +224,7 @@ func newJoin(opts *options) *cobra.Command {
 	var routes, advertise []string
 	var ping, upgrade, replaceApproval, wait, noWait bool
 	var waitTimeout time.Duration
-	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC network or direct Connector", Long: "Join NETWORK through a gateway in the nearest Datum location. If the project has no gateway there, Connect creates one using the operator's default gateway class. Connect creates or reuses this device's ConnectNetworkBinding, then asks for Administrator approval before installing the local interface and exact approved routes.\n\nIf the project does not manage NETWORK through a VPC gateway, pass --peer and explicit traffic permissions for direct Connector setup. Both peers use the same network name and approve each other. Routed direct attachments wait for the peer by default.\n\nSuccessful managed VPC attachments reconnect when the daemon or project resumes. Route changes outside the existing helper approval fail closed and require interactive approval. Direct peer attachments remain ephemeral. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC gateway or direct Connector", Long: "Join NETWORK through a gateway in the nearest Datum location. If the project has no gateway there, Connect creates one using the operator's default gateway class. Connect creates or reuses this device's ConnectNetworkBinding. The first managed VPC join asks for one-time administrator approval of a constrained client networking policy; later compliant VPC joins do not prompt.\n\nIf the project does not manage NETWORK through a VPC gateway, pass --peer and explicit traffic permissions for direct Connector setup. Both peers use the same network name and approve each other. Routed direct attachments wait for the peer by default.\n\nSuccessful managed VPC attachments reconnect when the daemon or project resumes. Plans outside the managed policy fail closed. Direct peer and route-advertising attachments remain ephemeral and require exact approval. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if wait && noWait {
 			return fmt.Errorf("choose either --wait or --no-wait")
 		}
@@ -298,7 +322,10 @@ func newJoin(opts *options) *cobra.Command {
 				return err
 			}
 			writeNetworkApproval(cmd.ErrOrStderr(), plan, peer)
-			question := "Install the privileged helper and approve this access?"
+			question := "Install the privileged helper and approve managed VPC networking for this user?"
+			if !plan.ManagedGateway {
+				question = "Install the privileged helper and approve this exact attachment?"
+			}
 			if upgrade {
 				question = "Upgrade the helper? Active IP attachments will disconnect; services and local ports stay running."
 			} else if replaceApproval {

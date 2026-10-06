@@ -712,8 +712,13 @@ impl Control for RealControl {
             };
             let config = connect_ip_adapter::helper::Config {
                 allowed_uid: unsafe { libc::geteuid() },
-                approvals: vec![approval],
+                approvals: vec![],
+                managed_policy: Some(
+                    connect_ip_adapter::helper::ManagedPolicy::managed_vpc_default(),
+                ),
             };
+            config.managed_policy.as_ref().expect("managed policy").approve(&approval)
+                .map_err(|error| ApiError::bad_request(format!("VPC attachment is outside the safe managed networking policy: {error}. No interface or route was created; configure IPv6 ULA client addresses and routes /16 or narrower, then retry")))?;
             config
                 .validate()
                 .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -734,7 +739,8 @@ impl Control for RealControl {
                     "allow_outbound": []
                 },
                 "helper_socket": crate::networking::helper_socket()?,
-                "helper_config": config
+                "helper_config": config,
+                "managed_approval": approval
             })));
         }
         #[cfg(not(unix))]
