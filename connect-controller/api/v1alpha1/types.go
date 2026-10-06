@@ -39,8 +39,8 @@ type ConnectorClassList struct {
 }
 
 // ConnectGatewayClass declares an operator-provided managed gateway service
-// profile. Concrete Compute details live in the referenced operator ConfigMap,
-// rather than in project-owned ConnectGateway resources.
+// profile installed into an entitled project. Concrete Compute details live in
+// the referenced operator ConfigMap rather than in project-owned resources.
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:subresource:status
@@ -191,7 +191,7 @@ type ConnectGateway struct {
 }
 
 type ConnectGatewaySpec struct {
-	// GatewayClassRef names a cluster-scoped ConnectGatewayClass.
+	// GatewayClassRef names a cluster-scoped ConnectGatewayClass in this project.
 	// +kubebuilder:validation:Required
 	GatewayClassRef string `json:"gatewayClassRef"`
 	// +kubebuilder:validation:Required

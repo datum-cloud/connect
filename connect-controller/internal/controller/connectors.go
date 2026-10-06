@@ -56,13 +56,11 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	if err := builder.ControllerManagedBy(local).Named("connectorclass").For(&connectv1alpha1.ConnectorClass{}).Complete(&ConnectorClassReconciler{client: local.GetClient()}); err != nil {
 		return fmt.Errorf("register ConnectorClass controller: %w", err)
 	}
-	if err := builder.ControllerManagedBy(local).Named("connectgatewayclass").For(&connectv1alpha1.ConnectGatewayClass{}).Complete(&GatewayClassReconciler{client: local.GetClient()}); err != nil {
-		return fmt.Errorf("register ConnectGatewayClass controller: %w", err)
-	}
 	for _, item := range []struct {
 		name string
 		obj  client.Object
 	}{
+		{"connectgatewayclass", &connectv1alpha1.ConnectGatewayClass{}},
 		{"connector", &connectv1alpha1.Connector{}},
 		{"connectoradvertisement", &connectv1alpha1.ConnectorAdvertisement{}},
 		{"connectgateway", &connectv1alpha1.ConnectGateway{}},
@@ -90,6 +88,19 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 	key := req.NamespacedName
 	// Each registered controller reconciles its own kind; absent objects are normal.
 	switch r.kind {
+	case "connectgatewayclass":
+		var obj connectv1alpha1.ConnectGatewayClass
+		if err := c.Get(ctx, key, &obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		if err := reconcileGatewayClass(ctx, c, r.classClient, &obj); err != nil {
+			logger.Error(err, "reconcile ConnectGatewayClass")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	case "connector":
 		var obj connectv1alpha1.Connector
 		if err := c.Get(ctx, key, &obj); err != nil {
@@ -168,23 +179,7 @@ func (r *ConnectorClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 const gatewayControllerName = "connect.datum.net/gateway-controller"
 
-type GatewayClassReconciler struct{ client client.Client }
-
-func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var obj connectv1alpha1.ConnectGatewayClass
-	if err := r.client.Get(ctx, req.NamespacedName, &obj); err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, err
-	}
-	if err := reconcileGatewayClass(ctx, r.client, &obj); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{RequeueAfter: time.Minute}, nil
-}
-
-func reconcileGatewayClass(ctx context.Context, c client.Client, obj *connectv1alpha1.ConnectGatewayClass) error {
+func reconcileGatewayClass(ctx context.Context, projectClient, parameterClient client.Client, obj *connectv1alpha1.ConnectGatewayClass) error {
 	before := obj.Status.DeepCopy()
 	accepted, acceptedReason, acceptedMessage := metav1.ConditionTrue, "Accepted", "gateway class is accepted by this controller"
 	ready, readyReason, readyMessage := metav1.ConditionTrue, "Ready", "gateway class implementation parameters are available"
@@ -194,7 +189,7 @@ func reconcileGatewayClass(ctx context.Context, c client.Client, obj *connectv1a
 	} else if err := validateGatewayClassSpec(obj); err != nil {
 		accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidParameters", err.Error()
 		ready, readyReason, readyMessage = metav1.ConditionFalse, "NotAccepted", "gateway class configuration is invalid"
-	} else if _, err := loadGatewayClassConfig(ctx, c, obj); err != nil {
+	} else if _, err := loadGatewayClassConfig(ctx, parameterClient, obj); err != nil {
 		if !apierrors.IsNotFound(err) && !errors.As(err, new(*gatewayClassParameterError)) {
 			return err
 		}
@@ -206,7 +201,7 @@ func reconcileGatewayClass(ctx context.Context, c client.Client, obj *connectv1a
 	if reflect.DeepEqual(before, &obj.Status) {
 		return nil
 	}
-	return c.Status().Update(ctx, obj)
+	return projectClient.Status().Update(ctx, obj)
 }
 
 func reconcileClass(ctx context.Context, c client.Client, obj *connectv1alpha1.ConnectorClass) error {
@@ -389,21 +384,21 @@ func loadGatewayClassConfig(ctx context.Context, c client.Client, class *connect
 	return config, nil
 }
 
-func reconcileGateway(ctx context.Context, c, classClient client.Client, project string, obj *connectv1alpha1.ConnectGateway, now time.Time) error {
+func reconcileGateway(ctx context.Context, c, parameterClient client.Client, project string, obj *connectv1alpha1.ConnectGateway, now time.Time) error {
 	before := obj.Status.DeepCopy()
 	status, reason, message := metav1.ConditionUnknown, "Provisioning", "gateway resources are being reconciled"
 	if err := validateGatewaySpec(obj.Spec); err != nil {
 		status, reason, message = metav1.ConditionFalse, "InvalidSpec", err.Error()
 	} else {
 		var class connectv1alpha1.ConnectGatewayClass
-		err := classClient.Get(ctx, types.NamespacedName{Name: obj.Spec.GatewayClassRef}, &class)
+		err := c.Get(ctx, types.NamespacedName{Name: obj.Spec.GatewayClassRef}, &class)
 		if apierrors.IsNotFound(err) {
-			status, reason, message = metav1.ConditionFalse, "GatewayClassNotFound", "referenced ConnectGatewayClass does not exist in the management cluster"
+			status, reason, message = metav1.ConditionFalse, "GatewayClassNotFound", "referenced ConnectGatewayClass does not exist in this project"
 		} else if err != nil {
 			return err
 		} else if class.Spec.ControllerName != gatewayControllerName || !meta.IsStatusConditionTrue(class.Status.Conditions, "Ready") {
 			status, reason, message = metav1.ConditionFalse, "GatewayClassNotReady", "referenced ConnectGatewayClass is not ready"
-		} else if config, err := loadGatewayClassConfig(ctx, classClient, &class); err != nil {
+		} else if config, err := loadGatewayClassConfig(ctx, parameterClient, &class); err != nil {
 			if !apierrors.IsNotFound(err) && !errors.As(err, new(*gatewayClassParameterError)) {
 				return err
 			}

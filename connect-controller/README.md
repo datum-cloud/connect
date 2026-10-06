@@ -6,9 +6,10 @@ bindings; the Rust daemon and `datumctl` plugin consume the binding API.
 
 ## Resource ownership
 
-`ConnectorClass` and `ConnectGatewayClass` are cluster-scoped platform
-configuration. A `ConnectGatewayClass` names this controller, describes its
-observable lifecycle policy, and references an operator-owned ConfigMap for
+`ConnectorClass` is cluster-scoped platform configuration in the management
+cluster. `ConnectGatewayClass` is installed cluster-wide in each entitled
+project; it names this controller, describes its observable lifecycle policy,
+and references an operator-owned ConfigMap in the controller cluster for
 private implementation parameters such as the gateway image and Compute
 instance type. `Connector`, `ConnectorAdvertisement`, and `ConnectGateway` are
 project resources and carry Milo's

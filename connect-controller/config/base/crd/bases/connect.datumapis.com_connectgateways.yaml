@@ -52,7 +52,8 @@ spec:
           spec:
             properties:
               gatewayClassRef:
-                description: GatewayClassRef names a cluster-scoped ConnectGatewayClass.
+                description: GatewayClassRef names a cluster-scoped ConnectGatewayClass
+                  in this project.
                 type: string
               locationRef:
                 type: string

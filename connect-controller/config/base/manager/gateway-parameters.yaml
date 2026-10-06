@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: standard-gateway
+  namespace: connect-system
+data:
+  image: ghcr.io/datum-cloud/iroh-gateway:main
+  instanceType: datumcloud/d1-standard-2

@@ -1,0 +1,19 @@
+apiVersion: services.miloapis.com/v1alpha1
+kind: Service
+metadata:
+  name: connect.datumapis.com
+spec:
+  serviceName: connect.datumapis.com
+  phase: Published
+  displayName: Connect
+  description: Securely connect devices and private networks to Datum Cloud projects.
+  dependencies:
+  - serviceRef:
+      name: compute
+  - serviceRef:
+      name: networking-datumapis-com
+  owner:
+    producerProjectRef:
+      name: datum-cloud
+  enablementPolicy:
+    mode: GatedByProvider

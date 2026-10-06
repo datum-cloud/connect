@@ -26,8 +26,8 @@ spec:
       openAPIV3Schema:
         description: |-
           ConnectGatewayClass declares an operator-provided managed gateway service
-          profile. Concrete Compute details live in the referenced operator ConfigMap,
-          rather than in project-owned ConnectGateway resources.
+          profile installed into an entitled project. Concrete Compute details live in
+          the referenced operator ConfigMap rather than in project-owned resources.
         properties:
           apiVersion:
             description: |-
