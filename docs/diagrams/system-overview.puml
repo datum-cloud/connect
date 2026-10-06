@@ -1,0 +1,26 @@
+@startuml system-overview
+!$NEW_C4_STYLE = 1
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+!include datum-theme.puml
+
+LAYOUT_LEFT_RIGHT()
+
+Person(user, "Connect User", "Publishes services, reaches peers, and joins project networks")
+
+System(connect, "Datum Connect", "Maintains device identity and creates authenticated private service or IP paths")
+
+System_Ext(local_apps, "Local Applications", "TCP, UDP, and IP clients or servers on user devices")
+System_Ext(project_api, "Datum Project Control Plane", "Stores Connect identity, discovery, gateway, and binding resources")
+System_Ext(peer, "Peer Connector", "Another enrolled device serving or consuming private traffic")
+System_Ext(gateway, "Connect Gateway", "Terminates CONNECT-IP and forwards approved traffic into a project VPC")
+System_Ext(relay, "iroh Relay Infrastructure", "Assists QUIC connectivity when endpoints cannot connect directly")
+
+Rel(user, connect, "Operates", "datumctl connect")
+Rel(connect, local_apps, "Publishes or connects")
+Rel(connect, project_api, "Reconciles identity and desired state", "HTTPS")
+Rel(connect, peer, "Carries private TCP or UDP", "HTTP/3 over QUIC")
+Rel(connect, gateway, "Carries approved IP packets", "CONNECT-IP")
+Rel(connect, relay, "Uses when a direct path is unavailable", "Encrypted QUIC")
+
+SHOW_LEGEND()
+@enduml
