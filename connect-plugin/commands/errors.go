@@ -34,6 +34,8 @@ func friendlyError(cmd *cobra.Command, opts *options, projectID string, err erro
 		fmt.Fprintf(cmd.ErrOrStderr(), "connect: %v\n", response)
 	}
 	switch response.Code {
+	case "network_not_found":
+		return fmt.Errorf("%s\nCheck: datumctl get networks --project %q", strings.TrimSpace(response.Message), projectID)
 	case "service_conflict":
 		// An expected configuration conflict already includes recovery steps.
 		// Verbose mode still emits HTTP status and the request ID above.

@@ -23,10 +23,12 @@ import (
 var ensureNetworking = daemonservice.EnsureNetworking
 
 type networkPlan struct {
-	Network        string                        `json:"network"`
-	ManagedGateway bool                          `json:"managed_gateway"`
-	HelperConfig   daemonservice.HelperApprovals `json:"helper_config"`
-	Binding        struct {
+	Network         string                        `json:"network"`
+	ManagedGateway  bool                          `json:"managed_gateway"`
+	Gateway         string                        `json:"gateway_resource"`
+	GatewayLocation string                        `json:"gateway_location"`
+	HelperConfig    daemonservice.HelperApprovals `json:"helper_config"`
+	Binding         struct {
 		Peer            string        `json:"peer"`
 		Address         string        `json:"assigned_address"`
 		PeerAddress     string        `json:"peer_address"`
@@ -102,6 +104,9 @@ func writeNetworkApproval(out io.Writer, plan networkPlan, peer string) {
 		fmt.Fprintf(out, "Peer: %s\n", peerLabel)
 	}
 	if plan.ManagedGateway {
+		if plan.Gateway != "" && plan.GatewayLocation != "" {
+			fmt.Fprintf(out, "VPC gateway: %s (%s)\n", plan.Gateway, plan.GatewayLocation)
+		}
 		if len(plan.Binding.Routes) > 0 {
 			fmt.Fprintf(out, "Routes through VPC gateway: %s\n", strings.Join(plan.Binding.Routes, ", "))
 		}
@@ -195,7 +200,7 @@ func newJoin(opts *options) *cobra.Command {
 	var routes, advertise []string
 	var ping, upgrade, replaceApproval, wait, noWait bool
 	var waitTimeout time.Duration
-	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC gateway or direct Connector", Long: "Join the ready ConnectGateway configured for NETWORK. Connect creates or reuses this device's ConnectNetworkBinding, then asks for Administrator approval before installing the local interface and exact approved routes.\n\nIf no managed gateway exists, pass --peer and explicit traffic permissions\nfor direct Connector setup. Both peers use the same network name and approve\neach other. Routed direct attachments wait for the peer by default.\n\nSuccessful managed VPC attachments reconnect when the daemon or project resumes. Route changes outside the existing helper approval fail closed and require interactive approval. Direct peer attachments remain ephemeral. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC network or direct Connector", Long: "Join NETWORK through a gateway in the nearest Datum location. If the project has no gateway there, Connect creates one using the operator's default gateway class. Connect creates or reuses this device's ConnectNetworkBinding, then asks for Administrator approval before installing the local interface and exact approved routes.\n\nIf the project does not manage NETWORK through a VPC gateway, pass --peer and explicit traffic permissions for direct Connector setup. Both peers use the same network name and approve each other. Routed direct attachments wait for the peer by default.\n\nSuccessful managed VPC attachments reconnect when the daemon or project resumes. Route changes outside the existing helper approval fail closed and require interactive approval. Direct peer attachments remain ephemeral. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if wait && noWait {
 			return fmt.Errorf("choose either --wait or --no-wait")
 		}

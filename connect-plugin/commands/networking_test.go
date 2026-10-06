@@ -137,6 +137,34 @@ func TestRoutedJoinNoWaitReturnsImmediately(t *testing.T) {
 	}
 }
 
+func TestJoinReportsMissingNetworkWithDatumctlLookup(t *testing.T) {
+	t.Setenv("DATUM_CONNECT_TOKEN", "local-test-token")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/health":
+			io.WriteString(w, `{"status":"ok"}`)
+		case "/v1/networks":
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"error":"Network \"missing-vpc\" was not found in this project.","code":"network_not_found"}`)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cmd := newJoin(&options{baseURL: server.URL, timeout: time.Second})
+	cmd.Flags().String("project", "datum-cloud", "")
+	cmd.Flags().String("output", "json", "")
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"missing-vpc"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "Network") || !strings.Contains(err.Error(), `datumctl get networks --project "datum-cloud"`) {
+		t.Fatalf("join error=%v, want missing-network guidance and a CLI lookup", err)
+	}
+}
+
 func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 	for _, test := range []struct {
 		name, input            string
@@ -348,12 +376,12 @@ func TestNetworkApprovalShowsOnlyActionableAccess(t *testing.T) {
 }
 
 func TestManagedGatewayApprovalExplainsRouteAndFirewallBoundary(t *testing.T) {
-	plan := networkPlan{Network: "staging-vpc", ManagedGateway: true}
+	plan := networkPlan{Network: "staging-vpc", ManagedGateway: true, Gateway: "connect-vpc-iad", GatewayLocation: "IAD"}
 	plan.Binding.Peer = "85fc4c10068b0c1a4b267d1b2a429300a512f1507ada41ea7d5b6149f44f40aa"
 	plan.Binding.Routes = []string{"fd20:0:27::/48"}
 	var output bytes.Buffer
 	writeNetworkApproval(&output, plan, "")
-	for _, want := range []string{"Routes through VPC gateway: fd20:0:27::/48", "VPC firewall rules still control access"} {
+	for _, want := range []string{"VPC gateway: connect-vpc-iad (IAD)", "Routes through VPC gateway: fd20:0:27::/48", "VPC firewall rules still control access"} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("approval output %q does not contain %q", output.String(), want)
 		}

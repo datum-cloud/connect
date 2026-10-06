@@ -720,6 +720,8 @@ impl Control for RealControl {
             return Ok(Some(serde_json::json!({
                 "network": network,
                 "managed_gateway": true,
+                "gateway_resource": status["gateway"],
+                "gateway_location": status["gateway_location"],
                 "binding": {
                     "peer": status["gatewayEndpointID"],
                     "assigned_address": assigned_address,
@@ -1131,6 +1133,8 @@ impl Control for RealControl {
             }
             let mut result = attachment.status().await;
             result["gateway"] = serde_json::json!(endpoint_id);
+            result["gateway_resource"] = status["gateway"].clone();
+            result["gateway_location"] = status["gateway_location"].clone();
             result["routes"] = serde_json::json!(routes);
             result["managed_gateway"] = serde_json::json!(true);
             result["persistent"] = serde_json::json!(true);
@@ -1598,10 +1602,17 @@ fn cloud_error(error: connect_lib::successor::Error) -> ApiError {
     let status = match error {
         Error::Invalid(_) => axum::http::StatusCode::BAD_REQUEST,
         Error::Unsupported(_) => axum::http::StatusCode::NOT_IMPLEMENTED,
+        Error::NotFound(_) => axum::http::StatusCode::NOT_FOUND,
         Error::Ownership(_) => axum::http::StatusCode::CONFLICT,
         _ => axum::http::StatusCode::BAD_GATEWAY,
     };
-    ApiError::new(status, error.to_string())
+    let message = error.to_string();
+    let api_error = ApiError::new(status, message);
+    if matches!(error, Error::NotFound(_)) {
+        api_error.with_code("network_not_found")
+    } else {
+        api_error
+    }
 }
 
 fn transport_error(error: connect_transport::Error) -> ApiError {

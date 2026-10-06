@@ -154,6 +154,19 @@ func TestGatewayClassReportsParameterReadiness(t *testing.T) {
 	}
 }
 
+func TestGatewayClassRejectsUnsafeRelayURLs(t *testing.T) {
+	class := &connectv1alpha1.ConnectGatewayClass{
+		Spec: connectv1alpha1.ConnectGatewayClassSpec{
+			ControllerName: gatewayControllerName,
+			ParametersRef:  connectv1alpha1.ConnectGatewayClassParametersReference{Name: "standard", Namespace: "connect-system"},
+			RelayURLs:      []string{"http://relay.example"},
+		},
+	}
+	if err := validateGatewayClassSpec(class); err == nil || !strings.Contains(err.Error(), "HTTPS URL") {
+		t.Fatalf("validateGatewayClassSpec error=%v, want HTTPS relay URL validation", err)
+	}
+}
+
 func TestOnDemandGatewayScalesBetweenZeroAndOne(t *testing.T) {
 	ctx := context.Background()
 	t0 := time.Date(2026, time.October, 5, 12, 0, 0, 0, time.UTC)

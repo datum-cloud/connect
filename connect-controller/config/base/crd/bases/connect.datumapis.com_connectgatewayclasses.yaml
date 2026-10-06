@@ -52,6 +52,17 @@ spec:
                 description: ControllerName identifies the controller responsible
                   for this class.
                 type: string
+              default:
+                description: |-
+                  Default marks the class selected by `datumctl connect join` when
+                  it creates a gateway automatically. At most one Ready class should
+                  be marked default.
+                type: boolean
+              relayURLs:
+                description: RelayURLs pins gateways created from this class to operator-managed relays.
+                items:
+                  type: string
+                type: array
               parametersRef:
                 description: |-
                   ParametersRef selects an operator-owned ConfigMap. Its image key is

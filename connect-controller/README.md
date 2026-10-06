@@ -139,6 +139,8 @@ metadata:
   name: standard
 spec:
   controllerName: connect.datum.net/gateway-controller
+  default: true
+  relayURLs: [https://<staging-relay-host>]
   parametersRef:
     namespace: connect-system
     name: standard-gateway
@@ -175,6 +177,13 @@ spec:
   gatewayRef: staging-vpc
   connectorRef: laptop
 ```
+
+Mark one Ready class as the default to let `datumctl connect join <network>`
+provision a gateway automatically. The daemon reads the nearest Datum edge colo
+from `edge.datum.net`, uses the Network's assigned IPv6 prefix as the gateway
+route, and creates a project ConnectGateway in that location. Keep the image,
+instance type, relay URLs, and scaling profile in operator-managed class
+configuration; do not put Compute sizing in the project-owned command flow.
 
 Creating the ConnectNetworkBinding is the project authorization boundary. Its
 status publishes the client and gateway `/128` addresses, gateway endpoint ID,

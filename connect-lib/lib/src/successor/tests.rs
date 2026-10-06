@@ -3,6 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 enum Reply {
     Json(u16, Value),
+    Text(u16, String),
     EchoCreated,
 }
 
@@ -48,16 +49,16 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
                 .to_string();
             let body = serde_json::from_slice::<Value>(&bytes[header_end..]).unwrap_or(Value::Null);
             let (status, response) = match reply {
-                Reply::Json(status, value) => (status, value),
+                Reply::Json(status, value) => (status, value.to_string()),
+                Reply::Text(status, value) => (status, value),
                 Reply::EchoCreated => {
                     let mut value = body.clone();
                     value["metadata"]["uid"] = json!("service-uid");
                     value["metadata"]["resourceVersion"] = json!("1");
-                    (201, value)
+                    (201, value.to_string())
                 }
             };
             requests.push((first_line, body));
-            let response = response.to_string();
             stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
         }
         requests
@@ -80,6 +81,14 @@ fn client(base: &str) -> CloudConnector {
         iroh::SecretKey::from_bytes(&[7; 32]).public().to_string(),
     )
     .unwrap()
+}
+
+fn set_edge_url(cloud: &mut CloudConnector, base: &str) {
+    cloud.edge_info_url = format!("{base}/edge");
+}
+
+fn edge_location() -> Reply {
+    Reply::Text(200, "colo=IAD\nloc=US\n".into())
 }
 
 fn connector() -> Value {
@@ -129,7 +138,7 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
     });
     let gateway = json!({
         "metadata":{"name":"vpc-gateway","generation":2},
-        "spec":{"networkRef":"staging-vpc"},
+        "spec":{"networkRef":"staging-vpc","locationRef":"IAD"},
         "status":{"endpointID":iroh::SecretKey::from_bytes(&[9; 32]).public().to_string(),"conditions":[{"type":"Ready","status":"True","observedGeneration":2}]}
     });
     let binding_name = network_binding_name("staging-vpc", &format!("connect-{}", &peer[..40]));
@@ -145,6 +154,8 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
     let (base, task) = server(vec![
         token(),
         Reply::Json(200, json!({"items":[gateway]})),
+        Reply::Json(200, json!({"metadata":{"name":"staging-vpc"}})),
+        edge_location(),
         Reply::Json(200, connect_connector),
         Reply::Json(200, lease),
         Reply::EchoCreated,
@@ -153,7 +164,8 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
         Reply::Json(200, accepted_binding),
     ])
     .await;
-    let cloud = client(&base);
+    let mut cloud = client(&base);
+    set_edge_url(&mut cloud, &base);
     let result = cloud
         .join_gateway_network("staging-vpc", &ConnectionDetails::default())
         .await
@@ -174,6 +186,103 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
             && line.contains("/leases/connect-lease")
             && body["metadata"]["resourceVersion"] == "4"
     }));
+}
+
+#[tokio::test]
+async fn joining_network_creates_a_gateway_in_the_edge_selected_location() {
+    let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let connector = json!({
+        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
+        "spec":{"publicKey":peer},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let class = json!({
+        "metadata":{"name":"standard","generation":1},
+        "spec":{"controllerName":"connect.datum.net/gateway-controller","default":true,"relayURLs":["https://relay.staging.datum.net/"]},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let gateway_name = network_gateway_name("staging-vpc", "IAD");
+    let binding_name = network_binding_name("staging-vpc", &format!("connect-{}", &peer[..40]));
+    let binding = json!({
+        "metadata":{"name":binding_name,"uid":"binding-uid","resourceVersion":"1","generation":1},
+        "spec":{"gatewayRef":gateway_name,"connectorRef":format!("connect-{}", &peer[..40])},
+        "status":{"endpointID":iroh::SecretKey::from_bytes(&[9; 32]).public().to_string(),"assignedAddress":"fd79::1/128","peerAddress":"fd79::2/128","routes":["fd20:0:27::/48"],"conditions":[{"type":"Accepted","status":"True","reason":"Approved","observedGeneration":1}]}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, json!({"items":[]})),
+        Reply::Json(
+            200,
+            json!({"status":{"ipam":{"ipv6Prefix":"fd20:0:27::/48"}}}),
+        ),
+        edge_location(),
+        Reply::Json(200, json!({"items":[class]})),
+        Reply::EchoCreated,
+        Reply::Json(200, connector),
+        Reply::Json(404, json!({})),
+        Reply::Json(201, binding),
+    ])
+    .await;
+    let mut cloud = client(&base);
+    set_edge_url(&mut cloud, &base);
+    let result = cloud
+        .join_gateway_network("staging-vpc", &ConnectionDetails::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["network"], "staging-vpc");
+    assert_eq!(result["gateway"], gateway_name);
+    assert_eq!(
+        result["gatewayEndpointID"],
+        iroh::SecretKey::from_bytes(&[9; 32]).public().to_string()
+    );
+    let requests = task.await.unwrap();
+    let create_gateway = requests
+        .iter()
+        .find(|(line, _)| line.starts_with("POST ") && line.contains("connectgateways"))
+        .expect("join creates a gateway");
+    assert_eq!(create_gateway.1["metadata"]["name"], gateway_name);
+    assert_eq!(create_gateway.1["spec"]["gatewayClassRef"], "standard");
+    assert_eq!(create_gateway.1["spec"]["networkRef"], "staging-vpc");
+    assert_eq!(create_gateway.1["spec"]["locationRef"], "IAD");
+    assert_eq!(
+        create_gateway.1["spec"]["routes"],
+        json!(["fd20:0:27::/48"])
+    );
+    assert_eq!(
+        create_gateway.1["spec"]["relayURLs"],
+        json!(["https://relay.staging.datum.net/"])
+    );
+    let create_binding = requests
+        .iter()
+        .position(|(line, _)| line.starts_with("POST ") && line.contains("connectnetworkbindings"))
+        .expect("join creates a Connector binding");
+    assert!(
+        requests
+            .iter()
+            .position(|(line, _)| line.starts_with("POST ") && line.contains("connectgateways"))
+            .unwrap()
+            < create_binding
+    );
+}
+
+#[tokio::test]
+async fn joining_a_missing_network_stops_before_edge_lookup_or_gateway_creation() {
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, json!({"items":[]})),
+        Reply::Json(404, json!({})),
+    ])
+    .await;
+    let error = client(&base)
+        .join_gateway_network("not-a-real-network", &ConnectionDetails::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotFound(_)));
+    assert!(error.to_string().contains("not-a-real-network"));
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].0.contains("/networks/not-a-real-network "));
 }
 
 #[tokio::test]
@@ -262,7 +371,7 @@ async fn lease_renewal_retries_resource_version_conflicts() {
 }
 
 #[tokio::test]
-async fn joining_managed_network_waits_for_gateway_readiness_after_a_config_rollout() {
+async fn joining_managed_network_binds_while_gateway_is_provisioning() {
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connect_connector = json!({
         "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
@@ -272,7 +381,7 @@ async fn joining_managed_network_waits_for_gateway_readiness_after_a_config_roll
     let endpoint_id = iroh::SecretKey::from_bytes(&[9; 32]).public().to_string();
     let gateway = json!({
         "metadata":{"name":"vpc-gateway","generation":2},
-        "spec":{"networkRef":"staging-vpc"},
+        "spec":{"networkRef":"staging-vpc","locationRef":"IAD"},
         "status":{"endpointID":endpoint_id,"conditions":[{"type":"Ready","status":"True","observedGeneration":2}]}
     });
     let mut provisioning = gateway.clone();
@@ -288,7 +397,8 @@ async fn joining_managed_network_waits_for_gateway_readiness_after_a_config_roll
     let (base, task) = server(vec![
         token(),
         Reply::Json(200, json!({"items":[provisioning]})),
-        Reply::Json(200, json!({"items":[gateway]})),
+        Reply::Json(200, json!({"metadata":{"name":"staging-vpc"}})),
+        edge_location(),
         Reply::Json(200, connect_connector),
         Reply::Json(200, lease),
         Reply::EchoCreated,
@@ -296,14 +406,16 @@ async fn joining_managed_network_waits_for_gateway_readiness_after_a_config_roll
         Reply::Json(201, created_binding),
     ])
     .await;
-    let result = client(&base)
+    let mut cloud = client(&base);
+    set_edge_url(&mut cloud, &base);
+    let result = cloud
         .join_gateway_network("staging-vpc", &ConnectionDetails::default())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(result["gateway"], "vpc-gateway");
     assert_eq!(result["assignedAddress"], "fd79::1/128");
-    assert_eq!(task.await.unwrap().len(), 8);
+    assert_eq!(task.await.unwrap().len(), 9);
 }
 
 #[tokio::test]

@@ -57,6 +57,11 @@ type ConnectGatewayClassSpec struct {
 	// ControllerName identifies the controller responsible for this class.
 	// +kubebuilder:validation:Required
 	ControllerName string `json:"controllerName"`
+	// Default marks the class selected by `datumctl connect join` when it creates
+	// a gateway automatically. At most one Ready class should be marked default.
+	Default bool `json:"default,omitempty"`
+	// RelayURLs pins gateways created from this class to operator-managed relays.
+	RelayURLs []string `json:"relayURLs,omitempty"`
 	// ParametersRef selects an operator-owned ConfigMap. Its image key is
 	// required; instanceType is optional and defaults to the platform standard.
 	ParametersRef ConnectGatewayClassParametersReference `json:"parametersRef"`

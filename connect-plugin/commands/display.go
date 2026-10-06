@@ -44,6 +44,8 @@ type dialDisplay struct {
 type networkDisplay struct {
 	Network                    string   `json:"network"`
 	Mode                       string   `json:"mode"`
+	Gateway                    string   `json:"gateway_resource"`
+	GatewayLocation            string   `json:"gateway_location"`
 	Peer                       string   `json:"peer"`
 	PeerAddress                string   `json:"peer_address"`
 	Connected                  *bool    `json:"connected"`
@@ -409,6 +411,9 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			fmt.Fprintf(&out, "The VPC binding for %s is approved, but this device is not forwarding traffic.\n", network.Network)
 		} else {
 			fmt.Fprintf(&out, "Connected to %s.\n", network.Network)
+		}
+		if network.Mode == "gateway" && network.Gateway != "" && network.GatewayLocation != "" {
+			fmt.Fprintf(&out, "VPC gateway: %s (%s).\n", network.Gateway, network.GatewayLocation)
 		}
 		if len(network.Routes) > 0 {
 			fmt.Fprintf(&out, "Route: %s\n", strings.Join(network.Routes, ", "))
