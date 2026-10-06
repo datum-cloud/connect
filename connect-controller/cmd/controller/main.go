@@ -5,6 +5,8 @@ import (
 	"flag"
 	"os"
 
+	iamv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
+	identityv1alpha1 "go.miloapis.com/milo/pkg/apis/identity/v1alpha1"
 	milo "go.miloapis.com/milo/pkg/multicluster-runtime/milo"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -31,16 +33,21 @@ var scheme = runtime.NewScheme()
 func init() {
 	utilruntime.Must(corev1.AddToScheme(scheme))
 	utilruntime.Must(coordinationv1.AddToScheme(scheme))
-	utilruntime.Must(coordinationv1.AddToScheme(scheme))
+	utilruntime.Must(iamv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(identityv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(connectv1alpha1.AddToScheme(scheme))
 }
 
 func main() {
-	var discoveryKubeconfig, projectKubeconfig string
+	var discoveryKubeconfig, projectKubeconfig, identityProject, identityKeyNamespace, connectorAgentRoleName, connectorAgentRoleNamespace string
 	var internalServiceDiscovery bool
 	flag.StringVar(&discoveryKubeconfig, "discovery-kubeconfig", "", "kubeconfig for Milo project discovery (defaults to in-cluster credentials)")
 	flag.StringVar(&projectKubeconfig, "project-kubeconfig", "", "kubeconfig template for project control planes (defaults to in-cluster credentials)")
 	flag.BoolVar(&internalServiceDiscovery, "internal-service-discovery", false, "use internal project control-plane service addresses")
+	flag.StringVar(&identityProject, "identity-project", "", "platform-controlled project that owns Connector service accounts and keys")
+	flag.StringVar(&identityKeyNamespace, "identity-key-namespace", "default", "namespace for Connector ServiceAccountKey resources in the identity project")
+	flag.StringVar(&connectorAgentRoleName, "connector-agent-role-name", "connect.datumapis.com-connector-agent", "pre-provisioned least-privilege role bound to each Connector principal")
+	flag.StringVar(&connectorAgentRoleNamespace, "connector-agent-role-namespace", "milo-system", "namespace containing the Connector agent role")
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseDevMode(false)))
 
@@ -107,7 +114,7 @@ func main() {
 		ctrl.Log.Error(err, "add readiness check")
 		os.Exit(1)
 	}
-	if err := (&controller.ConnectReconciler{}).SetupWithManager(mgr); err != nil {
+	if err := (&controller.ConnectReconciler{Identity: controller.ConnectorIdentityConfig{Project: identityProject, KeyNamespace: identityKeyNamespace, RoleName: connectorAgentRoleName, RoleNamespace: connectorAgentRoleNamespace}}).SetupWithManager(mgr); err != nil {
 		ctrl.Log.Error(err, "setup Connect controllers")
 		os.Exit(1)
 	}

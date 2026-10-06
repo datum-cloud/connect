@@ -24,6 +24,8 @@ pub struct Credentials {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_email: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub helper_path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session: String,
@@ -49,7 +51,13 @@ impl std::fmt::Debug for Credentials {
 
 impl Credentials {
     /// Pins a host-owned login session without copying its bearer or refresh token.
-    pub fn datumctl_session(project: &str, api: &str, helper: &str, session: &str) -> Result<Self> {
+    pub fn datumctl_session(
+        project: &str,
+        api: &str,
+        token_uri: &str,
+        helper: &str,
+        session: &str,
+    ) -> Result<Self> {
         if !Path::new(helper).is_absolute() {
             return Err(Error::Invalid(
                 "datumctl helper must have an absolute path".into(),
@@ -61,8 +69,9 @@ impl Credentials {
             credential_type: "datumctl_session".into(),
             project_id: project.into(),
             api_endpoint: api.into(),
-            token_uri: String::new(),
+            token_uri: token_uri.into(),
             client_id: String::new(),
+            client_email: String::new(),
             helper_path: helper
                 .to_str()
                 .ok_or_else(|| Error::Invalid("datumctl helper path must be valid UTF-8".into()))?
@@ -119,13 +128,13 @@ impl Credentials {
                         .into(),
                 ));
             }
-            if !self.refresh_token.is_empty()
-                || !self.private_key.is_empty()
-                || !self.token_uri.is_empty()
-            {
+            if !self.refresh_token.is_empty() || !self.private_key.is_empty() {
                 return Err(Error::Invalid(
                     "datumctl session descriptors must not contain copied credentials".into(),
                 ));
+            }
+            if !self.token_uri.is_empty() {
+                validate_connector_token_binding(&self.api_endpoint, &self.token_uri)?;
             }
             return validate_helper(Path::new(&self.helper_path));
         }
@@ -136,7 +145,9 @@ impl Credentials {
         match self.credential_type.as_str() {
             "connector" if !self.refresh_token.is_empty() => Ok(()),
             "datum_service_account"
-                if !self.private_key_id.is_empty() && !self.private_key.is_empty() =>
+                if !self.client_email.is_empty()
+                    && !self.private_key_id.is_empty()
+                    && !self.private_key.is_empty() =>
             {
                 EncodingKey::from_rsa_pem(self.private_key.as_bytes()).map_err(|_| {
                     Error::Invalid("invalid RSA service-account private key".into())
@@ -148,6 +159,120 @@ impl Credentials {
             )),
         }
     }
+
+    pub(crate) fn connector_service_account(
+        &self,
+        client_id: String,
+        client_email: String,
+        private_key_id: String,
+        private_key: String,
+    ) -> Result<Self> {
+        if self.credential_type != "datumctl_session" || self.token_uri.is_empty() {
+            return Err(Error::Unsupported(
+                "Connector identity enrollment requires the trusted OAuth token endpoint for the pinned datumctl session"
+                    .into(),
+            ));
+        }
+        let credentials = Self {
+            credential_type: "datum_service_account".into(),
+            project_id: self.project_id.clone(),
+            api_endpoint: self.api_endpoint.clone(),
+            token_uri: self.token_uri.clone(),
+            client_id,
+            client_email,
+            helper_path: String::new(),
+            session: String::new(),
+            scope: "openid profile email".into(),
+            private_key_id,
+            private_key,
+            refresh_token: String::new(),
+            path: self.path.clone(),
+        };
+        credentials.validate()?;
+        Ok(credentials)
+    }
+
+    pub(crate) async fn persist(&self) -> Result<()> {
+        if let Some(path) = &self.path {
+            crate::repo::atomic_write_private(path, &serde_json::to_vec(self)?).await?;
+        }
+        Ok(())
+    }
+
+    fn pending_identity_path(&self) -> Option<PathBuf> {
+        let path = self.path.as_ref()?;
+        Some(path.with_file_name("connector-identity.pending.json"))
+    }
+
+    pub(crate) async fn load_pending_identity(&self) -> Result<Option<Vec<u8>>> {
+        let Some(path) = self.pending_identity_path() else {
+            return Ok(None);
+        };
+        match tokio::fs::read(path).await {
+            Ok(bytes) if bytes.len() <= 64 * 1024 => Ok(Some(bytes)),
+            Ok(_) => Err(Error::Invalid(
+                "pending Connector identity exceeds 64 KiB".into(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) async fn save_pending_identity(&self, bytes: &[u8]) -> Result<()> {
+        let Some(path) = self.pending_identity_path() else {
+            return Ok(());
+        };
+        crate::repo::atomic_write_private(&path, bytes).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn clear_pending_identity(&self) -> Result<()> {
+        let Some(path) = self.pending_identity_path() else {
+            return Ok(());
+        };
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn clear_pending_identity_best_effort(&self) {
+        let Some(path) = self.pending_identity_path() else {
+            return;
+        };
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "could_not_remove_stale_connector_identity");
+        }
+    }
+}
+
+fn validate_connector_token_binding(api_endpoint: &str, token_uri: &str) -> Result<()> {
+    let api = validate_url(api_endpoint)?;
+    let token = validate_url(token_uri)?;
+    let official = matches!(
+        (api.host_str(), token.as_str()),
+        (
+            Some("api.datum.net"),
+            "https://auth.datum.net/oauth/v2/token"
+        ) | (
+            Some("api.staging.env.datum.net"),
+            "https://auth.staging.env.datum.net/oauth/v2/token"
+        )
+    );
+    let local = matches!(
+        api.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+    ) && api.origin() == token.origin()
+        && token.path() == "/token";
+    if !official && !local {
+        return Err(Error::Invalid(
+            "OAuth token endpoint is not trusted for this Datum API origin".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_helper(path: &Path) -> Result<()> {
@@ -473,6 +598,16 @@ impl TokenProvider {
 
     pub async fn invalidate(&self) {
         self.inner.lock().await.expires_at = UNIX_EPOCH;
+    }
+
+    pub async fn replace_credentials(&self, credentials: Credentials) -> Result<()> {
+        credentials.validate()?;
+        *self.inner.lock().await = TokenState {
+            credentials,
+            access_token: String::new(),
+            expires_at: UNIX_EPOCH,
+        };
+        Ok(())
     }
 
     #[tracing::instrument(name = "credentials.refresh", skip_all)]

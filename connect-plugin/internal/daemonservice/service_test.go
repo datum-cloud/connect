@@ -2,6 +2,8 @@ package daemonservice
 
 import (
 	"context"
+	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -171,5 +173,34 @@ func TestCopyCredentialRejectsUnknownType(t *testing.T) {
 	}
 	if err := copyCredential(source, filepath.Join(dir, "out.json")); err == nil {
 		t.Fatal("expected validation error")
+	}
+}
+
+func TestCopyCredentialRequiresStandardServiceAccountIdentityFields(t *testing.T) {
+	dir := t.TempDir()
+	valid := map[string]string{
+		"type":           "datum_service_account",
+		"project_id":     "project",
+		"client_id":      "provider-client-id",
+		"client_email":   "connector@example.invalid",
+		"private_key_id": "provider-key-id",
+		"private_key":    "private-key",
+	}
+	for _, field := range []string{"client_id", "client_email", "private_key_id"} {
+		t.Run(field, func(t *testing.T) {
+			shape := maps.Clone(valid)
+			delete(shape, field)
+			data, err := json.Marshal(shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(dir, field+".json")
+			if err := os.WriteFile(source, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := copyCredential(source, filepath.Join(dir, field+"-out.json")); err == nil {
+				t.Fatalf("service-account credentials without %s were accepted", field)
+			}
+		})
 	}
 }

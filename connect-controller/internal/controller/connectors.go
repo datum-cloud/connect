@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	iamv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
+	identityv1alpha1 "go.miloapis.com/milo/pkg/apis/identity/v1alpha1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	connectv1alpha1 "go.datum.net/connect-controller/api/v1alpha1"
@@ -43,13 +46,20 @@ type ConnectReconciler struct {
 	mgr         mcmanager.Manager
 	kind        string
 	classClient client.Client
+	Identity    ConnectorIdentityConfig
 }
 
-// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectors;connectoradvertisements;connectgateways;connectnetworkbindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectoradvertisements;connectgateways;connectnetworkbindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorenrollments,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectors,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectors/finalizers,verbs=update
 // +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectnetworkbindings/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloads,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=configmaps;secrets,verbs=get;create;update;patch
+// +kubebuilder:rbac:groups=iam.miloapis.com,resources=serviceaccounts,verbs=get;create;update;patch;delete
+// +kubebuilder:rbac:groups=iam.miloapis.com,resources=policybindings,verbs=get;create;delete
+// +kubebuilder:rbac:groups=identity.miloapis.com,resources=serviceaccountkeys,verbs=get;list;watch;create;delete
 
 func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	local := mgr.GetLocalManager()
@@ -61,6 +71,7 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		obj  client.Object
 	}{
 		{"connector", &connectv1alpha1.Connector{}},
+		{"connectorenrollment", &connectv1alpha1.ConnectorEnrollment{}},
 		{"connectoradvertisement", &connectv1alpha1.ConnectorAdvertisement{}},
 		{"connectgateway", &connectv1alpha1.ConnectGateway{}},
 		{"connectnetworkbinding", &connectv1alpha1.ConnectNetworkBinding{}},
@@ -70,7 +81,7 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		if item.name == "connector" {
 			builder = builder.Owns(&coordinationv1.Lease{})
 		}
-		if err := builder.Complete(&ConnectReconciler{mgr: mgr, kind: item.name, classClient: local.GetClient()}); err != nil {
+		if err := builder.Complete(&ConnectReconciler{mgr: mgr, kind: item.name, classClient: local.GetClient(), Identity: r.Identity}); err != nil {
 			return fmt.Errorf("register %s controller: %w", item.name, err)
 		}
 	}
@@ -95,12 +106,76 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 			}
 			return ctrl.Result{}, err
 		}
-		if err := reconcileConnector(ctx, c, r.classClient, &obj); err != nil {
+		var enrollment connectv1alpha1.ConnectorEnrollment
+		var enrollmentPtr *connectv1alpha1.ConnectorEnrollment
+		if err := c.Get(ctx, key, &enrollment); err == nil {
+			enrollmentPtr = &enrollment
+		} else if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		var identityClient client.Client
+		if enrollmentPtr != nil || controllerutil.ContainsFinalizer(&obj, connectorIdentityFinalizer) {
+			if r.Identity.Project == "" || r.Identity.Project == req.ClusterName.String() {
+				return ctrl.Result{}, fmt.Errorf("platform identity project must be configured and distinct from consumer project %q", req.ClusterName)
+			}
+			identityCluster, err := r.mgr.GetCluster(ctx, multicluster.ClusterName(r.Identity.Project))
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("get platform identity project %q: %w", r.Identity.Project, err)
+			}
+			identityClient = identityCluster.GetClient()
+		}
+		if err := reconcileConnector(ctx, c, r.classClient, identityClient, r.Identity, req.ClusterName.String(), &obj, enrollmentPtr); err != nil {
 			logger.Error(err, "reconcile Connector")
 			return ctrl.Result{}, err
 		}
 		// Recheck expiry even if no Lease update arrives at the exact TTL edge.
 		// Lease renewals also enqueue the owning Connector through Owns above.
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	case "connectorenrollment":
+		var enrollment connectv1alpha1.ConnectorEnrollment
+		if err := c.Get(ctx, key, &enrollment); err != nil {
+			if apierrors.IsNotFound(err) {
+				// ConnectorEnrollment is required to be same-name. A deletion
+				// event must immediately reconcile the Connector so its grants
+				// and credentials are revoked rather than waiting for polling.
+				var obj connectv1alpha1.Connector
+				if err := c.Get(ctx, key, &obj); err != nil {
+					if apierrors.IsNotFound(err) {
+						return ctrl.Result{}, nil
+					}
+					return ctrl.Result{}, err
+				}
+				if !controllerutil.ContainsFinalizer(&obj, connectorIdentityFinalizer) {
+					return ctrl.Result{}, nil
+				}
+				if r.Identity.Project == "" || r.Identity.Project == req.ClusterName.String() {
+					return ctrl.Result{}, fmt.Errorf("platform identity project must be configured and distinct from consumer project %q", req.ClusterName)
+				}
+				identityCluster, err := r.mgr.GetCluster(ctx, multicluster.ClusterName(r.Identity.Project))
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("get platform identity project %q: %w", r.Identity.Project, err)
+				}
+				if err := reconcileConnector(ctx, c, r.classClient, identityCluster.GetClient(), r.Identity, req.ClusterName.String(), &obj, nil); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		var obj connectv1alpha1.Connector
+		if err := c.Get(ctx, types.NamespacedName{Name: enrollment.Spec.ConnectorRef.Name, Namespace: enrollment.Namespace}, &obj); err != nil {
+			return ctrl.Result{}, err
+		}
+		if r.Identity.Project == "" || r.Identity.Project == req.ClusterName.String() {
+			return ctrl.Result{}, fmt.Errorf("platform identity project must be configured and distinct from consumer project %q", req.ClusterName)
+		}
+		identityCluster, err := r.mgr.GetCluster(ctx, multicluster.ClusterName(r.Identity.Project))
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("get platform identity project %q: %w", r.Identity.Project, err)
+		}
+		if err := reconcileConnector(ctx, c, r.classClient, identityCluster.GetClient(), r.Identity, req.ClusterName.String(), &obj, &enrollment); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	case "connectoradvertisement":
 		var obj connectv1alpha1.ConnectorAdvertisement
@@ -177,32 +252,110 @@ func reconcileClass(ctx context.Context, c client.Client, obj *connectv1alpha1.C
 	return c.Status().Update(ctx, obj)
 }
 
-func reconcileConnector(ctx context.Context, c, classClient client.Client, obj *connectv1alpha1.Connector) error {
+func reconcileConnector(ctx context.Context, c, classClient, identityClient client.Client, identityConfig ConnectorIdentityConfig, consumerProject string, obj *connectv1alpha1.Connector, enrollment *connectv1alpha1.ConnectorEnrollment) error {
+	if !obj.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(obj, connectorIdentityFinalizer) {
+			if identityClient == nil {
+				return fmt.Errorf("platform identity client is required to finalize Connector credentials")
+			}
+			complete, err := cleanupConnectorIdentity(ctx, c, identityClient, identityConfig, obj, true)
+			if err != nil {
+				return err
+			}
+			if !complete {
+				return nil
+			}
+			controllerutil.RemoveFinalizer(obj, connectorIdentityFinalizer)
+			return c.Update(ctx, obj)
+		}
+		return nil
+	}
+	if enrollment != nil && !controllerutil.ContainsFinalizer(obj, connectorIdentityFinalizer) {
+		if identityClient == nil {
+			return fmt.Errorf("platform identity client is required for Connector authentication")
+		}
+		controllerutil.AddFinalizer(obj, connectorIdentityFinalizer)
+		if err := c.Update(ctx, obj); err != nil {
+			return err
+		}
+	}
 	before := obj.Status.DeepCopy()
+	var reconcileErr error
 	accepted, acceptedReason, acceptedMessage := metav1.ConditionTrue, "Accepted", "Connector class and identity are valid"
 	if _, err := hex.DecodeString(obj.Spec.PublicKey); err != nil || len(obj.Spec.PublicKey) != 64 {
 		accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidPublicKey", "publicKey must be a 32-byte hexadecimal iroh public key"
-	} else if errs := validation.IsDNS1123Subdomain(obj.Spec.ClassRef); len(errs) > 0 {
-		accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidClassReference", "classRef must be a DNS subdomain resource name"
-	} else {
-		var class connectv1alpha1.ConnectorClass
-		err := classClient.Get(ctx, types.NamespacedName{Name: obj.Spec.ClassRef}, &class)
-		if apierrors.IsNotFound(err) {
-			accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "ClassNotFound", "referenced ConnectorClass does not exist in the management cluster"
-		} else if err != nil {
-			return err
-		} else if !contains(class.Spec.Transports, "masque-v1") {
-			accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "TransportUnsupported", "ConnectorClass does not advertise masque-v1"
+	} else if enrollment != nil {
+		if err := validateConnectorAuthentication(obj, enrollment); err != nil {
+			accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidAuthentication", err.Error()
+		}
+	}
+	if accepted == metav1.ConditionTrue {
+		if errs := validation.IsDNS1123Subdomain(obj.Spec.ClassRef); len(errs) > 0 {
+			accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidClassReference", "classRef must be a DNS subdomain resource name"
+		} else {
+			var class connectv1alpha1.ConnectorClass
+			err := classClient.Get(ctx, types.NamespacedName{Name: obj.Spec.ClassRef}, &class)
+			if apierrors.IsNotFound(err) {
+				accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "ClassNotFound", "referenced ConnectorClass does not exist in the management cluster"
+			} else if err != nil {
+				return err
+			} else if !contains(class.Spec.Transports, "masque-v1") {
+				accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "TransportUnsupported", "ConnectorClass does not advertise masque-v1"
+			}
 		}
 	}
 	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Accepted", Status: accepted, Reason: acceptedReason, Message: acceptedMessage, ObservedGeneration: obj.Generation})
-	ready, readyReason, readyMessage := metav1.ConditionFalse, "NotReady", "waiting for a valid Connector configuration"
+	var lease *coordinationv1.Lease
 	if accepted == metav1.ConditionTrue {
-		lease, err := ensureConnectorLease(ctx, c, obj)
+		var err error
+		lease, err = ensureConnectorLease(ctx, c, obj)
 		if err != nil {
 			return err
 		}
 		obj.Status.LeaseRef = lease.Name
+	}
+	identityReady := accepted == metav1.ConditionTrue
+	identityStatus, identityReason, identityMessage := metav1.ConditionFalse, "NotAccepted", "waiting for a valid Connector configuration"
+	if accepted == metav1.ConditionTrue {
+		if enrollment == nil {
+			if controllerutil.ContainsFinalizer(obj, connectorIdentityFinalizer) {
+				// Do not continue advertising revoked provider identifiers in
+				// status after the protected enrollment has disappeared.
+				obj.Status.Authentication = nil
+				if identityClient == nil {
+					identityReady, identityReason, identityMessage = false, "IdentityConfigurationMissing", "platform identity project is not configured"
+				} else {
+					complete, err := cleanupConnectorIdentity(ctx, c, identityClient, identityConfig, obj, false)
+					if err != nil {
+						reconcileErr = err
+						identityReady, identityStatus, identityReason, identityMessage = false, metav1.ConditionFalse, "RevocationFailed", "protected Connector enrollment is missing and credential revocation failed"
+					} else if !complete {
+						identityReady, identityStatus, identityReason, identityMessage = false, metav1.ConditionFalse, "RevocationPending", "protected Connector enrollment is missing; platform credential and grant deletion is pending"
+					} else {
+						identityReady, identityStatus, identityReason, identityMessage = false, metav1.ConditionFalse, "EnrollmentMissing", "protected Connector enrollment is missing; platform credentials and grants are revoked; platform recovery is required"
+					}
+				}
+			} else {
+				identityStatus, identityReason, identityMessage = metav1.ConditionUnknown, "LegacyCredentials", "Connector uses externally supplied migration credentials"
+			}
+		} else {
+			var err error
+			if identityClient == nil {
+				identityReady, identityReason, identityMessage = false, "IdentityConfigurationMissing", "platform identity project is not configured"
+			} else {
+				identityReady, identityReason, identityMessage, err = ensureConnectorIdentity(ctx, c, identityClient, identityConfig, consumerProject, obj, enrollment)
+			}
+			if identityReady {
+				identityStatus = metav1.ConditionTrue
+			}
+			if err != nil {
+				reconcileErr = err
+			}
+		}
+	}
+	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "AuthenticationReady", Status: identityStatus, Reason: identityReason, Message: identityMessage, ObservedGeneration: obj.Generation})
+	ready, readyReason, readyMessage := metav1.ConditionFalse, "NotReady", "waiting for a valid Connector configuration"
+	if accepted == metav1.ConditionTrue && identityReady && lease != nil {
 		if lease.Spec.RenewTime == nil || lease.Spec.LeaseDurationSeconds == nil {
 			readyReason, readyMessage = "AgentOffline", "Connector has not renewed its liveness lease"
 		} else {
@@ -217,9 +370,12 @@ func reconcileConnector(ctx context.Context, c, classClient client.Client, obj *
 	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Ready", Status: ready, Reason: readyReason, Message: readyMessage, ObservedGeneration: obj.Generation})
 	obj.Status.ObservedGeneration = obj.Generation
 	if reflect.DeepEqual(before, &obj.Status) {
-		return nil
+		return reconcileErr
 	}
-	return c.Status().Update(ctx, obj)
+	if err := c.Status().Update(ctx, obj); err != nil {
+		return err
+	}
+	return reconcileErr
 }
 
 func ensureConnectorLease(ctx context.Context, c client.Client, connector *connectv1alpha1.Connector) (*coordinationv1.Lease, error) {
@@ -254,6 +410,8 @@ func schemeForConnector() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = corev1.AddToScheme(s)
 	_ = coordinationv1.AddToScheme(s)
+	_ = iamv1alpha1.AddToScheme(s)
+	_ = identityv1alpha1.AddToScheme(s)
 	_ = connectv1alpha1.AddToScheme(s)
 	return s
 }

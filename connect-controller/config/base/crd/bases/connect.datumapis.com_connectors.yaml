@@ -26,8 +26,9 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          Connector represents one Connect installation in one project. The public key
-          is the stable iroh identity; private material must never be stored in the API.
+          Connector represents one Connect installation in one project. PublicKey is
+          the stable iroh transport identity. Authentication keys are independent
+          control-plane identities; private material must never be stored in the API.
         properties:
           apiVersion:
             description: |-
@@ -61,6 +62,10 @@ spec:
                   iroh public key.
                 pattern: ^[a-fA-F0-9]{64}$
                 type: string
+                x-kubernetes-validations:
+                - message: publicKey is the immutable iroh transport identity; replace
+                    the Connector to rotate it
+                  rule: oldSelf == null || self == oldSelf
               relayURLs:
                 description: RelayURLs are optional relay URLs published by the Connector.
                 items:
@@ -76,6 +81,47 @@ spec:
                 items:
                   type: string
                 type: array
+              authentication:
+                description: |-
+                  Authentication identifies the platform principal bound to this immutable
+                  Connector UID and the provider key IDs available for JWT assertions.
+                properties:
+                  connectorUID:
+                    type: string
+                  principalRef:
+                    properties:
+                      clientEmail:
+                        type: string
+                      clientID:
+                        type: string
+                      name:
+                        type: string
+                      project:
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - name
+                    - project
+                    type: object
+                  registeredKeys:
+                    items:
+                      properties:
+                        authProviderKeyID:
+                          type: string
+                        id:
+                          type: string
+                        serviceAccountKeyRef:
+                          type: string
+                      required:
+                      - id
+                      - serviceAccountKeyRef
+                      type: object
+                    type: array
+                required:
+                - connectorUID
+                - principalRef
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

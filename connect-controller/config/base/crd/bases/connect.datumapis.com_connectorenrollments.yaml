@@ -5,22 +5,23 @@ metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
     discovery.miloapis.com/parent-contexts: Project
-  name: connectgateways.connect.datumapis.com
+  name: connectorenrollments.connect.datumapis.com
 spec:
   group: connect.datumapis.com
   names:
-    kind: ConnectGateway
-    listKind: ConnectGatewayList
-    plural: connectgateways
-    singular: connectgateway
+    kind: ConnectorEnrollment
+    listKind: ConnectorEnrollmentList
+    plural: connectorenrollments
+    singular: connectorenrollment
   scope: Namespaced
   versions:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: |-
-          ConnectGateway runs a managed gateway in a project VPC. Project Connectors
-          attach through ConnectNetworkBinding resources.
+          ConnectorEnrollment is the protected bootstrap interface for a Connector's
+          platform-owned identity. Grant create permission independently from ordinary
+          Connector update permission. Its spec is immutable after creation.
         properties:
           apiVersion:
             description: |-
@@ -41,41 +42,60 @@ spec:
             type: object
           spec:
             properties:
-              image:
-                description: Image must be a Linux gateway image with Datum CONNECT-IP
-                  support.
-                type: string
-              instanceType:
-                description: InstanceType selects the Compute instance size. The platform
-                  default is used when empty.
-                type: string
-              locationRef:
-                type: string
-              networkRef:
-                type: string
-              peerRouting:
-                description: |-
-                  PeerRouting allows Connectors attached to this gateway to route directly
-                  to the assigned addresses of the other attached Connectors. It is disabled
-                  by default; VPC routes remain available regardless of this setting.
-                type: boolean
-              relayURLs:
-                description: RelayURLs pins the gateway to operator-managed iroh relays
-                  when set.
-                items:
-                  type: string
-                type: array
-              routes:
-                items:
-                  type: string
-                maxItems: 32
-                minItems: 1
-                type: array
+              connectorRef:
+                properties:
+                  name:
+                    type: string
+                  uid:
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
+              key:
+                properties:
+                  id:
+                    description: ID is a client-selected, DNS-label identifier for
+                      this key.
+                    maxLength: 63
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  proof:
+                    description: |-
+                      Proof is an unpadded base64url RSA-PSS/SHA-256 signature over the canonical
+                      enrollment statement documented by the Connect API.
+                    maxLength: 2048
+                    minLength: 1
+                    type: string
+                    x-kubernetes-validations:
+                    - message: proof is immutable for an enrolled key
+                      rule: oldSelf == null || self == oldSelf
+                  publicKey:
+                    description: |-
+                      PublicKey is a PEM encoded RSA public key. The matching private key remains
+                      on the Connector and signs both enrollment proofs and OAuth JWT assertions.
+                    maxLength: 8192
+                    minLength: 1
+                    type: string
+                    x-kubernetes-validations:
+                    - message: publicKey is immutable in an enrollment
+                      rule: oldSelf == null || self == oldSelf
+                  state:
+                    description: |-
+                      State must be Active for the initial enrollment key. Revocation and
+                      rotation occur through a protected platform operation, not Connector edits.
+                    enum:
+                    - Active
+                    type: string
+                required:
+                - id
+                - proof
+                - publicKey
+                - state
+                type: object
             required:
-            - image
-            - locationRef
-            - networkRef
-            - routes
+            - connectorRef
+            - key
             type: object
           status:
             properties:
@@ -135,15 +155,17 @@ spec:
                   - type
                   type: object
                 type: array
-              endpointID:
-                type: string
               observedGeneration:
                 format: int64
                 type: integer
-              workloadRef:
-                type: string
             type: object
+        required:
+        - spec
         type: object
+        x-kubernetes-validations:
+        - message: enrollment spec is immutable; use the protected platform rotation
+            or recovery API
+          rule: oldSelf == null || self.spec == oldSelf.spec
     served: true
     storage: true
     subresources:

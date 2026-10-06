@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -179,7 +180,7 @@ func TestUpSendsSessionMetadataWithoutTokens(t *testing.T) {
 		t.Fatalf("unexpected request body = %#v", body)
 	}
 	session, ok := body["datumctl_session"].(map[string]any)
-	if !ok || len(session) != 3 || session["session"] != "personal" || session["helper_path"] != helper || session["api_endpoint"] != "https://api.datum.net" {
+	if !ok || len(session) != 4 || session["session"] != "personal" || session["helper_path"] != helper || session["api_endpoint"] != "https://api.datum.net" || session["token_uri"] != "https://auth.datum.net/oauth/v2/token" {
 		t.Fatalf("session = %#v", body["datumctl_session"])
 	}
 }
@@ -191,5 +192,24 @@ func TestSetupCommandOmitsCurrentProject(t *testing.T) {
 	}
 	if got := setupCommand("other"); got != `datumctl connect up --project "other"` {
 		t.Fatal(got)
+	}
+}
+
+func TestConnectorTokenURIUsesOnlyKnownDatumOrigins(t *testing.T) {
+	tests := map[string]string{
+		"https://api.datum.net":                  "https://auth.datum.net/oauth/v2/token",
+		"https://api.staging.env.datum.net":      "https://auth.staging.env.datum.net/oauth/v2/token",
+		"https://api.attacker.example":           "",
+		"http://api.datum.net":                   "",
+		"https://api.datum.net.attacker.example": "",
+	}
+	for input, want := range tests {
+		u, err := url.Parse(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := connectorTokenURI(u); got != want {
+			t.Errorf("connectorTokenURI(%q)=%q, want %q", input, got, want)
+		}
 	}
 }

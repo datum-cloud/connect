@@ -179,8 +179,9 @@ datumctl connect up
 Connect uses the project in your current `datumctl` context. Add
 `--project PROJECT` to override it.
 
-The plugin passes your current host session, API endpoint, and the absolute
-`datumctl` executable path to the daemon. The daemon stores that descriptor and
+The plugin passes your current host session, API endpoint, its allowlisted Datum
+OAuth token endpoint, and the absolute `datumctl` executable path to the daemon.
+The daemon stores that descriptor and
 calls `datumctl auth get-token --session SESSION --output client.authentication.k8s.io/v1`
 when it needs an access token. The host owns login and token refresh. The daemon
 caches the returned access token in memory for at most 30 seconds, subject to
@@ -197,12 +198,25 @@ run `up --auth oidc` to register the new path.
 The daemon must run as an OS user that can access the selected host session.
 Use a user service for interactive login. Root/system daemons reject host-session
 enrollment; supply service-account credentials for those deployments.
-Logging out or losing access to the
-session stops networking when the daemon next checks authorization; this is
-not an instantaneous revocation guarantee. Restart does not bypass that check.
-This mode uses your user's permissions, not a restricted per-Connector token.
-Least-privilege per-Connector credential issuance remains future platform work;
-you do not need that feature to use host-session enrollment.
+For a new Connector on a supported Datum origin whose ConnectorClass advertises
+`connector-authentication`, the session is bootstrap-only.
+The daemon creates the Connector, reads its immutable UID, generates and
+privately persists a separate RSA key, creates the protected immutable
+ConnectorEnrollment with its signed proof, and waits for the controller's
+external service-account client ID and provider key ID. It
+then exchanges a short-lived JWT assertion and verifies that the issued token
+can read that exact Connector before atomically replacing the stored session
+descriptor with the private-key credential. A crash during enrollment reuses
+the private pending key rather than orphaning or silently replacing it. Neither
+the API resource nor logs contain the private key.
+
+If token issuance or UID-scoped authorization is unavailable, `up` fails while
+preserving the bootstrap session and pending key for a safe retry. It does not
+fall back to project-wide Connector Admin. Existing enrolled Connectors,
+imported credentials, and custom API origins without an explicitly trusted
+token endpoint retain their migration authorization path. Logging out affects
+those retained host-session paths, but not a Connector already switched to its
+own service account.
 
 For unattended servers, use a service-account credential file:
 
@@ -216,6 +230,10 @@ in-process, without invoking the host helper. Supported files are portal
 Protect the source file with mode 600. Do not place a short-lived human access
 token in this file. `daemon install --credentials-file FILE --system` supplies
 credentials to a system service without depending on an interactive user login.
+For `datum_service_account`, `client_id` is the authentication provider's stable
+client ID, `client_email` is the ServiceAccount email, and `private_key_id` is
+the provider key ID. They are distinct fields; clients must not substitute the
+email or Kubernetes UID for `client_id`.
 
 ```json
 {
@@ -292,10 +310,10 @@ project-wide transport diagnostics.
 
 | Area | Current behavior | Required follow-up |
 | --- | --- | --- |
-| Enrollment | Requires exactly one ConnectorClass annotated `connect.datum.net/transport=masque-v1` | Deploy and validate a MASQUE-aware class/controller |
+| Enrollment | Requires exactly one ConnectorClass supporting `masque-v1`; per-Connector credential migration additionally requires its explicit `connector-authentication` capability and permission to create immutable ConnectorEnrollment resources | Advertise the authentication capability only after the platform identity project, protected bootstrap permission, UID-scoped IAM policy, and token endpoint are deployed |
 | Public ingress | Requires approved gateway Connector identities in the class's `connect.datum.net/gateway-connectors` JSON-array annotation | Implement and deploy the gateway; certify HTTPProxy readiness |
-| Credentials | Uses a pinned host login session through `datumctl auth get-token`, or imports renewable OAuth/service-account JSON with in-process refresh | Issue least-privilege, per-Connector credentials; host-session mode currently uses user permissions |
-| Identity rotation | Restart and `up` refuse to recreate a revoked enrollment | Add an explicit administrator leave/rejoin workflow that rotates the key |
+| Credentials | New supported-origin host-session enrollments generate a private RSA key, prove it against the Connector UID, register it in a configured platform identity project, wait for the ready ServiceAccount's provider `clientID` and email plus the key's provider ID, verify exact-Connector access, and switch to short-lived JWT assertions; existing/custom/imported paths remain compatible | Deploy Milo's ServiceAccount `status.clientID` contract and the Zitadel provider that populates it, plus the external identity project, exact-resource role/policy, ownership-aware child-resource admission, and token endpoint; never substitute email, Kubernetes UID, or project-wide admin |
+| Identity rotation | Connector updates cannot mutate keys and ConnectorEnrollment is immutable; loss of an established enrollment immediately deactivates and deletes its platform identity and UID-scoped grants, while deletion finalization waits until those security objects are observed absent | Add a protected rotation endpoint that requires the current active-key signature or an audited platform recovery path; Milo lacks a safe future-child selector for local implementation |
 | VPC | Managed joins use `ConnectGateway` and `ConnectNetworkBinding`; the local adapter installs approved routes for the assigned address | Validate routing and packet forwarding on each supported host; the gateway and VPC firewall must allow the traffic |
 | Desktop | Existing app remains unchanged | Convert it into a daemon client in `datum-cloud/app` |
 | Packaging | Includes the daemon and architecture-matched pinned Wintun DLLs for Windows | Validate native services, Windows ACLs, signing, upgrades, and rollback on each OS |

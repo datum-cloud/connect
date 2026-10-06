@@ -30,6 +30,7 @@ n0-error = { workspace = true }
 n0-future = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+rsa = { version = "0.9", features = ["pem", "sha2"] }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -108,8 +108,15 @@ This branch is a preview, not a production release. Public ingress requires a
 gateway and control plane configured for the matching transport profile.
 Interactive enrollment uses your current `datumctl` login session. The daemon
 pins that session and calls `datumctl auth get-token` to refresh authorization.
-It stores the session reference, not your access or refresh tokens. Your
-session retains your user permissions; it is not a per-Connector credential.
+It stores the session reference, not your access or refresh tokens. On first
+enrollment against a supported Datum API origin and a ConnectorClass advertising
+`connector-authentication`, it uses that session only as bootstrap authorization,
+creates a separate private RSA key, proves possession
+against the Connector UID through an immutable protected enrollment resource,
+and switches to the resulting platform-owned per-Connector Milo service account
+after verifying exact-Connector access. Existing migration
+enrollments and custom API origins without a trusted token-endpoint contract
+continue using their stored authorization.
 Use `up --credentials-file /absolute/credentials.json` for service-account
 deployment. Use `up --auth oidc` to explicitly replace stored authorization with
 the current host session, or `up --auth stored` to reuse stored authorization.
@@ -184,7 +191,7 @@ services, token scopes, diagnostics, platform requirements, and test limits.
 | `connect-lib/transport` | iroh 1.0, HTTP/3 CONNECT, CONNECT-UDP, local CONNECT-IP, and peer access policy |
 | `connect-lib/network-helper` | Separate privileged service executable; no cloud credentials or Connector keys |
 | `connect-lib/ip-adapter` | Native interfaces, authenticated helper IPC, and exact host-route enforcement |
-| `connect-lib/lib/src/successor` | Host-session or in-process file credentials and Connector-owned control-plane resources |
+| `connect-lib/lib/src/successor` | Host-session or in-process file credentials and protected Connector enrollment requests |
 
 The Rust workspace retains historical library code and the `connect-lib/bin`
 development harness. The CLI does not invoke that harness. Product builds and

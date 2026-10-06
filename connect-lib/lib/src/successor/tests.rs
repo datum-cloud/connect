@@ -46,7 +46,13 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
                 .next()
                 .unwrap()
                 .to_string();
-            let body = serde_json::from_slice::<Value>(&bytes[header_end..]).unwrap_or(Value::Null);
+            let body = serde_json::from_slice::<Value>(&bytes[header_end..]).unwrap_or_else(|_| {
+                let fields = url::form_urlencoded::parse(&bytes[header_end..])
+                    .into_owned()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect::<serde_json::Map<_, _>>();
+                Value::Object(fields)
+            });
             let (status, response) = match reply {
                 Reply::Json(status, value) => (status, value),
                 Reply::EchoCreated => {
@@ -117,6 +123,32 @@ fn network_binding_name_is_deterministic_and_scoped_to_connector_and_network() {
     assert_ne!(first, network_binding_name("other-vpc", "macbook"));
     assert_ne!(first, network_binding_name("staging-vpc", "router"));
     assert!(first.len() <= 63);
+}
+
+#[test]
+fn generated_connector_identity_proves_the_uid_bound_canonical_statement() {
+    use rsa::{
+        RsaPublicKey,
+        pkcs8::DecodePublicKey,
+        pss::{Signature, VerifyingKey},
+        signature::Verifier,
+    };
+
+    let transport = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let identity = generate_connector_identity("connector-uid", &transport).unwrap();
+    validate_pending_connector_identity(&identity, "connector-uid", &transport).unwrap();
+    assert!(validate_pending_connector_identity(&identity, "other-uid", &transport).is_err());
+    let public_key = RsaPublicKey::from_public_key_pem(&identity.public_key).unwrap();
+    let public_der = public_key.to_public_key_der().unwrap();
+    let statement = format!(
+        "datum-connect-connector-enrollment-v1\nconnector-uid:connector-uid\ntransport-public-key:{transport}\nkey-id:initial\nauthentication-public-key-sha256:{}\n",
+        hex::encode(Sha256::digest(public_der.as_ref()))
+    );
+    let signature =
+        Signature::try_from(URL_SAFE_NO_PAD.decode(&identity.proof).unwrap().as_slice()).unwrap();
+    VerifyingKey::<Sha256>::new(public_key)
+        .verify(statement.as_bytes(), &signature)
+        .unwrap();
 }
 
 #[tokio::test]
@@ -347,6 +379,157 @@ async fn connect_enrollment_uses_only_the_connect_api() {
             .iter()
             .all(|(line, _)| !line.contains("networking.datumapis.com"))
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_session_enrollment_proves_key_and_switches_to_jwt_assertions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let class = json!({
+        "metadata":{"name":"masque-class","generation":1},
+        "spec":{"transports":["masque-v1"],"capabilities":["connector-authentication"]},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let probe_connector = json!({
+        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"service-uid","generation":2},
+        "spec":{"classRef":"masque-class","publicKey":peer}
+    });
+    let ready_connector = json!({
+        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"service-uid","generation":2},
+        "spec":{"classRef":"masque-class","publicKey":peer},
+        "status":{
+            "authentication":{
+                "connectorUID":"service-uid",
+                "principalRef":{"name":"connect-principal","uid":"service-account-uid","clientID":"provider-client-id","clientEmail":"connect-client@example.invalid","project":"platform-identities"},
+                "registeredKeys":[{"id":"initial","serviceAccountKeyRef":"connect-key","authProviderKeyID":"provider-key-id"}]
+            },
+            "conditions":[{"type":"Ready","status":"True","observedGeneration":2}]
+        }
+    });
+    let (base, task) = server(vec![
+        Reply::Json(404, json!({})),
+        Reply::Json(200, json!({"items":[class.clone()]})),
+        Reply::EchoCreated,
+        Reply::Json(404, json!({})),
+        Reply::Json(200, class),
+        Reply::EchoCreated,
+        Reply::Json(200, ready_connector.clone()),
+        token(),
+        Reply::Json(200, probe_connector),
+        token(),
+        Reply::Json(200, ready_connector),
+    ])
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let helper = directory.path().join("datumctl");
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf '%s' '{{\"apiVersion\":\"client.authentication.k8s.io/v1\",\"kind\":\"ExecCredential\",\"status\":{{\"token\":\"bootstrap-token\",\"expirationTimestamp\":\"{expiry}\"}}}}'\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let credentials = Credentials::datumctl_session(
+        "demo",
+        &base,
+        &format!("{base}/token"),
+        helper.to_str().unwrap(),
+        "test-session",
+    )
+    .unwrap();
+    let credential_path = directory.path().join("credentials.json");
+    std::fs::write(&credential_path, serde_json::to_vec(&credentials).unwrap()).unwrap();
+    std::fs::set_permissions(&credential_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let credentials = Credentials::load(&credential_path).await.unwrap();
+    let cloud = CloudConnector::new(credentials, "demo".into(), peer.clone()).unwrap();
+    let identity = cloud
+        .ensure_connect_connector(&ConnectionDetails::default())
+        .await
+        .unwrap();
+    assert_eq!(identity.uid, "service-uid");
+    let repeated = cloud
+        .ensure_connect_connector(&ConnectionDetails::default())
+        .await
+        .unwrap();
+    assert_eq!(repeated.uid, "service-uid");
+    let saved: Value = serde_json::from_slice(&std::fs::read(&credential_path).unwrap()).unwrap();
+    assert_eq!(saved["type"], "datum_service_account");
+    assert_eq!(saved["client_id"], "provider-client-id");
+    assert_eq!(saved["client_email"], "connect-client@example.invalid");
+    assert_eq!(saved["private_key_id"], "provider-key-id");
+    assert!(
+        saved["private_key"]
+            .as_str()
+            .unwrap()
+            .contains("PRIVATE KEY")
+    );
+    assert!(
+        !directory
+            .path()
+            .join("connector-identity.pending.json")
+            .exists()
+    );
+    let pending_path = directory.path().join("connector-identity.pending.json");
+    std::fs::write(&pending_path, b"stale enrollment journal").unwrap();
+    let restarted_credentials = Credentials::load(&credential_path).await.unwrap();
+    let _restarted = CloudConnector::new(restarted_credentials, "demo".into(), peer).unwrap();
+    assert!(!pending_path.exists());
+
+    let requests = task.await.unwrap();
+    let enrollment = requests
+        .iter()
+        .find(|(line, _)| line.starts_with("POST ") && line.contains("/connectorenrollments"))
+        .map(|(_, body)| body)
+        .unwrap();
+    assert_eq!(enrollment["kind"], "ConnectorEnrollment");
+    assert_eq!(enrollment["spec"]["connectorRef"]["uid"], "service-uid");
+    let key = &enrollment["spec"]["key"];
+    assert_eq!(key["id"], "initial");
+    assert_eq!(key["state"], "Active");
+    assert!(
+        key["publicKey"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN PUBLIC KEY")
+    );
+    assert!(!key["proof"].as_str().unwrap().is_empty());
+    assert!(!enrollment.to_string().contains("PRIVATE KEY"));
+    assert!(!requests.iter().any(|(line, body)| {
+        line.starts_with("PUT ")
+            && line.contains("/connectors/")
+            && body.pointer("/spec/authentication").is_some()
+    }));
+
+    let token_request = requests
+        .iter()
+        .find(|(line, body)| line.contains("/token") && body["assertion"].is_string())
+        .map(|(_, body)| body)
+        .unwrap();
+    assert_eq!(
+        token_request["grant_type"],
+        "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    );
+    let assertion = token_request["assertion"].as_str().unwrap();
+    assert_eq!(
+        jsonwebtoken::decode_header(assertion)
+            .unwrap()
+            .kid
+            .as_deref(),
+        Some("provider-key-id")
+    );
+    let claims: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(assertion.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claims["iss"], "provider-client-id");
+    assert_eq!(claims["sub"], "provider-client-id");
+    assert_eq!(claims["aud"], base);
 }
 
 #[tokio::test]

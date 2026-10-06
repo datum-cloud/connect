@@ -265,6 +265,8 @@ struct DatumctlSession {
     helper_path: String,
     session: String,
     api_endpoint: String,
+    #[serde(default)]
+    token_uri: String,
 }
 
 async fn up(
@@ -379,6 +381,7 @@ async fn up(
         let credentials = connect_lib::successor::Credentials::datumctl_session(
             &project_name,
             &session.api_endpoint,
+            &session.token_uri,
             &session.helper_path,
             &session.session,
         )
@@ -448,10 +451,29 @@ async fn up(
     };
     match result {
         Ok(connector) => {
+            let connector_authentication = if authentication
+                .as_ref()
+                .is_some_and(|value| value.kind == "oidc")
+            {
+                let persisted = connect_lib::successor::Credentials::load(&credentials)
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))?;
+                (persisted.credential_type == "datum_service_account").then_some(
+                    AuthenticationState {
+                        kind: "connector_service_account".into(),
+                        session: None,
+                    },
+                )
+            } else {
+                None
+            };
             state
                 .store
                 .transact(|root| {
                     let project = require_project_mut(root, &request.project)?;
+                    if let Some(authentication) = connector_authentication.clone() {
+                        project.authentication = Some(authentication);
+                    }
                     project.connector = Some(connector);
                     project.running = true;
                     project.enrolled = true;
