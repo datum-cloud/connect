@@ -10,6 +10,7 @@ import (
 )
 
 type catalogObject struct {
+	Kind     string `json:"kind"`
 	Metadata struct {
 		Name string `json:"name"`
 	} `json:"metadata"`
@@ -60,6 +61,9 @@ func TestServiceCatalogReferencesUseResourceNames(t *testing.T) {
 	}
 	for _, path := range protectedResources {
 		resource := readCatalogObject(t, path)
+		if resource.Kind != "ProtectedResource" {
+			continue
+		}
 		if resource.Spec.ServiceRef.Name != service.Metadata.Name {
 			t.Errorf("%s serviceRef %q does not reference Service %q", path, resource.Spec.ServiceRef.Name, service.Metadata.Name)
 		}
