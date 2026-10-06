@@ -1079,7 +1079,7 @@ impl Control for RealControl {
                         )
                         .with_code("network_setup_required")
                     })?;
-                if !helper.approvals.contains(&expected) {
+                if !helper_approves_managed_attachment(&helper, &expected) {
                     return Err(ApiError::new(
                         axum::http::StatusCode::CONFLICT,
                         "Administrator approval is required for the exact VPC address and routes; no interface was created",
@@ -1291,6 +1291,17 @@ fn require_network_authorization(
     Ok(())
 }
 
+fn helper_approves_managed_attachment(
+    helper: &connect_ip_adapter::helper::Status,
+    expected: &connect_ip_adapter::helper::Approval,
+) -> bool {
+    helper.approvals.contains(expected)
+        || helper
+            .managed_policy
+            .as_ref()
+            .is_some_and(|policy| policy.approve(expected).is_ok())
+}
+
 #[cfg(test)]
 mod network_authorization_tests {
     use super::*;
@@ -1325,6 +1336,44 @@ mod network_authorization_tests {
         require_network_authorization(&authorized, &cancel).unwrap();
         cancel.cancel();
         assert!(require_network_authorization(&authorized, &cancel).is_err());
+    }
+
+    #[test]
+    fn managed_policy_approves_managed_vpc_attachment_without_exact_approval() {
+        let helper = connect_ip_adapter::helper::Status {
+            version: 2,
+            approvals: vec![],
+            managed_policy: Some(connect_ip_adapter::helper::ManagedPolicy::managed_vpc_default()),
+        };
+        let approval = connect_ip_adapter::helper::Approval {
+            interface_name: "dc12345678ab".into(),
+            assigned_address: "fd60::1/128".parse().unwrap(),
+            peer_address: "fd8f::1/128".parse().unwrap(),
+            mtu: 1280,
+            routes: vec!["fd20:0:27::1:0:0/128".parse().unwrap()],
+            advertise_routes: vec![],
+        };
+
+        assert!(helper_approves_managed_attachment(&helper, &approval));
+    }
+
+    #[test]
+    fn managed_policy_does_not_approve_out_of_policy_routes() {
+        let helper = connect_ip_adapter::helper::Status {
+            version: 2,
+            approvals: vec![],
+            managed_policy: Some(connect_ip_adapter::helper::ManagedPolicy::managed_vpc_default()),
+        };
+        let approval = connect_ip_adapter::helper::Approval {
+            interface_name: "dc12345678ab".into(),
+            assigned_address: "fd60::1/128".parse().unwrap(),
+            peer_address: "fd8f::1/128".parse().unwrap(),
+            mtu: 1280,
+            routes: vec!["::/0".parse().unwrap()],
+            advertise_routes: vec![],
+        };
+
+        assert!(!helper_approves_managed_attachment(&helper, &approval));
     }
 }
 
