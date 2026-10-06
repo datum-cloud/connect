@@ -1,0 +1,33 @@
+@startuml managed-gateway
+!$NEW_C4_STYLE = 1
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+!include datum-theme.puml
+
+LAYOUT_LEFT_RIGHT()
+
+System_Ext(client, "Client Device Daemon", "Authenticates with its Connector endpoint key")
+System_Ext(project_api, "Project Control Plane", "Stores logical gateway, binding, endpoint, and grant state")
+System_Ext(controller, "Connect Controller", "Reconciles gateway assignments and effective peer grants")
+
+System_Boundary(service, "Connect Gateway Service") {
+    Container(gateway, "Gateway Runtime", "Shared or dedicated capacity", "Terminates CONNECT-IP and enforces isolated Connector grants")
+    Container(attachment, "Project Network Attachment", "Isolated packet path", "Carries approved packets between the gateway and one project network")
+}
+
+System_Ext(vpc, "Project VPC", "Network containing approved destinations")
+
+Lay_R(controller, project_api)
+Lay_D(controller, client)
+Lay_D(project_api, gateway)
+Lay_R(client, gateway)
+Lay_R(gateway, attachment)
+Lay_R(attachment, vpc)
+
+Rel(controller, project_api, "Writes status and gateway configuration", "Kubernetes API")
+Rel(project_api, gateway, "Provides endpoint assignment and peer grants", "Gateway control plane")
+Rel(client, gateway, "Opens authenticated packet session", "CONNECT-IP over QUIC DATAGRAM")
+Rel(gateway, attachment, "Injects and receives approved packets")
+Rel(attachment, vpc, "Forwards through the platform data plane")
+
+SHOW_LEGEND()
+@enduml
