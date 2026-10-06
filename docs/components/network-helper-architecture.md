@@ -99,6 +99,7 @@ pins the official driver, and validates protected ACLs and reparse-point rules.
 
 ## External References
 
+- [Client Device Architecture](./client-device-architecture.md)
 - [CONNECT-IP Data Plane](../architecture/connect-ip-data-plane.md)
 - [Identity and Authorization](../architecture/identity-and-authorization.md)
 - [Daemon operational guide](../../connect-lib/daemon/README.md)

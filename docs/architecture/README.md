@@ -180,6 +180,21 @@ no conversion webhook or automatic copy from legacy Connector resources.
 
 ## Learn More
 
+### Components
+
+- [Client Device Architecture](../components/client-device-architecture.md) —
+  complete device process model and platform boundaries
+- [Daemon Architecture](../components/daemon-architecture.md) — loopback API,
+  durable state, reconciliation, and transport runtime
+- [Network Helper Architecture](../components/network-helper-architecture.md) —
+  privileged approvals, adapter ownership, and packet IPC
+- [Controller Architecture](../components/controller-architecture.md) —
+  multicluster reconciliation and gateway provisioning
+- [Managed Gateway Architecture](../components/gateway-architecture.md) —
+  gateway identity, admission, CONNECT-IP, and VPC forwarding
+
+### End-to-End Flows
+
 - [Deployment Topology](./deployment-topology.md) — process placement,
   ownership, privilege, and network boundaries
 - [Enrollment and Reconciliation](./enrollment-and-reconciliation.md) — local
@@ -190,17 +205,14 @@ no conversion webhook or automatic copy from legacy Connector resources.
   reconciliation
 - [CONNECT-IP Data Plane](./connect-ip-data-plane.md) — packet path, policy,
   MTU, and recovery
+
+### Cross-Cutting Concerns
+
 - [Identity and Authorization](./identity-and-authorization.md) — credentials,
   keys, daemon roles, and approval boundaries
 - [Resource Model](./resource-model.md) — API and local state ownership
 - [Multi-Tenancy](./multi-tenancy.md) — project isolation and cross-scope rules
 - [Observability](./observability.md) — logs, counters, traces, and diagnostics
-- [Daemon Architecture](../components/daemon-architecture.md) — local control
-  plane internals
-- [Controller Architecture](../components/controller-architecture.md) —
-  multicluster reconciliation internals
-- [Network Helper Architecture](../components/network-helper-architecture.md) —
-  privileged boundary and adapter lifecycle
 
 ## References
 

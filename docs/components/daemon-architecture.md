@@ -145,6 +145,7 @@ also disappear when authenticated IPC closes.
 
 ## External References
 
+- [Client Device Architecture](./client-device-architecture.md)
 - [Architecture Overview](../architecture/README.md)
 - [Enrollment and Reconciliation](../architecture/enrollment-and-reconciliation.md)
 - [Daemon operational guide](../../connect-lib/daemon/README.md)

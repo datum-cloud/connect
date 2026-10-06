@@ -124,6 +124,7 @@ control planes.
 
 ## External References
 
+- [Managed Gateway Architecture](./gateway-architecture.md)
 - [Managed VPC Attachment](../architecture/managed-vpc-attachment.md)
 - [Resource Model](../architecture/resource-model.md)
 - [Connect API and controller guide](../../connect-controller/README.md)

@@ -14,20 +14,36 @@ Use these guides to install, operate, and develop Datum Connect.
 - See the [deployment topology](architecture/deployment-topology.md) for the
   process placement across user devices, Milo, project control planes, Compute
   workers, VPCs, and relay infrastructure.
-- Follow the focused design documents for
-  [enrollment and reconciliation](architecture/enrollment-and-reconciliation.md),
-  [service publication](architecture/service-publication.md),
-  [managed VPC attachment](architecture/managed-vpc-attachment.md), and the
-  [CONNECT-IP data plane](architecture/connect-ip-data-plane.md).
-- Review cross-cutting design for
-  [identity and authorization](architecture/identity-and-authorization.md),
-  [resource ownership](architecture/resource-model.md),
-  [multi-tenancy](architecture/multi-tenancy.md), and
-  [observability](architecture/observability.md).
-- Read the component internals for the
-  [daemon](components/daemon-architecture.md),
-  [controller](components/controller-architecture.md), and
-  [network helper](components/network-helper-architecture.md).
+
+### Components
+
+- [Client device](components/client-device-architecture.md) — CLI, daemon,
+  local applications, privilege separation, and platform deployment.
+- [Daemon](components/daemon-architecture.md) — loopback API, durable state,
+  reconciliation, project runtimes, and transports.
+- [Network helper](components/network-helper-architecture.md) — privileged
+  approvals, packet IPC, and native adapter ownership.
+- [Controller](components/controller-architecture.md) — Milo multicluster
+  reconciliation and managed gateway provisioning.
+- [Managed gateway](components/gateway-architecture.md) — gateway identity,
+  admission, CONNECT-IP termination, TUN forwarding, and VPC integration.
+
+### End-to-End Flows
+
+- [Enrollment and reconciliation](architecture/enrollment-and-reconciliation.md)
+- [Service publication and dialing](architecture/service-publication.md)
+- [Managed VPC attachment](architecture/managed-vpc-attachment.md)
+- [CONNECT-IP data plane](architecture/connect-ip-data-plane.md)
+
+### Cross-Cutting Concerns
+
+- [Identity and authorization](architecture/identity-and-authorization.md)
+- [Resource ownership and state](architecture/resource-model.md)
+- [Multi-tenancy](architecture/multi-tenancy.md)
+- [Observability and diagnostics](architecture/observability.md)
+
+### Implementation Guides
+
 - [Connect API and controller](../connect-controller/README.md) describes project resources and gateway reconciliation.
 - [CONNECT-IP daemon guide](../connect-lib/daemon/README.md) describes local adapters, approvals, and packet-path diagnostics.
 
