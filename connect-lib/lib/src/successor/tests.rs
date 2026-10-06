@@ -104,15 +104,19 @@ fn connect_connector() -> Value {
 #[test]
 fn project_connect_resources_use_the_connect_api_group() {
     let client = client("https://api.example");
-    assert!(client
-        .connect_resource("connectgateways", "")
-        .ends_with("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectgateways"));
+    assert!(
+        client
+            .connect_resource("connectgateways", "")
+            .ends_with("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectgateways")
+    );
     assert!(client
         .connect_resource("connectgateways", "vpc-gateway")
         .ends_with("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectgateways/vpc-gateway"));
-    assert!(client
-        .resource("networks", "")
-        .ends_with("/apis/networking.datumapis.com/v1alpha1/namespaces/default/networks"));
+    assert!(
+        client
+            .resource("networks", "")
+            .ends_with("/apis/networking.datumapis.com/v1alpha1/namespaces/default/networks")
+    );
     assert!(
         client
             .connect_resource("connectnetworkbindings", "binding")

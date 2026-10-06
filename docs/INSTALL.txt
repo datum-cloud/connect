@@ -219,16 +219,18 @@ in the matching source release for Windows requirements.
 
 7. Join a VPC and reach a Compute instance
 
-   A project administrator must install the Connect API/controller, configure
-   a compatible ConnectorClass, and create a Ready ConnectGateway for the VPC.
-   The gateway must advertise a route that contains the running Compute
-   instance's IPv6 address. Your account must be allowed to enroll a Connector
-   and create a ConnectNetworkBinding. The instance must listen on the target
-   port, and VPC firewall rules must allow the connection. This preview does
-   not create the VPC or gateway for you.
+   A project administrator must install the Connect API/controller and
+   configure a default ConnectGatewayClass and provide exactly one Ready
+   ConnectorClass that supports MASQUE. The Network must already exist. Your
+   account must be allowed to enroll a Connector and
+   create a ConnectGateway and ConnectNetworkBinding. The join command creates
+   or reuses a gateway in the nearest Datum location. Its routes must include
+   the running Compute instance's IPv6 address. The instance must listen on the
+   target port, and VPC firewall rules must allow the connection. This preview
+   does not create the VPC or Network.
 
    Sign in to the same Datum environment and select the project that owns the
-   gateway. Replace the example network, project, address, and port with the
+   project. Replace the example network, project, address, and port with the
    values provided by your administrator:
 
      datumctl login --hostname auth.staging.env.datum.net
@@ -253,11 +255,12 @@ in the matching source release for Windows requirements.
 
      datumctl connect leave staging-vpc --project my-project
 
-   If the gateway is missing or not Ready, ask the project administrator to
-   provision it. If `curl` times out, check `datumctl connect status`, the
-   gateway's route and workload status, the instance listener, and VPC firewall
-   rules. For static peer-to-subnet labs, use the separate staging subnet lab
-   guide; that flow is not the managed ConnectGateway workflow.
+   If `join` cannot create or find a gateway, ask the project administrator to
+   check the Connect APIs, default gateway class, and your resource permissions.
+   If `curl` times out, check `datumctl connect status`, the gateway's route and
+   workload status, the instance listener, and VPC firewall rules. For static
+   peer-to-subnet labs, use the separate staging subnet lab guide; that flow is
+   not the managed ConnectGateway workflow.
 
 8. Windows
 
