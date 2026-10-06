@@ -16,7 +16,7 @@ System_Boundary(device, "Client Device") {
 }
 
 System_Ext(project_api, "Project Control Plane", "Stores shared identity, discovery, and attachment resources")
-System_Ext(remote, "Peer or Managed Gateway", "Authenticated transport endpoint")
+System_Ext(remote, "Peer or Connect Gateway", "Authenticated transport endpoint")
 
 Rel(user, cli, "Runs")
 Rel(user, app, "Uses")

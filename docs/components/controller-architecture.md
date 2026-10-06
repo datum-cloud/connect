@@ -70,7 +70,7 @@ the current gateway Workload to have the grant applied.
 
 ## Gateway Workload
 
-The generated Workload runs the configured `iroh-gateway` image with:
+The generated Workload runs the configured Connect Gateway image with:
 
 - one interface on the requested VPC Network;
 - the gateway identity mounted read-only;
@@ -124,7 +124,7 @@ control planes.
 
 ## External References
 
-- [Managed Gateway Architecture](./gateway-architecture.md)
+- [Connect Gateway Architecture](./gateway-architecture.md)
 - [Managed VPC Attachment](../architecture/managed-vpc-attachment.md)
 - [Resource Model](../architecture/resource-model.md)
 - [Connect API and controller guide](../../connect-controller/README.md)

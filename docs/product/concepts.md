@@ -74,9 +74,9 @@ There are two attachment models:
 Use service sharing when you need one known application. Use a network
 attachment when software must reach addresses or protocols at the IP layer.
 
-## Managed gateway
+## Connect Gateway
 
-A managed gateway is a project workload that terminates authenticated Connect
+A Connect Gateway is a project workload that terminates authenticated Connect
 sessions and forwards approved traffic into a VPC. It can also provide public
 HTTP ingress when the platform is configured for the matching transport
 profile.

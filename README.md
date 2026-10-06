@@ -198,7 +198,7 @@ component internals.
 | `connect-lib/ip-adapter` | Native interfaces, authenticated helper IPC, and exact host-route enforcement |
 | `connect-lib/lib/src/successor` | Host-session or in-process file credentials and Connector-owned control-plane resources |
 | `connect-lib/masque-interop-lab` | Reusable standards-facing MASQUE edge plus interoperability lab binary |
-| external `iroh-gateway` | Managed CONNECT-IP termination and approved VPC forwarding |
+| Connect Gateway | Managed CONNECT-IP termination and approved VPC forwarding |
 
 The Rust workspace retains historical library code and the `connect-lib/bin`
 development harness. The CLI does not invoke that harness. Product builds and

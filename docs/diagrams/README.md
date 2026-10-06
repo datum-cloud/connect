@@ -11,7 +11,7 @@ a sibling checkout.
 | `system-overview` | System context | Architecture overview |
 | `deployment-topology` | Deployment | Architecture overview and deployment topology |
 | `client-device` | Container | Client device architecture |
-| `managed-gateway` | Container | Managed gateway architecture |
+| `managed-gateway` | Container | Connect Gateway architecture |
 
 Markdown embeds the committed PNGs. Edit the corresponding `.puml` source and
 render it from the repository root:

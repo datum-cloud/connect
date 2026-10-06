@@ -10,7 +10,7 @@ System_Ext(project_api, "Project Control Plane", "Stores gateway, binding, ident
 System_Ext(controller, "Connect Controller", "Reconciles the Workload and effective peer grants")
 
 System_Boundary(workload, "Gateway Compute Workload") {
-    Container(gateway, "iroh-gateway", "Linux process", "Terminates CONNECT-IP and enforces the Connector grant")
+    Container(gateway, "Connect Gateway", "Linux process", "Terminates CONNECT-IP and enforces the Connector grant")
     Container(tun, "Gateway TUN", "Kernel interface", "Carries approved packets between the session and worker networking")
 }
 

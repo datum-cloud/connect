@@ -41,7 +41,7 @@ Use these guides to install, operate, and develop Datum Connect.
   approvals, packet IPC, and native adapter ownership.
 - [Controller](components/controller-architecture.md) — Milo multicluster
   reconciliation and managed gateway provisioning.
-- [Managed gateway](components/gateway-architecture.md) — gateway identity,
+- [Connect Gateway](components/gateway-architecture.md) — gateway identity,
   admission, CONNECT-IP termination, TUN forwarding, and VPC integration.
 
 ### End-to-End Flows

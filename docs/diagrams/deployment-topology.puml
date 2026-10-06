@@ -20,7 +20,7 @@ Deployment_Node(project, "Project Control Plane", "Kubernetes-compatible API") {
 }
 
 Deployment_Node(compute, "Compute Worker", "Attached to the project VPC") {
-    Container(gateway, "iroh-gateway", "Compute Workload", "Terminates CONNECT-IP and forwards approved packets")
+    Container(gateway, "Connect Gateway", "Compute Workload", "Terminates CONNECT-IP and forwards approved packets")
     Container(vpc, "Project VPC", "Virtual network", "Contains the destinations reached through the gateway")
 }
 

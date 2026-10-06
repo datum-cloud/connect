@@ -94,7 +94,7 @@ route, global forwarding, or the host firewall.
 | Network adapter | Rust with Linux TUN, macOS utun, or Wintun | Native packet delivery and exact routes |
 | Network helper | Privileged Rust service | Applies only administrator-approved adapter plans |
 | Connect controller | Go, controller-runtime, Milo multicluster runtime | Reconciles project resources, gateways, and bindings |
-| Managed gateway | Linux, iroh-gateway | Terminates CONNECT-IP and forwards approved VPC traffic |
+| Connect Gateway | Linux service | Terminates CONNECT-IP and forwards approved VPC traffic |
 | Gateway runtime | Datum Compute Workload | Places one gateway interface in the requested VPC |
 
 ## API Resources
@@ -127,7 +127,7 @@ no conversion webhook or automatic copy from legacy Connector resources.
   privileged approvals, adapter ownership, and packet IPC
 - [Controller Architecture](../components/controller-architecture.md) —
   multicluster reconciliation and gateway provisioning
-- [Managed Gateway Architecture](../components/gateway-architecture.md) —
+- [Connect Gateway Architecture](../components/gateway-architecture.md) —
   gateway identity, admission, CONNECT-IP, and VPC forwarding
 
 ### End-to-End Flows

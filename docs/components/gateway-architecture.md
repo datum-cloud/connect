@@ -1,8 +1,8 @@
-# Managed Gateway Architecture
+# Connect Gateway Architecture
 
-The managed gateway connects authenticated Connectors to one project VPC. One
+The Connect Gateway connects authenticated Connectors to one project VPC. One
 `ConnectGateway` resource produces one gateway identity, one grant
-configuration, and one `iroh-gateway` process inside a VPC-attached Compute
+configuration, and one Connect Gateway process inside a VPC-attached Compute
 Workload.
 
 This component is distinct from the separately deployed public-ingress MASQUE
@@ -11,7 +11,7 @@ routing; it does not implement the public HTTPProxy control plane.
 
 ## Overview
 
-![Managed gateway architecture](../diagrams/managed-gateway.png)
+![Connect Gateway architecture](../diagrams/managed-gateway.png)
 
 The gateway process is the only Connect-managed cloud component in the packet
 path. The Connect controller and project API prepare its identity and grants but

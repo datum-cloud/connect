@@ -24,7 +24,7 @@ API never carry application bytes or IP packets.
 | `datum-connect-network-helper` | macOS or Linux user device | Persistent root service when CONNECT-IP is enabled | Owns only approved adapters, routes, and packet IPC; has no cloud credentials or Connector key |
 | Windows `datum-connect-daemon` | Windows device | Persistent LocalSystem service | Owns daemon responsibilities and Wintun because Windows does not use the Unix helper model |
 | `connect-controller` | Milo management cluster | Persistent Kubernetes Deployment with leader election | Discovers projects and reconciles Connect resources, gateway configuration, and Compute Workloads |
-| `iroh-gateway` | Compute Workload on a VPC-attached worker | Persistent per managed `ConnectGateway` | Authenticates CONNECT-IP clients and forwards approved packets between its TUN and the VPC |
+| Connect Gateway | Compute Workload on a VPC-attached worker | Persistent per managed `ConnectGateway` | Authenticates CONNECT-IP clients and forwards approved packets between its TUN and the VPC |
 | iroh relay | Operator-managed relay infrastructure | Persistent shared service | Assists QUIC reachability; does not authorize a Connector or inspect Connect control-plane intent |
 | MASQUE-capable ingress edge | Deployment-specific ingress infrastructure | Persistent when public ingress is offered | Reaches explicitly public services as an approved gateway identity; not deployed by `connect-controller` |
 
@@ -88,8 +88,8 @@ CONNECT-IP packets do not traverse the project API server.
 ## Compute and VPC Data Plane
 
 Every managed ConnectGateway becomes a one-replica Compute Workload. The
-Workload runs the externally built `iroh-gateway` executable on a worker with an
-interface in the requested project Network. The gateway receives its private
+Workload runs the Connect Gateway on a worker with an interface in the requested
+project Network. The gateway receives its private
 identity from a mounted Secret and its exact peer grants from a mounted or
 rendered ConfigMap.
 
@@ -123,7 +123,7 @@ in the ConnectorClass and use the compatible transport profile to reach the
 serving daemon.
 
 The reusable standards-facing MASQUE edge implementation in this repository is
-not the same process as the managed `iroh-gateway` Workload. The Connect
+not the same process as the Connect Gateway Workload. The Connect
 controller currently deploys only the managed CONNECT-IP gateway. Production
 placement and operation of the public edge remain platform deployment concerns.
 
@@ -148,7 +148,7 @@ controller and project API are used for identity, discovery, and policy refresh.
 host packet
   -> local adapter and device daemon
   -> direct or relay-assisted CONNECT-IP
-  -> iroh-gateway Compute Workload
+  -> Connect Gateway Compute Workload
   -> gateway TUN and VPC interface
   -> VPC destination
 ```

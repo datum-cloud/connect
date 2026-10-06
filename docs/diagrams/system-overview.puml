@@ -12,7 +12,7 @@ System(connect, "Datum Connect", "Maintains device identity and creates authenti
 System_Ext(local_apps, "Local Applications", "TCP, UDP, and IP clients or servers on user devices")
 System_Ext(project_api, "Datum Project Control Plane", "Stores Connect identity, discovery, gateway, and binding resources")
 System_Ext(peer, "Peer Connector", "Another enrolled device serving or consuming private traffic")
-System_Ext(gateway, "Managed Gateway", "Terminates CONNECT-IP and forwards approved traffic into a project VPC")
+System_Ext(gateway, "Connect Gateway", "Terminates CONNECT-IP and forwards approved traffic into a project VPC")
 System_Ext(relay, "iroh Relay Infrastructure", "Assists QUIC connectivity when endpoints cannot connect directly")
 
 Rel(user, connect, "Operates", "datumctl connect")
