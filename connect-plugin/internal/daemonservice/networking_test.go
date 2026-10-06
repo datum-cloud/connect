@@ -25,17 +25,17 @@ func TestHelperCheckErrorExplainsStaleOverlapBehavior(t *testing.T) {
 func TestApprovalsAreAdditiveAndCannotRetarget(t *testing.T) {
 	first := InterfaceApproval{InterfaceName: "dcfirst", AssignedAddress: "fd00::1/128", PeerAddress: "fd00::2/128", MTU: 1280}
 	second := InterfaceApproval{InterfaceName: "dcsecond", AssignedAddress: "fd01::1/128", PeerAddress: "fd01::2/128", MTU: 1280}
-	old := HelperApprovals{501, []InterfaceApproval{first}}
-	merged, _, err := mergeApprovals(old, HelperApprovals{501, []InterfaceApproval{first, second}}, false)
+	old := HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{first}}
+	merged, _, err := mergeApprovals(old, HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{first, second}}, false)
 	if err != nil || len(merged.Approvals) != 2 {
 		t.Fatalf("%+v %v", merged, err)
 	}
 	changed := first
 	changed.PeerAddress = "fd00::3/128"
-	if _, _, err := mergeApprovals(old, HelperApprovals{501, []InterfaceApproval{changed}}, false); err == nil {
+	if _, _, err := mergeApprovals(old, HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{changed}}, false); err == nil {
 		t.Fatal("retargeted existing grant")
 	}
-	if _, _, err := mergeApprovals(old, HelperApprovals{502, []InterfaceApproval{second}}, false); err == nil {
+	if _, _, err := mergeApprovals(old, HelperApprovals{AllowedUID: 502, Approvals: []InterfaceApproval{second}}, false); err == nil {
 		t.Fatal("changed approved user")
 	}
 	if len(old.Approvals) != 1 || !sameApproval(old.Approvals[0], first) {
@@ -47,20 +47,36 @@ func TestExistingApprovalCannotGainSubnetAccess(t *testing.T) {
 	host := InterfaceApproval{InterfaceName: "dcfirst", AssignedAddress: "fd00::1/128", PeerAddress: "fd00::2/128", MTU: 1280}
 	subnet := host
 	subnet.Routes = []string{"fd20::/64"}
-	if _, _, err := mergeApprovals(HelperApprovals{501, []InterfaceApproval{host}}, HelperApprovals{501, []InterfaceApproval{subnet}}, false); err == nil {
+	if _, _, err := mergeApprovals(HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{host}}, HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{subnet}}, false); err == nil {
 		t.Fatal("expanded existing host approval")
 	}
-	merged, changed, err := mergeApprovals(HelperApprovals{501, []InterfaceApproval{host}}, HelperApprovals{501, []InterfaceApproval{subnet}}, true)
+	merged, changed, err := mergeApprovals(HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{host}}, HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{subnet}}, true)
 	if err != nil || !changed || len(merged.Approvals) != 1 || !sameApproval(merged.Approvals[0], subnet) {
 		t.Fatalf("explicit replacement failed: merged=%+v changed=%v err=%v", merged, changed, err)
 	}
-	if !sameApproval(host, HelperApprovals{501, []InterfaceApproval{host}}.Approvals[0]) {
+	if !sameApproval(host, HelperApprovals{AllowedUID: 501, Approvals: []InterfaceApproval{host}}.Approvals[0]) {
 		t.Fatal("replacement mutated the old approval")
 	}
 	empty := host
 	empty.Routes = []string{}
 	if !sameApproval(host, empty) {
 		t.Fatal("empty optional prefixes must remain compatible with old host approvals")
+	}
+}
+
+func TestManagedPolicyInstallsOnceAndCannotSilentlyExpand(t *testing.T) {
+	policy := &ManagedPolicy{ClientOnly: true, AddressRanges: []string{"fc00::/7"}, RouteRanges: []string{"fc00::/7"}, MinimumRoutePrefix: 16, MinimumMTU: 1280, MaximumMTU: 1500, InterfacePrefix: "dc", InterfaceBehavior: "ephemeral_exclusive", MaximumActiveAttachments: 8, MaximumRoutesPerAttachment: 32, DenyConnectRouteOverlap: true}
+	installed, changed, err := mergeApprovals(HelperApprovals{}, HelperApprovals{AllowedUID: 501, ManagedPolicy: policy}, false)
+	if err != nil || changed || !sameManagedPolicy(installed.ManagedPolicy, policy) {
+		t.Fatalf("first policy install failed: %+v changed=%v err=%v", installed, changed, err)
+	}
+	expanded := *policy
+	expanded.RouteRanges = []string{"::/1"}
+	if _, _, err := mergeApprovals(installed, HelperApprovals{AllowedUID: 501, ManagedPolicy: &expanded}, false); err == nil {
+		t.Fatal("silently expanded installed policy")
+	}
+	if _, _, err := mergeApprovals(HelperApprovals{}, HelperApprovals{AllowedUID: 501, ManagedPolicy: &expanded}, false); err == nil {
+		t.Fatal("accepted default-route policy range")
 	}
 }
 

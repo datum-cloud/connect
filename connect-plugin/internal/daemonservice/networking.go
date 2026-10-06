@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,8 +34,47 @@ type InterfaceApproval struct {
 	AdvertiseRoutes []string `json:"advertise_routes,omitempty"`
 }
 type HelperApprovals struct {
-	AllowedUID uint32              `json:"allowed_uid"`
-	Approvals  []InterfaceApproval `json:"approvals"`
+	AllowedUID    uint32              `json:"allowed_uid"`
+	Approvals     []InterfaceApproval `json:"approvals"`
+	ManagedPolicy *ManagedPolicy      `json:"managed_policy,omitempty"`
+}
+
+type ManagedPolicy struct {
+	ClientOnly                 bool     `json:"client_only"`
+	AddressRanges              []string `json:"address_ranges"`
+	RouteRanges                []string `json:"route_ranges"`
+	MinimumRoutePrefix         uint8    `json:"minimum_route_prefix"`
+	MinimumMTU                 uint16   `json:"minimum_mtu"`
+	MaximumMTU                 uint16   `json:"maximum_mtu"`
+	InterfacePrefix            string   `json:"interface_prefix"`
+	InterfaceBehavior          string   `json:"interface_behavior"`
+	MaximumActiveAttachments   uint8    `json:"maximum_active_attachments"`
+	MaximumRoutesPerAttachment uint8    `json:"maximum_routes_per_attachment"`
+	DenyConnectRouteOverlap    bool     `json:"deny_connect_route_overlap"`
+}
+
+func sameManagedPolicy(a, b *ManagedPolicy) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.ClientOnly == b.ClientOnly && slices.Equal(a.AddressRanges, b.AddressRanges) && slices.Equal(a.RouteRanges, b.RouteRanges) && a.MinimumRoutePrefix == b.MinimumRoutePrefix && a.MinimumMTU == b.MinimumMTU && a.MaximumMTU == b.MaximumMTU && a.InterfacePrefix == b.InterfacePrefix && a.InterfaceBehavior == b.InterfaceBehavior && a.MaximumActiveAttachments == b.MaximumActiveAttachments && a.MaximumRoutesPerAttachment == b.MaximumRoutesPerAttachment && a.DenyConnectRouteOverlap == b.DenyConnectRouteOverlap
+}
+
+func validateManagedPolicy(policy *ManagedPolicy) error {
+	if policy == nil {
+		return nil
+	}
+	if !policy.ClientOnly || !policy.DenyConnectRouteOverlap || policy.InterfacePrefix != "dc" || policy.InterfaceBehavior != "ephemeral_exclusive" || policy.MinimumRoutePrefix < 8 || policy.MinimumMTU < 1280 || policy.MaximumMTU < policy.MinimumMTU || policy.MaximumMTU > 1500 || policy.MaximumActiveAttachments == 0 || policy.MaximumActiveAttachments > 16 || policy.MaximumRoutesPerAttachment == 0 || policy.MaximumRoutesPerAttachment > 32 || len(policy.AddressRanges) == 0 || len(policy.AddressRanges) > 8 || len(policy.RouteRanges) == 0 || len(policy.RouteRanges) > 8 {
+		return fmt.Errorf("managed policy must describe bounded, ephemeral client-only networking")
+	}
+	ula := netip.MustParsePrefix("fc00::/7")
+	for _, value := range append(append([]string{}, policy.AddressRanges...), policy.RouteRanges...) {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil || !prefix.Addr().Is6() || prefix.Bits() < ula.Bits() || prefix != prefix.Masked() || !ula.Contains(prefix.Addr()) {
+			return fmt.Errorf("managed policy ranges must be canonical IPv6 ULA prefixes")
+		}
+	}
+	return nil
 }
 
 func sameApproval(a, b InterfaceApproval) bool {
@@ -116,8 +156,18 @@ func mergeApprovals(existing, requested HelperApprovals, replace bool) (HelperAp
 	if requested.AllowedUID == 0 || requested.AllowedUID == ^uint32(0) || (existing.AllowedUID != 0 && existing.AllowedUID != requested.AllowedUID) {
 		return HelperApprovals{}, false, fmt.Errorf("approval user mismatch")
 	}
-	merged := HelperApprovals{AllowedUID: requested.AllowedUID, Approvals: append([]InterfaceApproval(nil), existing.Approvals...)}
+	if err := validateManagedPolicy(requested.ManagedPolicy); err != nil {
+		return HelperApprovals{}, false, err
+	}
+	merged := HelperApprovals{AllowedUID: requested.AllowedUID, Approvals: append([]InterfaceApproval(nil), existing.Approvals...), ManagedPolicy: existing.ManagedPolicy}
 	changed := false
+	if requested.ManagedPolicy != nil && !sameManagedPolicy(existing.ManagedPolicy, requested.ManagedPolicy) {
+		if existing.ManagedPolicy != nil && !replace {
+			return HelperApprovals{}, false, fmt.Errorf("existing managed VPC policy differs; review it and retry with --replace-helper-approval")
+		}
+		merged.ManagedPolicy = requested.ManagedPolicy
+		changed = existing.ManagedPolicy != nil
+	}
 	for _, incoming := range requested.Approvals {
 		found := false
 		for i, current := range merged.Approvals {
@@ -136,8 +186,8 @@ func mergeApprovals(existing, requested HelperApprovals, replace bool) (HelperAp
 			merged.Approvals = append(merged.Approvals, incoming)
 		}
 	}
-	if len(merged.Approvals) == 0 || len(merged.Approvals) > 16 {
-		return HelperApprovals{}, false, fmt.Errorf("approve between 1 and 16 peer host pairs")
+	if (len(merged.Approvals) == 0 && merged.ManagedPolicy == nil) || len(merged.Approvals) > 16 {
+		return HelperApprovals{}, false, fmt.Errorf("approve a managed VPC policy or between 1 and 16 peer host pairs")
 	}
 	return merged, changed, nil
 }

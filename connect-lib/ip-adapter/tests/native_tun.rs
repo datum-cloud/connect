@@ -227,6 +227,7 @@ async fn helper_roundtrip(local: &str, remote: &str, test_name: &str) {
             routes: vec![],
             advertise_routes: vec![],
         }],
+        managed_policy: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let config_path = dir.path().join("approvals.json");

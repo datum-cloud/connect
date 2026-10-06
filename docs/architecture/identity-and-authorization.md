@@ -13,7 +13,7 @@ one boundary can authorize.
 | Connector keypair | Private daemon repository; public key in `Connector` | Peer authentication and stable device identity |
 | Daemon bearer token | Secret presented locally; salted hash in daemon state | Loopback API roles and scopes |
 | Gateway keypair | Project Secret mounted read-only in Workload | Gateway endpoint authentication |
-| Networking-helper peer credentials | Protected local helper configuration and IPC | Authorize one user daemon and exact adapter plans |
+| Networking-helper peer credentials | Protected local helper configuration and IPC | Authorize one user daemon and bounded adapter plans |
 
 No Connector private key is stored in the project API. Gateway status exposes
 only the public endpoint ID. The networking helper has no cloud credentials or
@@ -61,7 +61,7 @@ authorization bodies are never written to diagnostic logs.
 | Create public ingress | Explicit `--public` plus permission to create the owned HTTPProxy |
 | Join a managed VPC | Permission to create or reuse the project `ConnectNetworkBinding` |
 | Enter a managed gateway | Authenticated Connector key present in the applied grant |
-| Install address and routes | Exact administrator-approved helper plan |
+| Install address and routes | Exact peer approval or administrator-approved managed-client policy |
 | Route direct-peer packets | Explicit protocol and direction rules on both operators' configuration |
 
 Authorization is checked at multiple layers intentionally. A binding without a

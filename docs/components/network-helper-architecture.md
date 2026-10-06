@@ -12,7 +12,7 @@ I/O.
 - no cloud credentials, API client, or Connector private key;
 - root-owned, private approval configuration;
 - daemon authentication with Unix peer credentials;
-- exact-match interface, address, peer, MTU, and route approval;
+- exact direct-peer approvals plus a constrained managed-VPC client policy;
 - framed packet IPC rather than commands or shell execution;
 - adapter lifetime bound to the authenticated IPC session.
 
@@ -36,8 +36,9 @@ flowchart LR
     helper --> kernel
 ```
 
-The administrator approves a finite plan. The daemon may activate that plan but
-cannot extend it. The helper validates the requesting UID, configuration path
+The administrator approves either a finite direct-peer plan or one constrained
+managed-VPC client policy. The daemon can activate only plans inside that
+authority. The helper validates the requesting UID, configuration path
 ownership, and every plan before changing networking.
 
 On Linux, Connect keeps approval state and the Unix socket in
@@ -50,7 +51,7 @@ Connect stops installation and reports the policy setup error.
 
 ## Approval Model
 
-One approval fixes:
+Direct-peer and router approvals fix:
 
 - interface name or label;
 - assigned host address and remote peer address;
@@ -58,10 +59,19 @@ One approval fixes:
 - installed routes;
 - any explicitly advertised router prefixes.
 
-Default routes, overlapping active routes, unapproved addresses, and plan
-changes are rejected. A managed binding whose status changes therefore requires
-explicit `--replace-helper-approval`; cloud state alone cannot expand root
-network authority.
+The one-time managed policy instead fixes the allowed UID, IPv6 ULA address and
+route pools, minimum route prefix length, MTU range, generated interface prefix,
+ephemeral/exclusive interface behavior, maximum active attachments, maximum
+routes per attachment, and active Connect-route overlap protection. It never
+permits advertised routes. Default, public, IPv4, and out-of-policy routes are
+rejected before interface creation.
+
+The current vertical slice treats the unprivileged daemon as the source of an
+exact managed attachment plan, bounded by the root-owned policy. A compromised
+daemon can consume the policy's full authority but cannot escape it. A later
+stage can add short-lived controller-signed plans to distinguish authentic
+control-plane plans from daemon-fabricated plans; signatures must supplement,
+not replace, this local policy.
 
 ## IPC and Packet Enforcement
 
@@ -90,7 +100,8 @@ pins the official driver, and validates protected ACLs and reparse-point rules.
 
 | Failure | Result |
 | --- | --- |
-| Approval missing or different | `approval_required`; no interface created |
+| Approval or managed policy missing/different | `network_setup_required`; no interface created |
+| Managed plan outside policy | Join fails with the rejected policy dimension; no interface created |
 | Wrong daemon UID | IPC rejected |
 | Unsafe approval path or permissions | Helper startup fails |
 | Route overlaps an active attachment | New attachment rejected |
