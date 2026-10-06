@@ -9,23 +9,27 @@ recovery role.
 | Resource | Scope | Desired state | Important status |
 | --- | --- | --- | --- |
 | `ConnectorClass` | Cluster | Allowed transports and capabilities | Valid configuration and Ready |
+| `ConnectGatewayClass` | Cluster | Controller, lifecycle policy, operator parameter reference | Accepted and Ready |
 | `Connector` | Project | Class, public key, endpoint, relay URLs | Ready, assigned addresses, Lease reference |
 | `ConnectorAdvertisement` | Project | Connector reference and TCP/UDP ports | Accepted/Ready conditions |
-| `ConnectGateway` | Project | Network, routes, gateway policy, peer routing | Service assignment, endpoint ID, Ready |
+| `ConnectGateway` | Project | Gateway class, network, routes, relay policy, peer routing | Service assignment, phase, idle time, endpoint ID, Ready |
 | `ConnectNetworkBinding` | Project | Connector and gateway references | Assigned and peer addresses, routes, relays, Ready |
 | `Lease` | Project | Connector liveness record | Renew time |
 | `HTTPProxy` | Project, NSO API | Explicit public hostname and backend | Ingress acceptance and hostnames |
 | `Network` | Project, NSO API | VPC selected by name | Consumed through an isolated gateway attachment |
 
-All Connect resources except ConnectorClass carry Milo's Project parent-context
-annotation. ConnectorClass is management-cluster configuration because the
-platform, not a project device, defines supported transport profiles.
+All namespaced Connect resources carry Milo's Project parent-context
+annotation. `ConnectorClass` is management-cluster configuration;
+`ConnectGatewayClass` is cluster-scoped within each entitled project and is
+installed by the Connect service because the platform defines the available
+gateway service profiles.
 
 ## Ownership Graph
 
 ```mermaid
 flowchart TD
     cc[ConnectorClass]
+    gc[ConnectGatewayClass]
     c[Connector]
     l[Lease]
     a[ConnectorAdvertisement]
@@ -39,6 +43,7 @@ flowchart TD
     c --> l
     c -->|owner reference| a
     c -->|owner reference| hp
+    g --> gc
     g -->|logical assignment| gs
     gs -->|isolated attachment| n
     b --> c

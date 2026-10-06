@@ -55,10 +55,11 @@ metadata; the controller never opens the local service or proxies its bytes.
 
 ### ConnectGateway
 
-Validates routes, relay policy, network, and placement requirements. Its target
-contract assigns the logical gateway to compatible shared or dedicated gateway
-capacity and publishes the endpoint and readiness status. A `ConnectGateway`
-does not imply a dedicated runtime instance.
+Resolves a ready project-installed `ConnectGatewayClass` and validates routes,
+relay policy, network, and placement requirements. Its target contract assigns
+the logical gateway to compatible shared or dedicated gateway capacity and
+publishes the endpoint, lifecycle phase, idle time, and readiness status. A
+`ConnectGateway` does not imply a dedicated runtime instance.
 
 ### ConnectNetworkBinding
 

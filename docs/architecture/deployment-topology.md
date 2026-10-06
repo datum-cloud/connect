@@ -92,6 +92,9 @@ Each `ConnectGateway` maps to a logical service assignment, not a dedicated
 process. Shared multi-tenant capacity is the default long-term model. A user can
 request dedicated single-tenant capacity when the platform offers that option.
 Both placements expose the same endpoint, grant, route, and readiness contract.
+The selected `ConnectGatewayClass` controls the service lifecycle, including
+whether capacity is continuously available or activated on demand and released
+after an idle grace period.
 
 The service terminates authenticated CONNECT-IP sessions, applies project- and
 Connector-scoped policy, and exchanges approved packets through an isolated

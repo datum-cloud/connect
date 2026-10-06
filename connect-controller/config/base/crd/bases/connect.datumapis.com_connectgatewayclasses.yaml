@@ -4,23 +4,19 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-    discovery.miloapis.com/parent-contexts: Project
-  name: connectgateways.connect.datumapis.com
+  name: connectgatewayclasses.connect.datumapis.com
 spec:
   group: connect.datumapis.com
   names:
-    kind: ConnectGateway
-    listKind: ConnectGatewayList
-    plural: connectgateways
-    singular: connectgateway
-  scope: Namespaced
+    kind: ConnectGatewayClass
+    listKind: ConnectGatewayClassList
+    plural: connectgatewayclasses
+    singular: connectgatewayclass
+  scope: Cluster
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.gatewayClassRef
-      name: Class
-      type: string
-    - jsonPath: .status.phase
-      name: Phase
+    - jsonPath: .spec.controllerName
+      name: Controller
       type: string
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
@@ -29,8 +25,9 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          ConnectGateway runs a managed gateway in a project VPC. Project Connectors
-          attach through ConnectNetworkBinding resources.
+          ConnectGatewayClass declares an operator-provided managed gateway service
+          profile. Concrete Compute details live in the referenced operator ConfigMap,
+          rather than in project-owned ConnectGateway resources.
         properties:
           apiVersion:
             description: |-
@@ -51,41 +48,46 @@ spec:
             type: object
           spec:
             properties:
-              gatewayClassRef:
-                description: GatewayClassRef names a cluster-scoped ConnectGatewayClass.
+              controllerName:
+                description: ControllerName identifies the controller responsible
+                  for this class.
                 type: string
-              locationRef:
-                type: string
-              networkRef:
-                type: string
-              peerRouting:
+              parametersRef:
                 description: |-
-                  PeerRouting allows Connectors attached to this gateway to route directly
-                  to the assigned addresses of the other attached Connectors. It is disabled
-                  by default; VPC routes remain available regardless of this setting.
-                type: boolean
-              relayURLs:
-                description: RelayURLs pins the gateway to operator-managed iroh relays
-                  when set.
-                items:
-                  type: string
-                type: array
-              routes:
-                items:
-                  type: string
-                maxItems: 32
-                minItems: 1
-                type: array
+                  ParametersRef selects an operator-owned ConfigMap. Its image key is
+                  required; instanceType is optional and defaults to the platform standard.
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                required:
+                - name
+                - namespace
+                type: object
+              scaling:
+                description: |-
+                  Scaling describes observable service lifecycle behavior. It deliberately
+                  does not expose Compute resource sizing or replica implementation details.
+                properties:
+                  idleTimeout:
+                    description: |-
+                      IdleTimeout is the grace period before an idle OnDemand Workload is
+                      removed. It defaults to ten minutes and must be at least one minute.
+                    type: string
+                  mode:
+                    default: OnDemand
+                    enum:
+                    - AlwaysOn
+                    - OnDemand
+                    type: string
+                type: object
             required:
-            - gatewayClassRef
-            - locationRef
-            - networkRef
-            - routes
+            - controllerName
+            - parametersRef
             type: object
           status:
             properties:
-              classRef:
-                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -142,26 +144,9 @@ spec:
                   - type
                   type: object
                 type: array
-              endpointID:
-                type: string
-              idleSince:
-                format: date-time
-                type: string
               observedGeneration:
                 format: int64
                 type: integer
-              phase:
-                description: |-
-                  Phase summarizes this gateway's operational state without exposing the
-                  underlying Compute implementation.
-                enum:
-                - Dormant
-                - Provisioning
-                - Available
-                - Scaling
-                type: string
-              workloadRef:
-                type: string
             type: object
         type: object
     served: true

@@ -7,5 +7,6 @@ resources:
 - protected-resources/connectors.yaml
 - protected-resources/connector-advertisements.yaml
 - protected-resources/connector-classes.yaml
+- protected-resources/connect-gateway-classes.yaml
 - protected-resources/connect-gateways.yaml
 - protected-resources/connect-network-bindings.yaml

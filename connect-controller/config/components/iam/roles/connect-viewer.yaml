@@ -17,6 +17,9 @@ spec:
     - connect.datumapis.com/connectorclasses.list
     - connect.datumapis.com/connectorclasses.get
     - connect.datumapis.com/connectorclasses.watch
+    - connect.datumapis.com/connectgatewayclasses.list
+    - connect.datumapis.com/connectgatewayclasses.get
+    - connect.datumapis.com/connectgatewayclasses.watch
     - connect.datumapis.com/connectgateways.list
     - connect.datumapis.com/connectgateways.get
     - connect.datumapis.com/connectgateways.watch

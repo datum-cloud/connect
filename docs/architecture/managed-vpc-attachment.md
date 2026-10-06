@@ -33,10 +33,11 @@ flowchart TD
 
 ## Gateway Reconciliation
 
-`ConnectGateway` names a Network and declares the gateway policy and approved
-routes. The controller:
+`ConnectGateway` selects a project-installed `ConnectGatewayClass`, names a
+Network, and declares the gateway policy and approved routes. The controller:
 
-1. validates routes, relay policy, placement requirements, and references;
+1. validates the class, routes, relay policy, placement requirements, and
+   references;
 2. assigns compatible gateway capacity according to platform policy; the target
    model defaults to shared multi-tenant capacity and can honor a dedicated
    single-tenant request when offered;
@@ -45,6 +46,12 @@ routes. The controller:
 5. publishes the public endpoint ID and assignment status; and
 6. reports Ready when the endpoint, network attachment, and configuration are
    available.
+
+OnDemand activity requires a non-deleting binding whose Connector is both
+Accepted and Ready. Binding readiness is intentionally excluded because it
+depends on the gateway service. When activity stops, the class idle timeout
+provides hysteresis before capacity is released; identity and durable grants
+are preserved for the next activation.
 
 The service's runtime placement and process count are not part of the resource
 contract. Gateway Ready proves service and attachment availability; it does not

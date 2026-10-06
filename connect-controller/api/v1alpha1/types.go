@@ -38,6 +38,61 @@ type ConnectorClassList struct {
 	Items           []ConnectorClass `json:"items"`
 }
 
+// ConnectGatewayClass declares an operator-provided managed gateway service
+// profile. Concrete Compute details live in the referenced operator ConfigMap,
+// rather than in project-owned ConnectGateway resources.
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Controller",type=string,JSONPath=`.spec.controllerName`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+type ConnectGatewayClass struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              ConnectGatewayClassSpec   `json:"spec,omitempty"`
+	Status            ConnectGatewayClassStatus `json:"status,omitempty"`
+}
+
+type ConnectGatewayClassSpec struct {
+	// ControllerName identifies the controller responsible for this class.
+	// +kubebuilder:validation:Required
+	ControllerName string `json:"controllerName"`
+	// ParametersRef selects an operator-owned ConfigMap. Its image key is
+	// required; instanceType is optional and defaults to the platform standard.
+	ParametersRef ConnectGatewayClassParametersReference `json:"parametersRef"`
+	// Scaling describes observable service lifecycle behavior. It deliberately
+	// does not expose Compute resource sizing or replica implementation details.
+	Scaling ConnectGatewayScalingPolicy `json:"scaling,omitempty"`
+}
+
+type ConnectGatewayClassParametersReference struct {
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+	// +kubebuilder:validation:Required
+	Namespace string `json:"namespace"`
+}
+
+type ConnectGatewayScalingPolicy struct {
+	// +kubebuilder:validation:Enum=AlwaysOn;OnDemand
+	// +kubebuilder:default=OnDemand
+	Mode string `json:"mode,omitempty"`
+	// IdleTimeout is the grace period before an idle OnDemand Workload is
+	// removed. It defaults to ten minutes and must be at least one minute.
+	IdleTimeout metav1.Duration `json:"idleTimeout,omitempty"`
+}
+
+type ConnectGatewayClassStatus struct {
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type ConnectGatewayClassList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ConnectGatewayClass `json:"items"`
+}
+
 // Connector represents one Connect installation in one project. The public key
 // is the stable iroh identity; private material must never be stored in the API.
 // +kubebuilder:object:root=true
@@ -125,6 +180,9 @@ type ConnectorAdvertisementList struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:metadata:annotations="discovery.miloapis.com/parent-contexts=Project"
+// +kubebuilder:printcolumn:name="Class",type=string,JSONPath=`.spec.gatewayClassRef`
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 type ConnectGateway struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -133,6 +191,9 @@ type ConnectGateway struct {
 }
 
 type ConnectGatewaySpec struct {
+	// GatewayClassRef names a cluster-scoped ConnectGatewayClass.
+	// +kubebuilder:validation:Required
+	GatewayClassRef string `json:"gatewayClassRef"`
 	// +kubebuilder:validation:Required
 	NetworkRef string `json:"networkRef"`
 	// +kubebuilder:validation:Required
@@ -141,11 +202,6 @@ type ConnectGatewaySpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=32
 	Routes []string `json:"routes,omitempty"`
-	// Image must be a Linux gateway image with Datum CONNECT-IP support.
-	// +kubebuilder:validation:Required
-	Image string `json:"image"`
-	// InstanceType selects the Compute instance size. The platform default is used when empty.
-	InstanceType string `json:"instanceType,omitempty"`
 	// RelayURLs pins the gateway to operator-managed iroh relays when set.
 	RelayURLs []string `json:"relayURLs,omitempty"`
 	// PeerRouting allows Connectors attached to this gateway to route directly
@@ -155,10 +211,16 @@ type ConnectGatewaySpec struct {
 }
 
 type ConnectGatewayStatus struct {
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
-	WorkloadRef        string             `json:"workloadRef,omitempty"`
-	EndpointID         string             `json:"endpointID,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	ObservedGeneration int64  `json:"observedGeneration,omitempty"`
+	ClassRef           string `json:"classRef,omitempty"`
+	// Phase summarizes this gateway's operational state without exposing the
+	// underlying Compute implementation.
+	// +kubebuilder:validation:Enum=Dormant;Provisioning;Available;Scaling
+	Phase       string             `json:"phase,omitempty"`
+	IdleSince   *metav1.Time       `json:"idleSince,omitempty"`
+	WorkloadRef string             `json:"workloadRef,omitempty"`
+	EndpointID  string             `json:"endpointID,omitempty"`
+	Conditions  []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -205,5 +267,5 @@ type ConnectNetworkBindingList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &Connector{}, &ConnectorList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{}, &ConnectNetworkBinding{}, &ConnectNetworkBindingList{})
+	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &ConnectGatewayClass{}, &ConnectGatewayClassList{}, &Connector{}, &ConnectorList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{}, &ConnectNetworkBinding{}, &ConnectNetworkBindingList{})
 }
