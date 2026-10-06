@@ -1291,6 +1291,7 @@ fn require_network_authorization(
     Ok(())
 }
 
+#[cfg(unix)]
 fn helper_approves_managed_attachment(
     helper: &connect_ip_adapter::helper::Status,
     expected: &connect_ip_adapter::helper::Approval,
@@ -1338,6 +1339,7 @@ mod network_authorization_tests {
         assert!(require_network_authorization(&authorized, &cancel).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_policy_approves_managed_vpc_attachment_without_exact_approval() {
         let helper = connect_ip_adapter::helper::Status {
@@ -1357,6 +1359,7 @@ mod network_authorization_tests {
         assert!(helper_approves_managed_attachment(&helper, &approval));
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_policy_does_not_approve_out_of_policy_routes() {
         let helper = connect_ip_adapter::helper::Status {
