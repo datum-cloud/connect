@@ -25,6 +25,8 @@ var ensureNetworking = daemonservice.EnsureNetworking
 type networkPlan struct {
 	Network         string                           `json:"network"`
 	ManagedGateway  bool                             `json:"managed_gateway"`
+	Gateway         string                           `json:"gateway_resource"`
+	GatewayLocation string                           `json:"gateway_location"`
 	ApprovalAction  string                           `json:"approval_action"`
 	ApprovalChanges []string                         `json:"approval_changes"`
 	HelperConfig    daemonservice.HelperApprovals    `json:"helper_config"`
@@ -44,7 +46,8 @@ type networkPlan struct {
 
 const defaultJoinRequestTimeout = 4 * time.Minute
 
-// A managed ConnectNetworkBinding can take up to 90 seconds to reconcile.
+// An on-demand gateway and its ConnectNetworkBinding can take several minutes
+// to provision and reconcile on the first join.
 // Keep the ordinary commands snappy, but don't let the global 30-second
 // default make a fresh join appear to fail while the controller is still
 // approving it. An explicitly supplied --timeout remains authoritative.
@@ -110,6 +113,9 @@ func writeNetworkApproval(out io.Writer, plan networkPlan, peer string) {
 		fmt.Fprintf(out, "  %s: %s\n", label, peerLabel)
 	}
 	if plan.ManagedGateway {
+		if plan.Gateway != "" && plan.GatewayLocation != "" {
+			fmt.Fprintf(out, "  VPC gateway: %s (%s)\n", plan.Gateway, plan.GatewayLocation)
+		}
 		if len(plan.Binding.Routes) > 0 {
 			fmt.Fprintln(out, "  Routes through the VPC gateway:")
 			for _, route := range plan.Binding.Routes {
@@ -242,7 +248,7 @@ func newJoin(opts *options) *cobra.Command {
 	var routes, advertise []string
 	var ping, upgrade, replaceApproval, wait, noWait bool
 	var waitTimeout time.Duration
-	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC gateway or direct Connector", Long: "Join the ready ConnectGateway configured for NETWORK. The first managed VPC join asks for one-time Administrator approval of a constrained client networking policy; later compliant VPC joins do not prompt.\n\nIf no managed gateway exists, pass --peer and explicit traffic permissions\nfor direct Connector setup. Both peers use the same network name and approve\neach other. Routed direct attachments wait for the peer by default.\n\nSuccessful managed VPC attachments reconnect when the daemon or project resumes. Plans outside the managed policy fail closed. Direct peer and route-advertising attachments remain ephemeral and require exact approval. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "join NETWORK", Short: "Join a VPC gateway or direct Connector", Long: "Join NETWORK through a gateway in the nearest Datum location. If the project has no gateway there, Connect creates one using the operator's default gateway class. Connect creates or reuses this device's ConnectNetworkBinding. The first managed VPC join asks for one-time Administrator approval of a constrained client networking policy; later compliant VPC joins do not prompt.\n\nIf the project does not manage NETWORK through a VPC gateway, pass --peer and explicit traffic permissions for direct Connector setup. Both peers use the same network name and approve each other. Routed direct attachments wait for the peer by default.\n\nSuccessful managed VPC attachments reconnect when the daemon or project resumes. Plans outside the managed policy fail closed. Direct peer and route-advertising attachments remain ephemeral and require exact approval. Scripts never prompt or elevate.", Example: "  datumctl connect join staging-vpc\n  datumctl connect join friend --peer laptop --allow-tcp 22", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if wait && noWait {
 			return fmt.Errorf("choose either --wait or --no-wait")
 		}
@@ -341,11 +347,12 @@ func newJoin(opts *options) *cobra.Command {
 			}
 			writeNetworkApproval(cmd.ErrOrStderr(), plan, peer)
 			replaceRequested := replaceApproval || plan.ApprovalAction == "replace"
+			upgradeRequested := upgrade || plan.ApprovalAction == "upgrade"
 			question := "Install the privileged helper and approve managed VPC networking for this user?"
 			if !plan.ManagedGateway {
 				question = "Install the privileged helper and approve this exact attachment?"
 			}
-			if upgrade {
+			if upgradeRequested {
 				question = "Upgrade the helper? Active IP attachments will disconnect; services and local ports stay running."
 			} else if replaceRequested {
 				question = "Approve this updated network access? The current IP attachment will reconnect; services and local ports stay running."
@@ -355,7 +362,7 @@ func newJoin(opts *options) *cobra.Command {
 			if err := confirmSetup(cmd, question); err != nil {
 				return err
 			}
-			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, upgrade, replaceRequested); err != nil {
+			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, upgradeRequested, replaceRequested); err != nil {
 				return err
 			}
 			// launchd/systemd acknowledging Start is not yet helper readiness.

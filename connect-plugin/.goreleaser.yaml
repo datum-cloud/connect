@@ -21,10 +21,17 @@ release:
   header: |
     This is the headless Connect preview. It makes breaking CLI changes.
     Each platform archive contains both datumctl-connect and datum-connectd.
-    Read INSTALL.txt for manual plugin installation, trust, and first-run setup.
+    With datumctl already installed, install this preview on macOS or Linux:
+
+    ```sh
+    bash -c 'set -e; v={{ .Tag }}; os=$(uname -s); case "$os" in Darwin|Linux) ;; *) echo "unsupported OS: $os" >&2; exit 1;; esac; arch=$(uname -m); case "$arch" in x86_64|amd64) arch=x86_64;; arm64|aarch64) arch=arm64;; *) echo "unsupported architecture: $arch" >&2; exit 1;; esac; asset="datumctl-connect_${os}_${arch}.tar.gz"; mkdir -p "$HOME/.local/bin"; curl -fsSL "https://github.com/datum-cloud/connect/releases/download/$v/$asset" | tar -xz -C "$HOME/.local/bin" datumctl-connect datum-connectd datum-connect-network-helper; export PATH="$HOME/.local/bin:$PATH"; datumctl plugin trust connect; datumctl connect version'
+    ```
+
+    Add `~/.local/bin` to `PATH` in your shell startup file if needed. Read
+    INSTALL.txt for the detailed manual flow and troubleshooting.
     Section 7 of INSTALL.txt covers joining a managed VPC and reaching a running
-    Compute instance by its VPC address. A project administrator must provision
-    a Ready ConnectGateway before a user can join.
+    Compute instance by its VPC address. Join creates a ConnectGateway in the
+    nearest location when the Network does not already have one.
     Checksums are not publisher signatures. macOS notarization is not included.
   extra_files:
     - glob: ../docs/INSTALL.txt

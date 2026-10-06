@@ -349,6 +349,20 @@ func validateGatewayClassSpec(class *connectv1alpha1.ConnectGatewayClass) error 
 	if class.Spec.ParametersRef.Name == "" || class.Spec.ParametersRef.Namespace == "" {
 		return fmt.Errorf("parametersRef name and namespace are required")
 	}
+	if len(class.Spec.RelayURLs) > 5 {
+		return fmt.Errorf("relayURLs cannot contain more than 5 entries")
+	}
+	seenRelays := map[string]bool{}
+	for _, relay := range class.Spec.RelayURLs {
+		parsed, err := url.Parse(relay)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return fmt.Errorf("relay URL %q must be an HTTPS URL without credentials, query, or fragment", relay)
+		}
+		if seenRelays[relay] {
+			return fmt.Errorf("relay URL %q is duplicated", relay)
+		}
+		seenRelays[relay] = true
+	}
 	return nil
 }
 

@@ -12,6 +12,10 @@ to use the existing service publication APIs. See the
 For manual installation, follow the [installation guide](docs/INSTALL.txt).
 It covers plugin trust, checksum verification, first use, and upgrades.
 
+Managed VPC join creates a gateway automatically when the named Network does
+not have one. It uses the nearest Datum location and the project's Ready default
+`ConnectGatewayClass`, then waits for the gateway and binding to become usable.
+
 ## Quickstart
 
 Install and trust the Connect plugin, sign in with `datumctl`, and start your

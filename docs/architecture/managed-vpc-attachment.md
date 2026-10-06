@@ -12,6 +12,7 @@ flowchart TD
     class[ConnectorClass]
     connector[Connector]
     lease[Lease]
+    gatewayClass[ConnectGatewayClass]
     gateway[ConnectGateway]
     service[Connect Gateway service]
     grants[Effective grants]
@@ -21,12 +22,14 @@ flowchart TD
 
     connector --> class
     connector --> lease
+    gateway --> gatewayClass
     gateway -->|logical assignment| service
     service -->|isolated attachment| network
     binding --> connector
     binding --> gateway
     binding --> grants
     grants --> service
+    daemon -->|select or create| gateway
     daemon -->|create, read, delete| binding
     daemon -->|CONNECT-IP| service
 ```
@@ -91,9 +94,14 @@ sequenceDiagram
 
     User->>CLI: join NETWORK
     CLI->>Daemon: prepare network
-    Daemon->>API: find Ready gateway
+    Daemon->>API: read Network and list gateways
+    Daemon->>Daemon: resolve nearest Datum location
+    alt no gateway in that location
+        Daemon->>API: select Ready default gateway class
+        Daemon->>API: create gateway
+    end
     Daemon->>API: create or reuse binding
-    Controller->>API: publish addresses, routes, endpoint, relays
+    Controller->>API: provision gateway and publish binding status
     Daemon->>Helper: request exact approved adapter plan
     Helper-->>Daemon: adapter ready
     Daemon->>Gateway: CONNECT-IP with Connector identity

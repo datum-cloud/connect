@@ -142,6 +142,20 @@ func TestGatewayClassReportsParameterReadiness(t *testing.T) {
 	}
 }
 
+func TestGatewayClassRejectsInvalidRelayURLs(t *testing.T) {
+	ctx := context.Background()
+	class, parameterClient := testGatewayClass(t, "OnDemand", 10*time.Minute)
+	class.Spec.RelayURLs = []string{"http://relay.example", "https://relay.example?token=secret"}
+	projectClient := testClient(t, class).Build()
+	if err := reconcileGatewayClass(ctx, projectClient, parameterClient, class); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(class.Status.Conditions, "Accepted")
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "InvalidParameters" {
+		t.Fatalf("class condition=%#v, want invalid relay URLs to be rejected", condition)
+	}
+}
+
 func TestOnDemandGatewayScalesBetweenZeroAndOne(t *testing.T) {
 	ctx := context.Background()
 	t0 := time.Date(2026, time.October, 5, 12, 0, 0, 0, time.UTC)

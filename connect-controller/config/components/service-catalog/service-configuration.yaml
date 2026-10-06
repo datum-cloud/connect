@@ -42,6 +42,10 @@ spec:
           name: standard
         spec:
           controllerName: connect.datum.net/gateway-controller
+          default: true
+          relayURLs:
+          - https://iroh-relay.us-central-1.datum-staging.net
+          - https://iroh-relay.us-east-1.datum-staging.net
           parametersRef:
             namespace: connect-system
             name: standard-gateway

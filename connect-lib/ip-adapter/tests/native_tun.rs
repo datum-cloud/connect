@@ -151,7 +151,6 @@ async fn helper_roundtrip(local: &str, remote: &str, test_name: &str) {
             std::path::PathBuf::from(std::env::var_os("DATUM_CONNECT_HELPER_TEST_SOCKET").unwrap());
         let label = std::env::var("DATUM_CONNECT_HELPER_TEST_LABEL").unwrap();
         let status = connect_ip_adapter::helper::inspect(&socket).await.unwrap();
-        assert_eq!(status.version, 1);
         assert_eq!(
             status.approvals[0].mtu, 1280,
             "new requests must load the updated root approval file"

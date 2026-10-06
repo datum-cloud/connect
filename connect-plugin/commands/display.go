@@ -44,6 +44,8 @@ type dialDisplay struct {
 type networkDisplay struct {
 	Network                    string   `json:"network"`
 	Mode                       string   `json:"mode"`
+	Gateway                    string   `json:"gateway_resource"`
+	GatewayLocation            string   `json:"gateway_location"`
 	Peer                       string   `json:"peer"`
 	PeerAddress                string   `json:"peer_address"`
 	Connected                  *bool    `json:"connected"`
@@ -253,6 +255,13 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 				lifetime = "persistent managed attachment"
 			}
 			fmt.Fprintf(&out, "Network %s: %s, %s on %s (%s).\n", network.Network, state, network.Address, interfaceName, lifetime)
+			if network.Mode == "gateway" && network.Gateway != "" {
+				if network.GatewayLocation != "" {
+					fmt.Fprintf(&out, "  VPC gateway: %s (%s)\n", network.Gateway, network.GatewayLocation)
+				} else {
+					fmt.Fprintf(&out, "  VPC gateway: %s\n", network.Gateway)
+				}
+			}
 			fmt.Fprintf(&out, "  Routes: %s\n", strings.Join(network.Routes, ", "))
 			if len(network.AdvertiseRoutes) > 0 {
 				fmt.Fprintf(&out, "  Approved subnet access for peer: %s\n  Forwarding, firewall, and return routing are managed separately on this device.\n", strings.Join(network.AdvertiseRoutes, ", "))
@@ -409,6 +418,9 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			fmt.Fprintf(&out, "The VPC binding for %s is approved, but this device is not forwarding traffic.\n", network.Network)
 		} else {
 			fmt.Fprintf(&out, "Connected to %s.\n", network.Network)
+		}
+		if network.Mode == "gateway" && network.Gateway != "" && network.GatewayLocation != "" {
+			fmt.Fprintf(&out, "VPC gateway: %s (%s).\n", network.Gateway, network.GatewayLocation)
 		}
 		if len(network.Routes) > 0 {
 			if len(network.Routes) == 1 {

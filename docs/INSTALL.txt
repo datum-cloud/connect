@@ -1,5 +1,5 @@
-Datum Connect v1.0.0-preview.24: manual installation with datumctl
-==================================================================
+Datum Connect v1.0.0-preview.26: installation with datumctl
+===========================================================
 
 This archive includes the datumctl plugin and its matching daemon. Install
 datumctl separately first. These instructions are verified with datumctl v0.20.0.
@@ -8,6 +8,17 @@ executable on PATH, then grant explicit trust as described below. Do not install
 preview over an existing production plugin or daemon without planning migration.
 Windows uses explicit privileged service setup; see docs/headless-preview.md
 in the matching source release for Windows requirements.
+
+Quick install on macOS or Linux
+-------------------------------
+Paste this into bash. It detects the operating system and CPU, installs the
+preview binaries in ~/.local/bin, and trusts the datumctl plugin:
+
+  bash -c 'set -e; v=v1.0.0-preview.26; os=$(uname -s); case "$os" in Darwin|Linux) ;; *) echo "unsupported OS: $os" >&2; exit 1;; esac; arch=$(uname -m); case "$arch" in x86_64|amd64) arch=x86_64;; arm64|aarch64) arch=arm64;; *) echo "unsupported architecture: $arch" >&2; exit 1;; esac; asset="datumctl-connect_${os}_${arch}.tar.gz"; mkdir -p "$HOME/.local/bin"; curl -fsSL "https://github.com/datum-cloud/connect/releases/download/$v/$asset" | tar -xz -C "$HOME/.local/bin" datumctl-connect datum-connectd datum-connect-network-helper; export PATH="$HOME/.local/bin:$PATH"; datumctl plugin trust connect; datumctl connect version'
+
+Add ~/.local/bin to PATH in your shell startup file if it is not already
+there. Continue with section 3. The detailed manual flow below includes archive
+verification, isolated preview directories, and troubleshooting.
 
 1. Verify and extract the platform archive
 
@@ -20,7 +31,7 @@ in the matching source release for Windows requirements.
    Example download for an Apple Silicon Mac. Change CONNECT_ARCHIVE for another
    platform. Check each command succeeds before continuing:
 
-     CONNECT_VERSION=v1.0.0-preview.24
+     CONNECT_VERSION=v1.0.0-preview.26
      CONNECT_ARCHIVE=datumctl-connect_Darwin_arm64.tar.gz
      CONNECT_RELEASE_URL="https://github.com/datum-cloud/connect/releases/download/$CONNECT_VERSION"
      CONNECT_DOWNLOAD_DIR=$(mktemp -d)
@@ -59,7 +70,7 @@ in the matching source release for Windows requirements.
      datumctl connect --version
      datumctl connect serve --help
 
-   Expected output: "connect version v1.0.0-preview.24". Check that the trust
+   Expected output: "connect version v1.0.0-preview.26". Check that the trust
    command identifies the executable inside CONNECT_PREVIEW_DIR.
    The daemon reports its release tag with `datumctl connect version`.
    Keep the two binaries from the same archive together.
@@ -73,7 +84,7 @@ in the matching source release for Windows requirements.
    To keep using this preview in new terminals, repeat these exports or add them
    to your shell startup file (~/.zshrc on macOS or ~/.bashrc on Linux):
 
-     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.24"
+     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.26"
      export PATH="$CONNECT_PREVIEW_DIR:$PATH"
      export DATUMCTL_PLUGINS_DIR="$CONNECT_PREVIEW_DIR/plugin-registry"
 
@@ -169,7 +180,8 @@ in the matching source release for Windows requirements.
    macOS default: ~/Library/Application Support/datumctl/connect/daemon/daemon.log
    Linux default: ~/.local/state/datumctl/connect/daemon/daemon.log
    Do not share setup tokens, credential files, or your datumctl login state.
-   Managed VPC enrollment requires a Ready ConnectGateway in the project.
+   Managed VPC enrollment requires an existing Network and a Ready default
+   ConnectGatewayClass. Join creates the nearest ConnectGateway when needed.
 
    Run unserve on the sender and hangup on the receiver. If TCP and UDP share
    one address, use the service ID from status to disambiguate unserve.
@@ -223,15 +235,16 @@ in the matching source release for Windows requirements.
 7. Join a VPC and reach a Compute instance
 
    A project administrator must install the Connect API/controller, configure
-   a compatible ConnectorClass, and create a Ready ConnectGateway for the VPC.
-   The gateway must advertise a route that contains the running Compute
-   instance's IPv6 address. Your account must be allowed to enroll a Connector
-   and create a ConnectNetworkBinding. The instance must listen on the target
-   port, and VPC firewall rules must allow the connection. This preview does
-   not create the VPC or gateway for you.
+   compatible Connector and ConnectGateway classes, and create the VPC Network.
+   The Connect service supplies a Ready default ConnectGatewayClass. On the
+   first join, Connect selects the nearest Datum location and creates the
+   ConnectGateway automatically. Your account must be allowed to enroll a
+   Connector and create ConnectGateway and ConnectNetworkBinding resources.
+   The instance must listen on the target port, and VPC firewall rules must
+   allow the connection. This preview does not create the VPC Network for you.
 
    Sign in to the same Datum environment and select the project that owns the
-   gateway. Replace the example network, project, address, and port with the
+   Network. Replace the example network, project, address, and port with the
    values provided by your administrator:
 
      datumctl login --hostname auth.staging.env.datum.net
@@ -256,8 +269,9 @@ in the matching source release for Windows requirements.
 
      datumctl connect leave staging-vpc --project my-project
 
-   If the gateway is missing or not Ready, ask the project administrator to
-   provision it. If `curl` times out, check `datumctl connect status`, the
+   If gateway creation fails, check that the Network exists, the Connect service
+   is enabled, and exactly one Ready ConnectGatewayClass is the default. If
+   `curl` times out, check `datumctl connect status`, the
    gateway's route and workload status, the instance listener, and VPC firewall
    rules. For static peer-to-subnet labs, use the separate staging subnet lab
    guide; that flow is not the managed ConnectGateway workflow.
@@ -272,7 +286,7 @@ in the matching source release for Windows requirements.
    protected executable location, and renewable credential-file authentication.
    Follow the matching version's Windows platform guide:
 
-   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.24/docs/headless-preview.md
+   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.26/docs/headless-preview.md
 
 Local build qualification
 -------------------------

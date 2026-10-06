@@ -9,12 +9,15 @@ use credentials::TokenProvider;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 pub type Result<T> = std::result::Result<T, Error>;
 const CONNECT_GROUP: &str = "connect.datumapis.com/v1alpha1";
 const OWNER: &str = "connect.datum.net/connector";
 const GATEWAYS: &str = "connect.datum.net/gateway-connectors";
+const GATEWAY_CONTROLLER: &str = "connect.datum.net/gateway-controller";
+const EDGE_INFO_URL: &str = "https://edge.datum.net/";
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +40,8 @@ pub enum Error {
     },
     #[error("resource is not owned by this Connector: {0}")]
     Ownership(String),
+    #[error("{0}")]
+    NotFound(String),
     #[error("platform capability unavailable: {0}")]
     Unsupported(String),
     #[error("network request failed: {0}")]
@@ -85,6 +90,7 @@ pub struct CloudConnector {
     base: String,
     name: String,
     public_key: String,
+    edge_info_url: String,
     lease_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -100,6 +106,37 @@ pub(crate) fn validate_url(value: &str) -> Result<url::Url> {
         return Err(Error::Invalid("API/token URL must use HTTPS (HTTP allowed only on loopback), without credentials/query/fragment".into()));
     }
     Ok(url)
+}
+
+fn validate_ipv6_prefix(value: &str) -> std::result::Result<(), ()> {
+    let (address, prefix) = value.split_once('/').ok_or(())?;
+    address.parse::<std::net::Ipv6Addr>().map_err(|_| ())?;
+    let prefix = prefix.parse::<u8>().map_err(|_| ())?;
+    if !(2..=128).contains(&prefix) {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn network_gateway_name(network: &str, location: &str) -> String {
+    let hash = sha2::Sha256::digest(format!("{network}/{location}").as_bytes());
+    let suffix = hex::encode(&hash[..5]);
+    let mut stem = network
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    stem = stem.trim_matches('-').to_owned();
+    if stem.is_empty() {
+        stem = "network".into();
+    }
+    stem.truncate(35);
+    format!("connect-{stem}-{}-{suffix}", location.to_ascii_lowercase())
 }
 
 pub(crate) async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
@@ -150,6 +187,7 @@ impl CloudConnector {
             base: base.to_string(),
             name,
             public_key,
+            edge_info_url: EDGE_INFO_URL.into(),
             lease_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -174,8 +212,27 @@ impl CloudConnector {
     }
 
     fn connect_resource(&self, plural: &str, name: &str) -> String {
+        let suffix = if name.is_empty() {
+            String::new()
+        } else {
+            format!("/{name}")
+        };
         format!(
-            "{}/apis/{CONNECT_GROUP}/namespaces/default/{plural}/{name}",
+            "{}/apis/{CONNECT_GROUP}/namespaces/default/{plural}{suffix}",
+            self.base.trim_end_matches('/')
+        )
+    }
+
+    fn network_resource(&self, name: &str) -> String {
+        format!(
+            "{}/apis/networking.datumapis.com/v1alpha/namespaces/default/networks/{name}",
+            self.base.trim_end_matches('/')
+        )
+    }
+
+    fn connect_cluster_resource(&self, plural: &str) -> String {
+        format!(
+            "{}/apis/{CONNECT_GROUP}/{plural}",
             self.base.trim_end_matches('/')
         )
     }
@@ -436,75 +493,74 @@ impl CloudConnector {
         self.renew_connect_connector_lease(&connector).await
     }
 
-    /// Create or reuse this Connector's project binding to the only Ready
-    /// gateway for `network`. `None` means the project has no managed gateway
-    /// for that network, allowing the legacy local approval flow to continue.
+    /// Create or reuse this Connector's project binding to a gateway in the
+    /// edge-selected location. If no gateway exists there, create one from the
+    /// network's assigned prefix and the operator's default gateway class.
+    /// `None` means the ConnectGateway API is not installed yet.
     pub async fn join_gateway_network(
         &self,
         network: &str,
         details: &ConnectionDetails,
     ) -> Result<Option<Value>> {
         validate_name(network)?;
-        let gateway_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-        let mut gateway_wait_logged = false;
-        let gateway = loop {
-            let Some(gateways) = self
-                .request(
-                    Method::GET,
-                    &self.connect_resource("connectgateways", ""),
-                    None,
-                )
+        let Some(gateways) = self
+            .request(
+                Method::GET,
+                &self.connect_resource("connectgateways", ""),
+                None,
+            )
+            .await?
+        else {
+            // Preserve staged rollout behavior while the ConnectGateway API is
+            // unavailable. Once installed, missing gateways are auto-created.
+            return Ok(None);
+        };
+        let network_object = self
+            .request(Method::GET, &self.network_resource(network), None)
+            .await?
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "Network {network:?} was not found in this project."
+                ))
+            })?;
+        let location = self.edge_location().await?;
+        let matches = gateways["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|gateway| {
+                gateway["spec"]["networkRef"] == network
+                    && gateway["spec"]["locationRef"] == location
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            let names = matches
+                .iter()
+                .filter_map(|item| item["metadata"]["name"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Unsupported(format!(
+                "multiple ConnectGateways exist for network {network:?} in location {location}: {names}; remove the duplicate or ask your administrator to resolve it"
+            )));
+        }
+        let gateway = if let Some(gateway) = matches.into_iter().next() {
+            gateway
+        } else {
+            self.create_network_gateway(network, &location, &network_object)
                 .await?
-            else {
-                // The controller CRD is optional during staged rollout; preserve
-                // legacy direct-peer behavior until ConnectGateway is installed.
-                return Ok(None);
-            };
-            let matches = gateways["items"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|gateway| gateway["spec"]["networkRef"] == network)
-                .cloned()
-                .collect::<Vec<_>>();
-            if matches.is_empty() {
-                return Ok(None);
-            }
-            if matches.len() != 1 {
-                let names = matches
-                    .iter()
-                    .filter_map(|item| item["metadata"]["name"].as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(Error::Unsupported(format!(
-                    "ConnectGateway for network {network:?} is not unique (matching gateways: {names}); inspect `datumctl get connectgateways`"
-                )));
-            }
-            let candidate = &matches[0];
-            if current_condition(candidate, "Ready") {
-                break candidate.clone();
-            }
-            if !gateway_wait_logged {
-                tracing::info!(network, gateway = %candidate["metadata"]["name"].as_str().unwrap_or("unknown"), stage="gateway_readiness", "waiting for ConnectGateway reconciliation");
-                gateway_wait_logged = true;
-            }
-            if tokio::time::Instant::now() >= gateway_deadline {
-                let reason = candidate
-                    .pointer("/status/conditions")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .find(|condition| condition["type"] == "Ready")
-                    .and_then(|condition| condition["reason"].as_str())
-                    .unwrap_or("unknown");
-                return Err(Error::Unsupported(format!(
-                    "ConnectGateway for network {network:?} did not become ready within 90 seconds (reason: {reason}); inspect `datumctl get connectgateways`"
-                )));
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
         };
         let gateway_name = string(&gateway, "/metadata/name")?;
-        let gateway_key = string(&gateway, "/status/endpointID")?;
+        tracing::info!(
+            network,
+            location,
+            gateway = gateway_name,
+            stage = "gateway_selected",
+            "selected project ConnectGateway"
+        );
+
+        // Register the Connector before creating its binding. An OnDemand
+        // gateway stays dormant until a ready Connector binding exists.
         self.ensure_connect_connector(details).await?;
         let binding_name = network_binding_name(network, &self.name);
         let binding = match self
@@ -534,17 +590,24 @@ impl CloudConnector {
                 .await?
             }
         };
-        // The controller publishes approval and addresses asynchronously. Wait
-        // for that status so `join` never reports a half-created attachment.
-        let until = tokio::time::Instant::now() + Duration::from_secs(90);
+        // A fresh OnDemand gateway needs time for its Compute Workload to
+        // provision and apply the Connector grant. Match the plugin's default
+        // four-minute request budget instead of timing out during startup.
+        let until = tokio::time::Instant::now() + Duration::from_secs(240);
         let mut binding = binding;
         let mut connector_not_ready_logged = false;
+        let mut gateway_workload_wait_logged = false;
         loop {
             if current_condition(&binding, "Accepted") {
                 let mut result = binding["status"].clone();
                 result["network"] = json!(network);
                 result["gateway"] = json!(gateway_name);
-                result["gatewayEndpointID"] = json!(gateway_key);
+                result["gateway_location"] = json!(gateway["spec"]["locationRef"]);
+                if result["endpointID"].is_string() {
+                    result["gatewayEndpointID"] = result["endpointID"].clone();
+                } else if let Some(endpoint) = gateway.pointer("/status/endpointID") {
+                    result["gatewayEndpointID"] = endpoint.clone();
+                }
                 result["bindingName"] = json!(binding_name);
                 result["connectorName"] = json!(self.name);
                 return Ok(Some(result));
@@ -576,6 +639,29 @@ impl CloudConnector {
                     connector_not_ready_logged = true;
                 }
             }
+            if !gateway_workload_wait_logged
+                && let Some(condition) = binding
+                    .pointer("/status/conditions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|condition| {
+                        condition["type"] == "Accepted"
+                            && matches!(
+                                condition["reason"].as_str(),
+                                Some("GatewayProvisioning" | "GatewayApplyingGrant")
+                            )
+                    })
+            {
+                tracing::info!(
+                    network,
+                    gateway = gateway_name,
+                    reason = condition["reason"].as_str().unwrap_or("unknown"),
+                    stage = "gateway_workload_startup",
+                    "waiting for the VPC gateway workload to become ready"
+                );
+                gateway_workload_wait_logged = true;
+            }
             if tokio::time::Instant::now() >= until {
                 if connector_not_ready_logged {
                     return Err(Error::Unsupported(format!(
@@ -584,7 +670,7 @@ impl CloudConnector {
                     )));
                 }
                 return Err(Error::Unsupported(format!(
-                    "timed out waiting for ConnectNetworkBinding {binding_name} approval; inspect `datumctl get connectnetworkbindings {binding_name}`"
+                    "timed out waiting for ConnectNetworkBinding {binding_name} approval; the VPC gateway may still be starting. Inspect `datumctl get connectnetworkbindings {binding_name}` and retry `datumctl connect join {network}`"
                 )));
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -593,6 +679,136 @@ impl CloudConnector {
                 .await?
                 .ok_or(Error::Api(404))?;
         }
+    }
+
+    async fn edge_location(&self) -> Result<String> {
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client.get(&self.edge_info_url).send(),
+        )
+        .await
+        .map_err(|_| {
+            Error::Unsupported(
+                "could not determine your nearest Connect location because edge.datum.net timed out; check your internet connection and retry".into(),
+            )
+        })?
+        .map_err(|error| {
+            tracing::warn!(error = %error, stage = "edge_location_lookup", "could not reach nearest-location service");
+            Error::Unsupported(
+                "could not reach edge.datum.net to determine your nearest Connect location; check your internet connection and retry".into(),
+            )
+        })?;
+        if !response.status().is_success() {
+            tracing::warn!(
+                status = response.status().as_u16(),
+                stage = "edge_location_lookup",
+                "nearest-location service returned an error"
+            );
+            return Err(Error::Unsupported(format!(
+                "could not determine your nearest Connect location because edge.datum.net returned HTTP {}; retry later or ask your administrator to check edge.datum.net",
+                response.status().as_u16()
+            )));
+        }
+        let mut body = Vec::new();
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            tracing::warn!(error = %error, stage = "edge_location_response", "failed to read nearest-location response");
+            Error::Unsupported(
+                "could not read the response from edge.datum.net; check your internet connection and retry".into(),
+            )
+        })? {
+            if body.len().saturating_add(chunk.len()) > 64 * 1024 {
+                return Err(Error::Unsupported(
+                    "edge.datum.net returned an unexpectedly large location response".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(body).map_err(|_| {
+            Error::Unsupported("edge.datum.net returned an invalid location response".into())
+        })?;
+        let colo = body
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("colo="))
+            .map(str::trim)
+            .filter(|colo| colo.len() == 3 && colo.bytes().all(|byte| byte.is_ascii_uppercase()))
+            .ok_or_else(|| Error::Unsupported("edge.datum.net did not return a valid three-letter colo; retry later or ask your administrator to check the edge location mapping".into()))?;
+        tracing::info!(
+            colo,
+            stage = "edge_location_resolved",
+            "resolved nearest Connect location"
+        );
+        Ok(colo.to_owned())
+    }
+
+    async fn create_network_gateway(
+        &self,
+        network: &str,
+        location: &str,
+        network_object: &Value,
+    ) -> Result<Value> {
+        let prefix = network_object
+            .pointer("/status/ipam/ipv6Prefix")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Unsupported(format!("network {network:?} has no assigned IPv6 prefix yet; wait for the Network to become Ready and retry")))?;
+        validate_ipv6_prefix(prefix).map_err(|_| Error::Unsupported(format!("network {network:?} has an invalid assigned IPv6 prefix; ask your administrator to check its IPAM status")))?;
+
+        let classes = self
+            .request(
+                Method::GET,
+                &self.connect_cluster_resource("connectgatewayclasses"),
+                None,
+            )
+            .await?
+            .ok_or_else(|| Error::Unsupported("the ConnectGatewayClass API is not available; ask your administrator to enable the Connect service".into()))?;
+        let ready = classes["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|class| {
+                class["spec"]["controllerName"] == GATEWAY_CONTROLLER
+                    && current_condition(class, "Ready")
+            })
+            .collect::<Vec<_>>();
+        let defaults = ready
+            .iter()
+            .copied()
+            .filter(|class| class["spec"]["default"] == true)
+            .collect::<Vec<_>>();
+        let class = match (defaults.as_slice(), ready.as_slice()) {
+            ([class], _) => *class,
+            ([], [class]) => *class,
+            ([], []) => return Err(Error::Unsupported("no Ready ConnectGatewayClass is available; ask your administrator to enable the Connect service".into())),
+            ([], _) => return Err(Error::Unsupported("multiple Ready ConnectGatewayClasses exist; ask your administrator to mark exactly one as the default".into())),
+            _ => return Err(Error::Unsupported("multiple Ready ConnectGatewayClasses are marked as the default; ask your administrator to leave only one default".into())),
+        };
+        let class_name = string(class, "/metadata/name")?;
+        let name = network_gateway_name(network, location);
+        let relay_urls = class["spec"]["relayURLs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let desired = json!({
+            "apiVersion": CONNECT_GROUP,
+            "kind": "ConnectGateway",
+            "metadata": {"name": name},
+            "spec": {
+                "gatewayClassRef": class_name,
+                "networkRef": network,
+                "locationRef": location,
+                "routes": [prefix],
+                "relayURLs": relay_urls
+            }
+        });
+        tracing::info!(
+            network,
+            location,
+            gateway = name,
+            gateway_class = class_name,
+            stage = "gateway_create",
+            "creating ConnectGateway for project network"
+        );
+        self.connect_create("connectgateways", &desired).await
     }
 
     pub async fn leave_gateway_network(&self, network: &str) -> Result<bool> {
@@ -664,7 +880,8 @@ impl CloudConnector {
                 "network": network,
                 "mode": "gateway",
                 "binding_name": name,
-                "gateway": gateway_ref,
+                "gateway_resource": gateway_ref,
+                "gateway_location": gateway["spec"]["locationRef"],
                 "assigned_address": status["assignedAddress"],
                 "peer_address": status["peerAddress"],
                 "routes": status["routes"],

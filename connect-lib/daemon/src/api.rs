@@ -1134,6 +1134,10 @@ async fn describe_helper_approval(mut plan: Value) -> Result<Value, ApiError> {
     )
     .map_err(|_| ApiError::internal("Network setup plan has invalid helper_config"))?;
     let current = connect_ip_adapter::helper::inspect(&crate::networking::helper_socket()?).await;
+    let helper_upgrade_required = current
+        .as_ref()
+        .err()
+        .is_some_and(helper_inspection_requires_upgrade);
     let (action, changes) = if let Some(requested_policy) = expected.managed_policy.as_ref() {
         match current {
             Ok(current) if current.managed_policy.as_ref() == Some(requested_policy) => {
@@ -1143,6 +1147,7 @@ async fn describe_helper_approval(mut plan: Value) -> Result<Value, ApiError> {
                 ("replace", vec!["managed VPC policy"])
             }
             Ok(_) => ("add", Vec::new()),
+            Err(_) if helper_upgrade_required => ("upgrade", Vec::new()),
             Err(_) => ("install", Vec::new()),
         }
     } else {
@@ -1178,6 +1183,7 @@ async fn describe_helper_approval(mut plan: Value) -> Result<Value, ApiError> {
                 }
                 None => ("add", Vec::new()),
             },
+            Err(_) if helper_upgrade_required => ("upgrade", Vec::new()),
             Err(_) => ("install", Vec::new()),
         }
     };
@@ -1187,6 +1193,33 @@ async fn describe_helper_approval(mut plan: Value) -> Result<Value, ApiError> {
     object.insert("approval_action".into(), serde_json::json!(action));
     object.insert("approval_changes".into(), serde_json::json!(changes));
     Ok(plan)
+}
+
+#[cfg(unix)]
+fn helper_inspection_requires_upgrade(error: &std::io::Error) -> bool {
+    let message = error.to_string();
+    message.contains("network helper protocol mismatch")
+        || message.contains("network helper needs an upgrade")
+}
+
+#[cfg(all(test, unix))]
+mod helper_approval_tests {
+    use super::helper_inspection_requires_upgrade;
+
+    #[test]
+    fn recognizes_old_helper_protocol_as_upgrade() {
+        for message in [
+            "network helper protocol mismatch; upgrade the helper with the matching Connect release",
+            "network helper needs an upgrade; approval inspection is unavailable",
+        ] {
+            assert!(helper_inspection_requires_upgrade(&std::io::Error::other(
+                message
+            )));
+        }
+        assert!(!helper_inspection_requires_upgrade(&std::io::Error::other(
+            "network helper did not respond"
+        )));
+    }
 }
 
 #[cfg(not(unix))]

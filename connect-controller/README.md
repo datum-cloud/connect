@@ -102,9 +102,10 @@ non-root user with a read-only root filesystem and leader election enabled.
 ## Migration status
 
 This is a new API group, not an in-place change to NSO's
-`networking.datumapis.com` resources. `datumctl connect join` now discovers a
-ready `ConnectGateway` and creates or reuses a `ConnectNetworkBinding` for the
-current Connector. Enrollment, peer discovery, and service advertisements use
+`networking.datumapis.com` resources. `datumctl connect join` discovers a
+gateway for the Network or creates one in the nearest location using the Ready
+default `ConnectGatewayClass`, then creates or reuses a `ConnectNetworkBinding`
+for the current Connector. Enrollment, peer discovery, and service advertisements use
 Connect `Connector` and `ConnectorAdvertisement` resources. Explicit public
 ingress still uses NSO's HTTPProxy API. No conversion webhook or automatic
 resource copy exists; keep the NSO Network and HTTPProxy APIs available for
@@ -140,6 +141,10 @@ metadata:
   name: standard
 spec:
   controllerName: connect.datum.net/gateway-controller
+  default: true
+  relayURLs:
+    - https://iroh-relay.us-central-1.datum-staging.net
+    - https://iroh-relay.us-east-1.datum-staging.net
   parametersRef:
     namespace: connect-system
     name: standard-gateway

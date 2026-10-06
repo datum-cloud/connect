@@ -6,9 +6,11 @@ application on another Connector, prefer a [private service](private-services.md
 
 ## Before you begin
 
-The project must have a ready `ConnectGateway` for the named network. The join
-also needs administrator approval to install a native interface with the exact
-assigned address and routes.
+The named Network must already exist and the project's Connect service must
+provide one ready default `ConnectGatewayClass`. Join selects the nearest Datum
+location and creates a `ConnectGateway` when the Network does not already have
+one. The join also needs administrator approval to install a native interface
+with the exact assigned address and routes.
 
 On macOS and Linux, interactive setup can install the separate networking
 helper. Scripts never prompt or elevate. Windows support requires
@@ -22,9 +24,10 @@ Select the project through your `datumctl` context or `--project`, then run:
 datumctl connect join staging-vpc
 ```
 
-Connect selects the ready gateway, creates or reuses this device's network
-binding, and shows the interface and route changes for approval. Approve only
-the network you expect.
+Connect selects an existing gateway or creates one in the nearest location,
+creates or reuses this device's network binding, waits for provisioning, and
+shows the interface and route changes for approval. Approve only the network
+you expect.
 
 A successful managed join is saved. The daemon recreates the session after the
 daemon or project resumes, as long as the helper's approved address and routes

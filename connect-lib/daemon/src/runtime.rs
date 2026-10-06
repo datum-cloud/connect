@@ -724,6 +724,8 @@ impl Control for RealControl {
             return Ok(Some(serde_json::json!({
                 "network": network,
                 "managed_gateway": true,
+                "gateway_resource": status["gateway"],
+                "gateway_location": status["gateway_location"],
                 "binding": {
                     "peer": status["gatewayEndpointID"],
                     "assigned_address": assigned_address,
@@ -1110,6 +1112,8 @@ impl Control for RealControl {
                 .filter(|attachment| !attachment.is_finished())
             {
                 let mut result = existing.status().await;
+                result["gateway_resource"] = status["gateway"].clone();
+                result["gateway_location"] = status["gateway_location"].clone();
                 result["managed_gateway"] = serde_json::json!(true);
                 result["persistent"] = serde_json::json!(true);
                 result["ephemeral"] = serde_json::json!(false);
@@ -1136,6 +1140,8 @@ impl Control for RealControl {
             }
             let mut result = attachment.status().await;
             result["gateway"] = serde_json::json!(endpoint_id);
+            result["gateway_resource"] = status["gateway"].clone();
+            result["gateway_location"] = status["gateway_location"].clone();
             result["routes"] = serde_json::json!(routes);
             result["managed_gateway"] = serde_json::json!(true);
             result["persistent"] = serde_json::json!(true);
@@ -1236,22 +1242,20 @@ impl Control for RealControl {
         for attachment in runtime.networks.lock().await.values() {
             values.push(attachment.status().await);
         }
-        let active: HashSet<_> = values
-            .iter()
-            .filter_map(|value| {
-                value
-                    .get("network")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect();
         match runtime.cloud.managed_network_bindings().await {
-            Ok(bindings) => values.extend(bindings.into_iter().filter(|binding| {
-                binding
-                    .get("network")
-                    .and_then(serde_json::Value::as_str)
-                    .is_none_or(|network| !active.contains(network))
-            })),
+            Ok(bindings) => {
+                for binding in bindings {
+                    let network = binding.get("network").and_then(serde_json::Value::as_str);
+                    if let Some(active) = values.iter_mut().find(|value| {
+                        value.get("network").and_then(serde_json::Value::as_str) == network
+                    }) {
+                        active["gateway_resource"] = binding["gateway_resource"].clone();
+                        active["gateway_location"] = binding["gateway_location"].clone();
+                    } else {
+                        values.push(binding);
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(project, error = %error, "managed_connect_network_status_failed")
             }
@@ -1305,6 +1309,15 @@ fn helper_approves_managed_attachment(
 #[cfg(test)]
 mod network_authorization_tests {
     use super::*;
+
+    #[test]
+    fn missing_network_has_a_stable_not_found_error() {
+        let error = cloud_error(connect_lib::successor::Error::NotFound(
+            "Network \"missing-vpc\" was not found in this project.".into(),
+        ));
+        assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error.code.as_deref(), Some("network_not_found"));
+    }
 
     #[test]
     fn managed_gateway_attachment_is_not_required_in_local_peer_approvals() {
@@ -1655,10 +1668,17 @@ fn cloud_error(error: connect_lib::successor::Error) -> ApiError {
     let status = match error {
         Error::Invalid(_) => axum::http::StatusCode::BAD_REQUEST,
         Error::Unsupported(_) => axum::http::StatusCode::NOT_IMPLEMENTED,
+        Error::NotFound(_) => axum::http::StatusCode::NOT_FOUND,
         Error::Ownership(_) => axum::http::StatusCode::CONFLICT,
         _ => axum::http::StatusCode::BAD_GATEWAY,
     };
-    ApiError::new(status, error.to_string())
+    let message = error.to_string();
+    let api_error = ApiError::new(status, message);
+    if matches!(error, Error::NotFound(_)) {
+        api_error.with_code("network_not_found")
+    } else {
+        api_error
+    }
 }
 
 fn transport_error(error: connect_transport::Error) -> ApiError {

@@ -66,8 +66,9 @@ forwards.
 There are two attachment models:
 
 - A **managed project network** uses a project `ConnectGateway` and a durable
-  `ConnectNetworkBinding`. A successful join reconnects after the daemon or
-  project resumes.
+  `ConnectNetworkBinding`. Join selects the nearest location and creates the
+  gateway from the project's default class when needed. A successful join
+  reconnects after the daemon or project resumes.
 - A **direct device network** connects two named Connectors. Both peers approve
   each other and declare allowed traffic. This preview attachment is ephemeral.
 
