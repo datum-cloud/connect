@@ -37,6 +37,20 @@ func TestHelperServiceContainsNoUserCredentials(t *testing.T) {
 	}
 }
 
+func TestHelperExecutableIsOutsideLinuxStateDirectory(t *testing.T) {
+	dir := helperExecutableDir(501)
+	if runtime.GOOS == "linux" {
+		if dir != "/usr/libexec/datum-connect/501" {
+			t.Fatalf("Linux helper executable directory = %q", dir)
+		}
+		if strings.HasPrefix(dir, helperStateDir(501)) {
+			t.Fatalf("Linux helper executable remains under mutable state: %q", dir)
+		}
+	} else if dir != helperStateDir(501) {
+		t.Fatalf("non-Linux helper path changed unexpectedly: %q", dir)
+	}
+}
+
 func TestUserIPConfigRequiresHelperAndPeerOnlyApprovals(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("Unix helper")

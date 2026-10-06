@@ -199,6 +199,25 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	if err := os.Chmod(dir, 0711); err != nil {
 		return err
 	}
+	executableDir := helperExecutableDir(requested.AllowedUID)
+	if runtime.GOOS == "linux" {
+		executableBase := filepath.Dir(executableDir)
+		if err := validatePrivilegedExecutable(filepath.Dir(executableBase)); err != nil {
+			return err
+		}
+		if err := ensurePrivilegedDirectory(executableBase, 0755); err != nil {
+			return err
+		}
+		if err := restoreSELinuxContext(executableBase); err != nil {
+			return err
+		}
+		if err := ensurePrivilegedDirectory(executableDir, 0755); err != nil {
+			return err
+		}
+		if err := restoreSELinuxContext(executableDir); err != nil {
+			return err
+		}
+	}
 	// Serialize root-side configuration and service changes, separately from the
 	// helper's socket lifetime lock. Never trust user-controlled install paths.
 	unlock, err := daemoninstall.Lock(filepath.Join(dir, "installer"))
@@ -206,7 +225,7 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 		return err
 	}
 	defer unlock()
-	target := filepath.Join(dir, "helper-"+digest)
+	target := filepath.Join(executableDir, "helper-"+digest)
 	if _, err := os.Lstat(target); errors.Is(err, os.ErrNotExist) {
 		if err := copyPrivateFile(source, target, 256<<20); err != nil {
 			return err
@@ -222,7 +241,13 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 		if err := os.Chmod(target, 0700); err != nil {
 			return err
 		}
+		if err := restoreSELinuxContext(target); err != nil {
+			_ = os.Remove(target)
+			return err
+		}
 	} else if err != nil {
+		return err
+	} else if err := restoreSELinuxContext(target); err != nil {
 		return err
 	}
 	if err := validatePrivilegedExecutable(target); err != nil {
@@ -366,6 +391,19 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 		return err
 	}
 	return activateHelper(svc, installed, status, replacing, func() error { return writeRootFile(receiptPath, receipt) }, restore)
+}
+
+func ensurePrivilegedDirectory(path string, mode os.FileMode) error {
+	err := os.Mkdir(path, mode)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create privileged directory %s: %w", path, err)
+	}
+	if err == nil {
+		if err := os.Chmod(path, mode); err != nil {
+			return err
+		}
+	}
+	return validatePrivilegedExecutable(path)
 }
 
 func helperCheckError(output []byte) error {

@@ -40,6 +40,14 @@ The administrator approves a finite plan. The daemon may activate that plan but
 cannot extend it. The helper validates the requesting UID, configuration path
 ownership, and every plan before changing networking.
 
+On Linux, Connect keeps approval state and the Unix socket in
+`/var/lib/datum-connect-network-<uid>` and installs the helper executable in
+`/usr/libexec/datum-connect/<uid>`. The executable must not live in `/var/lib`:
+SELinux labels that directory as state, not executable code. When SELinux is
+enabled, installation runs `restorecon` on the helper path so the system policy
+assigns its expected executable label. If `restorecon` is unavailable or fails,
+Connect stops installation and reports the policy setup error.
+
 ## Approval Model
 
 One approval fixes:
