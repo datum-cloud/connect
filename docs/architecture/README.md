@@ -8,7 +8,9 @@ identity, durable intent, transports, and local networking.
 Connect is a preview. Device identity, service advertisements, and managed VPC
 attachment use `connect.datumapis.com/v1alpha1`. Public ingress still uses the
 NSO-owned HTTPProxy API. This documentation describes that split as it exists
-today.
+today. Gateway sections describe the stable service contract and deliberately
+leave runtime placement abstract so shared and dedicated capacity can evolve
+without changing client behavior.
 
 ## How It Works
 
@@ -35,7 +37,7 @@ through the Connect controller.
 The CLI is intentionally stateless. The daemon is the local control point and
 persists desired state before applying it. The project API stores shared
 identity, discovery, and attachment resources. The controller turns gateway
-and binding resources into Compute workloads and gateway grants. A separate
+and binding resources into gateway service assignments and grants. A separate
 privileged helper limits native interface changes to pre-approved plans.
 
 ## Deployment Topology
@@ -44,8 +46,9 @@ privileged helper limits native interface changes to pre-approved plans.
 
 The user-facing plugin runs only for a command. The daemon persists on the user
 device. The controller runs centrally in the Milo management cluster and
-reconciles remote project APIs. Each managed gateway runs as a separate Compute
-Workload on a worker attached to the selected project VPC. Relays are shared
+reconciles remote project APIs. The platform Connect Gateway service provides
+isolated project network attachments using shared multi-tenant capacity by
+default or dedicated single-tenant capacity when requested. Relays are shared
 infrastructure outside the Connect controller deployment.
 
 See [Deployment Topology](./deployment-topology.md) for the complete process
@@ -94,8 +97,7 @@ route, global forwarding, or the host firewall.
 | Network adapter | Rust with Linux TUN, macOS utun, or Wintun | Native packet delivery and exact routes |
 | Network helper | Privileged Rust service | Applies only administrator-approved adapter plans |
 | Connect controller | Go, controller-runtime, Milo multicluster runtime | Reconciles project resources, gateways, and bindings |
-| Connect Gateway | Linux service | Terminates CONNECT-IP and forwards approved VPC traffic |
-| Gateway runtime | Datum Compute Workload | Places one gateway interface in the requested VPC |
+| Connect Gateway | Platform-managed shared or dedicated service | Terminates CONNECT-IP and forwards approved VPC traffic |
 
 ## API Resources
 
@@ -107,7 +109,7 @@ The Connect controller serves these resources under
 | `ConnectorClass` | Cluster | Permitted transports and capabilities |
 | `Connector` | Project | Device public identity, endpoint, relays, and readiness |
 | `ConnectorAdvertisement` | Project | TCP and UDP services published by one Connector |
-| `ConnectGateway` | Project | Desired managed gateway Workload and VPC attachment |
+| `ConnectGateway` | Project | Logical gateway policy and VPC attachment |
 | `ConnectNetworkBinding` | Project | Approval for one Connector to attach to one gateway |
 
 Public ingress still creates an NSO-owned

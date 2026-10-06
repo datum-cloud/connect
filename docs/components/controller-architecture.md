@@ -11,10 +11,10 @@ does not proxy application or packet traffic.
 - **Multicluster**: watches Project control planes discovered through Milo.
 - **Declarative**: status conditions describe validation and convergence.
 - **Deterministic**: stable child names, gateway identity, and peer addresses.
-- **Least privilege**: controller deployment is non-root; only the gateway
-  Workload receives the networking capabilities needed for TUN forwarding.
+- **Least privilege**: controller deployment is non-root; privileged packet
+  forwarding remains inside the platform gateway data plane.
 - **Eventually consistent**: periodic requeues cover Lease expiry and external
-  Workload/config convergence.
+  gateway-service configuration convergence.
 
 ## Architecture Diagram
 
@@ -24,16 +24,14 @@ flowchart LR
     project[Project control plane]
     manager[Connect controller manager]
     reconcilers[Class and project reconcilers]
-    compute[Compute API]
-    workload[Gateway Workload]
+    gateway[Connect Gateway service]
     vpc[NSO Network]
 
     mgmt -->|Project discovery and ConnectorClass| manager
     manager --> reconcilers
-    reconcilers -->|Connect resources, Secret, ConfigMap| project
-    reconcilers -->|Workload desired state| compute
-    compute --> workload
-    workload --> vpc
+    reconcilers -->|Connect resources and status| project
+    reconcilers -->|Gateway assignment and grants| gateway
+    gateway -->|Isolated network attachment| vpc
 ```
 
 ## Reconciler Set
@@ -57,31 +55,34 @@ metadata; the controller never opens the local service or proxies its bytes.
 
 ### ConnectGateway
 
-Validates routes, image, relay URLs, network, and location. It reconciles a
-stable private-key Secret, peer-grant ConfigMap, and one-replica Compute
-Workload. Status exposes the public endpoint ID and Workload reference only.
+Validates routes, relay policy, network, and placement requirements. Its target
+contract assigns the logical gateway to compatible shared or dedicated gateway
+capacity and publishes the endpoint and readiness status. A `ConnectGateway`
+does not imply a dedicated runtime instance.
 
 ### ConnectNetworkBinding
 
 Validates same-project Connector and gateway references, derives deterministic
 client/gateway IPv6 `/128`s, contributes an exact peer grant, and reports the
 endpoint, addresses, routes, and relays consumed by the daemon. Ready requires
-the current gateway Workload to have the grant applied.
+the assigned gateway service to have the grant applied.
 
-## Gateway Workload
+## Gateway Service Assignment
 
-The generated Workload runs the configured Connect Gateway image with:
+The controller reconciles a logical gateway assignment with:
 
-- one interface on the requested VPC Network;
-- the gateway identity mounted read-only;
-- generated peer configuration from the ConfigMap;
-- `NET_ADMIN` and `MKNOD` plus required forwarding sysctls;
-- a loopback-only Prometheus listener;
-- one replica and a configuration digest that rolls on grant changes.
+- an endpoint identity and relay reachability;
+- an isolated attachment to the requested VPC Network;
+- exact project and Connector grant configuration;
+- shared multi-tenant placement by default, or dedicated single-tenant
+  placement when requested and available; and
+- an applied configuration generation used for readiness.
 
-The controller creates the Workload but not the Workload's NSO NetworkBinding;
-Compute owns that attachment. The Network reference remains a name-only
-cross-service reference.
+The runtime topology behind that assignment is not part of the Connect API
+contract. The platform can implement an assignment with shared processes,
+dedicated capacity, or a different scheduler as long as the endpoint, network
+isolation, grants, and readiness contract remain intact. The Network reference
+remains a name-only cross-service reference.
 
 ## Binding Reconciliation Flow
 
@@ -90,16 +91,14 @@ sequenceDiagram
     participant Daemon
     participant API as Project API
     participant Controller
-    participant Compute
     participant Gateway
 
     Daemon->>API: create ConnectNetworkBinding
     Controller->>API: read Connector and ConnectGateway
     Controller->>Controller: derive addresses and routes
-    Controller->>API: update gateway peer ConfigMap
-    Controller->>Compute: reconcile Workload config digest
-    Compute-->>Controller: Workload Available
-    Controller->>API: verify grant in applied config
+    Controller->>Gateway: reconcile assignment and grants
+    Gateway-->>Controller: endpoint ready and config applied
+    Controller->>API: publish endpoint and verify applied grant
     Controller->>API: mark binding Ready with status
     Daemon->>Gateway: authenticated CONNECT-IP
 ```
@@ -116,10 +115,11 @@ control planes.
 
 - Invalid specs produce conditions rather than partial child resources.
 - Lease expiry removes Connector readiness without forcing a disruptive gateway
-  rollout for every peer.
-- Route count, grant convergence, and Workload readiness are explicit binding
-  failure reasons.
-- Gateway Ready means Workload availability, not an end-to-end packet probe.
+  restart for every peer.
+- Route count, grant convergence, and gateway-service readiness are explicit
+  binding failure reasons.
+- Gateway Ready means the assigned endpoint and network attachment are
+  available, not that an end-to-end destination probe succeeded.
 - Deleting a binding removes its grant on the next reconciliation.
 
 ## External References

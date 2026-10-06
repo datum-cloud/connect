@@ -10,9 +10,10 @@ document shows where each process runs and which team or user operates it.
 
 The plugin and daemon run on each user device. The controller runs once in the
 Milo management cluster. Project resources live in the project control plane,
-and each managed gateway runs as a Compute Workload attached to that project's
-VPC. Dotted arrows are optional relay-assisted paths. The controller and project
-API never carry application bytes or IP packets.
+and the platform Connect Gateway service attaches approved sessions to project
+VPCs. Gateway capacity can be shared across tenants or dedicated to one tenant.
+Dotted arrows are optional relay-assisted paths. The controller and project API
+never carry application bytes or IP packets.
 
 ## Process Inventory
 
@@ -20,11 +21,11 @@ API never carry application bytes or IP packets.
 | --- | --- | --- | --- |
 | `datumctl` | User shell or automation host | One CLI invocation | Selects login and project context, then launches the plugin |
 | `datumctl-connect` | Same user host as `datumctl` | One plugin invocation | Stateless UX, installation workflow, and loopback daemon client |
-| `datum-connect-daemon` | User device | Persistent background service | Owns cloud authorization, Connector keys, durable intent, listeners, transports, and sessions |
+| `datum-connectd` | User device | Persistent background service | Owns cloud authorization, Connector keys, durable intent, listeners, transports, and sessions |
 | `datum-connect-network-helper` | macOS or Linux user device | Persistent root service when CONNECT-IP is enabled | Owns only approved adapters, routes, and packet IPC; has no cloud credentials or Connector key |
-| Windows `datum-connect-daemon` | Windows device | Persistent LocalSystem service | Owns daemon responsibilities and Wintun because Windows does not use the Unix helper model |
-| `connect-controller` | Milo management cluster | Persistent Kubernetes Deployment with leader election | Discovers projects and reconciles Connect resources, gateway configuration, and Compute Workloads |
-| Connect Gateway | Compute Workload on a VPC-attached worker | Persistent per managed `ConnectGateway` | Authenticates CONNECT-IP clients and forwards approved packets between its TUN and the VPC |
+| Windows `datum-connectd` | Windows device | Persistent LocalSystem service | Owns daemon responsibilities and Wintun because Windows does not use the Unix helper model |
+| `connect-controller` | Milo management cluster | Persistent Kubernetes Deployment with leader election | Discovers projects and reconciles Connect resources, gateway assignments, and grants |
+| Connect Gateway service | Platform gateway data plane | Platform managed; shared by default or dedicated on request | Authenticates CONNECT-IP clients and forwards approved packets through an isolated project-network attachment |
 | iroh relay | Operator-managed relay infrastructure | Persistent shared service | Assists QUIC reachability; does not authorize a Connector or inspect Connect control-plane intent |
 | MASQUE-capable ingress edge | Deployment-specific ingress infrastructure | Persistent when public ingress is offered | Reaches explicitly public services as an approved gateway identity; not deployed by `connect-controller` |
 
@@ -34,7 +35,7 @@ API never carry application bytes or IP packets.
 
 The plugin is executed by `datumctl` for each command and exits after printing
 the result. A per-user launchd or systemd service keeps
-`datum-connect-daemon` running independently of the terminal. Its loopback API
+`datum-connectd` running independently of the terminal. Its loopback API
 defaults to `127.0.0.1:47780` and requires a daemon bearer token for all project
 operations.
 
@@ -76,31 +77,31 @@ controller watches these remote APIs and reconciles:
 
 - Connector identity and its 30-second Lease;
 - service advertisements;
-- managed gateway intent and gateway Secret/ConfigMap;
+- logical gateway intent, assignment, and grants;
 - Connector-to-gateway bindings and their derived addresses and routes;
-- the Compute Workload resource for the gateway;
+- gateway endpoint and applied-configuration status;
 - optional NSO HTTPProxy resources created by the device daemon for public
   ingress.
 
 This API traffic is control-plane traffic only. Private service connections and
 CONNECT-IP packets do not traverse the project API server.
 
-## Compute and VPC Data Plane
+## Gateway and VPC Data Plane
 
-Every managed ConnectGateway becomes a one-replica Compute Workload. The
-Workload runs the Connect Gateway on a worker with an interface in the requested
-project Network. The gateway receives its private
-identity from a mounted Secret and its exact peer grants from a mounted or
-rendered ConfigMap.
+Each `ConnectGateway` maps to a logical service assignment, not a dedicated
+process. Shared multi-tenant capacity is the default long-term model. A user can
+request dedicated single-tenant capacity when the platform offers that option.
+Both placements expose the same endpoint, grant, route, and readiness contract.
 
-Inside the Workload, the process terminates authenticated CONNECT-IP sessions,
-applies grant and packet policy, and exchanges packets with a TUN. The worker
-routes approved traffic between that TUN and the VPC interface. The Workload
-needs `NET_ADMIN`, `MKNOD`, and forwarding sysctls; the controller itself does
-not.
+The service terminates authenticated CONNECT-IP sessions, applies project- and
+Connector-scoped policy, and exchanges approved packets through an isolated
+attachment to the selected project Network. Physical processes, interfaces,
+privileges, and scheduling are internal to the platform gateway data plane; the
+controller itself remains outside the packet path and needs no packet-forwarding
+privileges.
 
-Gateway Prometheus metrics bind to `127.0.0.1:9090` inside the Workload. They are
-not exposed on the VPC interface by the controller.
+Gateway metrics are operator-only and are not exposed on the project VPC
+interface.
 
 ## Relay Infrastructure
 
@@ -123,8 +124,7 @@ in the ConnectorClass and use the compatible transport profile to reach the
 serving daemon.
 
 The reusable standards-facing MASQUE edge implementation in this repository is
-not the same process as the Connect Gateway Workload. The Connect
-controller currently deploys only the managed CONNECT-IP gateway. Production
+not the same logical service as the Connect Gateway data plane. Production
 placement and operation of the public edge remain platform deployment concerns.
 
 ## Common Deployment Paths
@@ -148,8 +148,8 @@ controller and project API are used for identity, discovery, and policy refresh.
 host packet
   -> local adapter and device daemon
   -> direct or relay-assisted CONNECT-IP
-  -> Connect Gateway Compute Workload
-  -> gateway TUN and VPC interface
+  -> Connect Gateway service
+  -> isolated project-network attachment
   -> VPC destination
 ```
 

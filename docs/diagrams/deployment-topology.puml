@@ -7,7 +7,7 @@ LAYOUT_LEFT_RIGHT()
 
 Deployment_Node(device, "User Device", "macOS, Linux, or Windows") {
     Container(cli, "datumctl-connect", "Go CLI plugin", "Runs for each command")
-    Container(daemon, "datum-connect-daemon", "Rust service", "Owns identity, durable intent, and transport sessions")
+    Container(daemon, "datum-connectd", "Rust service", "Owns identity, durable intent, and transport sessions")
     Container(helper, "Network Helper", "Privileged local service", "Optionally owns approved interfaces and routes")
 }
 
@@ -19,8 +19,11 @@ Deployment_Node(project, "Project Control Plane", "Kubernetes-compatible API") {
     Container(project_api, "Connect Resources", "API resources", "Identity, advertisements, gateways, bindings, and status")
 }
 
-Deployment_Node(compute, "Compute Worker", "Attached to the project VPC") {
-    Container(gateway, "Connect Gateway", "Compute Workload", "Terminates CONNECT-IP and forwards approved packets")
+Deployment_Node(gateway_plane, "Connect Gateway Service", "Platform-managed gateway data plane") {
+    Container(gateway, "Gateway Runtime", "Shared or dedicated capacity", "Terminates CONNECT-IP and isolates gateway policy")
+}
+
+Deployment_Node(project_network, "Project Network", "Datum VPC") {
     Container(vpc, "Project VPC", "Virtual network", "Contains the destinations reached through the gateway")
 }
 
@@ -32,7 +35,7 @@ Rel(cli, daemon, "Calls", "Loopback HTTP")
 Rel(daemon, helper, "Activates approved networking", "Authenticated local IPC")
 Rel(daemon, project_api, "Reconciles identity and intent", "HTTPS")
 Rel(controller, project_api, "Watches and reconciles", "Kubernetes API")
-Rel(project_api, gateway, "Declares and configures", "Compute Workload")
+Rel(project_api, gateway, "Assigns endpoint and grants", "Gateway control plane")
 Rel(gateway, vpc, "Forwards approved packets")
 Rel(daemon, gateway, "Managed network attachment", "CONNECT-IP")
 Rel(daemon, relay, "Uses when direct path is unavailable", "Encrypted QUIC")

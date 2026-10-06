@@ -47,11 +47,23 @@ binding.
 
 ## Gateway Isolation
 
-A ConnectGateway, its private key, grant ConfigMap, Compute Workload, and
-bindings all live in one project. A binding must reference a Connector and
-gateway from that same control plane. Deterministic address derivation includes
-project and network context, preventing identical device keys in different
-projects from receiving the same binding identity by accident.
+A ConnectGateway and its bindings live in one project. A binding must reference
+a Connector and gateway from that same control plane. Deterministic address
+derivation includes project and network context, preventing identical device
+keys in different projects from receiving the same binding identity by
+accident.
+
+The runtime providing that logical gateway can be shared across tenants. A
+shared Connect Gateway must partition endpoint identity, grants, session state,
+packet paths, network attachments, and telemetry by project and logical gateway.
+No shared-runtime lookup or default may broaden a binding beyond its project,
+Connector identity, routes, or network.
+
+Users can request dedicated single-tenant gateway capacity when the platform
+offers it. Dedicated placement changes the runtime's resource and failure
+isolation, and may carry separate pricing, but uses the same project-scoped
+authorization and packet policy. It is not a cross-project access mechanism or
+a stronger grant.
 
 Optional peer routing is confined to other Ready bindings on the same gateway.
 It does not aggregate routes from another project or turn the gateway into

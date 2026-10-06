@@ -2,8 +2,8 @@
 
 A managed attachment connects one project Connector to an operator-managed
 gateway in the same project's VPC. The project API is the authorization and
-coordination surface; the controller provisions the gateway and derives the
-exact client grant consumed by the daemon.
+coordination surface; the controller assigns gateway service capacity and
+derives the exact client grant consumed by the daemon.
 
 ## Resource Flow
 
@@ -13,42 +13,43 @@ flowchart TD
     connector[Connector]
     lease[Lease]
     gateway[ConnectGateway]
-    secret[Gateway key Secret]
-    config[Peer-grant ConfigMap]
-    workload[Compute Workload]
+    service[Connect Gateway service]
+    grants[Effective grants]
     network[NSO Network]
     binding[ConnectNetworkBinding]
     daemon[Connector daemon]
 
     connector --> class
     connector --> lease
-    gateway --> secret
-    gateway --> config
-    gateway --> workload
-    workload --> network
+    gateway -->|logical assignment| service
+    service -->|isolated attachment| network
     binding --> connector
     binding --> gateway
-    binding --> config
+    binding --> grants
+    grants --> service
     daemon -->|create, read, delete| binding
-    daemon -->|CONNECT-IP| workload
+    daemon -->|CONNECT-IP| service
 ```
 
 ## Gateway Reconciliation
 
-`ConnectGateway` names a Network and Location, selects a gateway image, and
-declares up to 32 routes. The controller:
+`ConnectGateway` names a Network and declares the gateway policy and approved
+routes. The controller:
 
-1. validates the image, routes, relay URLs, and references;
-2. creates a stable private gateway key in a project Secret;
-3. renders a ConfigMap containing the approved peer grants;
-4. creates a one-replica Compute Workload attached to the requested Network;
-5. publishes the Workload name and public endpoint ID in gateway status;
-6. reports Ready when the Compute Workload is Available.
+1. validates routes, relay policy, placement requirements, and references;
+2. assigns compatible gateway capacity according to platform policy; the target
+   model defaults to shared multi-tenant capacity and can honor a dedicated
+   single-tenant request when offered;
+3. establishes an isolated attachment to the requested Network;
+4. applies the gateway endpoint identity and approved peer grants;
+5. publishes the public endpoint ID and assignment status; and
+6. reports Ready when the endpoint, network attachment, and configuration are
+   available.
 
-Compute, not Connect, creates the Workload's NSO NetworkBinding. Connect avoids
-creating a competing VPC interface resource. Gateway Ready proves Workload
-availability; it does not prove that any client is attached or that packets can
-reach a destination inside the VPC.
+The service's runtime placement and process count are not part of the resource
+contract. Gateway Ready proves service and attachment availability; it does not
+prove that any client is attached or that packets can reach a destination
+inside the VPC.
 
 ## Binding Reconciliation
 
@@ -65,8 +66,8 @@ Binding status contains:
 - the relay URLs selected for the gateway;
 - readiness conditions and observed generation.
 
-The same values are rendered into the gateway's peer-grant ConfigMap. A binding
-is not Ready until the Workload has observed a configuration that includes the
+The same values are applied to the assigned gateway service. A binding is not
+Ready until the service has observed a configuration that includes the
 Connector. Deleting the binding removes the grant during reconciliation.
 
 ## Join Flow
@@ -89,7 +90,7 @@ sequenceDiagram
     Daemon->>Helper: request exact approved adapter plan
     Helper-->>Daemon: adapter ready
     Daemon->>Gateway: CONNECT-IP with Connector identity
-    Gateway->>Gateway: match ConfigMap peer grant
+    Gateway->>Gateway: match effective peer grant
     Daemon-->>CLI: assigned address, routes, interface
 ```
 
@@ -114,9 +115,9 @@ arbitrary source prefixes or change host firewall policy.
 
 | Condition | Behavior |
 | --- | --- |
-| Gateway Workload unavailable | Gateway and dependent bindings remain not Ready |
+| Assigned gateway capacity unavailable | Gateway and dependent bindings remain not Ready |
 | Connector Lease expires | Connector is not Ready; new admission fails |
-| Grant absent from applied ConfigMap | Binding waits and gateway rejects the session |
+| Grant absent from applied configuration | Binding waits and gateway rejects the session |
 | Route capacity exceeds 32 | Reconciliation reports an explicit capacity error |
 | Helper approval differs | No local interface is created until explicit replacement approval |
 | Session or daemon stops | Runtime interface is removed; durable managed intent is retried |

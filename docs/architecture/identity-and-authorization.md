@@ -12,7 +12,7 @@ one boundary can authorize.
 | Datum user or service account | Host session reference or protected credential file | Project API authorization |
 | Connector keypair | Private daemon repository; public key in `Connector` | Peer authentication and stable device identity |
 | Daemon bearer token | Secret presented locally; salted hash in daemon state | Loopback API roles and scopes |
-| Gateway keypair | Project Secret mounted read-only in Workload | Gateway endpoint authentication |
+| Gateway endpoint identity | Protected platform gateway state | Gateway endpoint authentication |
 | Networking-helper peer credentials | Protected local helper configuration and IPC | Authorize one user daemon and bounded adapter plans |
 
 No Connector private key is stored in the project API. Gateway status exposes

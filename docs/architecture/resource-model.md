@@ -11,12 +11,11 @@ recovery role.
 | `ConnectorClass` | Cluster | Allowed transports and capabilities | Valid configuration and Ready |
 | `Connector` | Project | Class, public key, endpoint, relay URLs | Ready, assigned addresses, Lease reference |
 | `ConnectorAdvertisement` | Project | Connector reference and TCP/UDP ports | Accepted/Ready conditions |
-| `ConnectGateway` | Project | Network, location, routes, image, relays, peer routing | Workload reference, endpoint ID, Ready |
+| `ConnectGateway` | Project | Network, routes, gateway policy, peer routing | Service assignment, endpoint ID, Ready |
 | `ConnectNetworkBinding` | Project | Connector and gateway references | Assigned and peer addresses, routes, relays, Ready |
 | `Lease` | Project | Connector liveness record | Renew time |
 | `HTTPProxy` | Project, NSO API | Explicit public hostname and backend | Ingress acceptance and hostnames |
-| `Network` | Project, NSO API | VPC selected by name | Consumed through Compute Workload attachment |
-| `Workload` | Project, Compute API | Gateway process and VPC interface | Availability and applied configuration |
+| `Network` | Project, NSO API | VPC selected by name | Consumed through an isolated gateway attachment |
 
 All Connect resources except ConnectorClass carry Milo's Project parent-context
 annotation. ConnectorClass is management-cluster configuration because the
@@ -32,22 +31,25 @@ flowchart TD
     a[ConnectorAdvertisement]
     hp[HTTPProxy]
     g[ConnectGateway]
-    s[Secret]
-    cm[ConfigMap]
-    w[Compute Workload]
+    gs[Connect Gateway service]
+    n[NSO Network]
     b[ConnectNetworkBinding]
 
     c --> cc
     c --> l
     c -->|owner reference| a
     c -->|owner reference| hp
-    g --> s
-    g --> cm
-    g --> w
+    g -->|logical assignment| gs
+    gs -->|isolated attachment| n
     b --> c
     b --> g
-    b -->|grant contribution| cm
+    b -->|grant contribution| gs
 ```
+
+The Connect API owns the logical gateway assignment and grant relationship, not
+the gateway service's deployment objects. Secrets, configuration objects,
+processes, and scheduling resources used by a particular runtime are internal
+to that platform implementation and are not part of the client contract.
 
 Daemon-created child resources carry an owner label and a Connector owner
 reference. Before reuse or deletion, the client checks both the label and owner

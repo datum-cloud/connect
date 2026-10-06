@@ -43,9 +43,9 @@ credential values or rejected secrets.
 
 ## Metrics
 
-The managed gateway exposes Prometheus metrics on `127.0.0.1:9090` only. The
-controller does not expose that port on the VPC interface. Operators inspect it
-from inside the Workload. Metrics include:
+The Connect Gateway service exposes operator-only Prometheus metrics. They are
+not exposed on a project VPC interface, regardless of whether gateway capacity
+is shared or dedicated. Metrics include:
 
 - active and opened CONNECT-IP sessions;
 - transport errors and policy drops;
@@ -83,11 +83,11 @@ Compare counters in this order:
 | Client send advances; gateway receive does not | QUIC path, relay, admission, or MTU |
 | Gateway receive advances; TUN injection does not | Gateway grant or packet policy |
 | Injection advances; NAT/forwarding does not | Gateway OS forwarding, routes, or nftables |
-| NAT advances; return does not | VPC route, firewall, workload, or service |
+| NAT advances; return does not | VPC route, firewall, destination, or service |
 | Gateway return advances; client receive does not | Return QUIC path or local adapter |
 
 Counters identify a segment, not a specific external firewall rule. Combine
-them with VPC and workload telemetry for final diagnosis.
+them with VPC and gateway-service telemetry for final diagnosis.
 
 ## Alerting Guidance
 
@@ -95,7 +95,7 @@ The preview does not ship a complete alert set. Useful production signals are:
 
 - Connector Lease renewal failure or Ready loss;
 - repeated project reconciliation failures;
-- gateway Workload unavailable or applied-config lag;
+- assigned gateway capacity unavailable or applied-config lag;
 - persistent transport errors or MTU capacity below approval;
 - growing policy-drop rates;
 - desired managed attachment not running;

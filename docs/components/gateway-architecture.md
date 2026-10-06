@@ -1,9 +1,8 @@
 # Connect Gateway Architecture
 
-The Connect Gateway connects authenticated Connectors to one project VPC. One
-`ConnectGateway` resource produces one gateway identity, one grant
-configuration, and one Connect Gateway process inside a VPC-attached Compute
-Workload.
+The Connect Gateway connects authenticated Connectors to approved project
+networks. A project-scoped `ConnectGateway` describes a logical gateway and its
+network policy; it does not determine process, pod, or runtime topology.
 
 This component is distinct from the separately deployed public-ingress MASQUE
 edge. The managed gateway terminates CONNECT-IP for VPC and optional peer
@@ -13,30 +12,50 @@ routing; it does not implement the public HTTPProxy control plane.
 
 ![Connect Gateway architecture](../diagrams/managed-gateway.png)
 
-The gateway process is the only Connect-managed cloud component in the packet
-path. The Connect controller and project API prepare its identity and grants but
-do not proxy sessions or packets.
+The gateway service is the only Connect-managed cloud component in the packet
+path. The Connect controller and project API prepare its endpoint assignment
+and grants but do not proxy sessions or packets.
 
-## Deployment Unit
+## Logical Service Boundary
 
-The controller renders a one-replica Compute Workload from
-`ConnectGateway.spec`. The Workload receives:
+A logical Connect Gateway provides:
 
-- a private gateway identity mounted read-only from a project Secret;
-- exact Connector peer grants generated in a project ConfigMap;
-- configured iroh relay URLs;
-- one interface attached by Compute to the requested NSO Network;
-- `NET_ADMIN`, `MKNOD`, and the forwarding sysctls needed for its TUN path;
-- a configuration digest that rolls the Workload when effective grants change.
+- an authenticated endpoint returned to approved clients;
+- exact Connector grants scoped to a project, gateway, and network;
+- an isolated packet path into the selected project network;
+- configured relay reachability; and
+- applied-configuration status used to determine readiness.
 
-Compute owns the Workload's VPC attachment. The Connect controller declares the
-Workload but does not create a second NSO NetworkBinding for it.
+Runtime placement, process count, scheduling, and network-interface mechanics
+are platform implementation details. Clients and project resources must not
+depend on them.
+
+## Deployment and Tenancy
+
+The gateway service supports two placement modes without changing its external
+contract:
+
+- **Shared multi-tenant** capacity hosts multiple isolated logical gateways and
+  is the default long-term operating model.
+- **Dedicated single-tenant** capacity can be requested when a user needs and
+  pays for isolated gateway runtime capacity.
+
+Both modes use the same Connector authentication, binding grants, route policy,
+and readiness semantics. Dedicated placement changes resource isolation,
+scaling, and failure scope; it does not grant broader network access. The
+platform may move a logical gateway between compatible runtime placements
+without changing the client's saved intent.
+
+These modes define the target deployment contract. The preview may use one
+implementation strategy and does not yet promise a user-selectable dedicated
+capacity tier or its commercial availability.
 
 ## Identity and Admission
 
-The gateway has a stable private key stored in the project Secret. Only its
+The platform assigns an endpoint identity to the logical gateway. Only its
 public endpoint ID is published in `ConnectGateway.status` and returned to
-clients through binding status.
+clients through binding status. Private identity material remains protected by
+the gateway service and is not exposed to project clients.
 
 Each ready `ConnectNetworkBinding` contributes a grant keyed by the Connector's
 public endpoint identity. A grant contains the assigned client address, gateway
@@ -58,16 +77,17 @@ sequenceDiagram
 
     Client->>API: create or reuse ConnectNetworkBinding
     Controller->>API: publish addresses, routes, endpoint, and relays
-    Controller->>Gateway: roll or update effective grant configuration
+    Controller->>Gateway: apply logical gateway and grant configuration
     Controller->>API: mark binding Ready after grant is applied
     Client->>Gateway: CONNECT-IP using Connector endpoint key
     Gateway->>Gateway: match identity and exact grant
     Gateway-->>Client: accept session and exchange datagrams
 ```
 
-Gateway Ready means that the Compute Workload is available. Binding Ready adds
-evidence that the effective Workload configuration contains the Connector's
-grant. Neither condition is an end-to-end packet probe of the destination VPC.
+Gateway Ready means that the assigned service endpoint and network attachment
+are available. Binding Ready adds evidence that the effective gateway
+configuration contains the Connector's grant. Neither condition is an
+end-to-end packet probe of the destination VPC.
 
 ## Packet Path
 
@@ -75,8 +95,9 @@ For an admitted session, the gateway:
 
 1. receives one complete IP packet in a QUIC DATAGRAM;
 2. validates its address, route, MTU, and packet policy against the grant;
-3. injects the approved packet into the gateway TUN;
-4. relies on worker forwarding and optional NAT or return routes to reach the
+3. injects the approved packet into the gateway's isolated project-network
+   attachment;
+4. uses the platform data plane and optional NAT or return routes to reach the
    project VPC;
 5. validates return traffic and sends it to the client in the reverse direction.
 
@@ -100,22 +121,20 @@ router.
 
 ## Reconfiguration
 
-Binding creation, deletion, and readiness changes alter the generated grant
-configuration. The controller computes a configuration digest for the Workload
-and waits for the current configuration to be applied before reporting the
-binding Ready.
+Binding creation, deletion, and readiness changes alter the effective grant
+configuration. The controller waits for the assigned gateway service to report
+that configuration applied before reporting the binding Ready.
 
 Temporary Connector Lease expiry prevents new readiness but does not
-automatically restart the shared gateway and disrupt every established peer.
+automatically restart gateway capacity and disrupt every established peer.
 Deleting a binding removes its grant during reconciliation. A client whose
 local helper approval no longer matches new binding status must receive explicit
 administrator approval before reconnecting.
 
 ## Observability
 
-The gateway exposes Prometheus metrics on `127.0.0.1:9090` inside the Workload.
-The controller does not expose that listener on the VPC interface. Metrics and
-structured logs cover:
+The gateway service exposes operator-only metrics that are not reachable from
+the project VPC. Metrics and structured logs cover:
 
 - active, opened, and closed CONNECT-IP sessions;
 - QUIC datagrams and transport errors;
@@ -136,7 +155,7 @@ packet.
 | Grant/configuration not yet applied | Keep the binding not Ready and reject admission |
 | Packet violates address or route policy | Drop and count the packet without broadening access |
 | Datagram capacity below approved MTU | Fail the session rather than fragment or reduce policy |
-| Workload unavailable | Gateway reports not Ready; clients cannot attach |
+| Assigned gateway capacity unavailable | Gateway reports not Ready; clients cannot attach |
 | VPC route, firewall, or destination failure | Session may remain up; packet counters identify the failing segment |
 
 ## Current Boundaries
@@ -145,6 +164,10 @@ packet.
 - One attachment does not provide dual-stack overlay networking.
 - IPv6 extension headers and fragments are unsupported.
 - The Network reference is a name-only cross-service reference.
+- Shared multi-tenant capacity is the target default; dedicated single-tenant
+  capacity is an optional placement request rather than a distinct protocol.
+- The preview does not yet expose dedicated capacity as a supported user
+  workflow.
 - Gateway identity rotation and full replacement semantics are not yet
   production-ready.
 - Native gateway-to-instance forwarding still requires validation for each

@@ -28,8 +28,8 @@ Use these guides to install, operate, and develop Datum Connect.
 
 - Start with the [architecture overview](architecture/README.md).
 - See the [deployment topology](architecture/deployment-topology.md) for the
-  process placement across user devices, Milo, project control planes, Compute
-  workers, VPCs, and relay infrastructure.
+  process placement across user devices, Milo, project control planes, the
+  Connect Gateway service, VPCs, and relay infrastructure.
 
 ### Components
 
@@ -40,7 +40,7 @@ Use these guides to install, operate, and develop Datum Connect.
 - [Network helper](components/network-helper-architecture.md) — privileged
   approvals, packet IPC, and native adapter ownership.
 - [Controller](components/controller-architecture.md) — Milo multicluster
-  reconciliation and managed gateway provisioning.
+  reconciliation and Connect Gateway service assignment.
 - [Connect Gateway](components/gateway-architecture.md) — gateway identity,
   admission, CONNECT-IP termination, TUN forwarding, and VPC integration.
 

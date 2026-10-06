@@ -76,10 +76,14 @@ attachment when software must reach addresses or protocols at the IP layer.
 
 ## Connect Gateway
 
-A Connect Gateway is a project workload that terminates authenticated Connect
-sessions and forwards approved traffic into a VPC. It can also provide public
-HTTP ingress when the platform is configured for the matching transport
-profile.
+A Connect Gateway is a platform-managed service that terminates authenticated
+Connect sessions and forwards approved traffic into a VPC. The deployment model
+is designed to use shared multi-tenant capacity by default and, when offered by
+the platform, let users request dedicated single-tenant capacity. That placement
+choice does not change the client workflow or authorization model.
+
+A Connect Gateway can also provide public HTTP ingress when the platform is
+configured for the matching transport profile.
 
 The gateway does not give a device unrestricted transit by default. Its
 configured network, binding, routes, and traffic policy determine what is
