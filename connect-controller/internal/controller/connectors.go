@@ -45,16 +45,19 @@ type ConnectReconciler struct {
 	classClient client.Client
 }
 
-// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectors;connectoradvertisements;connectgateways;connectnetworkbindings,verbs=get;list;watch
-// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectnetworkbindings/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectgatewayclasses;connectors;connectoradvertisements;connectgateways;connectnetworkbindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectgatewayclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectnetworkbindings/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
-// +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloads,verbs=get;create;update;patch
+// +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloads,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps;secrets,verbs=get;create;update;patch
 
 func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	local := mgr.GetLocalManager()
-	if err := builder.ControllerManagedBy(local).Named("connectorclass").For(&connectv1alpha1.ConnectorClass{}).Complete(&ClassReconciler{client: local.GetClient()}); err != nil {
+	if err := builder.ControllerManagedBy(local).Named("connectorclass").For(&connectv1alpha1.ConnectorClass{}).Complete(&ConnectorClassReconciler{client: local.GetClient()}); err != nil {
 		return fmt.Errorf("register ConnectorClass controller: %w", err)
+	}
+	if err := builder.ControllerManagedBy(local).Named("connectgatewayclass").For(&connectv1alpha1.ConnectGatewayClass{}).Complete(&GatewayClassReconciler{client: local.GetClient()}); err != nil {
+		return fmt.Errorf("register ConnectGatewayClass controller: %w", err)
 	}
 	for _, item := range []struct {
 		name string
@@ -125,7 +128,7 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 			}
 			return ctrl.Result{}, err
 		}
-		if err := reconcileGateway(ctx, c, string(req.ClusterName), &obj); err != nil {
+		if err := reconcileGateway(ctx, c, r.classClient, string(req.ClusterName), &obj, time.Now()); err != nil {
 			logger.Error(err, "reconcile ConnectGateway")
 			return ctrl.Result{}, err
 		}
@@ -147,9 +150,9 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 	return ctrl.Result{}, nil
 }
 
-type ClassReconciler struct{ client client.Client }
+type ConnectorClassReconciler struct{ client client.Client }
 
-func (r *ClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ConnectorClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var obj connectv1alpha1.ConnectorClass
 	if err := r.client.Get(ctx, req.NamespacedName, &obj); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -161,6 +164,49 @@ func (r *ClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+const gatewayControllerName = "connect.datum.net/gateway-controller"
+
+type GatewayClassReconciler struct{ client client.Client }
+
+func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var obj connectv1alpha1.ConnectGatewayClass
+	if err := r.client.Get(ctx, req.NamespacedName, &obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	if err := reconcileGatewayClass(ctx, r.client, &obj); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: time.Minute}, nil
+}
+
+func reconcileGatewayClass(ctx context.Context, c client.Client, obj *connectv1alpha1.ConnectGatewayClass) error {
+	before := obj.Status.DeepCopy()
+	accepted, acceptedReason, acceptedMessage := metav1.ConditionTrue, "Accepted", "gateway class is accepted by this controller"
+	ready, readyReason, readyMessage := metav1.ConditionTrue, "Ready", "gateway class implementation parameters are available"
+	if obj.Spec.ControllerName != gatewayControllerName {
+		accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "UnsupportedController", "gateway class is assigned to a different controller"
+		ready, readyReason, readyMessage = metav1.ConditionFalse, "NotAccepted", "gateway class is not accepted by this controller"
+	} else if err := validateGatewayClassSpec(obj); err != nil {
+		accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidParameters", err.Error()
+		ready, readyReason, readyMessage = metav1.ConditionFalse, "NotAccepted", "gateway class configuration is invalid"
+	} else if _, err := loadGatewayClassConfig(ctx, c, obj); err != nil {
+		if !apierrors.IsNotFound(err) && !errors.As(err, new(*gatewayClassParameterError)) {
+			return err
+		}
+		ready, readyReason, readyMessage = metav1.ConditionFalse, "ParametersNotReady", err.Error()
+	}
+	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Accepted", Status: accepted, Reason: acceptedReason, Message: acceptedMessage, ObservedGeneration: obj.Generation})
+	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Ready", Status: ready, Reason: readyReason, Message: readyMessage, ObservedGeneration: obj.Generation})
+	obj.Status.ObservedGeneration = obj.Generation
+	if reflect.DeepEqual(before, &obj.Status) {
+		return nil
+	}
+	return c.Status().Update(ctx, obj)
 }
 
 func reconcileClass(ctx context.Context, c client.Client, obj *connectv1alpha1.ConnectorClass) error {
@@ -284,31 +330,130 @@ func reconcileAdvertisement(ctx context.Context, c client.Client, obj *connectv1
 	return c.Status().Update(ctx, obj)
 }
 
-func reconcileGateway(ctx context.Context, c client.Client, project string, obj *connectv1alpha1.ConnectGateway) error {
+type gatewayClassConfig struct {
+	image        string
+	instanceType string
+	mode         string
+	idleTimeout  time.Duration
+}
+
+type gatewayClassParameterError struct{ message string }
+
+func (e *gatewayClassParameterError) Error() string { return e.message }
+
+func validateGatewayClassSpec(class *connectv1alpha1.ConnectGatewayClass) error {
+	mode := class.Spec.Scaling.Mode
+	if mode == "" {
+		mode = "OnDemand"
+	}
+	if mode != "OnDemand" && mode != "AlwaysOn" {
+		return fmt.Errorf("scaling mode must be OnDemand or AlwaysOn")
+	}
+	if mode == "OnDemand" && class.Spec.Scaling.IdleTimeout.Duration != 0 && class.Spec.Scaling.IdleTimeout.Duration < time.Minute {
+		return fmt.Errorf("OnDemand idleTimeout must be at least one minute")
+	}
+	if class.Spec.ParametersRef.Name == "" || class.Spec.ParametersRef.Namespace == "" {
+		return fmt.Errorf("parametersRef name and namespace are required")
+	}
+	return nil
+}
+
+func loadGatewayClassConfig(ctx context.Context, c client.Client, class *connectv1alpha1.ConnectGatewayClass) (gatewayClassConfig, error) {
+	if err := validateGatewayClassSpec(class); err != nil {
+		return gatewayClassConfig{}, err
+	}
+	config := gatewayClassConfig{mode: class.Spec.Scaling.Mode, idleTimeout: class.Spec.Scaling.IdleTimeout.Duration}
+	if config.mode == "" {
+		config.mode = "OnDemand"
+	}
+	if config.mode == "OnDemand" {
+		if config.idleTimeout == 0 {
+			config.idleTimeout = 10 * time.Minute
+		}
+	}
+	parameters := &corev1.ConfigMap{}
+	key := types.NamespacedName{Name: class.Spec.ParametersRef.Name, Namespace: class.Spec.ParametersRef.Namespace}
+	if err := c.Get(ctx, key, parameters); err != nil {
+		if apierrors.IsNotFound(err) {
+			return config, fmt.Errorf("referenced gateway parameters ConfigMap %s/%s does not exist: %w", key.Namespace, key.Name, err)
+		}
+		return config, err
+	}
+	config.image = strings.TrimSpace(parameters.Data["image"])
+	config.instanceType = strings.TrimSpace(parameters.Data["instanceType"])
+	if config.image == "" {
+		return config, &gatewayClassParameterError{message: fmt.Sprintf("gateway parameters ConfigMap %s/%s must contain a non-empty image", key.Namespace, key.Name)}
+	}
+	if config.instanceType == "" {
+		config.instanceType = "datumcloud/d1-standard-2"
+	}
+	return config, nil
+}
+
+func reconcileGateway(ctx context.Context, c, classClient client.Client, project string, obj *connectv1alpha1.ConnectGateway, now time.Time) error {
 	before := obj.Status.DeepCopy()
 	status, reason, message := metav1.ConditionUnknown, "Provisioning", "gateway resources are being reconciled"
 	if err := validateGatewaySpec(obj.Spec); err != nil {
 		status, reason, message = metav1.ConditionFalse, "InvalidSpec", err.Error()
-	} else if err := reconcileGatewayResources(ctx, c, project, obj); err != nil {
-		var capacityError *gatewayPeerRouteCapacityError
-		if errors.As(err, &capacityError) {
-			status, reason, message = metav1.ConditionFalse, "PeerRouteCapacityExceeded", capacityError.Error()
-		} else {
-			return err
-		}
 	} else {
-		workload := &unstructured.Unstructured{}
-		workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
-		if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(obj.Name, "workload"), Namespace: obj.Namespace}, workload); err != nil {
+		var class connectv1alpha1.ConnectGatewayClass
+		err := classClient.Get(ctx, types.NamespacedName{Name: obj.Spec.GatewayClassRef}, &class)
+		if apierrors.IsNotFound(err) {
+			status, reason, message = metav1.ConditionFalse, "GatewayClassNotFound", "referenced ConnectGatewayClass does not exist in the management cluster"
+		} else if err != nil {
 			return err
-		}
-		if gatewayWorkloadReady(workload) && gatewayWorkloadConfigApplied(ctx, c, obj, workload) {
-			status, reason, message = metav1.ConditionTrue, "GatewayAvailable", "gateway Workload is available in the requested VPC"
+		} else if class.Spec.ControllerName != gatewayControllerName || !meta.IsStatusConditionTrue(class.Status.Conditions, "Ready") {
+			status, reason, message = metav1.ConditionFalse, "GatewayClassNotReady", "referenced ConnectGatewayClass is not ready"
+		} else if config, err := loadGatewayClassConfig(ctx, classClient, &class); err != nil {
+			if !apierrors.IsNotFound(err) && !errors.As(err, new(*gatewayClassParameterError)) {
+				return err
+			}
+			status, reason, message = metav1.ConditionFalse, "GatewayClassNotReady", err.Error()
+		} else if err := reconcileGatewayResources(ctx, c, project, obj, config, now); err != nil {
+			var capacityError *gatewayPeerRouteCapacityError
+			if errors.As(err, &capacityError) {
+				status, reason, message = metav1.ConditionFalse, "PeerRouteCapacityExceeded", capacityError.Error()
+			} else {
+				return err
+			}
+		} else if obj.Status.WorkloadRef == "" {
+			status, reason, message = metav1.ConditionFalse, "GatewayDormant", "gateway has no live attached Connectors and its Compute Workload is stopped"
 		} else {
-			status, reason, message = metav1.ConditionUnknown, "WorkloadProvisioning", "waiting for the Compute gateway Workload to apply its current configuration and become available"
+			workload := &unstructured.Unstructured{}
+			workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
+			if err := c.Get(ctx, types.NamespacedName{Name: obj.Status.WorkloadRef, Namespace: obj.Namespace}, workload); err != nil {
+				return err
+			}
+			if gatewayWorkloadReady(workload) && gatewayWorkloadConfigApplied(ctx, c, obj, workload) {
+				status, reason, message = metav1.ConditionTrue, "GatewayAvailable", "gateway Workload is available in the requested VPC"
+			} else {
+				status, reason, message = metav1.ConditionUnknown, "WorkloadProvisioning", "waiting for the Compute gateway Workload to apply its current configuration and become available"
+			}
 		}
 	}
 	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Ready", Status: status, Reason: reason, Message: message, ObservedGeneration: obj.Generation})
+	phase := "Provisioning"
+	if reason == "GatewayDormant" {
+		phase = "Dormant"
+	} else if reason == "GatewayAvailable" {
+		phase = "Available"
+	} else if reason == "WorkloadProvisioning" && obj.Status.Phase == "Scaling" {
+		phase = "Scaling"
+	}
+	obj.Status.Phase = phase
+	dormantStatus := metav1.ConditionFalse
+	dormantReason, dormantMessage := "GatewayActive", "gateway Compute Workload is running or provisioning"
+	if obj.Status.WorkloadRef == "" && reason == "GatewayDormant" {
+		dormantStatus, dormantReason, dormantMessage = metav1.ConditionTrue, "GatewayDormant", message
+	}
+	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Dormant", Status: dormantStatus, Reason: dormantReason, Message: dormantMessage, ObservedGeneration: obj.Generation})
+	scalingStatus := metav1.ConditionFalse
+	scalingReason, scalingMessage := "Stable", "gateway capacity is stable"
+	if obj.Status.Phase == "Scaling" {
+		scalingStatus, scalingReason, scalingMessage = metav1.ConditionTrue, "WorkloadChanging", "gateway Compute capacity is changing"
+	}
+	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Scaling", Status: scalingStatus, Reason: scalingReason, Message: scalingMessage, ObservedGeneration: obj.Generation})
+	obj.Status.ClassRef = obj.Spec.GatewayClassRef
 	obj.Status.ObservedGeneration = obj.Generation
 	if reflect.DeepEqual(before, &obj.Status) {
 		return nil
@@ -317,7 +462,7 @@ func reconcileGateway(ctx context.Context, c client.Client, project string, obj 
 }
 
 func validateGatewaySpec(spec connectv1alpha1.ConnectGatewaySpec) error {
-	for name, value := range map[string]string{"networkRef": spec.NetworkRef, "locationRef": spec.LocationRef, "image": spec.Image} {
+	for name, value := range map[string]string{"gatewayClassRef": spec.GatewayClassRef, "networkRef": spec.NetworkRef, "locationRef": spec.LocationRef} {
 		if value == "" {
 			return fmt.Errorf("%s is required", name)
 		}
@@ -358,7 +503,7 @@ func validateGatewaySpec(spec connectv1alpha1.ConnectGatewaySpec) error {
 	return nil
 }
 
-func reconcileGatewayResources(ctx context.Context, c client.Client, project string, gateway *connectv1alpha1.ConnectGateway) error {
+func reconcileGatewayResources(ctx context.Context, c client.Client, project string, gateway *connectv1alpha1.ConnectGateway, class gatewayClassConfig, now time.Time) error {
 	scheme := schemeForGateway()
 	secretName := gatewayChildName(gateway.Name, "identity")
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: gateway.Namespace}}
@@ -408,11 +553,44 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	if err != nil {
 		return fmt.Errorf("reconcile gateway config ConfigMap: %w", err)
 	}
+	active, err := activeGatewayConnectors(ctx, c, gateway)
+	if err != nil {
+		return err
+	}
 	workload := &unstructured.Unstructured{}
 	workload.SetGroupVersionKind(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"})
 	workload.SetName(gatewayChildName(gateway.Name, "workload"))
 	workload.SetNamespace(gateway.Namespace)
-	desired := gatewayWorkloadSpec(gateway.Spec, configMap.Name, secretName)
+	workloadExists := true
+	if err := c.Get(ctx, client.ObjectKeyFromObject(workload), workload); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("get Compute gateway Workload: %w", err)
+		}
+		workloadExists = false
+	}
+	shouldRun := class.mode == "AlwaysOn" || active > 0
+	if !shouldRun {
+		if gateway.Status.IdleSince == nil {
+			idleSince := metav1.NewTime(now)
+			gateway.Status.IdleSince = &idleSince
+		}
+		if !workloadExists {
+			gateway.Status.WorkloadRef = ""
+			gateway.Status.Phase = "Dormant"
+			return nil
+		}
+		if now.Sub(gateway.Status.IdleSince.Time) >= class.idleTimeout {
+			if err := c.Delete(ctx, workload); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete idle Compute gateway Workload: %w", err)
+			}
+			gateway.Status.WorkloadRef = ""
+			gateway.Status.Phase = "Scaling"
+			return nil
+		}
+	} else {
+		gateway.Status.IdleSince = nil
+	}
+	desired := gatewayWorkloadSpec(gateway.Spec, class, configMap.Name, secretName)
 	template := desired["template"].(map[string]interface{})
 	template["metadata"] = map[string]interface{}{"annotations": map[string]interface{}{
 		"connect.datumapis.com/config-hash": fmt.Sprintf("%x", sha256.Sum256([]byte(gatewayYAML+"\x00"+string(grantJSON)))),
@@ -426,6 +604,9 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	})
 	if err != nil {
 		return fmt.Errorf("reconcile Compute gateway Workload: %w", err)
+	}
+	if !workloadExists {
+		gateway.Status.Phase = "Scaling"
 	}
 	legacyWorkloadName := legacyGatewayWorkloadName(gateway.Name)
 	if legacyWorkloadName != workload.GetName() {
@@ -445,6 +626,31 @@ func reconcileGatewayResources(ctx context.Context, c client.Client, project str
 	}
 	gateway.Status.WorkloadRef = workload.GetName()
 	return nil
+}
+
+func activeGatewayConnectors(ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway) (int, error) {
+	bindings := &connectv1alpha1.ConnectNetworkBindingList{}
+	if err := c.List(ctx, bindings, client.InNamespace(gateway.Namespace)); err != nil {
+		return 0, err
+	}
+	active := map[string]struct{}{}
+	for i := range bindings.Items {
+		binding := &bindings.Items[i]
+		if binding.Spec.GatewayRef != gateway.Name || binding.DeletionTimestamp != nil {
+			continue
+		}
+		var connector connectv1alpha1.Connector
+		if err := c.Get(ctx, types.NamespacedName{Name: binding.Spec.ConnectorRef, Namespace: binding.Namespace}, &connector); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return 0, err
+		}
+		if connector.DeletionTimestamp == nil && meta.IsStatusConditionTrue(connector.Status.Conditions, "Accepted") && meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
+			active[connector.Name] = struct{}{}
+		}
+	}
+	return len(active), nil
 }
 
 func reconcileNetworkBinding(ctx context.Context, c client.Client, project string, binding *connectv1alpha1.ConnectNetworkBinding) error {
@@ -634,12 +840,8 @@ func gatewayConfigIncludesConnector(ctx context.Context, c client.Client, gatewa
 	return false
 }
 
-func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, secretName string) map[string]interface{} {
-	instanceType := spec.InstanceType
-	if instanceType == "" {
-		instanceType = "datumcloud/d1-standard-2"
-	}
-	container := map[string]interface{}{"name": "connect-gateway", "image": spec.Image, "command": []interface{}{"/bin/sh", "-ec"}, "args": []interface{}{"mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && install -D -m 600 /etc/connect/key/key /run/connect-inputs/key && install -D -m 600 /etc/connect/gateway/gateway.yaml /run/connect-inputs/gateway.yaml && install -D -m 600 /etc/connect/gateway/grants.json /run/connect-inputs/grants.json && exec /usr/local/bin/iroh-gateway --config-file=/run/connect-inputs/gateway.yaml --key-file=/run/connect-inputs/key"}, "securityContext": map[string]interface{}{"capabilities": map[string]interface{}{"add": []interface{}{"NET_ADMIN", "MKNOD"}}}, "volumeAttachments": []interface{}{map[string]interface{}{"name": "connect-config", "mountPath": "/etc/connect/gateway"}, map[string]interface{}{"name": "connect-key", "mountPath": "/etc/connect/key"}}}
+func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, class gatewayClassConfig, configName, secretName string) map[string]interface{} {
+	container := map[string]interface{}{"name": "connect-gateway", "image": class.image, "command": []interface{}{"/bin/sh", "-ec"}, "args": []interface{}{"mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && install -D -m 600 /etc/connect/key/key /run/connect-inputs/key && install -D -m 600 /etc/connect/gateway/gateway.yaml /run/connect-inputs/gateway.yaml && install -D -m 600 /etc/connect/gateway/grants.json /run/connect-inputs/grants.json && exec /usr/local/bin/iroh-gateway --config-file=/run/connect-inputs/gateway.yaml --key-file=/run/connect-inputs/key"}, "securityContext": map[string]interface{}{"capabilities": map[string]interface{}{"add": []interface{}{"NET_ADMIN", "MKNOD"}}}, "volumeAttachments": []interface{}{map[string]interface{}{"name": "connect-config", "mountPath": "/etc/connect/gateway"}, map[string]interface{}{"name": "connect-key", "mountPath": "/etc/connect/key"}}}
 	container["args"] = []interface{}{"mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && install -D -m 600 /etc/connect/key/key /run/connect-inputs/key && install -D -m 600 /etc/connect/gateway/gateway.yaml /run/connect-inputs/gateway.yaml && install -D -m 600 /etc/connect/gateway/grants.json /run/connect-inputs/grants.json && exec /usr/local/bin/iroh-gateway --config-file=/run/connect-inputs/gateway.yaml --key-file=/run/connect-inputs/key --ip-config=/run/connect-inputs/grants.json --metrics-addr=127.0.0.1 --metrics-port=9090"}
 	if len(spec.RelayURLs) > 0 {
 		container["env"] = []interface{}{map[string]interface{}{"name": "IROH_GATEWAY_RELAY_URLS", "value": strings.Join(spec.RelayURLs, ",")}}
@@ -648,7 +850,7 @@ func gatewayWorkloadSpec(spec connectv1alpha1.ConnectGatewaySpec, configName, se
 		"placements": []interface{}{map[string]interface{}{"name": "gateway", "locationSelector": map[string]interface{}{"matchLabels": map[string]interface{}{"topology.datum.net/city-code": spec.LocationRef}}, "scaleSettings": map[string]interface{}{"minReplicas": int64(1), "instanceManagementPolicy": "OrderedReady"}}},
 		"template": map[string]interface{}{"spec": map[string]interface{}{
 			"networkInterfaces": []interface{}{map[string]interface{}{"name": "eth0", "network": map[string]interface{}{"name": spec.NetworkRef}, "ipFamilies": []interface{}{"IPv6"}}},
-			"runtime": map[string]interface{}{"class": "general-purpose", "resources": map[string]interface{}{"instanceType": instanceType}, "sandbox": map[string]interface{}{
+			"runtime": map[string]interface{}{"class": "general-purpose", "resources": map[string]interface{}{"instanceType": class.instanceType}, "sandbox": map[string]interface{}{
 				"sysctls":    []interface{}{map[string]interface{}{"name": "net.ipv6.conf.all.forwarding", "value": "1"}, map[string]interface{}{"name": "net.ipv6.conf.default.forwarding", "value": "1"}},
 				"containers": []interface{}{container},
 			}},

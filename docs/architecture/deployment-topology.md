@@ -163,7 +163,8 @@ CONNECT-IP packets do not traverse the project API server.
 
 ## Compute and VPC Data Plane
 
-Every managed ConnectGateway becomes a one-replica Compute Workload. The
+Every active managed ConnectGateway becomes a one-replica Compute Workload;
+OnDemand classes remove that Workload after their idle grace period. The
 Workload runs the externally built `iroh-gateway` executable on a worker with an
 interface in the requested project Network. The gateway receives its private
 identity from a mounted Secret and its exact peer grants from a mounted or

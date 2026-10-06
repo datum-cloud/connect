@@ -168,9 +168,10 @@ The Connect controller serves these resources under
 | Resource | Scope | Description |
 | --- | --- | --- |
 | `ConnectorClass` | Cluster | Permitted transports and capabilities |
+| `ConnectGatewayClass` | Cluster | Gateway controller, lifecycle policy, and operator implementation reference |
 | `Connector` | Project | Device public identity, endpoint, relays, and readiness |
 | `ConnectorAdvertisement` | Project | TCP and UDP services published by one Connector |
-| `ConnectGateway` | Project | Desired managed gateway Workload and VPC attachment |
+| `ConnectGateway` | Project | Desired managed gateway service and VPC attachment |
 | `ConnectNetworkBinding` | Project | Approval for one Connector to attach to one gateway |
 
 Public ingress still creates an NSO-owned

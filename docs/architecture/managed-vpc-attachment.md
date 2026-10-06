@@ -35,15 +35,23 @@ flowchart TD
 
 ## Gateway Reconciliation
 
-`ConnectGateway` names a Network and Location, selects a gateway image, and
-declares up to 32 routes. The controller:
+`ConnectGateway` selects a cluster-scoped ConnectGatewayClass, names a Network
+and Location, and declares up to 32 routes. The controller:
 
-1. validates the image, routes, relay URLs, and references;
+1. validates the class, routes, relay URLs, and references;
 2. creates a stable private gateway key in a project Secret;
 3. renders a ConfigMap containing the approved peer grants;
-4. creates a one-replica Compute Workload attached to the requested Network;
+4. creates a one-replica Compute Workload attached to the requested Network
+   when the class is AlwaysOn or a live bound Connector needs it;
 5. publishes the Workload name and public endpoint ID in gateway status;
-6. reports Ready when the Compute Workload is Available.
+6. reports Ready when the Compute Workload is Available, or Dormant after an
+   idle OnDemand Workload has been removed.
+
+OnDemand activity requires a non-deleting binding whose Connector is both
+Accepted and Ready. Binding readiness is intentionally excluded because it
+depends on the Workload. When activity stops, the class idle timeout provides
+hysteresis before only the Workload is deleted; identity and durable grants are
+preserved for the next activation.
 
 Compute, not Connect, creates the Workload's NSO NetworkBinding. Connect avoids
 creating a competing VPC interface resource. Gateway Ready proves Workload

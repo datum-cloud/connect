@@ -9,24 +9,27 @@ recovery role.
 | Resource | Scope | Desired state | Important status |
 | --- | --- | --- | --- |
 | `ConnectorClass` | Cluster | Allowed transports and capabilities | Valid configuration and Ready |
+| `ConnectGatewayClass` | Cluster | Controller, lifecycle policy, operator parameter reference | Accepted and Ready |
 | `Connector` | Project | Class, public key, endpoint, relay URLs | Ready, assigned addresses, Lease reference |
 | `ConnectorAdvertisement` | Project | Connector reference and TCP/UDP ports | Accepted/Ready conditions |
-| `ConnectGateway` | Project | Network, location, routes, image, relays, peer routing | Workload reference, endpoint ID, Ready |
+| `ConnectGateway` | Project | Gateway class, network, location, routes, relays, peer routing | Phase, idle time, Workload reference, endpoint ID, Ready |
 | `ConnectNetworkBinding` | Project | Connector and gateway references | Assigned and peer addresses, routes, relays, Ready |
 | `Lease` | Project | Connector liveness record | Renew time |
 | `HTTPProxy` | Project, NSO API | Explicit public hostname and backend | Ingress acceptance and hostnames |
 | `Network` | Project, NSO API | VPC selected by name | Consumed through Compute Workload attachment |
 | `Workload` | Project, Compute API | Gateway process and VPC interface | Availability and applied configuration |
 
-All Connect resources except ConnectorClass carry Milo's Project parent-context
-annotation. ConnectorClass is management-cluster configuration because the
-platform, not a project device, defines supported transport profiles.
+All Connect resources except ConnectorClass and ConnectGatewayClass carry
+Milo's Project parent-context annotation. The classes are management-cluster
+configuration because the platform defines supported transport and gateway
+service profiles.
 
 ## Ownership Graph
 
 ```mermaid
 flowchart TD
     cc[ConnectorClass]
+    gc[ConnectGatewayClass]
     c[Connector]
     l[Lease]
     a[ConnectorAdvertisement]
@@ -42,6 +45,7 @@ flowchart TD
     c -->|owner reference| a
     c -->|owner reference| hp
     g --> s
+    g --> gc
     g --> cm
     g --> w
     b --> c

@@ -6,9 +6,12 @@ bindings; the Rust daemon and `datumctl` plugin consume the binding API.
 
 ## Resource ownership
 
-`ConnectorClass` is cluster-scoped platform configuration, matching the scope
-of the current NSO ConnectorClass. `Connector`, `ConnectorAdvertisement`, and
-`ConnectGateway` are project resources and carry Milo's
+`ConnectorClass` and `ConnectGatewayClass` are cluster-scoped platform
+configuration. A `ConnectGatewayClass` names this controller, describes its
+observable lifecycle policy, and references an operator-owned ConfigMap for
+private implementation parameters such as the gateway image and Compute
+instance type. `Connector`, `ConnectorAdvertisement`, and `ConnectGateway` are
+project resources and carry Milo's
 `discovery.miloapis.com/parent-contexts=Project` annotation. The controller
 uses `go.miloapis.com/milo/pkg/multicluster-runtime/milo` and registers these
 project controllers with `WithEngageWithLocalCluster(false)`.
@@ -22,10 +25,14 @@ The controller provisions the first single-project CONNECT-IP gateway slice:
   while the agent renews that Lease.
 - ConnectorAdvertisement is accepted only when its Connector is ready and its
   service protocol/port fields are valid.
-- ConnectGateway creates a stable private gateway key, a ConfigMap containing
-  the gateway's peer grants, and a one-replica Compute Workload attached to the
-  requested IPv6 Network and Location. Compute creates the NSO NetworkBinding
-  for the Workload interface. The gateway does not create a competing binding.
+- ConnectGateway selects a ConnectGatewayClass and creates a stable private
+  gateway key plus a ConfigMap containing the gateway's durable peer grants.
+  An `AlwaysOn` class maintains a one-replica Compute Workload. An `OnDemand`
+  class creates it while a non-deleting binding targets an Accepted and Ready
+  Connector, then deletes only the Workload after the class idle timeout.
+  Binding readiness is not used as the activity signal because it depends on
+  Workload availability. Compute creates the NSO NetworkBinding for the
+  Workload interface. The gateway does not create a competing binding.
   Its Prometheus endpoint binds to `127.0.0.1:9090`; the controller does not
   expose a metrics port on the VPC interface.
 - ConnectNetworkBinding attaches one project Connector to a ConnectGateway.
@@ -38,9 +45,12 @@ The controller provisions the first single-project CONNECT-IP gateway slice:
   Peer packets are forwarded between authenticated gateway sessions without
   entering the VPC or its NAT path. VPC and peer routes together are limited to
   32 routes per Connector.
-- ConnectGateway status publishes the gateway endpoint ID and Workload name.
-  Ready becomes true after the Compute Workload is Available. This reports
-  workload availability, not an active client attachment or a working packet path.
+- ConnectGatewayClass status reports whether the class is accepted and its
+  operator parameters are ready. ConnectGateway status publishes its resolved
+  class, operational phase, stable endpoint ID, idle timestamp, and current
+  Workload name. A stopped OnDemand gateway reports `Dormant`; Ready becomes
+  true only after the Compute Workload is Available. This reports workload
+  availability, not a working packet path.
 
 For gateway diagnostics, exec into the gateway Workload and query
 `http://127.0.0.1:9090/metrics`. CONNECT-IP counters show active/opened
@@ -124,15 +134,37 @@ The intended staging resources look like this:
 
 ```yaml
 apiVersion: connect.datumapis.com/v1alpha1
+kind: ConnectGatewayClass
+metadata:
+  name: standard
+spec:
+  controllerName: connect.datum.net/gateway-controller
+  parametersRef:
+    namespace: connect-system
+    name: standard-gateway
+  scaling:
+    mode: OnDemand
+    idleTimeout: 10m
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: connect-system
+  name: standard-gateway
+data:
+  image: ghcr.io/datum-cloud/iroh-gateway:<connect-ip-build>
+  instanceType: datumcloud/d1-standard-2
+---
+apiVersion: connect.datumapis.com/v1alpha1
 kind: ConnectGateway
 metadata:
   name: staging-vpc
 spec:
+  gatewayClassRef: standard
   networkRef: staging-vpc
   locationRef: DFW
   routes: [fd20:0:27::/48]
   peerRouting: true
-  image: ghcr.io/datum-cloud/iroh-gateway:<connect-ip-build>
   relayURLs: [https://<staging-relay-host>]
 ---
 apiVersion: connect.datumapis.com/v1alpha1

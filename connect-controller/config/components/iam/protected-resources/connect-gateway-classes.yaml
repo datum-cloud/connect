@@ -1,0 +1,27 @@
+apiVersion: iam.miloapis.com/v1alpha1
+kind: ProtectedResource
+metadata:
+  name: connect.datumapis.com-connectgatewayclass
+spec:
+  serviceRef:
+    name: connect.datumapis.com
+  kind: ConnectGatewayClass
+  plural: connectgatewayclasses
+  singular: connectgatewayclass
+  permissions:
+  - list
+  - get
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+  subresources:
+  - name: status
+    permissions:
+    - get
+    - update
+    - patch
+  parentResources:
+  - apiGroup: resourcemanager.miloapis.com
+    kind: Project

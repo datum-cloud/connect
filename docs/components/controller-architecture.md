@@ -57,9 +57,11 @@ metadata; the controller never opens the local service or proxies its bytes.
 
 ### ConnectGateway
 
-Validates routes, image, relay URLs, network, and location. It reconciles a
-stable private-key Secret, peer-grant ConfigMap, and one-replica Compute
-Workload. Status exposes the public endpoint ID and Workload reference only.
+Resolves a ready ConnectGatewayClass, validates routes, relay URLs, network,
+and location, and reconciles a stable private-key Secret plus peer-grant
+ConfigMap. It maintains a one-replica Compute Workload according to the class's
+AlwaysOn or OnDemand lifecycle. Status exposes the operational phase, stable
+public endpoint ID, idle time, and current Workload reference.
 
 ### ConnectNetworkBinding
 
@@ -77,7 +79,8 @@ The generated Workload runs the configured `iroh-gateway` image with:
 - generated peer configuration from the ConfigMap;
 - `NET_ADMIN` and `MKNOD` plus required forwarding sysctls;
 - a loopback-only Prometheus listener;
-- one replica and a configuration digest that rolls on grant changes.
+- zero or one replica-bearing Workload according to class policy, with a
+  configuration digest that rolls on grant changes.
 
 The controller creates the Workload but not the Workload's NSO NetworkBinding;
 Compute owns that attachment. The Network reference remains a name-only
