@@ -2,7 +2,23 @@
 
 Use these guides to install, operate, and develop Datum Connect.
 
-## Use Connect
+## Learn and use Connect
+
+- Start with the [product overview](product/README.md) to understand what
+  Connect provides and when to use each connectivity model.
+- Read the [core concepts](product/concepts.md) for the vocabulary used by the
+  CLI and the rest of these guides.
+- Follow [Getting started](guides/getting-started.md) to connect a device and
+  share your first private service.
+
+### Common tasks
+
+- [Share a private service](guides/private-services.md)
+- [Publish a public HTTP service](guides/public-services.md)
+- [Access a managed project network](guides/project-network-access.md)
+- [Connect two devices directly](guides/direct-device-networking.md)
+
+### Install and validate
 
 - [Install the preview](INSTALL.txt) on a supported host.
 - [Validate the headless preview](headless-preview.md) with the CLI and daemon.
