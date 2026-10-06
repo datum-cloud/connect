@@ -167,16 +167,18 @@ func TestJoinReportsMissingNetworkWithDatumctlLookup(t *testing.T) {
 
 func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 	for _, test := range []struct {
-		name, input            string
+		name, input, action    string
 		guided, ready, success bool
 		replace                bool
+		upgrade                bool
 		prompts                int
 	}{
-		{"first join accepted", "y\n", true, false, true, false, 1},
-		{"declined", "n\n", true, false, false, false, 0},
-		{"script never elevates", "", false, false, false, false, 0},
-		{"saved ready", "", false, true, true, false, 0},
-		{"approval replacement accepted", "y\n", true, false, true, true, 1},
+		{name: "first join accepted", input: "y\n", action: "install", guided: true, success: true, prompts: 1},
+		{name: "declined", input: "n\n", action: "install", guided: true, prompts: 0},
+		{name: "script never elevates", action: "install"},
+		{name: "saved ready", ready: true, success: true},
+		{name: "approval replacement accepted", input: "y\n", action: "replace", guided: true, success: true, replace: true, prompts: 1},
+		{name: "outdated helper is upgraded", input: "y\n", action: "upgrade", guided: true, success: true, upgrade: true, prompts: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv("DATUM_CONNECT_TOKEN", "local-test-token")
@@ -184,8 +186,10 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 			t.Cleanup(func() { guidedSetupEnabled, ensureNetworking = previousGuided, previousEnsure })
 			guidedSetupEnabled = func(*cobra.Command, *options) bool { return test.guided }
 			approvals, prepared, joins := 0, 0, 0
-			ensureNetworking = func(_ *cobra.Command, _, _ string, config daemonservice.HelperApprovals, _, replace bool) error {
+			var upgraded bool
+			ensureNetworking = func(_ *cobra.Command, _, _ string, config daemonservice.HelperApprovals, upgrade, replace bool) error {
 				approvals++
+				upgraded = upgrade
 				if len(config.Approvals) != 1 {
 					t.Fatal("unexpected approval")
 				}
@@ -210,11 +214,7 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 					}
 					io.WriteString(w, `{}`)
 				case "/v1/networks/friend/setup":
-					action := "install"
-					if test.replace {
-						action = "replace"
-					}
-					fmt.Fprintf(w, `{"network":"friend","approval_action":%q,"approval_changes":["routes"],"binding":{"peer":"pinned-key","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","interface_name":"dcfriend","mtu":1280},"helper_config":{"allowed_uid":501,"approvals":[{"interface_name":"dcfriend","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","mtu":1280}]}}`, action)
+					fmt.Fprintf(w, `{"network":"friend","approval_action":%q,"approval_changes":["routes"],"binding":{"peer":"pinned-key","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","interface_name":"dcfriend","mtu":1280},"helper_config":{"allowed_uid":501,"approvals":[{"interface_name":"dcfriend","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","mtu":1280}]}}`, test.action)
 				case "/v1/networks":
 					joins++
 					if !test.ready && approvals == 0 {
@@ -238,8 +238,8 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 			args := []string{"friend", "--peer", "friend-mac", "--allow-tcp", "8080", "--allow-ping"}
 			cmd.SetArgs(args)
 			err := cmd.Execute()
-			if (err == nil) != test.success || approvals != test.prompts || prepared != 1 || joins < 1 {
-				t.Fatalf("err=%v approvals=%d prepared=%d joins=%d", err, approvals, prepared, joins)
+			if (err == nil) != test.success || approvals != test.prompts || prepared != 1 || joins < 1 || upgraded != test.upgrade {
+				t.Fatalf("err=%v approvals=%d prepared=%d joins=%d upgraded=%v", err, approvals, prepared, joins, upgraded)
 			}
 		})
 	}

@@ -13,7 +13,7 @@ func TestHumanOutput(t *testing.T) {
 		name, command, data string
 		contains, absent    []string
 	}{
-		{"health", "health", `{"status":"ok","release_version":"v1.0.0-preview.19"}`, []string{"daemon is reachable", "Daemon version: v1.0.0-preview.19"}, []string{"{", "connected to project"}},
+		{"health", "health", `{"status":"ok","release_version":"v1.0.0-preview.20"}`, []string{"daemon is reachable", "Daemon version: v1.0.0-preview.20"}, []string{"{", "connected to project"}},
 		{"new project", "status", `{"project":"demo","credential_configured":false}`, []string{"not configured", `up --project "demo"`, "datumctl login"}, []string{"/v1/up"}},
 		{"down", "down", `{"project":"demo","credential_configured":true,"desired_up":false}`, []string{"Disconnected", `up --project "demo"`}, nil},
 		{"running", "up", `{"project":"demo","running":true,"credential_configured":true,"connector":{"name":"device-a"}}`, []string{"Connected", "Connector: device-a", "No services"}, nil},

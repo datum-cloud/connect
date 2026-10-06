@@ -1,4 +1,4 @@
-Datum Connect v1.0.0-preview.19: manual installation with datumctl
+Datum Connect v1.0.0-preview.20: manual installation with datumctl
 ==============================================================
 
 This archive includes the datumctl plugin and its matching daemon. Install
@@ -20,7 +20,7 @@ in the matching source release for Windows requirements.
    Example download for an Apple Silicon Mac. Change CONNECT_ARCHIVE for another
    platform. Check each command succeeds before continuing:
 
-     CONNECT_VERSION=v1.0.0-preview.19
+     CONNECT_VERSION=v1.0.0-preview.20
      CONNECT_ARCHIVE=datumctl-connect_Darwin_arm64.tar.gz
      CONNECT_RELEASE_URL="https://github.com/datum-cloud/connect/releases/download/$CONNECT_VERSION"
      CONNECT_DOWNLOAD_DIR=$(mktemp -d)
@@ -59,7 +59,7 @@ in the matching source release for Windows requirements.
      datumctl connect health
      datumctl connect serve --help
 
-   Expected health output includes "Daemon version: v1.0.0-preview.19". Check
+   Expected health output includes "Daemon version: v1.0.0-preview.20". Check
    that the trust command identifies the executable inside CONNECT_PREVIEW_DIR.
    `datumctl connect health` reports the running daemon, not just the plugin.
    Keep the two binaries from the same archive together.
@@ -73,7 +73,7 @@ in the matching source release for Windows requirements.
    To keep using this preview in new terminals, repeat these exports or add them
    to your shell startup file (~/.zshrc on macOS or ~/.bashrc on Linux):
 
-     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.19"
+     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.20"
      export PATH="$CONNECT_PREVIEW_DIR:$PATH"
      export DATUMCTL_PLUGINS_DIR="$CONNECT_PREVIEW_DIR/plugin-registry"
 
@@ -272,7 +272,7 @@ in the matching source release for Windows requirements.
    protected executable location, and renewable credential-file authentication.
    Follow the matching version's Windows platform guide:
 
-   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.19/docs/headless-preview.md
+   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.20/docs/headless-preview.md
 
 Local build qualification
 -------------------------

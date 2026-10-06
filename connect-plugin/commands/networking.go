@@ -346,11 +346,12 @@ func newJoin(opts *options) *cobra.Command {
 			}
 			writeNetworkApproval(cmd.ErrOrStderr(), plan, peer)
 			replaceRequested := replaceApproval || plan.ApprovalAction == "replace"
+			upgradeRequested := upgrade || plan.ApprovalAction == "upgrade"
 			question := "Install the privileged helper and approve managed VPC networking for this user?"
 			if !plan.ManagedGateway {
 				question = "Install the privileged helper and approve this exact attachment?"
 			}
-			if upgrade {
+			if upgradeRequested {
 				question = "Upgrade the helper? Active IP attachments will disconnect; services and local ports stay running."
 			} else if replaceRequested {
 				question = "Approve this updated network access? The current IP attachment will reconnect; services and local ports stay running."
@@ -360,7 +361,7 @@ func newJoin(opts *options) *cobra.Command {
 			if err := confirmSetup(cmd, question); err != nil {
 				return err
 			}
-			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, upgrade, replaceRequested); err != nil {
+			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, upgradeRequested, replaceRequested); err != nil {
 				return err
 			}
 			// launchd/systemd acknowledging Start is not yet helper readiness.
