@@ -156,11 +156,12 @@ func helperStateDir(uid uint32) string {
 
 // helperExecutableDir keeps executable code out of mutable state directories.
 // On SELinux systems, /var/lib is labeled var_lib_t and systemd cannot execute
-// a helper stored there. Linux executables belong under /usr/libexec; approvals
-// and the socket remain under /var/lib.
+// a helper stored there. Linux executables belong under /usr/libexec, or the
+// resolved /usr/local/sbin when /usr is read-only; approvals and the socket
+// remain under /var/lib.
 func helperExecutableDir(uid uint32) string {
 	if runtime.GOOS == "linux" {
-		return filepath.Join("/usr/libexec/datum-connect", strconv.FormatUint(uint64(uid), 10))
+		return filepath.Join(linuxHelperExecutableBase(), strconv.FormatUint(uint64(uid), 10))
 	}
 	return helperStateDir(uid)
 }

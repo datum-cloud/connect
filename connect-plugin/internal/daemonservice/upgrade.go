@@ -30,7 +30,8 @@ func EnsureCurrentUser(ctx context.Context, version, executable string, timeout 
 		return false, false, nil
 	}
 	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
-	if executable == "" && (version == "" || strings.Contains(strings.ToLower(version), "dev")) && !force {
+	// Local builds have no release to download; leave the running daemon alone.
+	if executable == "" && !daemoninstall.PublishedRelease("v"+version) && !force {
 		return false, false, nil
 	}
 	if err := validatePlatformScope(false); err != nil {

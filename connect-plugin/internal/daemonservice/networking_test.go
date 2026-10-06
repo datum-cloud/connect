@@ -1,8 +1,12 @@
 package daemonservice
 
 import (
+	"encoding/json"
 	"errors"
 	"github.com/kardianos/service"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -80,6 +84,22 @@ func TestManagedPolicyInstallsOnceAndCannotSilentlyExpand(t *testing.T) {
 	}
 }
 
+func TestPolicyOnlyApprovalSerializesEmptyApprovalList(t *testing.T) {
+	policy := &ManagedPolicy{ClientOnly: true, AddressRanges: []string{"fc00::/7"}, RouteRanges: []string{"fc00::/7"}, MinimumRoutePrefix: 16, MinimumMTU: 1280, MaximumMTU: 1500, InterfacePrefix: "dc", InterfaceBehavior: "ephemeral_exclusive", MaximumActiveAttachments: 8, MaximumRoutesPerAttachment: 32, DenyConnectRouteOverlap: true}
+	merged, _, err := mergeApprovals(HelperApprovals{}, HelperApprovals{AllowedUID: 501, ManagedPolicy: policy}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The helper's serde config rejects null for its approvals Vec.
+	if !strings.Contains(string(data), `"approvals":[]`) {
+		t.Fatalf("helper config must carry an empty approvals list, got %s", data)
+	}
+}
+
 type helperTestService struct {
 	service.Service
 	events []string
@@ -121,5 +141,31 @@ func TestHelperActivationKeepsLiveSessionsAndRollsBackUpgrades(t *testing.T) {
 	svc = &helperTestService{}
 	if err := activateHelper(svc, false, service.StatusUnknown, false, func() error { return nil }, nil); err != nil || len(svc.events) != 2 || svc.events[0] != "install" || svc.events[1] != "start" {
 		t.Fatalf("%v %v", svc.events, err)
+	}
+}
+
+func TestHelperSetupRefusesContainers(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("container markers are Linux-only")
+	}
+	original := containerMarkers
+	t.Cleanup(func() { containerMarkers = original })
+	dir := t.TempDir()
+	containerMarkers = []string{filepath.Join(dir, ".toolboxenv")}
+	if err := refuseContainer(); err != nil {
+		t.Fatalf("refused without a marker: %v", err)
+	}
+	if err := os.WriteFile(containerMarkers[0], nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := refuseContainer(); err == nil || !strings.Contains(err.Error(), "from the host") {
+		t.Fatalf("container was not refused: %v", err)
+	}
+}
+
+func TestHelperActivationErrorsNameTheFailedStep(t *testing.T) {
+	err := activateHelper(&helperTestService{fail: "start"}, false, service.StatusUnknown, false, func() error { return nil }, nil)
+	if err == nil || !strings.Contains(err.Error(), "start helper service") {
+		t.Fatalf("error does not name the failed step: %v", err)
 	}
 }
