@@ -217,9 +217,9 @@ Install the executable in a root-owned, non-writable-by-users location before
 installing the macOS system service. For example, after building locally:
 
 ```sh
-sudo install -o root -g wheel -m 755 connect-lib/target/debug/datum-connect-daemon /Library/PrivilegedHelperTools/datum-connect-daemon
+sudo install -o root -g wheel -m 755 connect-lib/target/debug/datum-connectd /Library/PrivilegedHelperTools/datum-connectd
 sudo datumctl connect daemon install --system \
-  --executable /Library/PrivilegedHelperTools/datum-connect-daemon \
+  --executable /Library/PrivilegedHelperTools/datum-connectd \
   --credentials-file /absolute/credentials.json \
   --local-ip-config /absolute/ip.json
 sudo datumctl connect daemon start --system
@@ -241,7 +241,7 @@ On Windows, install the daemon and matching signed `wintun.dll` beneath
 
 ```powershell
 datumctl connect daemon install --system `
-  --executable 'C:\Program Files\Datum Connect\datum-connect-daemon.exe' `
+  --executable 'C:\Program Files\Datum Connect\datum-connectd.exe' `
   --credentials-file 'C:\private\credentials.json' `
   --local-ip-config 'C:\private\ip.json'
 datumctl connect daemon start --system
@@ -332,7 +332,7 @@ go build -o ../target/windows-amd64/datumctl-connect.exe .
 Pop-Location
 ./scripts/windows-service-smoke.ps1 `
   -Plugin (Resolve-Path target/windows-amd64/datumctl-connect.exe) `
-  -Daemon (Resolve-Path connect-lib/target/debug/datum-connect-daemon.exe)
+  -Daemon (Resolve-Path connect-lib/target/debug/datum-connectd.exe)
 ```
 
 The test exercises install, start, loopback health, authenticated status,
@@ -507,7 +507,7 @@ state paths, service ports, and existing IP approvals instead of using these def
 ```sh
 datumctl connect daemon stop
 datumctl connect daemon uninstall
-datumctl connect daemon install --executable "$PWD/connect-lib/target/debug/datum-connect-daemon" --local-ip-config "$PWD/peer-ip.json"
+datumctl connect daemon install --executable "$PWD/connect-lib/target/debug/datum-connectd" --local-ip-config "$PWD/peer-ip.json"
 datumctl connect daemon start
 datumctl connect up --project datum-cloud
 datumctl connect join friend --project datum-cloud

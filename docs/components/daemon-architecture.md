@@ -1,6 +1,6 @@
 # Daemon Architecture
 
-`datum-connect-daemon` is the local control plane for one host. It owns durable
+`datum-connectd` is the local control plane for one host. It owns durable
 intent, cloud authorization, Connector identities, peer transports, loopback
 listeners, and network attachments. The CLI is a stateless client of this
 daemon rather than a second owner of those resources.

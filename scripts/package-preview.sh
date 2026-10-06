@@ -36,8 +36,8 @@ case "$preview_arch" in
 esac
 preview_daemon_version=$("$preview_daemon" --version)
 case "$preview_daemon_version" in
-  datum-connect-daemon*) ;;
-  *) echo "The supplied executable is not datum-connect-daemon." >&2; exit 2 ;;
+  datum-connectd*) ;;
+  *) echo "The supplied executable is not datum-connectd." >&2; exit 2 ;;
 esac
 mkdir -m 700 "$preview_output"
 mkdir -m 700 "$preview_output/bundle"
@@ -47,7 +47,7 @@ mkdir -m 700 "$preview_output/bundle"
     -ldflags "-X main.version=$preview_version" \
     -o "$preview_output/bundle/datumctl-connect" .
 )
-install -m 700 "$preview_daemon" "$preview_output/bundle/datum-connect-daemon"
+install -m 700 "$preview_daemon" "$preview_output/bundle/datum-connectd"
 install -m 600 "$preview_repo/docs/INSTALL.txt" "$preview_output/bundle/INSTALL.txt"
 install -m 600 "$preview_repo/LICENSE" "$preview_output/bundle/LICENSE"
 # Generated build metadata deliberately includes no environment or credentials.
@@ -63,7 +63,7 @@ install -m 600 "$preview_repo/LICENSE" "$preview_output/bundle/LICENSE"
 } > "$preview_output/bundle/BUILDINFO.txt"
 preview_archive="datumctl-connect_${preview_os}_${preview_archive_arch}.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$preview_output/$preview_archive" -C "$preview_output/bundle" \
-  datumctl-connect datum-connect-daemon INSTALL.txt LICENSE BUILDINFO.txt
+  datumctl-connect datum-connectd INSTALL.txt LICENSE BUILDINFO.txt
 (
   cd "$preview_output"
   shasum -a 256 "$preview_archive" > checksums.txt

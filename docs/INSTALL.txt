@@ -1,5 +1,5 @@
-Datum Connect v1.0.0-preview.15: manual installation with datumctl
-==============================================================
+Datum Connect v1.0.0-preview.24: manual installation with datumctl
+==================================================================
 
 This archive includes the datumctl plugin and its matching daemon. Install
 datumctl separately first. These instructions are verified with datumctl v0.20.0.
@@ -20,7 +20,7 @@ in the matching source release for Windows requirements.
    Example download for an Apple Silicon Mac. Change CONNECT_ARCHIVE for another
    platform. Check each command succeeds before continuing:
 
-     CONNECT_VERSION=v1.0.0-preview.15
+     CONNECT_VERSION=v1.0.0-preview.24
      CONNECT_ARCHIVE=datumctl-connect_Darwin_arm64.tar.gz
      CONNECT_RELEASE_URL="https://github.com/datum-cloud/connect/releases/download/$CONNECT_VERSION"
      CONNECT_DOWNLOAD_DIR=$(mktemp -d)
@@ -42,7 +42,7 @@ in the matching source release for Windows requirements.
      CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/$CONNECT_VERSION"
      mkdir -p "$CONNECT_PREVIEW_DIR"
      tar -xzf "$CONNECT_DOWNLOAD_DIR/$CONNECT_ARCHIVE" -C "$CONNECT_PREVIEW_DIR"
-     chmod 755 "$CONNECT_PREVIEW_DIR/datumctl-connect" "$CONNECT_PREVIEW_DIR/datum-connect-daemon"
+     chmod 755 "$CONNECT_PREVIEW_DIR/datumctl-connect" "$CONNECT_PREVIEW_DIR/datum-connectd"
 
    If this version is already extracted, reuse its directory. Do not overwrite
    binaries used by a running service. Keep both binaries together.
@@ -59,9 +59,9 @@ in the matching source release for Windows requirements.
      datumctl connect --version
      datumctl connect serve --help
 
-   Expected output: "connect version v1.0.0-preview.15". Check that the trust
+   Expected output: "connect version v1.0.0-preview.24". Check that the trust
    command identifies the executable inside CONNECT_PREVIEW_DIR.
-   The daemon currently reports its crate version (0.1.0), not the preview tag.
+   The daemon reports its release tag with `datumctl connect version`.
    Keep the two binaries from the same archive together.
    The separate plugin registry keeps this preview's trust record isolated from
    your normal plugins. Repeat both exports when using a new terminal. Without
@@ -73,7 +73,7 @@ in the matching source release for Windows requirements.
    To keep using this preview in new terminals, repeat these exports or add them
    to your shell startup file (~/.zshrc on macOS or ~/.bashrc on Linux):
 
-     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.15"
+     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.24"
      export PATH="$CONNECT_PREVIEW_DIR:$PATH"
      export DATUMCTL_PLUGINS_DIR="$CONNECT_PREVIEW_DIR/plugin-registry"
 
@@ -106,12 +106,20 @@ in the matching source release for Windows requirements.
    If you received this bundle directly, before its GitHub release is published,
    or need to install the daemon without downloading it again, run this once:
 
-     datumctl connect install --executable "$CONNECT_PREVIEW_DIR/datum-connect-daemon"
+     datumctl connect install --executable "$CONNECT_PREVIEW_DIR/datum-connectd"
      datumctl connect serve localhost:8080
 
    Keep that directory: the service references the executable by absolute path.
-   This installer does not upgrade or overwrite existing services. Inspect an
-   existing service with datumctl connect daemon status before changing it.
+   Connect checks for a daemon release mismatch before `join`, `up`, `serve`,
+   or `install` and upgrades the standard macOS/Linux user service when needed.
+   You can also check explicitly with:
+
+     datumctl connect install --upgrade
+
+   An upgrade briefly restarts the daemon, preserves its service settings and state,
+   and checks readiness. If the new daemon does not become ready, Connect
+   restores the previous service definition. Use --executable PATH with
+   --upgrade to use a local build.
    Do not delete existing daemon state or credentials during migration.
    Do not run these per-user service commands with sudo. Scripts, JSON/YAML
    output, explicit tokens, custom daemon URLs, root, and Windows do not use the
@@ -161,7 +169,7 @@ in the matching source release for Windows requirements.
    macOS default: ~/Library/Application Support/datumctl/connect/daemon/daemon.log
    Linux default: ~/.local/state/datumctl/connect/daemon/daemon.log
    Do not share setup tokens, credential files, or your datumctl login state.
-   This preview does not include production VPC enrollment or automatic upgrades.
+   Managed VPC enrollment requires a Ready ConnectGateway in the project.
 
    Run unserve on the sender and hangup on the receiver. If TCP and UDP share
    one address, use the service ID from status to disambiguate unserve.
@@ -186,24 +194,21 @@ in the matching source release for Windows requirements.
 
 6. Upgrade an existing headless preview daemon
 
-   Replacing the plugin does NOT upgrade a running daemon. These steps apply
-   only to a standard per-user macOS/Linux headless preview service, not to
-   the legacy desktop app or tunnel CLI. Preserve any custom state path, port,
-   credential-file, system-service, or IP approval settings using your original
-   installation configuration rather than replacing them with these defaults.
+   The plugin upgrades the daemon automatically when you run `join`, `up`,
+   `serve`, or `install`. This applies only to the standard per-user macOS/Linux
+   service, not to the legacy desktop app, system service, or tunnel CLI. To
+   check explicitly after installing and trusting the plugin in sections 1-2,
+   run:
 
-   After downloading and trusting the new plugin in sections 1-2, securely back
-   up private daemon state and retain the previous executable for rollback:
-
-     datumctl connect daemon status
-     datumctl connect daemon stop
-     datumctl connect daemon uninstall
-     datumctl connect install --executable "$CONNECT_PREVIEW_DIR/datum-connect-daemon"
+     datumctl connect install --upgrade
      datumctl connect status
 
-   Stop/uninstall removes the service registration, NOT saved configuration,
-   credentials, keys, or Cloud Connectors. The new service reuses default state
-   and reconciles saved intent. Restarting briefly interrupts tunnels.
+   An upgrade briefly interrupts tunnels. It preserves saved configuration,
+   credentials, keys, Cloud Connectors, and service settings. If readiness
+   fails, the installer restores the previous service definition. Use
+   --executable PATH with --upgrade to install a local build. Custom ports and
+   state paths are not supported by this guided upgrade command; use the
+   original service manager configuration to upgrade those installations.
    If earlier enrollment failed, finish it with:
 
      datumctl connect up
@@ -211,8 +216,6 @@ in the matching source release for Windows requirements.
 
    Do not delete state to clear a 409 or 422 error. This release waits for relay
    readiness, retries conflicting status updates, and identifies invalid fields.
-   The daemon's crate version alone cannot identify the running build; inspect
-   the executable path in its service definition if behavior is still outdated.
    If port 47780 is occupied, inspect the existing process/service rather than
    killing an unknown listener. Stop a manually run daemon with its original
    terminal or service manager before installing a background service.
@@ -269,7 +272,7 @@ in the matching source release for Windows requirements.
    protected executable location, and renewable credential-file authentication.
    Follow the matching version's Windows platform guide:
 
-   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.15/docs/headless-preview.md
+   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.24/docs/headless-preview.md
 
 Local build qualification
 -------------------------

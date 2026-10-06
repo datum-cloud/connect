@@ -77,7 +77,7 @@ func TestRunServiceActionTimesOut(t *testing.T) {
 }
 
 func TestServiceConfigIsExplicitAndScoped(t *testing.T) {
-	exe := filepath.Join(t.TempDir(), "datum-connect-daemon")
+	exe := filepath.Join(t.TempDir(), "datum-connectd")
 	if err := os.WriteFile(exe, []byte("binary"), 0700); err != nil {
 		t.Fatal(err)
 	}

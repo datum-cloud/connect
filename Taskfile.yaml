@@ -6,7 +6,8 @@ vars:
   RUST_PROJECT: connect-lib
   GO_PROJECT: connect-plugin
   PLUGIN_BINARY: datumctl-connect
-  DAEMON_BINARY: datum-connect-daemon
+  DAEMON_PACKAGE: datum-connect-daemon
+  DAEMON_BINARY: datum-connectd
   PLUGIN_DIR: '{{.ROOT_DIR}}/bin'
   PLUGIN_INSTALL_DIR: '$HOME/.datumctl/plugins'
 
@@ -14,10 +15,11 @@ vars:
 
   GIT_COMMIT:
     sh: git rev-parse --short HEAD
-  GO_LDFLAGS: -X main.version=v0.1.0+{{.GIT_COMMIT}}
+  DEV_VERSION: v0.1.0+{{.GIT_COMMIT}}
+  GO_LDFLAGS: -X main.version={{.DEV_VERSION}}
 
   CARGO_TARGET_DIR: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}/target'
-  CARGO_BUILD_FLAGS: --locked -p {{.DAEMON_BINARY}} -p datum-connect-network-helper
+  CARGO_BUILD_FLAGS: --locked -p {{.DAEMON_PACKAGE}} -p datum-connect-network-helper
   RELEASE_FLAGS: --release
 
   E2E_SCRIPT: '{{.ROOT_DIR}}/scripts/daemon-e2e.py'
@@ -50,7 +52,7 @@ tasks:
   build:rust:
     desc: "Build the Rust binary (debug)"
     cmds:
-      - cargo build {{.CARGO_BUILD_FLAGS}}
+      - cmd: DATUM_CONNECT_RELEASE_VERSION={{.DEV_VERSION}} cargo build {{.CARGO_BUILD_FLAGS}}
     dir: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}'
 
   build:release:
@@ -62,7 +64,7 @@ tasks:
   build:rust:release:
     desc: "Build the Rust binary with LTO and symbol stripping"
     cmds:
-      - cargo build {{.CARGO_BUILD_FLAGS}} {{.RELEASE_FLAGS}}
+      - cmd: DATUM_CONNECT_RELEASE_VERSION={{.DEV_VERSION}} cargo build {{.CARGO_BUILD_FLAGS}} {{.RELEASE_FLAGS}}
     dir: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}'
 
   # ════════════════════════════════════════════════════════════════════════

@@ -71,11 +71,15 @@ same guided setup without sharing an application. If you previously ran `down`,
 `serve` asks before restoring the project's saved services and forwards.
 
 Downloads support macOS/Linux on arm64 and amd64. They require a published
-release with the matching daemon archive and checksums. Development builds
-never download an unrelated release. For a local build or offline setup, run
-`datumctl connect install --executable /absolute/path/to/datum-connect-daemon`
-once, then run `serve`. This optional setup command does not enroll a device.
-Existing services are not automatically upgraded or replaced. The checksum
+release with the matching `datum-connectd` archive and checksums. Release
+builds report the same version as the plugin. Development builds never download
+an unrelated release. For a local build or offline setup, run
+`datumctl connect install --executable /absolute/path/to/datum-connectd` once,
+then run `serve`. This optional setup command does not enroll a device.
+When the plugin and daemon releases differ, `join`, `up`, `serve`, and
+`install` upgrade the standard macOS/Linux user service before continuing. The
+upgrade verifies readiness and restores the previous service definition if the
+new daemon does not start. It briefly interrupts active tunnels. The checksum
 protects archive integrity over HTTPS; it is not a publisher signature.
 
 New devices use a hostname-derived Connector resource name. Use `up --name NAME`
@@ -202,7 +206,7 @@ component internals.
 
 The Rust workspace retains historical library code and the `connect-lib/bin`
 development harness. The CLI does not invoke that harness. Product builds and
-release archives include `datumctl-connect`, `datum-connect-daemon`, and the
+release archives include `datumctl-connect`, `datum-connectd`, and the
 networking helper on macOS/Linux. The helper is not installed or elevated for
 ordinary `serve` and `dial` commands.
 

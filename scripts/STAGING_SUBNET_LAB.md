@@ -96,7 +96,7 @@ the exact existing identity and binding but issues a new expiring key. You need
 permission to create those resources; the script does not bypass IAM.
 
 Build Linux amd64 binaries for `datumctl`, `datumctl-connect`,
-`datum-connect-daemon`, and `datum-connect-network-helper` into
+`datum-connectd`, and `datum-connect-network-helper` into
 `target/staging-subnet-bin/`. Then run:
 
 ```sh

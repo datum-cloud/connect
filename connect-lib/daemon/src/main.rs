@@ -22,7 +22,7 @@ use tracing_subscriber::{
 mod windows_service;
 
 #[derive(Clone, Debug, Parser)]
-#[command(name = "datum-connect-daemon", version)]
+#[command(name = "datum-connectd", version = env!("DATUM_CONNECT_RELEASE_VERSION"))]
 struct Args {
     /// Private daemon repository. Overrides DATUM_CONNECT_DIR.
     #[arg(long, env = "DATUM_CONNECT_DIR")]
@@ -241,7 +241,7 @@ async fn init_tracing(
     std::io::Error,
 > {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let (otel_layer, otel_guard) = init_otel("datum-connect-daemon");
+    let (otel_layer, otel_guard) = init_otel("datum-connectd");
     let otel_enabled = otel_layer.is_some();
     let stderr_layer = tracing_subscriber::fmt::layer()
         .json()
@@ -350,5 +350,21 @@ fn otlp_traces_endpoint(endpoint: &str) -> String {
         endpoint.to_owned()
     } else {
         format!("{endpoint}/v1/traces")
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::Args;
+    use clap::CommandFactory;
+
+    #[test]
+    fn command_reports_release_version_and_executable_name() {
+        let command = Args::command();
+        assert_eq!(command.get_name(), "datum-connectd");
+        assert_eq!(
+            command.get_version(),
+            Some(env!("DATUM_CONNECT_RELEASE_VERSION"))
+        );
     }
 }

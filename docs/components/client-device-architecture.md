@@ -24,7 +24,7 @@ when native CONNECT-IP networking requires elevated interface and route access.
 | --- | --- | --- |
 | `datumctl` | One command | Supplies login and project context and invokes the plugin |
 | `datumctl-connect` | One command | Presents the UX, validates command input, and calls the daemon API |
-| `datum-connect-daemon` | Persistent service | Owns identity, authorization, desired state, reconciliation, listeners, and transports |
+| `datum-connectd` | Persistent service | Owns identity, authorization, desired state, reconciliation, listeners, and transports |
 | `datum-connect-network-helper` | Optional persistent root service on macOS/Linux | Owns only pre-approved native interfaces, routes, and packet IPC |
 | Windows daemon and Wintun | Persistent LocalSystem service | Combines daemon operation and native adapter ownership on Windows |
 

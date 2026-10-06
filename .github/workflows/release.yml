@@ -44,13 +44,15 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
       - name: Build Rust binary
+        env:
+          DATUM_CONNECT_RELEASE_VERSION: ${{ github.ref_name }}
         run: cargo build --locked --release -p datum-connect-daemon -p datum-connect-network-helper --target ${{ matrix.target }}
         working-directory: connect-lib
       - name: Rename binary with platform suffix
         run: |
           mkdir -p dist/rust-bin
-          cp connect-lib/target/${{ matrix.target }}/release/datum-connect-daemon${{ contains(matrix.target, 'windows') && '.exe' || '' }} \
-            dist/rust-bin/datum-connect-daemon-${{ matrix.name }}
+          cp connect-lib/target/${{ matrix.target }}/release/datum-connectd${{ contains(matrix.target, 'windows') && '.exe' || '' }} \
+            dist/rust-bin/datum-connectd-${{ matrix.name }}
           if [[ '${{ matrix.target }}' != *windows* ]]; then
             cp connect-lib/target/${{ matrix.target }}/release/datum-connect-network-helper dist/rust-bin/datum-connect-network-helper-${{ matrix.name }}
           fi
@@ -91,9 +93,9 @@ jobs:
               suffix=""
               if [ "$platform" = windows ]; then suffix=".exe"; fi
               mkdir -p "../dist/rust/$platform-$arch"
-              cp "../dist/rust/datum-connect-daemon-$platform-$arch$suffix" "../dist/rust/$platform-$arch/datum-connect-daemon$suffix"
+              cp "../dist/rust/datum-connectd-$platform-$arch$suffix" "../dist/rust/$platform-$arch/datum-connectd$suffix"
               if [ "$platform" != windows ]; then
-                chmod 755 "../dist/rust/$platform-$arch/datum-connect-daemon"
+                chmod 755 "../dist/rust/$platform-$arch/datum-connectd"
                 cp "../dist/rust/datum-connect-network-helper-$platform-$arch" "../dist/rust/$platform-$arch/datum-connect-network-helper"
                 chmod 755 "../dist/rust/$platform-$arch/datum-connect-network-helper"
               fi

@@ -160,7 +160,7 @@ def run_lab(args):
     artifacts = Path(tempfile.mkdtemp(prefix=tag + "-peer-", dir=target))
     print(f"Artifacts: {artifacts}", flush=True)
     binaries = args.binaries.resolve()
-    for name in ("datumctl", "datumctl-connect", "datum-connect-daemon"):
+    for name in ("datumctl", "datumctl-connect", "datum-connectd"):
         if not (binaries / name).is_file():
             raise RuntimeError(f"Missing {binaries / name}; use --build")
     if args.helper and not (binaries / "datum-connect-network-helper").is_file():
@@ -245,7 +245,7 @@ def run_lab(args):
         execute(side, "python3", SCRIPT, "--udp-probe", address, "5353")
 
     def start(side, configured):
-        command = ["/binaries/datum-connect-daemon", "--repo", "/lab/repo"]
+        command = ["/binaries/datum-connectd", "--repo", "/lab/repo"]
         if args.relay_urls:
             command += ["--relay-urls", args.relay_urls]
         if configured:

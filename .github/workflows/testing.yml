@@ -69,7 +69,7 @@ jobs:
         run: cargo build --locked -p datum-connect-daemon --target x86_64-pc-windows-gnu
         working-directory: connect-lib
       - name: Inspect Windows executable imports
-        run: x86_64-w64-mingw32-objdump -p connect-lib/target/x86_64-pc-windows-gnu/debug/datum-connect-daemon.exe
+        run: x86_64-w64-mingw32-objdump -p connect-lib/target/x86_64-pc-windows-gnu/debug/datum-connectd.exe
 
   native-platforms:
     strategy:
@@ -107,7 +107,9 @@ jobs:
         run: cargo test --locked -p connect-ip-adapter
         working-directory: connect-lib
       - name: Test native service state transitions
-        run: cargo test --locked -p datum-connect-daemon --bin datum-connect-daemon
+        env:
+          DATUM_CONNECT_RELEASE_VERSION: v1.0.0-test.1
+        run: cargo test --locked -p datum-connect-daemon --bin datum-connectd
         working-directory: connect-lib
       - name: Build opt-in native packet tests
         run: cargo test --locked -p connect-ip-adapter --test native_tun --no-run
@@ -144,7 +146,7 @@ jobs:
         run: |
           ./scripts/windows-service-smoke.ps1 `
             -Plugin (Resolve-Path target/windows-amd64/datumctl-connect.exe) `
-            -Daemon (Resolve-Path connect-lib/target/debug/datum-connect-daemon.exe)
+            -Daemon (Resolve-Path connect-lib/target/debug/datum-connectd.exe)
 
   go:
     runs-on: ubuntu-latest
@@ -197,9 +199,9 @@ jobs:
       - name: Upload Linux daemon for staging validation
         uses: actions/upload-artifact@v4
         with:
-          name: datum-connect-daemon-linux-amd64
-          path: connect-lib/target/debug/datum-connect-daemon
+          name: datum-connectd-linux-amd64
+          path: connect-lib/target/debug/datum-connectd
       - name: Verify local CLI, daemon, and transport together
-        run: python3 ../scripts/daemon-e2e.py --daemon target/debug/datum-connect-daemon --plugin ../connect-plugin/datumctl-connect
+        run: python3 ../scripts/daemon-e2e.py --daemon target/debug/datum-connectd --plugin ../connect-plugin/datumctl-connect
       - name: Verify OIDC session enrollment and renewal
-        run: python3 ../scripts/daemon-e2e.py --daemon target/debug/datum-connect-daemon --plugin ../connect-plugin/datumctl-connect --oidc
+        run: python3 ../scripts/daemon-e2e.py --daemon target/debug/datum-connectd --plugin ../connect-plugin/datumctl-connect --oidc

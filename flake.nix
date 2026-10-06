@@ -43,7 +43,7 @@
         # ── Packaged Rust binary ──────────────────────────────────────────
         # `nix build` produces the persistent daemon. The Go CLI talks to its API.
         packages.default = rustPlatform.buildRustPackage {
-          pname = "datum-connect-daemon";
+          pname = "datum-connectd";
           version = "0.1.0";
           src = ./connect-lib;
 
@@ -61,7 +61,7 @@
             description = "Persistent Datum Connect daemon";
             homepage = "https://github.com/datum-cloud/datumctl-plugins";
             license = licenses.agpl3Only;
-            mainProgram = "datum-connect-daemon";
+            mainProgram = "datum-connectd";
           };
         };
 

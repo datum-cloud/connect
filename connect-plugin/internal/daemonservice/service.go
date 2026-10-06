@@ -1,4 +1,5 @@
-// Package daemonservice manages datum-connect-daemon as an OS service.
+// Package daemonservice manages the Connect OS service registration. The
+// existing service label remains datum-connect-daemon for upgrade compatibility.
 package daemonservice
 
 import (
@@ -22,7 +23,7 @@ import (
 	"go.datum.net/datumctl-plugins/connect/internal/state"
 )
 
-const serviceName = "datum-connect-daemon"
+const serviceName = "datum-connect-daemon" // Keep the registered label stable across binary renames.
 
 // DiscoverExecutable finds the daemon beside the plugin or in PATH.
 func DiscoverExecutable() (string, error) { return daemonExecutable("") }
@@ -49,7 +50,7 @@ func InstallCommand() *cobra.Command {
 	cmd.Flags().StringVar(&o.credentialsFile, "credentials-file", "", "Credential JSON to copy into service-owned state")
 	cmd.Flags().StringVar(&o.localIPConfig, "local-ip-config", "", "Absolute path to CONNECT-IP approvals (system daemon or approved networking helper)")
 	cmd.Flags().Uint16Var(&o.port, "port", 47780, "Loopback HTTP port")
-	cmd.Flags().StringVar(&o.executable, "executable", "", "Path to datum-connect-daemon (defaults to PATH lookup)")
+	cmd.Flags().StringVar(&o.executable, "executable", "", "Path to datum-connectd (defaults to PATH lookup)")
 	return cmd
 }
 
@@ -408,7 +409,7 @@ func validatePlatformScope(system bool) error {
 			return fmt.Errorf("user services require systemd; detected %s (use --system only if a system service is intended)", service.Platform())
 		}
 	default:
-		return fmt.Errorf("daemon service management is unsupported on %s; run datum-connect-daemon directly", runtime.GOOS)
+		return fmt.Errorf("daemon service management is unsupported on %s; run datum-connectd directly", runtime.GOOS)
 	}
 	return nil
 }
@@ -416,7 +417,7 @@ func validatePlatformScope(system bool) error {
 func daemonExecutable(explicit string) (string, error) {
 	if explicit == "" {
 		if self, err := os.Executable(); err == nil {
-			name := "datum-connect-daemon"
+			name := "datum-connectd"
 			if runtime.GOOS == "windows" {
 				name += ".exe"
 			}
@@ -427,9 +428,9 @@ func daemonExecutable(explicit string) (string, error) {
 		}
 		if explicit == "" {
 			var err error
-			explicit, err = exec.LookPath("datum-connect-daemon")
+			explicit, err = exec.LookPath("datum-connectd")
 			if err != nil {
-				return "", fmt.Errorf("find datum-connect-daemon next to the plugin or in PATH: %w", err)
+				return "", fmt.Errorf("find datum-connectd next to the plugin or in PATH: %w", err)
 			}
 		}
 	}

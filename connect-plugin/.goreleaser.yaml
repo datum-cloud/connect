@@ -5,7 +5,7 @@
 # to a GitHub release. Manual PATH installation and trust are documented in INSTALL.txt.
 #
 # Each archive bundles the Go plugin binary (datumctl-connect) and the
-# Rust daemon (datum-connect-daemon). The daemon is cross-compiled in the workflow and
+# Rust daemon (datum-connectd). The daemon is cross-compiled in the workflow and
 # placed at ../dist/rust/ before goreleaser runs.
 #
 # yaml-language-server: $schema=https://goreleaser.com/static/schema.json
@@ -20,7 +20,7 @@ release:
   make_latest: false
   header: |
     This is the headless Connect preview. It makes breaking CLI changes.
-    Each platform archive contains both datumctl-connect and datum-connect-daemon.
+    Each platform archive contains both datumctl-connect and datum-connectd.
     Read INSTALL.txt for manual plugin installation, trust, and first-run setup.
     Section 7 of INSTALL.txt covers joining a managed VPC and reaching a running
     Compute instance by its VPC address. A project administrator must provision
@@ -68,7 +68,7 @@ archives:
       - src: ../LICENSE
         dst: .
         strip_parent: true
-      - src: ../dist/rust/{{ .Os }}-{{ .Arch }}/datum-connect-daemon{{ if eq .Os "windows" }}.exe{{ end }}
+      - src: ../dist/rust/{{ .Os }}-{{ .Arch }}/datum-connectd{{ if eq .Os "windows" }}.exe{{ end }}
         dst: .
         strip_parent: true
       - src: '{{ if ne .Os "windows" }}../dist/rust/{{ .Os }}-{{ .Arch }}/datum-connect-network-helper{{ else }}__no_network_helper_files__*{{ end }}'

@@ -85,10 +85,10 @@ print(name,p.pid)
 def deploy(args):
     for role in args.roles:
         upload(role, [(args.binaries/name, "bin/"+name, 0o755) for name in
-                      ("datumctl", "datumctl-connect", "datum-connect-daemon", "datum-connect-network-helper")]
+                      ("datumctl", "datumctl-connect", "datum-connectd", "datum-connect-network-helper")]
                     + [(args.credentials, "credentials.json", 0o600)])
         remote(role, "sh", "-ec", "id ubuntu; install -d -m 700 -o 1000 -g 1000 /lab/daemon; chown 1000:1000 /lab/credentials.json")
-        launch(role, "daemon", ["/lab/bin/datum-connect-daemon", "--repo", "/lab/daemon"], user=True)
+        launch(role, "daemon", ["/lab/bin/datum-connectd", "--repo", "/lab/daemon"], user=True)
         print(role, cli(role, "up", "--credentials-file", "/lab/credentials.json", "--name", f"connect-subnet-lab-{role}"), flush=True)
     if not args.skip_origin:
         upload("origin", [(Path(__file__), "staging-subnet-lab.py", 0o755)])
@@ -105,7 +105,7 @@ def upgrade(args):
     """Replace only this lab's daemon binary, preserving identity and saved state."""
     stop = """import os,subprocess,time
 p=int(open('/lab/daemon.pid').read())
-check_and_stop="import os,signal,sys; p=int(sys.argv[1]); assert os.readlink('/proc/'+str(p)+'/exe')=='/lab/bin/datum-connect-daemon'; os.kill(p,signal.SIGTERM)"
+check_and_stop="import os,signal,sys; p=int(sys.argv[1]); assert os.readlink('/proc/'+str(p)+'/exe')=='/lab/bin/datum-connectd'; os.kill(p,signal.SIGTERM)"
 subprocess.run(['python3','-c',check_and_stop,str(p)],user=1000,group=1000,extra_groups=[],check=True)
 for _ in range(100):
  try: state=open('/proc/'+str(p)+'/stat').read().split()[2]
@@ -117,8 +117,8 @@ os.unlink('/lab/daemon.pid')
 """
     for role in args.roles:
         python(role, stop)
-        upload(role, [(args.binaries/"datum-connect-daemon", "bin/datum-connect-daemon", 0o755)])
-        launch(role, "daemon", ["/lab/bin/datum-connect-daemon", "--repo", "/lab/daemon"], user=True)
+        upload(role, [(args.binaries/"datum-connectd", "bin/datum-connectd", 0o755)])
+        launch(role, "daemon", ["/lab/bin/datum-connectd", "--repo", "/lab/daemon"], user=True)
         print(role, "daemon replaced; run enroll, then explicitly rejoin attachments", flush=True)
 
 

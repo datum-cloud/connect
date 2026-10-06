@@ -3,6 +3,12 @@ name = "datum-connect-daemon"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
+autobins = false
+build = "build.rs"
+
+[[bin]]
+name = "datum-connectd"
+path = "src/main.rs"
 
 [lints]
 workspace = true

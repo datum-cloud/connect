@@ -57,7 +57,7 @@ def run(args):
     tag = "connect-multi-" + uuid.uuid4().hex[:10]
     artifacts = Path(tempfile.mkdtemp(prefix=tag + "-", dir=CONNECT / "target"))
     binaries = args.binaries.resolve()
-    for name in ("datum-connect-daemon", "iroh-gateway", "datumctl-connect"):
+    for name in ("datum-connectd", "iroh-gateway", "datumctl-connect"):
         if not (binaries / name).is_file():
             raise RuntimeError(f"missing {binaries / name}")
     containers, networks = [], []
@@ -155,7 +155,7 @@ def run(args):
             write_json(name, "/lab/credentials.json", {"type": "connector", "project_id": "demo",
                        "api_endpoint": "http://127.0.0.1:18080", "token_uri": "http://127.0.0.1:18080/token",
                        "client_id": "multi-device-lab", "refresh_token": "test-refresh-secret"})
-            launch(name, "daemon", ["/binaries/datum-connect-daemon", "--repo", "/lab/repo"])
+            launch(name, "daemon", ["/binaries/datum-connectd", "--repo", "/lab/repo"])
             wait_port(name, 47780)
             client_keys[role] = cli(name, "up", "--credentials-file", "/lab/credentials.json")["connector"]["public_key"]
             stop(name, "daemon")
@@ -175,7 +175,7 @@ def run(args):
                        "addresses": [gateway_socket], "assigned_address": values["assigned"] + "/128",
                        "routes": [vpc_subnet, *peer_routes], "interface_name": "dcvpc0", "mtu": 1280}
             write_json(name, "/lab/ip.json", {"underlay_address": client_ip, "bindings": [binding]})
-            launch(name, "daemon", ["/binaries/datum-connect-daemon", "--repo", "/lab/repo", "--local-ip-config", "/lab/ip.json"])
+            launch(name, "daemon", ["/binaries/datum-connectd", "--repo", "/lab/repo", "--local-ip-config", "/lab/ip.json"])
             wait_port(name, 47780)
             grants.append({"network": "local-vpc", "peer": client_keys[role],
                            "client_address": values["assigned"] + "/128",

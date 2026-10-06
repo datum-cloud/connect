@@ -22,9 +22,15 @@ import (
 func interactiveFixture(t *testing.T) {
 	t.Helper()
 	oldInteractive, oldGuided := interactiveTerminal, guidedSetupEnabled
+	oldCurrent := ensureCurrentUserDaemon
 	interactiveTerminal = func(*cobra.Command) bool { return true }
 	guidedSetupEnabled = func(*cobra.Command, *options) bool { return true }
-	t.Cleanup(func() { interactiveTerminal, guidedSetupEnabled = oldInteractive, oldGuided })
+	ensureCurrentUserDaemon = func(context.Context, string, string, time.Duration, io.Writer, bool) (bool, bool, error) {
+		return false, false, nil
+	}
+	t.Cleanup(func() {
+		interactiveTerminal, guidedSetupEnabled, ensureCurrentUserDaemon = oldInteractive, oldGuided, oldCurrent
+	})
 	t.Setenv("DATUM_CONNECT_TOKEN", "")
 	repo := t.TempDir()
 	t.Setenv("DATUM_CONNECT_DIR", repo)
@@ -147,6 +153,25 @@ func TestUnexpectedListenerNeverInstallsAService(t *testing.T) {
 	cmd.SetContext(context.Background())
 	if err := ensureDaemonForUp(cmd, &options{baseURL: server.URL, timeout: time.Second}); err == nil {
 		t.Fatal("expected failure")
+	}
+}
+
+func TestEnsureDaemonForUpChecksManagedDaemonVersionFirst(t *testing.T) {
+	old, oldGuided := ensureCurrentUserDaemon, guidedSetupEnabled
+	t.Cleanup(func() { ensureCurrentUserDaemon, guidedSetupEnabled = old, oldGuided })
+	guidedSetupEnabled = func(*cobra.Command, *options) bool { return true }
+	checked := false
+	ensureCurrentUserDaemon = func(context.Context, string, string, time.Duration, io.Writer, bool) (bool, bool, error) {
+		checked = true
+		return true, true, nil
+	}
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	if err := ensureDaemonForUp(cmd, &options{baseURL: connectapi.DefaultBaseURL, timeout: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if !checked {
+		t.Fatal("did not check the installed daemon version before using it")
 	}
 }
 

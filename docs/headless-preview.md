@@ -20,7 +20,7 @@ After you install the plugin, you can include the host's real dispatch path:
 
 ```sh
 python3 scripts/daemon-e2e.py \
-  --daemon connect-lib/target/debug/datum-connect-daemon \
+  --daemon connect-lib/target/debug/datum-connectd \
   --plugin connect-plugin/datumctl-connect --host "$(command -v datumctl)"
 ```
 
@@ -39,7 +39,7 @@ cannot replace the fixture session. It does not read or change your real login.
 
 ```sh
 python3 scripts/daemon-e2e.py --oidc \
-  --daemon connect-lib/target/debug/datum-connect-daemon \
+  --daemon connect-lib/target/debug/datum-connectd \
   --plugin connect-plugin/datumctl-connect
 ```
 
@@ -79,7 +79,7 @@ For local evaluation before publication, package a freshly built native daemon:
 
 ```sh
 bash scripts/package-preview.sh v1.0.0-preview.N \
-  /absolute/path/to/datum-connect-daemon /absolute/path/to/new-bundle-directory
+  /absolute/path/to/datum-connectd /absolute/path/to/new-bundle-directory
 ```
 
 The script builds the matching-version CLI and packages the supplied daemon.
@@ -96,10 +96,12 @@ host login/context selection, and device enrollment, then shares the service.
 `up` remains available for explicit enrollment and reconnecting. A previous
 `down` requires confirmation before `serve` restores saved networking.
 Prompts default to no. Cancelling stops further work; an already-confirmed
-service installation remains installed. Existing services are never overwritten.
+service installation remains installed. Version-matched services are left
+unchanged; an older managed user service is upgraded before the command proceeds.
 
-Guided setup is restricted to the default local API with implicit interactive
-setup authorization. Explicit tokens, custom URLs, JSON/YAML output, scripts,
+Automatic daemon version checks apply to the default local API and standard
+macOS/Linux user service. First-time guided installation still requires an
+interactive terminal and implicit setup authorization. Custom daemon URLs,
 root, and Windows retain the manual setup below. A custom cloud environment
 requires an explicit `datumctl login` rather than silently using production.
 New devices use the hostname as their project-unique resource name; choose
@@ -120,17 +122,32 @@ published release assets, so an unpublished local build cannot bootstrap from
 GitHub. For local testing or offline installation, use a trusted daemon build:
 
 ```sh
-datumctl connect install --executable /absolute/path/to/datum-connect-daemon
+datumctl connect install --executable /absolute/path/to/datum-connectd
 datumctl connect serve localhost:8080
 ```
 
 `connect install` installs, starts, and checks the default user service without
-logging in, enrolling, or sharing anything. It leaves existing services unchanged.
+logging in, enrolling, or sharing anything. If an existing managed user service
+runs a different daemon release, the command upgrades it first.
 An interrupted setup can leave a `runtime/setup.lock`; remove it only after you
 confirm no installer is running. A failed start preserves the installed service
 for diagnosis with `daemon status` and `daemon.log` in the daemon state directory.
 
-For explicit system setup, install `datumctl-connect` and `datum-connect-daemon`
+`join`, `up`, and `serve` also check for a daemon release mismatch before using
+the standard macOS/Linux user service. To check explicitly after installing the
+new plugin, run:
+
+```sh
+datumctl connect install --upgrade
+```
+
+The upgrade changes only the daemon executable path in the service definition.
+It preserves the service settings and daemon state, then checks readiness. If
+the new daemon does not become ready, Connect restores the previous service
+definition. The restart briefly interrupts active tunnels. This guided upgrade
+does not support system services or custom ports and state paths.
+
+For explicit system setup, install `datumctl-connect` and `datum-connectd`
 together in your PATH or the `~/.datumctl/plugins` directory. The lower-level
 `daemon install` discovers the daemon next to the plugin before searching PATH.
 Trust your local plugin with
@@ -152,7 +169,7 @@ rotation for that file. Starting the daemon is a separate operation. You can
 also run it in a terminal without an OS service:
 
 ```sh
-datum-connect-daemon --repo /absolute/private/connect-state --port 47780
+datum-connectd --repo /absolute/private/connect-state --port 47780
 datumctl connect status --project PROJECT \
   --token-file /absolute/private/connect-state/daemon_auth/setup.token
 ```
@@ -272,7 +289,7 @@ more detail:
 
 ```sh
 RUST_LOG=info,datum_connect_daemon=debug,connect_transport=debug,connect_lib::successor=debug \
-  datum-connect-daemon --repo /absolute/private/connect-state \
+  datum-connectd --repo /absolute/private/connect-state \
   --log-file /absolute/private/connect.log
 ```
 

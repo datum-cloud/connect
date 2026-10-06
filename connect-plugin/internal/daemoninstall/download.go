@@ -29,7 +29,7 @@ const (
 	maxArchive  = 160 << 20
 	maxBinary   = 256 << 20
 	maxExpanded = 512 << 20
-	binaryName  = "datum-connect-daemon"
+	binaryName  = "datum-connectd"
 )
 
 var releaseTag = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$`)
@@ -85,7 +85,7 @@ func (i Installer) Acquire(ctx context.Context, version string) (string, error) 
 		if executableName == "datum-connect-network-helper" {
 			return "", fmt.Errorf("cannot download a matching network helper: %w. Install a released Connect plugin to download its helper automatically, or rerun `datumctl connect join` with `--helper-executable /absolute/path/to/datum-connect-network-helper` to use a local helper", err)
 		}
-		return "", fmt.Errorf("cannot download the Connect daemon: %w. Install a released Connect plugin, or install a local daemon with `datumctl connect install --executable /absolute/path/to/datum-connect-daemon`", err)
+		return "", fmt.Errorf("cannot download the Connect daemon: %w. Install a released Connect plugin, or install a local daemon with `datumctl connect install --executable /absolute/path/to/datum-connectd`", err)
 	}
 	if i.Progress == nil {
 		i.Progress = io.Discard
