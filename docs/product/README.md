@@ -11,12 +11,18 @@ path.
 
 ## What you can do
 
-| Goal | Connect workflow | Start here |
-| --- | --- | --- |
-| Let project members reach an application on your device | Share it privately with `serve`, then reach it through a loopback port created by `dial` | [Private services](../guides/private-services.md) |
-| Put a local web application on a public hostname | Publish a TCP service with `serve --public` through a compatible platform gateway | [Public services](../guides/public-services.md) |
-| Reach private addresses in a project VPC | Join a managed network through its Connect gateway | [Project network access](../guides/project-network-access.md) |
-| Give two devices controlled IP connectivity | Create a direct network with explicit protocol and port permissions on both devices | [Direct device networking](../guides/direct-device-networking.md) |
+- **Share an application with project members.** Use `serve` to share it
+  privately, then use `dial` to reach it through a local loopback port. See
+  [Private services](../guides/private-services.md).
+- **Put a local web application on a public hostname.** Publish the TCP service
+  with `serve --public` through a compatible platform gateway. See
+  [Public services](../guides/public-services.md).
+- **Reach private addresses in a project VPC.** Join the managed network through
+  its Connect gateway. See
+  [Project network access](../guides/project-network-access.md).
+- **Give two devices controlled IP connectivity.** Create a direct network with
+  explicit protocol and port permissions on both devices. See
+  [Direct device networking](../guides/direct-device-networking.md).
 
 These workflows can coexist on one device. For example, a developer can share
 a local application with a teammate while also joining a staging VPC.
