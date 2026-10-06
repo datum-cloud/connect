@@ -28,7 +28,6 @@ class Platform(http.server.BaseHTTPRequestHandler):
     lock = threading.Lock()
     accepted_tokens = {'test-access-secret'}
     observed_tokens = set()
-    conflicted_connectors = set()
 
     def log_message(self, *_):
         pass
@@ -90,31 +89,26 @@ class Platform(http.server.BaseHTTPRequestHandler):
                     ]}
                 self.objects[key] = value
                 return self.reply(201, value)
-            if self.command == 'PUT':
+            if self.command in ('PUT', 'PATCH'):
                 if key not in self.objects:
                     return self.reply(404, {})
-                if plural == 'connectors':
-                    relay = value.get('status', {}).get('connectionDetails', {}).get('publicKey', {}).get('homeRelay', '')
-                    if not urllib.parse.urlparse(relay).hostname:
-                        return self.reply(422, {'reason': 'Invalid', 'details': {'causes': [{'field': 'status.connectionDetails.publicKey.homeRelay'}]}})
-                    # Model a controller's concurrent first status update. A retry
-                    # must re-read rather than resubmit the stale whole object.
-                    if key not in self.conflicted_connectors:
-                        self.conflicted_connectors.add(key)
-                        self.objects[key]['metadata']['resourceVersion'] = '2'
-                        self.objects[key].setdefault('status', {})['conditions'] = [{'type': 'Accepted', 'status': 'True'}]
-                        return self.reply(409, {'reason': 'Conflict'})
-                    if value['metadata'].get('resourceVersion') != self.objects[key]['metadata']['resourceVersion']:
-                        return self.reply(409, {'reason': 'Conflict'})
-                    if value.get('status', {}).get('conditions') != self.objects[key].get('status', {}).get('conditions'):
-                        return self.reply(422, {'reason': 'Invalid'})
+                # Exercise spec updates to the Connect-owned API. Controller
+                # status remains server-owned and is never written by clients.
+                current = self.objects[key]
+                if self.command == 'PATCH':
+                    for field, patch_value in value.items():
+                        if isinstance(patch_value, dict) and isinstance(current.get(field), dict):
+                            current[field].update(patch_value)
+                        else:
+                            current[field] = patch_value
+                    value = current
                 self.objects[key] = value
                 return self.reply(200, value)
             if self.command == 'DELETE':
                 self.objects.pop(key, None)
                 return self.reply(200, {})
 
-    do_GET = do_POST = do_PUT = do_DELETE = handle_api
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = handle_api
 
 
 class Origin(http.server.BaseHTTPRequestHandler):

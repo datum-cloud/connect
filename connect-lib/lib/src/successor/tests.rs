@@ -82,11 +82,6 @@ fn client(base: &str) -> CloudConnector {
     .unwrap()
 }
 
-fn connector() -> Value {
-    let public = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
-    json!({"metadata":{"name":format!("connect-{}",&public[..40]),"uid":"connector-uid","annotations":{"connect.datum.net/public-key":public}},"spec":{"connectorClassName":"masque"},"status":{"connectionDetails":{"publicKey":{"id":public}}}})
-}
-
 fn connect_connector() -> Value {
     let public = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     json!({"metadata":{"name":format!("connect-{}",&public[..40]),"uid":"connector-uid","generation":1},"spec":{"classRef":"masque","publicKey":public},"status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}})
@@ -102,11 +97,6 @@ fn project_connect_resources_use_the_connect_api_group() {
         client
             .connect_resource("connectnetworkbindings", "binding")
             .contains("/projects/demo/control-plane/apis/connect.datumapis.com/v1alpha1/")
-    );
-    assert!(
-        client.resource("connectors", "legacy").contains(
-            "/apis/networking.datumapis.com/v1alpha1/namespaces/default/connectors/legacy"
-        )
     );
 }
 
@@ -174,6 +164,11 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
             && line.contains("/leases/connect-lease")
             && body["metadata"]["resourceVersion"] == "4"
     }));
+    assert!(
+        requests
+            .iter()
+            .all(|(line, _)| { !line.contains("networking.datumapis.com/v1alpha1") })
+    );
 }
 
 #[tokio::test]
@@ -393,122 +388,6 @@ async fn connect_peer_lookup_uses_connect_connector_identity_and_addresses() {
 }
 
 #[tokio::test]
-async fn lease_renewal_uses_kubernetes_microtime_precision() {
-    let mut value = connector();
-    value["status"]["leaseRef"] = json!({"name":"connector-lease"});
-    let lease = json!({"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"connector-lease","resourceVersion":"7"},"spec":{"leaseDurationSeconds":30}});
-    let (base, task) = server(vec![
-        token(),
-        Reply::Json(200, value.clone()),
-        Reply::Json(200, value),
-        Reply::Json(200, lease),
-        Reply::EchoCreated,
-        Reply::Json(404, json!({})),
-    ])
-    .await;
-    client(&base)
-        .renew(&ConnectionDetails {
-            relay_url: "https://relay.example.com/".into(),
-            addresses: vec![],
-        })
-        .await
-        .unwrap();
-    let requests = task.await.unwrap();
-    let renewal = &requests[4];
-    assert!(renewal.0.contains("/leases/connector-lease"));
-    assert_eq!(renewal.1["metadata"]["resourceVersion"], "7");
-    let timestamp = renewal.1["spec"]["renewTime"].as_str().unwrap();
-    assert_eq!(timestamp.len(), 27);
-    assert!(timestamp.ends_with('Z'));
-    assert_eq!(timestamp.split_once('.').unwrap().1.len(), 7);
-    chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
-}
-
-#[tokio::test]
-async fn renewal_retries_conflicts_with_fresh_resource_version_and_preserves_conditions() {
-    let mut first = connector();
-    first["metadata"]["resourceVersion"] = json!("1");
-    let mut fresh = first.clone();
-    fresh["metadata"]["resourceVersion"] = json!("2");
-    fresh["status"]["conditions"] = json!([{"type":"Accepted","status":"True"}]);
-    let (base, task) = server(vec![
-        token(),
-        Reply::Json(200, first),
-        Reply::Json(409, json!({})),
-        Reply::Json(200, fresh),
-        Reply::EchoCreated,
-        Reply::Json(404, json!({})),
-    ])
-    .await;
-    client(&base)
-        .renew(&ConnectionDetails {
-            relay_url: "https://relay.example.com/".into(),
-            addresses: vec![],
-        })
-        .await
-        .unwrap();
-    let requests = task.await.unwrap();
-    assert_eq!(requests[2].1["metadata"]["resourceVersion"], "1");
-    assert_eq!(requests[4].1["metadata"]["resourceVersion"], "2");
-    assert_eq!(requests[4].1["status"]["conditions"][0]["type"], "Accepted");
-}
-
-#[tokio::test]
-async fn renewal_never_retries_into_replaced_connector() {
-    let mut replaced = connector();
-    replaced["metadata"]["uid"] = json!("replacement");
-    let (base, task) = server(vec![
-        token(),
-        Reply::Json(200, connector()),
-        Reply::Json(409, json!({})),
-        Reply::Json(200, replaced),
-    ])
-    .await;
-    assert!(matches!(
-        client(&base).renew(&ConnectionDetails::default()).await,
-        Err(Error::Ownership(_))
-    ));
-    assert_eq!(
-        task.await
-            .unwrap()
-            .iter()
-            .filter(|(line, _)| line.starts_with("PUT "))
-            .count(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn renewal_conflict_retries_are_bounded() {
-    let mut replies = vec![token()];
-    for _ in 0..4 {
-        replies.push(Reply::Json(200, connector()));
-        replies.push(Reply::Json(409, json!({})));
-    }
-    let (base, task) = server(replies).await;
-    assert!(matches!(
-        client(&base).renew(&ConnectionDetails::default()).await,
-        Err(Error::Api(409))
-    ));
-    assert_eq!(task.await.unwrap().len(), 9);
-}
-
-#[tokio::test]
-async fn validation_error_exposes_field_not_rejected_values() {
-    let (base, task) = server(vec![token(), Reply::Json(200, connector()), Reply::Json(422, json!({"reason":"Invalid","message":"secret-do-not-print", "details":{"causes":[{"field":"status.connectionDetails.publicKey.homeRelay","message":"secret-do-not-print"}]}}))]).await;
-    let error = client(&base)
-        .renew(&ConnectionDetails::default())
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("status.connectionDetails.publicKey.homeRelay"));
-    assert!(error.contains("PUT"));
-    assert!(error.contains("HTTP 422"));
-    assert!(!error.contains("secret-do-not-print"));
-    assert_eq!(task.await.unwrap().len(), 3);
-}
-
-#[tokio::test]
 async fn named_connector_is_resolved_by_name_and_by_exact_public_key() {
     let mut named = connect_connector();
     named["metadata"]["name"] = json!("alice-mac");
@@ -543,31 +422,6 @@ async fn reused_name_cannot_resolve_a_previously_pinned_key() {
 }
 
 #[tokio::test]
-async fn named_connector_collision_never_updates_foreign_identity() {
-    let mut foreign = connector();
-    foreign["metadata"]["name"] = json!("alice-mac");
-    foreign["metadata"]["annotations"]["connect.datum.net/public-key"] =
-        json!(iroh::SecretKey::from_bytes(&[8; 32]).public().to_string());
-    let (base, task) = server(vec![
-        token(),
-        Reply::Json(200, foreign.clone()),
-        Reply::Json(200, foreign),
-    ])
-    .await;
-    let client = client(&base).with_name("alice-mac").unwrap();
-    assert!(matches!(
-        client.ensure_connector(&ConnectionDetails::default()).await,
-        Err(Error::Ownership(_))
-    ));
-    assert!(
-        task.await
-            .unwrap()
-            .iter()
-            .all(|(request, _)| !request.starts_with("PUT"))
-    );
-}
-
-#[tokio::test]
 async fn ambiguous_key_discovery_fails_closed() {
     let value = connect_connector();
     let key = value["spec"]["publicKey"].as_str().unwrap().to_owned();
@@ -581,26 +435,6 @@ async fn ambiguous_key_discovery_fails_closed() {
         Err(Error::Invalid(_))
     ));
     task.await.unwrap();
-}
-
-#[tokio::test]
-async fn legacy_platform_fails_closed_before_connector_creation() {
-    let (base, task) = server(vec![
-        token(),
-        Reply::Json(404, json!({})),
-        Reply::Json(200, json!({"items":[{"metadata":{"name":"legacy"}}]})),
-    ])
-    .await;
-    let result = client(&base)
-        .ensure_connector(&ConnectionDetails::default())
-        .await;
-    assert!(matches!(result, Err(Error::Unsupported(_))));
-    let requests = task.await.unwrap();
-    assert!(
-        !requests
-            .iter()
-            .any(|(line, _)| line.starts_with("POST ") && line.contains("connectors"))
-    );
 }
 
 #[tokio::test]
@@ -627,9 +461,11 @@ async fn private_service_creates_owned_advertisement_and_never_public_ingress() 
     assert!(result.ready);
     assert!(result.hostnames.is_empty());
     let requests = task.await.unwrap();
-    assert!(requests.iter().all(|(line, _)| {
-        !line.contains("networking.datumapis.com/v1alpha1/namespaces/default/connectors/")
-    }));
+    assert!(
+        requests
+            .iter()
+            .all(|(line, _)| { !line.contains("networking.datumapis.com/v1alpha1") })
+    );
     assert!(
         !requests
             .iter()

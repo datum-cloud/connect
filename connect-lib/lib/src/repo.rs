@@ -389,11 +389,8 @@ impl Repo {
         .into())
     }
 
-    /// Project-scoped listen key. Each project gets its own iroh identity so
-    /// Connectors registered in different projects don't collide on the iroh
-    /// DNS record (the controller assigns ownership to one and leaves the
-    /// others with `IrohDNSPublished=False; DeferredToOwner`, which manifests
-    /// as a tunnel that reports ready but silently drops data).
+    /// Project-scoped listen key. A Connector identity belongs to one device
+    /// in one project, so each project gets a distinct iroh identity.
     ///
     /// On first access for any project, if the legacy flat `listen_key` exists
     /// it is moved into this project's directory so the user keeps continuity

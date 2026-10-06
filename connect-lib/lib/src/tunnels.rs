@@ -8,15 +8,9 @@ use n0_error::{Result, StackResultExt, StdResultExt};
 use serde_json::json;
 use tracing::{debug, warn};
 
-use crate::datum_apis::connector::{
-    CONNECTOR_CONDITION_IROH_DNS_PUBLISHED, CONNECTOR_CONDITION_READY,
-    CONNECTOR_REASON_DEFERRED_TO_OWNER, Connector, ConnectorConnectionDetails,
-    ConnectorConnectionDetailsPublicKey, ConnectorConnectionType, ConnectorSpec,
-    PublicKeyConnectorAddress, PublicKeyDiscoveryMode,
-};
+use crate::datum_apis::connector::{CONNECTOR_CONDITION_READY, Connector, ConnectorSpec};
 use crate::datum_apis::connector_advertisement::{
-    ConnectorAdvertisement, ConnectorAdvertisementLayer4, ConnectorAdvertisementLayer4Service,
-    ConnectorAdvertisementSpec, Layer4ServiceAddress, Layer4ServicePort, Protocol,
+    AdvertisedService, ConnectorAdvertisement, ConnectorAdvertisementSpec,
 };
 use crate::datum_apis::connector_class::ConnectorClass;
 use crate::datum_apis::http_proxy::{
@@ -26,17 +20,10 @@ use crate::datum_apis::http_proxy::{
     HTTPRouteRulesMatchesHeaders, HTTPRouteRulesMatchesHeadersType, HTTPRouteRulesMatchesPath,
     HTTPRouteRulesMatchesPathType,
 };
-use crate::datum_apis::traffic_protection_policy::{
-    LocalPolicyTargetReferenceWithSectionName, OWASPCRS, ParanoiaLevels, TrafficProtectionPolicy,
-    TrafficProtectionPolicyMode, TrafficProtectionPolicyRuleSet,
-    TrafficProtectionPolicyRuleSetType, TrafficProtectionPolicySpec,
-};
 use crate::datum_cloud::DatumCloudClient;
 use crate::kube_error::is_quota_check_timeout;
 use crate::{Advertisment, DEFAULT_PCP_NAMESPACE, ListenNode, TcpProxyData, state::ProxyState};
-const DEFAULT_CONNECTOR_CLASS_NAME: &str = "datum-connect";
-const CONNECTOR_SELECTOR_FIELD: &str = "status.connectionDetails.publicKey.id";
-const ADVERTISEMENT_CONNECTOR_FIELD: &str = "spec.connectorRef.name";
+const MASQUE_TRANSPORT: &str = "masque-v1";
 const DISPLAY_NAME_ANNOTATION: &str = "app.kubernetes.io/name";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,7 +71,6 @@ pub struct TunnelDeleteOutcome {
     pub project_id: String,
     pub http_proxy: Option<String>,
     pub connector_ad: Option<String>,
-    pub traffic_protection_policy: Option<String>,
     pub connector: Option<String>,
 }
 
@@ -93,7 +79,6 @@ pub struct TunnelService {
     datum: DatumCloudClient,
     listen: ListenNode,
     publish_tickets: bool,
-    create_traffic_protection_policies: bool,
 }
 
 fn proxy_state_from_summary(
@@ -135,10 +120,6 @@ pub enum ProgressStepKind {
     CertificatesReady,
     /// Connector `Ready` — agent is online and renewing its lease.
     ConnectorReady,
-    /// Connector `IrohDNSPublished` — iroh DNS record published. The
-    /// failure-with-`DeferredToOwner` case is the silent-tunnel failure
-    /// that signals cross-project iroh-key collision.
-    IrohDnsPublished,
     /// HTTPProxy `Programmed` — edge actually programmed the route.
     ProxyProgrammed,
     /// HTTPProxy `ConnectorMetadataProgrammed` — Envoy has the iroh metadata
@@ -152,7 +133,6 @@ impl ProgressStepKind {
             Self::ProxyAccepted => "tunnel accepted",
             Self::CertificatesReady => "TLS certificate issued",
             Self::ConnectorReady => "connector ready",
-            Self::IrohDnsPublished => "iroh DNS published",
             Self::ProxyProgrammed => "route programmed",
             Self::ConnectorMetadataProgrammed => "envoy metadata propagated",
         }
@@ -163,7 +143,6 @@ impl ProgressStepKind {
             Self::ProxyAccepted,
             Self::CertificatesReady,
             Self::ConnectorReady,
-            Self::IrohDnsPublished,
             Self::ProxyProgrammed,
             Self::ConnectorMetadataProgrammed,
         ]
@@ -199,24 +178,12 @@ impl ProgressStepKind {
     /// The Kubernetes resource kind whose conditions back this step.
     pub fn resource_kind(&self) -> &'static str {
         match self {
-            Self::ConnectorReady | Self::IrohDnsPublished => "Connector",
+            Self::ConnectorReady => "Connector",
             Self::ProxyAccepted
             | Self::CertificatesReady
             | Self::ProxyProgrammed
             | Self::ConnectorMetadataProgrammed => "HTTPProxy",
         }
-    }
-}
-
-impl ProgressStep {
-    /// True if this step is in a terminal failure mode that won't self-heal
-    /// without user action. The canonical case is the iroh DNS owner
-    /// collision: another Connector with the same iroh key owns the record,
-    /// and waiting longer won't change that.
-    pub fn is_terminal_failure(&self) -> bool {
-        matches!(self.kind, ProgressStepKind::IrohDnsPublished)
-            && self.status == StepStatus::Pending
-            && self.reason.as_deref() == Some(CONNECTOR_REASON_DEFERRED_TO_OWNER)
     }
 }
 
@@ -246,10 +213,6 @@ impl TunnelProgress {
         self.steps.iter().find(|s| s.kind == kind)
     }
 
-    pub fn terminal_failure(&self) -> Option<&ProgressStep> {
-        self.steps.iter().find(|s| s.is_terminal_failure())
-    }
-
     fn from_resources(proxy: &HTTPProxy, connector: Option<&Connector>) -> Self {
         let proxy_conds = proxy.status.as_ref().and_then(|s| s.conditions.as_deref());
         let proxy_gen = proxy.metadata.generation.unwrap_or(0);
@@ -260,7 +223,7 @@ impl TunnelProgress {
             .map(|n| format!("HTTPProxy/{n}"));
         let conn_conds = connector
             .and_then(|c| c.status.as_ref())
-            .and_then(|s| s.conditions.as_deref());
+            .map(|s| s.conditions.as_slice());
         let conn_gen = connector.and_then(|c| c.metadata.generation).unwrap_or(0);
         let connector_resource = connector
             .and_then(|c| c.metadata.name.as_deref())
@@ -320,13 +283,6 @@ impl TunnelProgress {
                 connector_resource.clone(),
             ),
             make_step(
-                ProgressStepKind::IrohDnsPublished,
-                conn_conds,
-                CONNECTOR_CONDITION_IROH_DNS_PUBLISHED,
-                conn_gen,
-                connector_resource.clone(),
-            ),
-            make_step(
                 ProgressStepKind::ProxyProgrammed,
                 proxy_conds,
                 HTTP_PROXY_CONDITION_PROGRAMMED,
@@ -355,7 +311,6 @@ impl TunnelService {
             datum,
             listen,
             publish_tickets: publish_tickets_enabled(),
-            create_traffic_protection_policies: create_traffic_protection_policies_enabled(),
         }
     }
 
@@ -416,17 +371,8 @@ impl TunnelService {
         )))
     }
 
-    /// Re-patch the connector's connectionDetails after it becomes Ready.
-    ///
-    /// The replicator mirrors the upstream-status annotation to the downstream
-    /// connector on every spec change. When the connector first becomes
-    /// Ready:True, the connector controller touches the downstream gateway
-    /// annotation to trigger an Envoy Gateway re-translation — but if the
-    /// annotation captured Ready:False before the lease renewed, that touch
-    /// never fires. Re-patching connectionDetails triggers a spec change on
-    /// the upstream connector, which causes the replicator to re-mirror the
-    /// annotation with the current (Ready:True) status, and EG re-translates.
-    pub async fn refresh_connection_details(&self) -> Result<()> {
+    /// Refresh the Connector endpoint address used by peers and gateways.
+    pub async fn refresh_endpoint(&self) -> Result<()> {
         let Some(selected) = self.datum.selected_context() else {
             return Ok(());
         };
@@ -437,17 +383,15 @@ impl TunnelService {
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let connectors: Api<Connector> = Api::namespaced(pcp.client(), DEFAULT_PCP_NAMESPACE);
         let name = connector.name_any();
-        if let Some(details) = build_connection_details(&self.listen) {
-            let details_value = serde_json::to_value(details)
-                .std_context("Failed to serialize connection details")?;
-            let patch = json!({ "status": { "connectionDetails": details_value } });
+        if let Some((endpoint, relay_urls)) = build_endpoint(&self.listen) {
+            let patch = json!({ "spec": { "endpoint": endpoint, "relayURLs": relay_urls } });
             if let Err(err) = connectors
-                .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
                 .await
             {
-                warn!(%name, "Failed to refresh connector connectionDetails: {err:#}");
+                warn!(%name, "Failed to refresh Connector endpoint: {err:#}");
             } else {
-                debug!(%name, "refreshed connector connectionDetails to trigger replicator");
+                debug!(%name, "refreshed Connector endpoint address");
             }
         }
         Ok(())
@@ -518,9 +462,12 @@ impl TunnelService {
                 continue;
             }
             // Delete leftover ConnectorAdvertisements for this connector.
-            let ad_selector = format!("{ADVERTISEMENT_CONNECTOR_FIELD}={name}");
-            if let Ok(ad_list) = ads.list(&ListParams::default().fields(&ad_selector)).await {
-                for ad in ad_list.items {
+            if let Ok(ad_list) = ads.list(&ListParams::default()).await {
+                for ad in ad_list
+                    .items
+                    .into_iter()
+                    .filter(|ad| ad.spec.connector_ref == name)
+                {
                     if let Some(ad_name) = ad.metadata.name.clone()
                         && let Err(err) = ads.delete(&ad_name, &DeleteParams::default()).await
                     {
@@ -604,7 +551,7 @@ impl TunnelService {
             .filter_map(|c| {
                 let name = c.metadata.name.clone()?;
                 let ready = condition_status(
-                    c.status.as_ref().and_then(|s| s.conditions.as_deref()),
+                    c.status.as_ref().map(|s| s.conditions.as_slice()),
                     CONNECTOR_CONDITION_READY,
                     true,
                 );
@@ -835,70 +782,6 @@ impl TunnelService {
             "created ConnectorAdvertisement"
         );
 
-        if self.create_traffic_protection_policies {
-            let tpps: Api<TrafficProtectionPolicy> =
-                Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
-            debug!(
-                %project_id,
-                proxy = %proxy_name,
-                "creating TrafficProtectionPolicy"
-            );
-            let tpp = TrafficProtectionPolicy {
-                metadata: ObjectMeta {
-                    name: Some(proxy_name.clone()),
-                    ..Default::default()
-                },
-                spec: TrafficProtectionPolicySpec {
-                    target_refs: vec![LocalPolicyTargetReferenceWithSectionName {
-                        group: "gateway.networking.k8s.io".to_string(),
-                        kind: "Gateway".to_string(),
-                        name: proxy_name.clone(),
-                        section_name: None,
-                    }],
-                    mode: Some(TrafficProtectionPolicyMode::Enforce),
-                    sampling_percentage: None,
-                    rule_sets: Some(vec![TrafficProtectionPolicyRuleSet {
-                        rule_set_type: TrafficProtectionPolicyRuleSetType::OWASPCoreRuleSet,
-                        owasp_core_rule_set: Some(OWASPCRS {
-                            paranoia_levels: Some(ParanoiaLevels {
-                                blocking: Some(1),
-                                detection: Some(1),
-                            }),
-                            score_thresholds: None,
-                            rule_exclusions: None,
-                        }),
-                    }]),
-                },
-                status: None,
-            };
-            let tpp_post = PostParams::default();
-            with_quota_check_retry("TrafficProtectionPolicy create", || {
-                tpps.create(&tpp_post, &tpp)
-            })
-            .await
-            .map_err(|err| {
-                warn!(
-                    %project_id,
-                    proxy = %proxy_name,
-                    "TrafficProtectionPolicy create failed: {err:#}"
-                );
-                format_quota_error(&err, "TrafficProtectionPolicy")
-                    .unwrap_or_else(|| format!("Failed to create TrafficProtectionPolicy: {err}"))
-            })
-            .map_err(|err| n0_error::anyerr!(err))?;
-            debug!(
-                %project_id,
-                proxy = %proxy_name,
-                "created TrafficProtectionPolicy"
-            );
-        } else {
-            debug!(
-                %project_id,
-                proxy = %proxy_name,
-                "skipping TrafficProtectionPolicy creation (env disabled)"
-            );
-        }
-
         let proxy_state = proxy_state_from_summary(&proxy_name, &endpoint, label, true)?;
         if self.publish_tickets {
             debug!(%proxy_name, "publishing ticket for tunnel");
@@ -1106,11 +989,9 @@ impl TunnelService {
             .cloned()
             .unwrap_or_else(|| tunnel_id.to_string());
 
-        // Always patch the proxy's connector backend to reference the fresh
-        // connector. The previous connector was deleted by ensure_connector;
-        // if we don't update the proxy here the operator watches a connector
-        // that no longer exists and the Ready/IrohDNSPublished conditions
-        // never become True.
+        // Keep the proxy backend pointed at the active Connector. A proxy can
+        // outlive the Connector it originally referenced, so update the
+        // reference before enabling its advertisement.
         {
             let target = parse_target(&endpoint)?;
             let desired_rules = vec![
@@ -1267,21 +1148,6 @@ impl TunnelService {
             connector_ad_name = Some(tunnel_id.to_string());
         }
 
-        let mut tpp_name: Option<String> = None;
-        let tpps: Api<TrafficProtectionPolicy> =
-            Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
-        if tpps
-            .get_opt(tunnel_id)
-            .await
-            .std_context("Failed to load TrafficProtectionPolicy")?
-            .is_some()
-        {
-            tpps.delete(tunnel_id, &DeleteParams::default())
-                .await
-                .std_context("Failed to delete TrafficProtectionPolicy")?;
-            tpp_name = Some(tunnel_id.to_string());
-        }
-
         if self.publish_tickets {
             debug!(%tunnel_id, "unpublishing ticket for tunnel");
             if let Err(err) = self.listen.remove_proxy(tunnel_id).await {
@@ -1310,12 +1176,15 @@ impl TunnelService {
                 })
                 .peekable();
             if remaining_for_connector.peek().is_none() {
-                let ad_selector = format!("{ADVERTISEMENT_CONNECTOR_FIELD}={connector_name}");
                 let ads_list = ads
-                    .list(&ListParams::default().fields(&ad_selector))
+                    .list(&ListParams::default())
                     .await
                     .std_context("Failed to list remaining ConnectorAdvertisements")?;
-                for ad in ads_list.items {
+                for ad in ads_list
+                    .items
+                    .into_iter()
+                    .filter(|ad| ad.spec.connector_ref == connector_name)
+                {
                     if let Some(name) = ad.metadata.name.clone()
                         && let Err(err) = ads.delete(&name, &DeleteParams::default()).await
                     {
@@ -1351,7 +1220,6 @@ impl TunnelService {
             project_id: project_id.to_string(),
             http_proxy: http_proxy_name,
             connector_ad: connector_ad_name,
-            traffic_protection_policy: tpp_name,
             connector: connector_name_out,
         })
     }
@@ -1361,11 +1229,8 @@ impl TunnelService {
         let client = pcp.client();
         let connectors: Api<Connector> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
         let endpoint_id = self.listen.endpoint_id().to_string();
-        let selector = format!("{CONNECTOR_SELECTOR_FIELD}={endpoint_id}");
-        let list = match connectors
-            .list(&ListParams::default().fields(&selector))
-            .await
-        {
+        let selector = format!("publicKey={endpoint_id}");
+        let list = match connectors.list(&ListParams::default()).await {
             Ok(list) => list,
             Err(kube::Error::Api(e)) if e.code == 403 => {
                 n0_error::bail_any!(
@@ -1385,7 +1250,12 @@ impl TunnelService {
                 return Err(err).std_context("Failed to list connectors");
             }
         };
-        let Some(mut connector) = select_unique_connector(list.items, &selector)? else {
+        let candidates = list
+            .items
+            .into_iter()
+            .filter(|c| c.spec.public_key == endpoint_id)
+            .collect();
+        let Some(mut connector) = select_unique_connector(candidates, &selector)? else {
             return Ok(None);
         };
         patch_device_annotations(&connectors, &mut connector).await;
@@ -1415,24 +1285,27 @@ impl TunnelService {
         // and the replicator re-mirrors on spec changes, avoiding the race.
         if let Some(connector) = self.find_connector(project_id).await? {
             let name = connector.name_any();
-            debug!(%name, "reusing existing connector, patching connectionDetails");
-            if let Some(details) = build_connection_details(&self.listen) {
-                let details_value = serde_json::to_value(details)
-                    .std_context("Failed to serialize connection details")?;
-                let patch = json!({ "status": { "connectionDetails": details_value } });
-                if let Err(err) = connectors
-                    .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            debug!(%name, "reusing existing Connect Connector");
+            let class_ref = Self::resolve_connector_class(client.clone()).await?;
+            if let Some((endpoint, relay_urls)) = build_endpoint(&self.listen) {
+                let patch = json!({ "spec": {
+                    "classRef": class_ref,
+                    "endpoint": endpoint,
+                    "relayURLs": relay_urls,
+                }});
+                connectors
+                    .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
                     .await
-                {
-                    warn!(%name, "Failed to patch connector connectionDetails: {err:#}");
-                }
+                    .std_context("Failed to update Connector endpoint")?;
             } else {
-                warn!(%name, "Missing connection details for connector status patch");
+                warn!(%name, "Could not encode Connect endpoint address");
             }
             return Ok(connector);
         }
 
         let class_name = Self::resolve_connector_class(client).await?;
+        let (endpoint, relay_urls) = build_endpoint(&self.listen)
+            .ok_or_else(|| n0_error::anyerr!("Could not encode Connect endpoint address"))?;
 
         let mut connector = Connector {
             metadata: ObjectMeta {
@@ -1441,8 +1314,10 @@ impl TunnelService {
                 ..Default::default()
             },
             spec: ConnectorSpec {
-                connector_class_name: class_name,
-                capabilities: None,
+                class_ref: class_name,
+                public_key: self.listen.endpoint_id().to_string(),
+                endpoint,
+                relay_urls,
             },
             status: None,
         };
@@ -1452,24 +1327,6 @@ impl TunnelService {
         })
         .await
         .std_context("Failed to create Connector")?;
-
-        if let Some(details) = build_connection_details(&self.listen) {
-            let details_value = serde_json::to_value(details)
-                .std_context("Failed to serialize connection details")?;
-            let patch = json!({ "status": { "connectionDetails": details_value } });
-            if let Err(err) = connectors
-                .patch_status(
-                    &connector.name_any(),
-                    &PatchParams::default(),
-                    &Patch::Merge(&patch),
-                )
-                .await
-            {
-                warn!(connector = %connector.name_any(), "Failed to patch connector status: {err:#}");
-            }
-        } else {
-            warn!(connector = %connector.name_any(), "Missing connection details for connector status");
-        }
 
         Ok(connector)
     }
@@ -1532,49 +1389,42 @@ pub(crate) fn select_unique_connector(
 }
 
 fn select_connector_class(classes: &[ConnectorClass]) -> Result<String> {
-    if classes
+    let compatible = classes
         .iter()
-        .any(|class| class.name_any() == DEFAULT_CONNECTOR_CLASS_NAME)
-    {
-        return Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string());
+        .filter(|class| {
+            class
+                .spec
+                .transports
+                .iter()
+                .any(|transport| transport == MASQUE_TRANSPORT)
+                && class.status.as_ref().is_some_and(|status| {
+                    status
+                        .conditions
+                        .iter()
+                        .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+                })
+        })
+        .collect::<Vec<_>>();
+    match compatible.as_slice() {
+        [class] => Ok(class.name_any()),
+        [] => n0_error::bail_any!(
+            "no ready ConnectorClass supports {MASQUE_TRANSPORT}; configure a Connect ConnectorClass first"
+        ),
+        _ => n0_error::bail_any!(
+            "multiple ready ConnectorClasses support {MASQUE_TRANSPORT}; select one class explicitly"
+        ),
     }
-
-    let available = classes
-        .iter()
-        .map(ResourceExt::name_any)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let available = if available.is_empty() {
-        "none".to_string()
-    } else {
-        available
-    };
-    n0_error::bail_any!(
-        "required ConnectorClass '{DEFAULT_CONNECTOR_CLASS_NAME}' is unavailable; found: {available}"
-    )
 }
 
-fn build_connection_details(listen: &ListenNode) -> Option<ConnectorConnectionDetails> {
+fn build_endpoint(listen: &ListenNode) -> Option<(String, Vec<String>)> {
     let endpoint = listen.endpoint();
     let endpoint_addr = endpoint.addr();
-    let home_relay = endpoint_addr.relay_urls().next()?.to_string();
-    let addresses: Vec<PublicKeyConnectorAddress> = endpoint_addr
-        .ip_addrs()
-        .map(|addr| PublicKeyConnectorAddress {
-            address: addr.ip().to_string(),
-            port: addr.port() as i32,
-        })
+    let endpoint = serde_json::to_string(&endpoint_addr).ok()?;
+    let relay_urls = endpoint_addr
+        .relay_urls()
+        .map(|relay| relay.to_string())
         .collect();
-
-    Some(ConnectorConnectionDetails {
-        connection_type: ConnectorConnectionType::PublicKey,
-        public_key: Some(ConnectorConnectionDetailsPublicKey {
-            id: endpoint.id().to_string(),
-            discovery_mode: Some(PublicKeyDiscoveryMode::Dns),
-            home_relay,
-            addresses,
-        }),
-    })
+    Some((endpoint, relay_urls))
 }
 
 /// Normalizes an endpoint string by ensuring it has an `http://` scheme prefix.
@@ -1728,22 +1578,13 @@ fn proxy_backend_endpoint(proxy: &HTTPProxy) -> Option<String> {
 }
 
 fn advertisement_spec(connector_name: &str, target: ParsedTarget) -> ConnectorAdvertisementSpec {
-    let port_name = format!("tcp-{}", target.port);
     ConnectorAdvertisementSpec {
-        connector_ref: crate::datum_apis::connector::LocalConnectorReference {
-            name: connector_name.to_string(),
-        },
-        layer4: Some(vec![ConnectorAdvertisementLayer4 {
-            name: "default".to_string(),
-            services: vec![ConnectorAdvertisementLayer4Service {
-                address: Layer4ServiceAddress(target.address),
-                ports: vec![Layer4ServicePort {
-                    name: port_name,
-                    port: target.port as i32,
-                    protocol: Protocol::Tcp,
-                }],
-            }],
-        }]),
+        connector_ref: connector_name.to_string(),
+        services: vec![AdvertisedService {
+            protocol: "TCP".to_string(),
+            port: target.port as i32,
+            hostname: target.address,
+        }],
     }
 }
 
@@ -1887,17 +1728,6 @@ fn publish_tickets_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn create_traffic_protection_policies_enabled() -> bool {
-    std::env::var("DATUM_CONNECT_CREATE_TRAFFIC_PROTECTION_POLICIES")
-        .ok()
-        .or_else(|| {
-            option_env!("BUILD_DATUM_CONNECT_CREATE_TRAFFIC_PROTECTION_POLICIES")
-                .map(str::to_string)
-        })
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1941,15 +1771,15 @@ mod tests {
         let mut c = Connector::new(
             "datum-connect-test",
             ConnectorSpec {
-                connector_class_name: "datum-connect".into(),
-                capabilities: None,
+                class_ref: "datum-connect".into(),
+                public_key: "ab".repeat(32),
+                endpoint: String::new(),
+                relay_urls: vec![],
             },
         );
         c.status = Some(ConnectorStatus {
-            capabilities: None,
-            conditions: Some(conds),
-            connection_details: None,
-            lease_ref: None,
+            conditions: conds,
+            ..Default::default()
         });
         c
     }
@@ -1958,7 +1788,7 @@ mod tests {
     fn progress_unknown_when_controllers_silent() {
         let p = proxy(vec![]);
         let progress = TunnelProgress::from_resources(&p, None);
-        assert_eq!(progress.steps.len(), 6);
+        assert_eq!(progress.steps.len(), 5);
         assert!(
             progress
                 .steps
@@ -1967,7 +1797,6 @@ mod tests {
             "no conditions yet → every step Unknown"
         );
         assert!(!progress.all_ready());
-        assert!(progress.terminal_failure().is_none());
     }
 
     #[test]
@@ -1988,44 +1817,14 @@ mod tests {
                 "",
             ),
         ]);
-        let c = connector(vec![
-            cond(CONNECTOR_CONDITION_READY, "True", "ConnectorReady", ""),
-            cond(CONNECTOR_CONDITION_IROH_DNS_PUBLISHED, "True", "Owner", ""),
-        ]);
-        let progress = TunnelProgress::from_resources(&p, Some(&c));
-        assert!(progress.all_ready());
-        assert!(progress.terminal_failure().is_none());
-    }
-
-    #[test]
-    fn progress_flags_deferred_to_owner_as_terminal() {
-        // This is the silent-tunnel failure: the iroh DNS record is owned by
-        // a different project's Connector. Waiting longer won't help — the
-        // CLI must bail and surface the owner so the user can act.
-        let p = proxy(vec![cond(
-            HTTP_PROXY_CONDITION_ACCEPTED,
+        let c = connector(vec![cond(
+            CONNECTOR_CONDITION_READY,
             "True",
-            "Accepted",
+            "ConnectorReady",
             "",
         )]);
-        let owner_msg =
-            "iroh DNS record is owned by Connector /other-project/default/datum-connect-xyz";
-        let c = connector(vec![
-            cond(CONNECTOR_CONDITION_READY, "True", "ConnectorReady", ""),
-            cond(
-                CONNECTOR_CONDITION_IROH_DNS_PUBLISHED,
-                "False",
-                CONNECTOR_REASON_DEFERRED_TO_OWNER,
-                owner_msg,
-            ),
-        ]);
         let progress = TunnelProgress::from_resources(&p, Some(&c));
-        let fail = progress
-            .terminal_failure()
-            .expect("terminal failure detected");
-        assert_eq!(fail.kind, ProgressStepKind::IrohDnsPublished);
-        assert_eq!(fail.message.as_deref(), Some(owner_msg));
-        assert!(!progress.all_ready());
+        assert!(progress.all_ready());
     }
 
     #[test]
@@ -2043,7 +1842,6 @@ mod tests {
             .step(ProgressStepKind::CertificatesReady)
             .expect("step exists");
         assert_eq!(cert_step.status, StepStatus::Pending);
-        assert!(progress.terminal_failure().is_none());
     }
 
     #[test]
@@ -2068,11 +1866,11 @@ mod tests {
 
         // Connector-backed steps fall back to None when no connector exists.
         let progress_no_conn = TunnelProgress::from_resources(&p, None);
-        let iroh = progress_no_conn
-            .step(ProgressStepKind::IrohDnsPublished)
+        let connector_step = progress_no_conn
+            .step(ProgressStepKind::ConnectorReady)
             .unwrap();
         assert!(
-            iroh.resource.is_none(),
+            connector_step.resource.is_none(),
             "connector-backed step has no resource when connector is missing"
         );
         let proxy_step = progress_no_conn
@@ -2104,7 +1902,7 @@ mod tests {
         // literally says "Please try again in a moment".
         let err = api_error(
             403,
-            "connectoradvertisements.networking.datumapis.com \"tunnel-x\" is forbidden: \
+            "connectoradvertisements.connect.datumapis.com \"tunnel-x\" is forbidden: \
              Your request took too long to be checked against your quota. Please try again \
              in a moment — if this keeps happening, contact support.",
         );
@@ -2308,13 +2106,32 @@ mod tests {
     }
 
     #[test]
-    fn connector_class_selection_requires_the_supported_class() {
+    fn connector_class_selection_requires_one_ready_masque_class() {
         let other = ConnectorClass::new(
             "custom",
-            crate::datum_apis::connector_class::ConnectorClassSpec {},
+            crate::datum_apis::connector_class::ConnectorClassSpec {
+                transports: vec!["legacy".into()],
+                capabilities: vec![],
+            },
         );
         let error = select_connector_class(&[other])
             .expect_err("an unrelated class must not be selected implicitly");
-        assert!(error.to_string().contains("required ConnectorClass"));
+        assert!(error.to_string().contains("no ready ConnectorClass"));
+    }
+
+    #[test]
+    fn connector_class_selection_uses_the_unique_ready_masque_class() {
+        let mut class = ConnectorClass::new(
+            "local-masque",
+            crate::datum_apis::connector_class::ConnectorClassSpec {
+                transports: vec![MASQUE_TRANSPORT.into()],
+                capabilities: vec!["connect-tcp".into()],
+            },
+        );
+        class.status = Some(crate::datum_apis::connector_class::ConnectorClassStatus {
+            conditions: vec![cond("Ready", "True", "Available", "")],
+            ..Default::default()
+        });
+        assert_eq!(select_connector_class(&[class]).unwrap(), "local-masque");
     }
 }

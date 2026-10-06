@@ -2,9 +2,6 @@
 //! presentation logic lives here.
 //!
 //! Three responsibilities:
-//! * `format_terminal_failure` — humanises a failed `ProgressStep` into an
-//!   actionable, multi-line error message. The canonical case is the iroh-DNS
-//!   owner-collision (`IrohDnsPublished: Pending` with `DeferredToOwner`).
 //! * `render_progress_step` / `render_verify` — mode-aware callbacks that emit
 //!   text-mode log lines on stderr or JSON event objects on stdout.
 //! * `await_tunnel_progress` / `verify_endpoints` — async drivers that own the
@@ -47,39 +44,6 @@ pub enum Mode {
     Json,
 }
 
-// --- format_terminal_failure ---
-
-pub fn format_terminal_failure(step: &ProgressStep) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Tunnel setup failed at step: {} ({})\n",
-        step.kind.label(),
-        step.kind.resource_kind()
-    ));
-    out.push_str(&format!(
-        "  resource: {}\n",
-        step.resource.as_deref().unwrap_or("(none)")
-    ));
-    if let Some(r) = &step.reason {
-        out.push_str(&format!("  reason: {}\n", r));
-    }
-    if let Some(m) = &step.message {
-        out.push_str(&format!("  message: {}\n", m));
-    }
-    if matches!(step.kind, ProgressStepKind::IrohDnsPublished)
-        && step.status == StepStatus::Pending
-        && step.reason.as_deref() == Some("DeferredToOwner")
-    {
-        out.push_str(
-            "\nAnother connector with the same iroh key owns the DNS record \
-             for this tunnel. Most likely this means you are running two \
-             connectors against the same listen_key store. Stop the other \
-             connector or use a different repo directory.\n",
-        );
-    }
-    out
-}
-
 // --- step-name + status-name helpers (used by JSON callback) ---
 
 pub(crate) fn step_kind_to_str(k: ProgressStepKind) -> &'static str {
@@ -87,7 +51,6 @@ pub(crate) fn step_kind_to_str(k: ProgressStepKind) -> &'static str {
         ProgressStepKind::ProxyAccepted => "proxy_accepted",
         ProgressStepKind::CertificatesReady => "certificates_ready",
         ProgressStepKind::ConnectorReady => "connector_ready",
-        ProgressStepKind::IrohDnsPublished => "iroh_dns_published",
         ProgressStepKind::ProxyProgrammed => "proxy_programmed",
         ProgressStepKind::ConnectorMetadataProgrammed => "connector_metadata_programmed",
     }
@@ -161,9 +124,8 @@ pub fn build_probe_urls(endpoint: &str, hostname: &str) -> (String, String) {
 /// Poll `service.get_active_progress(tunnel_id)` on a 250ms cadence; emit a
 /// transition callback for every step whose status changed since the previous
 /// poll. Returns the final `TunnelProgress` when all steps are Ready, returns
-/// an error formatted via `format_terminal_failure` when a terminal-failure
-/// step is observed, and returns an error if the tunnel disappears upstream
-/// during setup. Prints a status line to stderr every 10s for any step that
+/// an error if the tunnel disappears upstream during setup. Prints a status
+/// line to stderr every 10s for any step that
 /// has been Pending for at least 10s.
 pub async fn await_tunnel_progress<F>(
     service: &TunnelService,
@@ -226,11 +188,6 @@ where
                 pending_since.remove(&step.kind);
                 last_status_print.remove(&step.kind);
             }
-        }
-
-        // Check terminal failure.
-        if let Some(failed) = progress.terminal_failure() {
-            return Err(n0_error::anyerr!("{}", format_terminal_failure(failed)));
         }
 
         if progress.all_ready() {
@@ -374,7 +331,7 @@ where
         }
         sleep(Duration::from_secs(10)).await;
         // Nudge the replicator → Envoy xDS propagation chain. The initial
-        // refresh_connection_details call may have raced with the
+        // endpoint refresh may have raced with the
         // replicator capturing Ready:False; re-patching here re-triggers
         // the mirror so Envoy eventually picks up the iroh cluster config.
         if let Err(error) = refresh_cb().await {
@@ -792,31 +749,6 @@ mod tests {
             message: None,
             resource: Some(format!("{}/x", kind.resource_kind())),
         }
-    }
-
-    #[test]
-    fn terminal_failure_iroh_owner_collision_includes_actionable_message() {
-        let s = step(
-            ProgressStepKind::IrohDnsPublished,
-            StepStatus::Pending,
-            Some("DeferredToOwner"),
-        );
-        let out = format_terminal_failure(&s);
-        assert!(out.contains("Tunnel setup failed at step"));
-        assert!(out.contains("Another connector with the same iroh key"));
-    }
-
-    #[test]
-    fn terminal_failure_generic_still_has_header_and_resource() {
-        let s = step(
-            ProgressStepKind::ProxyAccepted,
-            StepStatus::Pending,
-            Some("Whatever"),
-        );
-        let out = format_terminal_failure(&s);
-        assert!(out.contains("Tunnel setup failed at step"));
-        assert!(out.contains("resource: HTTPProxy/x"));
-        assert!(!out.contains("Another connector with the same iroh key"));
     }
 
     #[test]

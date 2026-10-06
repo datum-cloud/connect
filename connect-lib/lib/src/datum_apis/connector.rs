@@ -1,42 +1,10 @@
-use k8s_openapi::{api::core::v1, apimachinery::pkg::apis::meta::v1 as metav1};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1 as metav1;
 use kube::CustomResource;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalConnectorReference {
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConnectorCapabilityType {
-    #[serde(rename = "ConnectTCP")]
-    ConnectTcp,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectorCapabilityCommon {
-    pub disabled: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectorCapabilityConnectTCP {
-    #[serde(flatten)]
-    pub common: ConnectorCapabilityCommon,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectorCapability {
-    #[serde(rename = "type")]
-    pub capability_type: ConnectorCapabilityType,
-    pub connect_tcp: Option<ConnectorCapabilityConnectTCP>,
-}
-
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize)]
 #[kube(
-    group = "networking.datumapis.com",
+    group = "connect.datumapis.com",
     version = "v1alpha1",
     kind = "Connector",
     plural = "connectors",
@@ -46,67 +14,45 @@ pub struct ConnectorCapability {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectorSpec {
-    pub connector_class_name: String,
-    pub capabilities: Option<Vec<ConnectorCapability>>,
+    pub class_ref: String,
+    pub public_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+    #[serde(rename = "relayURLs", default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_urls: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PublicKeyDiscoveryMode {
-    #[serde(rename = "DNS")]
-    Dns,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PublicKeyConnectorAddress {
-    pub address: String,
-    pub port: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectorConnectionDetailsPublicKey {
-    pub id: String,
-    pub discovery_mode: Option<PublicKeyDiscoveryMode>,
-    pub home_relay: String,
-    pub addresses: Vec<PublicKeyConnectorAddress>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConnectorConnectionType {
-    #[serde(rename = "PublicKey")]
-    PublicKey,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectorConnectionDetails {
-    #[serde(rename = "type")]
-    pub connection_type: ConnectorConnectionType,
-    pub public_key: Option<ConnectorConnectionDetailsPublicKey>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectorCapabilityStatus {
-    #[serde(rename = "type")]
-    pub capability_type: ConnectorCapabilityType,
-    pub conditions: Option<Vec<metav1::Condition>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectorStatus {
-    pub capabilities: Option<Vec<ConnectorCapabilityStatus>>,
-    pub conditions: Option<Vec<metav1::Condition>>,
-    pub connection_details: Option<ConnectorConnectionDetails>,
-    pub lease_ref: Option<v1::LocalObjectReference>,
+    #[serde(default)]
+    pub observed_generation: i64,
+    #[serde(default)]
+    pub conditions: Vec<metav1::Condition>,
+    #[serde(default)]
+    pub assigned_addresses: Vec<String>,
+    #[serde(default)]
+    pub lease_ref: String,
 }
 
 pub const CONNECTOR_CONDITION_READY: &str = "Ready";
-pub const CONNECTOR_CONDITION_IROH_DNS_PUBLISHED: &str = "IrohDNSPublished";
-/// The iroh DNS record is already owned by another Connector with the same
-/// public key — typically a Connector in a different project. The losing
-/// Connector cannot publish DNS and its tunnel data plane is silently
-/// unreachable. See network-services-operator iroh_dns_controller.go.
-pub const CONNECTOR_REASON_DEFERRED_TO_OWNER: &str = "DeferredToOwner";
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectorSpec;
+
+    #[test]
+    fn spec_uses_the_connect_api_field_names() {
+        let spec = ConnectorSpec {
+            class_ref: "masque".into(),
+            public_key: "ab".repeat(32),
+            endpoint: "serialized-endpoint".into(),
+            relay_urls: vec!["https://relay.example/".into()],
+        };
+        let value = serde_json::to_value(spec).unwrap();
+        assert_eq!(value["classRef"], "masque");
+        assert_eq!(value["publicKey"], "ab".repeat(32));
+        assert_eq!(value["relayURLs"][0], "https://relay.example/");
+        assert!(value.get("relayUrls").is_none());
+    }
+}

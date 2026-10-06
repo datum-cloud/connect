@@ -8,6 +8,7 @@ uniquely labeled, and isolated from the host. --ipv6 disables non-loopback IPv4.
 import argparse
 import http.server
 import importlib.util
+import ipaddress
 import json
 from pathlib import Path
 import socket
@@ -23,6 +24,39 @@ WORKSPACE = CONNECT.parent
 SCRIPT = "/workspace/connect/scripts/connect-peer-ip-local.py"
 GATEWAY_SCRIPT = "/workspace/iroh-gateway/scripts/connect-ip-local.py"
 BODY = b"direct-daemon-connect-ip-http\n"
+
+
+def endpoint_ip_addresses(connector):
+    """Extract direct IP hints from the serialized Connect Connector endpoint."""
+    raw_endpoint = connector.get("spec", {}).get("endpoint", "")
+    try:
+        endpoint = json.loads(raw_endpoint) if isinstance(raw_endpoint, str) else raw_endpoint
+    except json.JSONDecodeError:
+        return set()
+
+    addresses = set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, str):
+            candidates = [value]
+            if value.startswith("[") and "]" in value:
+                candidates.append(value[1:value.index("]")])
+            if ":" in value:
+                candidates.append(value.rsplit(":", 1)[0].strip("[]"))
+            for candidate in candidates:
+                try:
+                    addresses.add(str(ipaddress.ip_address(candidate)))
+                except ValueError:
+                    pass
+
+    visit(endpoint)
+    return addresses
 
 
 def module(path, name):
@@ -303,8 +337,7 @@ def run_lab(args):
             for side, remote in (("client", "peer"), ("peer", "client")):
                 if args.relay_only:
                     for value in published[remote]:
-                        details = value["status"]["connectionDetails"]["publicKey"]
-                        for address in {item["address"] for item in details["addresses"]}:
+                        for address in endpoint_ip_addresses(value):
                             transport_family = "-6" if ":" in address else "-4"
                             prefix = 128 if ":" in address else 32
                             execute(side, "ip", transport_family, "route", "add", "blackhole", f"{address}/{prefix}")

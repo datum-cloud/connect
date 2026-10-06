@@ -568,9 +568,8 @@ impl RealControl {
         if let Some(name) = name {
             cloud = cloud.with_name(name).map_err(cloud_error)?;
         }
-        // Enrollment and liveness belong to the Connect API. Do not create or
-        // renew the legacy networking.datumapis.com Connector here; managed
-        // gateway joins must work with Connect permissions alone.
+        // Enrollment and liveness use Connect-owned resources. Managed gateway
+        // joins must work with Connect permissions alone.
         let identity_result = if expected.is_some() {
             cloud.refresh_connect_connector(&initial_details).await
         } else {

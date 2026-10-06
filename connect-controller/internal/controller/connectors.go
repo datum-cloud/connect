@@ -223,9 +223,8 @@ func reconcileConnector(ctx context.Context, c, classClient client.Client, obj *
 }
 
 func ensureConnectorLease(ctx context.Context, c client.Client, connector *connectv1alpha1.Connector) (*coordinationv1.Lease, error) {
-	// Keep Connect leases distinct from the legacy networking.datumapis.com
-	// Connector controller, which historically used the Connector name for its
-	// Lease. The two APIs can coexist during migration and cannot share owner refs.
+	// Use a Connector-specific Lease name to avoid collisions with other Lease
+	// owners and keep each Connector's liveness record independently owned.
 	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: connectorLeaseName(connector.Name), Namespace: connector.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, c, lease, func() error {
 		if err := controllerutil.SetControllerReference(connector, lease, schemeForConnector()); err != nil {

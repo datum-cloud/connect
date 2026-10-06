@@ -41,18 +41,7 @@ func testClient(t *testing.T, objs ...runtime.Object) *fake.ClientBuilder {
 func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	ctx := context.Background()
 	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", UID: types.UID("laptop-uid")}, Spec: connectv1alpha1.ConnectorSpec{ClassRef: "masque", PublicKey: strings.Repeat("a", 64)}}
-	legacyController := true
-	legacyLease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
-		Name: "laptop",
-		OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: "networking.datumapis.com/v1alpha1",
-			Kind:       "Connector",
-			Name:       "laptop",
-			UID:        types.UID("legacy-laptop-uid"),
-			Controller: &legacyController,
-		}},
-	}}
-	projectClient := testClient(t, connector, legacyLease).Build()
+	projectClient := testClient(t, connector).Build()
 	classClient := testClient(t).Build()
 	if err := reconcileConnector(ctx, projectClient, classClient, connector); err != nil {
 		t.Fatal(err)
@@ -89,13 +78,6 @@ func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	}
 	if got := meta.FindStatusCondition(connector.Status.Conditions, "Ready").Status; got != metav1.ConditionTrue {
 		t.Fatalf("ready=%q after Lease renewal, want True", got)
-	}
-	var preservedLegacyLease coordinationv1.Lease
-	if err := projectClient.Get(ctx, types.NamespacedName{Name: "laptop"}, &preservedLegacyLease); err != nil {
-		t.Fatal(err)
-	}
-	if got := preservedLegacyLease.OwnerReferences[0].UID; got != types.UID("legacy-laptop-uid") {
-		t.Fatalf("legacy Lease owner UID=%q, want it preserved", got)
 	}
 }
 

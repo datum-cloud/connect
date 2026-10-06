@@ -13,7 +13,6 @@
 //! | `tunnel_updated`          | label/endpoint changed                     | `id`, `label`, `endpoint`, `hostnames`                                            |
 //! | `tunnel_ready`            | setup complete AND proxy reachable (non-5xx) | `id`, `label`, `endpoint`, `hostnames`, `endpoint_id`, `status`, `elapsed_secs` |
 //! | `tunnel_login_lost`       | LoginState::Missing observed mid-run       | `id`, `message`                                                                   |
-//! | `tunnel_terminal_failure` | progress.terminal_failure() Some mid-run   | `id`, `message`                                                                   |
 //! | `tunnel_deleted_upstream` | get_active_progress -> None mid-run        | `id`, `message`                                                                   |
 //! | `tunnel_disabled`         | cleanup before exit                        | `id`                                                                              |
 //! | `tunnel_deleted`          | `delete` subcommand only                   | `id`, `deleted: true`                                                             |
@@ -226,11 +225,10 @@ enum Commands {
 }
 
 /// Why the Listen handler's runtime select-loop terminated. Drives the
-/// final exit status: CtrlC = clean exit 0; TerminalFailure / DeletedUpstream
+/// final exit status: CtrlC = clean exit 0; DeletedUpstream
 /// = exit 1 with an n0_error::anyerr! message.
 enum ExitReason {
     CtrlC,
-    TerminalFailure,
     DeletedUpstream,
 }
 
@@ -551,7 +549,7 @@ async fn run() -> n0_error::Result<()> {
 
             // Start heartbeat BEFORE create_active/ensure_connector so the
             // iroh endpoint connects to the relay and populates its address
-            // before build_connection_details() runs. Without this the
+            // before the Connector endpoint is built. Without this the
             // connector status patch has no relay URL and the operator never
             // sees connection details → Connector/Ready stays False forever.
             let heartbeat = HeartbeatAgent::new(datum.clone(), node.clone());
@@ -669,7 +667,7 @@ async fn run() -> n0_error::Result<()> {
                 )
             })??;
 
-            // Re-patch connectionDetails now that the connector is Ready:True.
+            // Refresh the advertised endpoint now that the Connector is Ready:True.
             // This triggers the replicator to re-mirror the upstream-status
             // annotation to the downstream cluster with the current Ready:True
             // state, which in turn triggers Envoy Gateway to re-translate xDS
@@ -677,7 +675,7 @@ async fn run() -> n0_error::Result<()> {
             // Without this, if the annotation was captured at Ready:False
             // (race between replicator and lease renewal), the extension
             // server serves 503 indefinitely.
-            service.refresh_connection_details().await?;
+            service.refresh_endpoint().await?;
 
             // Hostnames are written by the gateway controller shortly after
             // Programmed=True. Poll until one appears (usually <1s).
@@ -721,7 +719,7 @@ async fn run() -> n0_error::Result<()> {
                 },
                 || {
                     let svc = service_for_refresh.clone();
-                    async move { svc.refresh_connection_details().await }
+                    async move { svc.refresh_endpoint().await }
                 },
                 &setup_cancel,
             )
@@ -780,7 +778,7 @@ async fn run() -> n0_error::Result<()> {
             //   2. login_state   — credential expiry/revocation guidance
             //                      (text or JSON; does NOT exit so user can read)
             //   3. 10s poll      — detect mid-session terminal failure
-            //                      (e.g. iroh-DNS collision flips post-Ready)
+            //                      (for example, connector readiness changes post-start)
             //                      or upstream deletion (HTTPProxy removed)
             //
             // Cleanup (set_enabled_active false + tunnel_disabled) runs for
@@ -825,24 +823,7 @@ async fn run() -> n0_error::Result<()> {
                     }
                     _ = runtime_poll.tick() => {
                         match service.get_active_progress(&tunnel_id).await {
-                            Ok(Some(progress)) => {
-                                if let Some(failed) = progress.terminal_failure() {
-                                    let msg = progress::format_terminal_failure(failed);
-                                    if json {
-                                        println!(
-                                            "{}",
-                                            serde_json::json!({
-                                                "type": "tunnel_terminal_failure",
-                                                "id": tunnel_id,
-                                                "message": msg
-                                            })
-                                        );
-                                    } else {
-                                        eprintln!("{}", msg);
-                                    }
-                                    break ExitReason::TerminalFailure;
-                                }
-                            }
+                            Ok(Some(_)) => {}
                             Ok(None) => {
                                 let msg = format!(
                                     "Tunnel {tunnel_id} no longer exists on the server"
@@ -883,9 +864,6 @@ async fn run() -> n0_error::Result<()> {
                                 serde_json::json!({"type": "ConnectorAdvertisement", "name": name}),
                             );
                         }
-                        if let Some(ref name) = o.traffic_protection_policy {
-                            resources.push(serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}));
-                        }
                         if let Some(ref name) = o.connector {
                             resources.push(serde_json::json!({"type": "Connector", "name": name}));
                         }
@@ -906,9 +884,6 @@ async fn run() -> n0_error::Result<()> {
                         if let Some(ref name) = o.connector_ad {
                             println!("  ConnectorAdvertisement {}", name);
                         }
-                        if let Some(ref name) = o.traffic_protection_policy {
-                            println!("  TrafficProtectionPolicy {}", name);
-                        }
                         if let Some(ref name) = o.connector {
                             println!("  Connector {}", name);
                         }
@@ -925,12 +900,9 @@ async fn run() -> n0_error::Result<()> {
                 }
             }
 
-            // Non-zero exit for terminal failures.
+            // Non-zero exit if the upstream tunnel was deleted.
             match exit_reason {
                 ExitReason::CtrlC => Ok(()),
-                ExitReason::TerminalFailure => {
-                    Err(n0_error::anyerr!("tunnel exited with terminal failure"))
-                }
                 ExitReason::DeletedUpstream => Err(n0_error::anyerr!("tunnel deleted upstream")),
             }?;
         }
@@ -980,10 +952,6 @@ async fn run() -> n0_error::Result<()> {
                     resources
                         .push(serde_json::json!({"type": "ConnectorAdvertisement", "name": name}));
                 }
-                if let Some(ref name) = outcome.traffic_protection_policy {
-                    resources
-                        .push(serde_json::json!({"type": "TrafficProtectionPolicy", "name": name}));
-                }
                 if let Some(ref name) = outcome.connector {
                     resources.push(serde_json::json!({"type": "Connector", "name": name}));
                 }
@@ -1003,9 +971,6 @@ async fn run() -> n0_error::Result<()> {
                 }
                 if let Some(name) = outcome.connector_ad {
                     println!("  ConnectorAdvertisement {}", name);
-                }
-                if let Some(name) = outcome.traffic_protection_policy {
-                    println!("  TrafficProtectionPolicy {}", name);
                 }
                 if let Some(name) = outcome.connector {
                     println!("  Connector {}", name);

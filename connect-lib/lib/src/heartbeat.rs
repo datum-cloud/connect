@@ -18,10 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::ListenNode;
-use crate::datum_apis::connector::{
-    Connector, ConnectorConnectionDetails, ConnectorConnectionDetailsPublicKey,
-    ConnectorConnectionType, PublicKeyConnectorAddress, PublicKeyDiscoveryMode,
-};
+use crate::datum_apis::connector::Connector;
 use crate::datum_apis::lease::Lease;
 use crate::datum_cloud::DatumCloudClient;
 use crate::kube_error::{is_not_found, is_unauthorized};
@@ -273,8 +270,8 @@ struct ConnectorCache {
     name: String,
     lease_name: Option<String>,
     lease_duration_seconds: Option<i32>,
-    last_details: Option<serde_json::Value>,
-    last_home_relay: Option<String>,
+    last_endpoint: Option<String>,
+    last_relay_urls: Vec<String>,
 }
 
 /// Returns true if `err` is a kube API error with HTTP status 401.
@@ -364,14 +361,11 @@ async fn run_project(
                     let lease_name = connector
                         .status
                         .as_ref()
-                        .and_then(|status| status.lease_ref.as_ref())
-                        .map(|lease| lease.name.clone());
-                    let last_home_relay = connector
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.connection_details.as_ref())
-                        .and_then(|details| details.public_key.as_ref())
-                        .map(|details| details.home_relay.clone());
+                        .map(|status| status.lease_ref.clone())
+                        .filter(|name| !name.is_empty());
+                    let last_endpoint = Some(connector.spec.endpoint.clone())
+                        .filter(|endpoint| !endpoint.is_empty());
+                    let last_relay_urls = connector.spec.relay_urls.clone();
                     info!(
                         %project_id,
                         connector = %connector_name,
@@ -382,8 +376,8 @@ async fn run_project(
                         name: connector_name,
                         lease_name,
                         lease_duration_seconds: None,
-                        last_details: None,
-                        last_home_relay,
+                        last_endpoint,
+                        last_relay_urls,
                     });
                     backoff.reset();
                 }
@@ -413,19 +407,16 @@ async fn run_project(
                     cached.lease_name = connector
                         .status
                         .as_ref()
-                        .and_then(|status| status.lease_ref.as_ref())
-                        .map(|lease| lease.name.clone());
+                        .map(|status| status.lease_ref.clone())
+                        .filter(|name| !name.is_empty());
                     if cached.lease_name.is_none() {
                         sleep_with_cancel(backoff.next(), &cancel).await;
                         cache = Some(cached);
                         continue;
                     }
-                    cached.last_home_relay = connector
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.connection_details.as_ref())
-                        .and_then(|details| details.public_key.as_ref())
-                        .map(|details| details.home_relay.clone());
+                    cached.last_endpoint = Some(connector.spec.endpoint.clone())
+                        .filter(|endpoint| !endpoint.is_empty());
+                    cached.last_relay_urls = connector.spec.relay_urls.clone();
                 }
                 Err(err) => {
                     warn!(
@@ -443,7 +434,7 @@ async fn run_project(
             }
         }
 
-        let details = match provider.connection_details(cached.last_home_relay.as_deref()) {
+        let details = match provider.connection_details() {
             Some(details) => details,
             None => {
                 warn!(%project_id, connector = %cached.name, "heartbeat: missing home relay");
@@ -453,28 +444,18 @@ async fn run_project(
             }
         };
 
-        let details_value = match serde_json::to_value(&details) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(
-                    %project_id,
-                    connector = %cached.name,
-                    "heartbeat: failed to serialize details: {err:#}"
-                );
-                cache = Some(cached);
-                sleep_with_cancel(backoff.next(), &cancel).await;
-                continue;
-            }
-        };
-
-        if cached.last_details.as_ref() != Some(&details_value) {
-            let patch = json!({ "status": { "connectionDetails": details_value } });
+        let (endpoint, relay_urls) = details;
+        if cached.last_endpoint.as_deref() != Some(endpoint.as_str())
+            || cached.last_relay_urls != relay_urls
+        {
+            let patch = json!({ "spec": { "endpoint": endpoint, "relayURLs": relay_urls } });
             match connectors
-                .patch_status(&cached.name, &PatchParams::default(), &Patch::Merge(&patch))
+                .patch(&cached.name, &PatchParams::default(), &Patch::Merge(&patch))
                 .await
             {
                 Ok(_) => {
-                    cached.last_details = Some(patch["status"]["connectionDetails"].clone());
+                    cached.last_endpoint = Some(endpoint);
+                    cached.last_relay_urls = relay_urls;
                 }
                 Err(err) => {
                     warn!(
@@ -579,11 +560,14 @@ async fn find_connector(
     connectors: &Api<Connector>,
     endpoint_id: String,
 ) -> std::result::Result<Option<Connector>, ConnectorLookupError> {
-    let selector = format!("status.connectionDetails.publicKey.id={endpoint_id}");
-    let list = connectors
-        .list(&ListParams::default().fields(&selector))
-        .await?;
-    select_unique_connector(list.items, &selector).map_err(ConnectorLookupError::Selection)
+    let list = connectors.list(&ListParams::default()).await?;
+    let selector = format!("publicKey={endpoint_id}");
+    let candidates = list
+        .items
+        .into_iter()
+        .filter(|c| c.spec.public_key == endpoint_id)
+        .collect();
+    select_unique_connector(candidates, &selector).map_err(ConnectorLookupError::Selection)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -596,10 +580,7 @@ enum ConnectorLookupError {
 
 trait HeartbeatDetailsProvider: Send + Sync {
     fn endpoint_id(&self) -> String;
-    fn connection_details(
-        &self,
-        fallback_home_relay: Option<&str>,
-    ) -> Option<ConnectorConnectionDetails>;
+    fn connection_details(&self) -> Option<(String, Vec<String>)>;
 }
 
 struct ListenNodeDetailsProvider {
@@ -617,34 +598,15 @@ impl HeartbeatDetailsProvider for ListenNodeDetailsProvider {
         self.listen.endpoint_id().to_string()
     }
 
-    fn connection_details(
-        &self,
-        fallback_home_relay: Option<&str>,
-    ) -> Option<ConnectorConnectionDetails> {
+    fn connection_details(&self) -> Option<(String, Vec<String>)> {
         let endpoint = self.listen.endpoint();
         let endpoint_addr = endpoint.addr();
-        let home_relay = endpoint_addr
+        let serialized = serde_json::to_string(&endpoint_addr).ok()?;
+        let relay_urls = endpoint_addr
             .relay_urls()
-            .next()
             .map(|url| url.to_string())
-            .or_else(|| fallback_home_relay.map(|relay| relay.to_string()))?;
-        let addresses: Vec<PublicKeyConnectorAddress> = endpoint_addr
-            .ip_addrs()
-            .map(|addr| PublicKeyConnectorAddress {
-                address: addr.ip().to_string(),
-                port: addr.port() as i32,
-            })
             .collect();
-
-        Some(ConnectorConnectionDetails {
-            connection_type: ConnectorConnectionType::PublicKey,
-            public_key: Some(ConnectorConnectionDetailsPublicKey {
-                id: endpoint.id().to_string(),
-                discovery_mode: Some(PublicKeyDiscoveryMode::Dns),
-                home_relay,
-                addresses,
-            }),
-        })
+        Some((serialized, relay_urls))
     }
 }
 
@@ -703,10 +665,7 @@ mod tests {
             self.endpoint_id.clone()
         }
 
-        fn connection_details(
-            &self,
-            _fallback_home_relay: Option<&str>,
-        ) -> Option<ConnectorConnectionDetails> {
+        fn connection_details(&self) -> Option<(String, Vec<String>)> {
             None
         }
     }

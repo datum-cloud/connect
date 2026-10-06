@@ -12,10 +12,8 @@ use serde_json::{Value, json};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 pub type Result<T> = std::result::Result<T, Error>;
-const GROUP: &str = "networking.datumapis.com/v1alpha1";
 const CONNECT_GROUP: &str = "connect.datumapis.com/v1alpha1";
 const OWNER: &str = "connect.datum.net/connector";
-const PROTOCOL: &str = "connect.datum.net/transport";
 const GATEWAYS: &str = "connect.datum.net/gateway-connectors";
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 
@@ -168,14 +166,9 @@ impl CloudConnector {
         Ok(self)
     }
 
-    fn resource(&self, plural: &str, name: &str) -> String {
-        let group = if plural == "httpproxies" {
-            "networking.datumapis.com/v1alpha"
-        } else {
-            GROUP
-        };
+    fn http_proxy_resource(&self, name: &str) -> String {
         format!(
-            "{}/apis/{group}/namespaces/default/{plural}/{name}",
+            "{}/apis/networking.datumapis.com/v1alpha/namespaces/default/httpproxies/{name}",
             self.base.trim_end_matches('/')
         )
     }
@@ -764,82 +757,25 @@ impl CloudConnector {
         Err(Error::Authentication(401))
     }
 
-    async fn get(&self, plural: &str, name: &str) -> Result<Option<Value>> {
-        self.request(Method::GET, &self.resource(plural, name), None)
+    async fn get_http_proxy(&self, name: &str) -> Result<Option<Value>> {
+        self.request(Method::GET, &self.http_proxy_resource(name), None)
             .await
     }
 
     /// Deterministic create + GET-on-conflict makes uncertain retries idempotent.
-    async fn create(&self, plural: &str, object: &Value) -> Result<Value> {
+    async fn create_http_proxy(&self, object: &Value) -> Result<Value> {
         let name = object["metadata"]["name"]
             .as_str()
             .ok_or_else(|| Error::Invalid("resource name missing".into()))?;
         match self
-            .request(Method::POST, &self.resource(plural, ""), Some(object))
+            .request(Method::POST, &self.http_proxy_resource(""), Some(object))
             .await
         {
             Ok(Some(value)) => Ok(value),
-            Err(Error::Api(409)) => self.get(plural, name).await?.ok_or(Error::Api(404)),
+            Err(Error::Api(409)) => self.get_http_proxy(name).await?.ok_or(Error::Api(404)),
             Ok(None) => Err(Error::Api(500)),
             Err(error) => Err(error),
         }
-    }
-
-    fn identity(&self, object: &Value) -> Result<PeerIdentity> {
-        if !object["metadata"]["deletionTimestamp"].is_null() {
-            return Err(Error::Ownership("Connector is terminating".into()));
-        }
-        let name = string(object, "/metadata/name")?;
-        let uid = string(object, "/metadata/uid")?;
-        let public_key = string(object, "/status/connectionDetails/publicKey/id")?;
-        let _: iroh::EndpointId = public_key
-            .parse()
-            .map_err(|_| Error::Invalid("control plane returned invalid public key".into()))?;
-        let relay_url = object
-            .pointer("/status/connectionDetails/publicKey/homeRelay")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        if !relay_url.is_empty() {
-            validate_url(&relay_url)?;
-        }
-        let mut addresses = Vec::new();
-        for address in object
-            .pointer("/status/connectionDetails/publicKey/addresses")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let ip = string(address, "/address")?
-                .parse()
-                .map_err(|_| Error::Invalid("invalid Connector address".into()))?;
-            let port = address["port"]
-                .as_u64()
-                .and_then(|p| u16::try_from(p).ok())
-                .filter(|p| *p != 0)
-                .ok_or_else(|| Error::Invalid("invalid Connector port".into()))?;
-            addresses.push(SocketAddr::new(ip, port));
-        }
-        Ok(PeerIdentity {
-            name,
-            uid,
-            public_key,
-            relay_url,
-            addresses,
-        })
-    }
-
-    async fn owned_connector(&self) -> Result<Value> {
-        let connector = self
-            .get("connectors", &self.name)
-            .await?
-            .ok_or(Error::Api(404))?;
-        if connector["metadata"]["annotations"]["connect.datum.net/public-key"] != self.public_key
-            || !connector["metadata"]["deletionTimestamp"].is_null()
-        {
-            return Err(Error::Ownership(self.name.clone()));
-        }
-        Ok(connector)
     }
 
     async fn owned_connect_connector(&self) -> Result<Value> {
@@ -853,82 +789,6 @@ impl CloudConnector {
             return Err(Error::Ownership(self.name.clone()));
         }
         Ok(connector)
-    }
-
-    pub async fn ensure_connector(&self, details: &ConnectionDetails) -> Result<PeerIdentity> {
-        if self.get("connectors", &self.name).await?.is_none() {
-            let classes_url = format!("{}/apis/{GROUP}/connectorclasses", self.base);
-            let classes = self
-                .request(Method::GET, &classes_url, None)
-                .await?
-                .ok_or(Error::Api(404))?;
-            let classes: Vec<&Value> = classes["items"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|item| item["metadata"]["annotations"][PROTOCOL] == "masque-v1")
-                .collect();
-            if classes.len() != 1 {
-                return Err(Error::Unsupported("exactly one ConnectorClass must advertise connect.datum.net/transport=masque-v1".into()));
-            }
-            self.create("connectors", &json!({"apiVersion":GROUP,"kind":"Connector","metadata":{"name":self.name,"annotations":{"connect.datum.net/public-key":self.public_key,(PROTOCOL):"masque-v1"}},"spec":{"connectorClassName":string(classes[0],"/metadata/name")?}})).await?;
-        }
-        self.renew(details).await
-    }
-
-    pub async fn renew(&self, details: &ConnectionDetails) -> Result<PeerIdentity> {
-        let mut uid = None;
-        for attempt in 0..4 {
-            match self.renew_once(details, &mut uid).await {
-                Err(Error::Api(409)) if attempt < 3 => {
-                    tracing::warn!(connector = %self.name, attempt = attempt + 1, "connector_renew_conflict_retry");
-                    tokio::time::sleep(Duration::from_millis(50 << attempt)).await;
-                }
-                result => return result,
-            }
-        }
-        unreachable!("last renewal attempt returns")
-    }
-
-    async fn renew_once(
-        &self,
-        details: &ConnectionDetails,
-        expected_uid: &mut Option<String>,
-    ) -> Result<PeerIdentity> {
-        let mut connector = self.owned_connector().await?;
-        let uid = string(&connector, "/metadata/uid")?;
-        if expected_uid
-            .as_ref()
-            .is_some_and(|expected| expected != &uid)
-        {
-            return Err(Error::Ownership(
-                "Connector was replaced during renewal".into(),
-            ));
-        }
-        *expected_uid = Some(uid);
-        let old_key = connector
-            .pointer("/status/connectionDetails/publicKey/id")
-            .and_then(Value::as_str);
-        if old_key.is_some_and(|key| key != self.public_key) {
-            return Err(Error::Ownership(self.name.clone()));
-        }
-        connector["status"]["connectionDetails"] = json!({"type":"PublicKey","publicKey":{"id":self.public_key,"discoveryMode":"DNS","homeRelay":details.relay_url,"addresses":details.addresses.iter().map(|addr| json!({"address":addr.ip().to_string(),"port":addr.port()})).collect::<Vec<_>>()}});
-        let updated = self
-            .request(
-                Method::PUT,
-                &format!("{}/status", self.resource("connectors", &self.name)),
-                Some(&connector),
-            )
-            .await?
-            .ok_or(Error::Api(500))?;
-        self.renew_connect_connector_lease(&updated).await?;
-        if let Some(connector) = self.connect_get("connectors", &self.name).await?
-            && connector.pointer("/spec/publicKey").and_then(Value::as_str)
-                != Some(self.public_key.as_str())
-        {
-            return Err(Error::Ownership(self.name.clone()));
-        }
-        self.identity(&updated)
     }
 
     pub async fn resolve_peer(&self, name_or_key: &str) -> Result<PeerIdentity> {
@@ -1113,11 +973,11 @@ impl CloudConnector {
         Ok(())
     }
 
-    async fn apply_owned(&self, plural: &str, object: Value, connector: &Value) -> Result<Value> {
+    async fn apply_http_proxy_owned(&self, object: Value, connector: &Value) -> Result<Value> {
         let name = string(&object, "/metadata/name")?;
-        let existing = match self.get(plural, &name).await? {
+        let existing = match self.get_http_proxy(&name).await? {
             Some(value) => value,
-            None => self.create(plural, &object).await?,
+            None => self.create_http_proxy(&object).await?,
         };
         self.check_owner(&name, &existing, connector)?;
         // No overwrite of administrator edits or foreign fields. Explicitly
@@ -1179,7 +1039,7 @@ impl CloudConnector {
             .filter(|p| *p != 0)
             .ok_or_else(|| Error::Invalid("endpoint port missing".into()))?;
         let connector = self.owned_connect_connector().await?;
-        if !intent.public && self.get("httpproxies", &intent.name).await?.is_some() {
+        if !intent.public && self.get_http_proxy(&intent.name).await?.is_some() {
             return Err(Error::Invalid("a public ingress already uses this service name; explicitly remove it before creating a private service".into()));
         }
         let metadata = self.metadata(&intent.name, &connector)?;
@@ -1197,7 +1057,7 @@ impl CloudConnector {
         }
         // HTTPProxy remains an NSO ingress resource. Its metadata ownership is
         // tied to the Connect Connector UID so cleanup cannot affect another device.
-        let proxy = self.apply_owned("httpproxies",json!({"apiVersion":"networking.datumapis.com/v1alpha","kind":"HTTPProxy","metadata":metadata,"spec":spec}),&connector).await?;
+        let proxy = self.apply_http_proxy_owned(json!({"apiVersion":"networking.datumapis.com/v1alpha","kind":"HTTPProxy","metadata":metadata,"spec":spec}),&connector).await?;
         let hostnames = proxy
             .pointer("/status/hostnames")
             .or_else(|| proxy.pointer("/spec/hostnames"))
@@ -1224,15 +1084,11 @@ impl CloudConnector {
         for plural in ["httpproxies", "connectoradvertisements"] {
             let result = async {
                 let is_connect_resource = plural == "connectoradvertisements";
-                let resource = if is_connect_resource {
-                    self.connect_get(plural, name).await?
-                } else {
-                    self.get(plural, name).await?
-                };
+                let resource = if is_connect_resource { self.connect_get(plural, name).await? } else { self.get_http_proxy(name).await? };
                 if let Some(resource) = resource {
                     self.check_owner(name,&resource,&connector)?;
                     let preconditions = json!({"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":string(&resource,"/metadata/uid")?,"resourceVersion":string(&resource,"/metadata/resourceVersion")?}});
-                    let url = if is_connect_resource { self.connect_resource(plural, name) } else { self.resource(plural, name) };
+                    let url = if is_connect_resource { self.connect_resource(plural, name) } else { self.http_proxy_resource(name) };
                     match self.request(Method::DELETE,&url,Some(&preconditions)).await { Ok(_) | Err(Error::Api(404)) => {}, Err(error) => return Err(error) }
                 }
                 Ok(())
