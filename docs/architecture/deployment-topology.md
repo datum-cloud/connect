@@ -7,88 +7,52 @@ document shows where each process runs and which team or user operates it.
 ## Deployment at a Glance
 
 ```mermaid
-flowchart TB
-    subgraph device_a[User device A]
-        direction TB
-        datumctl_a[datumctl process]
-        plugin_a[datumctl-connect plugin process<br/>started for each command]
-        daemon_a[datum-connect-daemon<br/>persistent user service]
-        helper_a[datum-connect-network-helper<br/>optional root service]
-        app_a[Local application or client]
-        adapter_a[TUN, utun, or Wintun]
+flowchart LR
+    subgraph devices[User devices]
+        cli[datumctl-connect<br/>runs for each command]
+        daemon[datum-connect-daemon<br/>persistent service]
+        helper[network helper<br/>optional privileged service]
+        peer[peer datum-connect-daemon]
 
-        datumctl_a --> plugin_a
-        plugin_a -->|HTTP on loopback| daemon_a
-        daemon_a --> app_a
-        daemon_a -->|authenticated local IPC| helper_a
-        helper_a --> adapter_a
+        cli --> daemon
+        daemon -.-> helper
     end
 
     subgraph management[Milo management cluster]
-        direction TB
-        controller[connect-controller Deployment<br/>one active leader]
-        discovery[Project and ProjectControlPlane discovery]
-        classes[ConnectorClass resources]
-
-        controller --> discovery
-        controller --> classes
+        controller[connect-controller]
     end
 
     subgraph project[Project control plane]
-        direction TB
-        project_api[Kubernetes-compatible project API]
-        resources[Connector, Advertisement,<br/>Gateway, Binding, and Lease]
-        gateway_config[Gateway Secret and ConfigMap]
-        compute_api[Compute Workload resource]
-        proxy[Optional NSO HTTPProxy]
-
-        project_api --> resources
-        project_api --> gateway_config
-        project_api --> compute_api
-        project_api --> proxy
+        project_api[Connect resources]
     end
 
-    subgraph compute[Compute worker attached to the project VPC]
-        direction TB
-        gateway[iroh-gateway process<br/>inside Compute Workload]
-        gateway_tun[Gateway TUN and forwarding policy]
-        vpc[Project VPC interface]
-
-        gateway --> gateway_tun --> vpc
+    subgraph compute[Compute worker and project VPC]
+        gateway[iroh-gateway<br/>Compute Workload]
+        vpc[Project VPC]
+        gateway --> vpc
     end
 
-    subgraph device_b[User device B]
-        daemon_b[Peer datum-connect-daemon]
-        app_b[Peer application or client]
-        daemon_b --> app_b
+    subgraph shared[Shared relay infrastructure]
+        relay[iroh relay]
     end
 
-    subgraph relay_infra[Relay infrastructure]
-        relay[iroh relay process]
-    end
+    daemon -->|control plane| project_api
+    peer -->|control plane| project_api
+    controller -->|reconciles| project_api
+    project_api -->|declares gateway| gateway
 
-    subgraph ingress_infra[Optional public-ingress infrastructure]
-        edge[MASQUE-capable gateway or edge process]
-    end
-
-    daemon_a -->|Connect API and Lease renewal| project_api
-    daemon_b -->|Connect API and Lease renewal| project_api
-    controller -->|watch and reconcile| project_api
-    controller -->|create or update| compute_api
-    compute_api -->|schedule and configure| gateway
-
-    daemon_a <-->|direct HTTP/3 when reachable| daemon_b
-    daemon_a -.->|relay-assisted QUIC| relay
-    daemon_b -.->|relay-assisted QUIC| relay
-    daemon_a <-->|CONNECT-IP| gateway
-    gateway -.->|relay-assisted QUIC| relay
-    edge -->|private service transport| daemon_a
-    proxy -->|program ingress| edge
+    daemon <-->|private services| peer
+    daemon <-->|CONNECT-IP| gateway
+    daemon -.-> relay
+    peer -.-> relay
+    gateway -.-> relay
 ```
 
-Solid arrows represent ownership, API calls, or direct data paths. Dotted
-arrows show optional relay-assisted paths. The Connect controller never carries
-application bytes or IP packets.
+The plugin and daemon run on each user device. The controller runs once in the
+Milo management cluster. Project resources live in the project control plane,
+and each managed gateway runs as a Compute Workload attached to that project's
+VPC. Dotted arrows are optional relay-assisted paths. The controller and project
+API never carry application bytes or IP packets.
 
 ## Process Inventory
 
