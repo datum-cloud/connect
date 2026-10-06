@@ -202,6 +202,7 @@ try {
         project_id = "windows-service-smoke"
         client_id = "windows-service-smoke"
         client_email = "windows-service-smoke@invalid.example"
+        private_key_id = "windows-service-smoke-key"
         private_key = "not-used-without-up"
     } | ConvertTo-Json
     [IO.File]::WriteAllText($credentials, $credentialJson, [Text.UTF8Encoding]::new($false))

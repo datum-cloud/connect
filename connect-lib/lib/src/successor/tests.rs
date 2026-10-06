@@ -12,7 +12,11 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
     let task = tokio::spawn(async move {
         let mut requests = Vec::new();
         for reply in replies {
-            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            // Full native CI runs many CPU-heavy tests concurrently. Initial
+            // Connector enrollment also generates an RSA key on a blocking
+            // worker, so allow that work to finish before declaring the mock
+            // control plane abandoned.
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
                 .await
                 .unwrap()
                 .unwrap();
