@@ -57,8 +57,14 @@ func (i Installer) AcquireHelper(ctx context.Context, version string) (string, e
 	return i.Acquire(ctx, version)
 }
 
+// PublishedRelease reports whether version names a downloadable release tag.
+// Local builds such as Taskfile's v0.1.0+<commit> never do.
+func PublishedRelease(version string) bool {
+	return releaseTag.MatchString(version) && !strings.Contains(strings.ToLower(version), "dev")
+}
+
 func assetName(version, goos, arch string) (string, error) {
-	if !releaseTag.MatchString(version) || strings.Contains(version, "dev") {
+	if !PublishedRelease(version) {
 		return "", fmt.Errorf("plugin version %q is not a published release", version)
 	}
 	platform := map[string]string{"darwin": "Darwin", "linux": "Linux"}[goos]

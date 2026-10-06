@@ -282,3 +282,20 @@ func TestPlatformArtifactNames(t *testing.T) {
 		}
 	}
 }
+
+func TestPublishedReleaseExcludesLocalBuilds(t *testing.T) {
+	for version, want := range map[string]bool{
+		"v1.0.0-preview.23": true,
+		"v1.2.3":            true,
+		"v0.1.0+5f7a378":    false, // Taskfile development build
+		"v1.0.0-dev":        false,
+		"v1.0.0-DEV.1":      false,
+		"1.0.0":             false,
+		"v":                 false,
+		"":                  false,
+	} {
+		if got := PublishedRelease(version); got != want {
+			t.Errorf("PublishedRelease(%q) = %v, want %v", version, got, want)
+		}
+	}
+}

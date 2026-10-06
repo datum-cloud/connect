@@ -70,3 +70,21 @@ func TestReplaceSystemdExecutableRejectsUnknownOrAmbiguousExecStart(t *testing.T
 		}
 	}
 }
+
+func TestAutomaticUpgradeSkipsLocalBuilds(t *testing.T) {
+	for _, test := range []struct {
+		version, executable string
+		force, skip         bool
+	}{
+		{version: "1.0.0-preview.23", skip: false},
+		{version: "0.1.0+5f7a378", skip: true}, // Taskfile development build
+		{version: "1.0.0-dev", skip: true},
+		{version: "", skip: true},
+		{version: "0.1.0+5f7a378", executable: "/opt/datum-connectd", skip: false},
+		{version: "0.1.0+5f7a378", force: true, skip: false},
+	} {
+		if got := skipAutomaticUpgrade(test.version, test.executable, test.force); got != test.skip {
+			t.Errorf("skipAutomaticUpgrade(%q, %q, %v) = %v, want %v", test.version, test.executable, test.force, got, test.skip)
+		}
+	}
+}

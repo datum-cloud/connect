@@ -40,9 +40,6 @@ func TestHelperServiceContainsNoUserCredentials(t *testing.T) {
 func TestHelperExecutableIsOutsideLinuxStateDirectory(t *testing.T) {
 	dir := helperExecutableDir(501)
 	if runtime.GOOS == "linux" {
-		if dir != "/usr/libexec/datum-connect/501" {
-			t.Fatalf("Linux helper executable directory = %q", dir)
-		}
 		if strings.HasPrefix(dir, helperStateDir(501)) {
 			t.Fatalf("Linux helper executable remains under mutable state: %q", dir)
 		}

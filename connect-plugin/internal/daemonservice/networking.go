@@ -92,6 +92,9 @@ func EnsureNetworking(cmd *cobra.Command, version, executable string, config Hel
 	if runtime.GOOS == "windows" || os.Geteuid() <= 0 || config.AllowedUID != uint32(os.Geteuid()) {
 		return fmt.Errorf("networking approval must run locally as the daemon's ordinary user")
 	}
+	if err := refuseContainer(); err != nil {
+		return err
+	}
 	if executable == "" {
 		var err error
 		executable, err = (daemoninstall.Installer{Root: filepath.Join(state.Dir(), "runtime"), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, Progress: cmd.ErrOrStderr()}).AcquireHelper(cmd.Context(), version)
@@ -141,6 +144,23 @@ func EnsureNetworking(cmd *cobra.Command, version, executable string, config Hel
 	return nil
 }
 
+// Toolbox, Podman, and Docker leave these markers. Inside them, root writes the
+// helper unit to the container's /etc while systemctl reaches the host's
+// systemd, so the helper can never start where the host daemon expects it.
+var containerMarkers = []string{"/run/.toolboxenv", "/run/.containerenv", "/.dockerenv"}
+
+func refuseContainer() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	for _, marker := range containerMarkers {
+		if _, err := os.Lstat(marker); err == nil {
+			return fmt.Errorf("the networking helper must be installed from the host, not inside a container (found %s). Rerun this join from a host terminal; nothing was changed", marker)
+		}
+	}
+	return nil
+}
+
 func executableHash(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -168,7 +188,9 @@ func mergeApprovals(existing, requested HelperApprovals, replace bool) (HelperAp
 	if err := validateManagedPolicy(requested.ManagedPolicy); err != nil {
 		return HelperApprovals{}, false, err
 	}
-	merged := HelperApprovals{AllowedUID: requested.AllowedUID, Approvals: append([]InterfaceApproval(nil), existing.Approvals...), ManagedPolicy: existing.ManagedPolicy}
+	// Never nil: the Rust helper accepts a missing or empty approvals list but
+	// rejects JSON null, which a policy-only managed VPC approval would produce.
+	merged := HelperApprovals{AllowedUID: requested.AllowedUID, Approvals: append(make([]InterfaceApproval, 0, len(existing.Approvals)), existing.Approvals...), ManagedPolicy: existing.ManagedPolicy}
 	changed := false
 	if requested.ManagedPolicy != nil && !sameManagedPolicy(existing.ManagedPolicy, requested.ManagedPolicy) {
 		if existing.ManagedPolicy != nil && !replace {
@@ -358,7 +380,8 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	if err != nil {
 		return helperCheckError(output)
 	}
-	svc, err := service.New(nil, helperServiceConfig(requested.AllowedUID, target))
+	config := helperServiceConfig(requested.AllowedUID, target)
+	svc, err := service.New(nil, config)
 	if err != nil {
 		return err
 	}
@@ -408,10 +431,18 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	// the new file when it starts.
 	receipt, _ := json.Marshal(helperReceipt{Executable: target, SHA256: digest})
 	var restore func() error
+	// An OS image update can remove the previous helper, for example after the
+	// install directory moves off a read-only /usr. That service cannot run
+	// again, so only the approvals file is restorable.
+	previousMissing := false
 	if replacing {
-		if err := validatePrivilegedExecutable(old.Executable); err != nil {
+		if _, err := os.Lstat(old.Executable); errors.Is(err, os.ErrNotExist) {
+			previousMissing = true
+		} else if err := validatePrivilegedExecutable(old.Executable); err != nil {
 			return err
 		}
+	}
+	if replacing && !previousMissing {
 		previous, err := service.New(nil, helperServiceConfig(requested.AllowedUID, old.Executable))
 		if err != nil {
 			return err
@@ -438,7 +469,7 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 			}
 			return errors.Join(failures...)
 		}
-	} else if approvalChanged {
+	} else if approvalChanged || previousMissing {
 		restore = func() error {
 			if len(existingBytes) == 0 {
 				return nil
@@ -449,7 +480,10 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	if err := os.Rename(name, path); err != nil {
 		return err
 	}
-	return activateHelper(svc, installed, status, replacing, func() error { return writeRootFile(receiptPath, receipt) }, restore)
+	if err := activateHelper(svc, installed, status, replacing, func() error { return writeRootFile(receiptPath, receipt) }, restore); err != nil {
+		return fmt.Errorf("%s: %w", config.Name, err)
+	}
+	return nil
 }
 
 func ensurePrivilegedDirectory(path string, mode os.FileMode) error {
@@ -500,11 +534,11 @@ func activateHelper(svc service.Service, installed bool, status service.Status, 
 	if replacing {
 		if status == service.StatusRunning {
 			if err := svc.Stop(); err != nil {
-				return rollback(err)
+				return rollback(fmt.Errorf("stop previous helper service: %w", err))
 			}
 		}
 		if err := svc.Uninstall(); err != nil {
-			return rollback(err)
+			return rollback(fmt.Errorf("remove previous helper service: %w", err))
 		}
 		installed = false
 	}
@@ -520,7 +554,7 @@ func activateHelper(svc service.Service, installed bool, status service.Status, 
 	}
 	if !installed {
 		if err := svc.Install(); err != nil {
-			return rollbackInstall(err)
+			return rollbackInstall(fmt.Errorf("install helper service: %w", err))
 		}
 		added = true
 	}
@@ -529,7 +563,7 @@ func activateHelper(svc service.Service, installed bool, status service.Status, 
 	}
 	if !installed || status != service.StatusRunning {
 		if err := svc.Start(); err != nil {
-			return rollbackInstall(err)
+			return rollbackInstall(fmt.Errorf("start helper service: %w", err))
 		}
 	}
 	return nil
