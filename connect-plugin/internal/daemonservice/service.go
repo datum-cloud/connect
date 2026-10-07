@@ -1,4 +1,5 @@
-// Package daemonservice manages datum-connect-daemon as an OS service.
+// Package daemonservice manages the Connect OS service registration. The
+// existing service label remains datum-connect-daemon for upgrade compatibility.
 package daemonservice
 
 import (
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/kardianos/service"
@@ -21,7 +23,7 @@ import (
 	"go.datum.net/datumctl-plugins/connect/internal/state"
 )
 
-const serviceName = "datum-connect-daemon"
+const serviceName = "datum-connect-daemon" // Keep the registered label stable across binary renames.
 
 // DiscoverExecutable finds the daemon beside the plugin or in PATH.
 func DiscoverExecutable() (string, error) { return daemonExecutable("") }
@@ -46,9 +48,9 @@ func InstallCommand() *cobra.Command {
 	}}
 	addScopeFlag(cmd, &o.system)
 	cmd.Flags().StringVar(&o.credentialsFile, "credentials-file", "", "Credential JSON to copy into service-owned state")
-	cmd.Flags().StringVar(&o.localIPConfig, "local-ip-config", "", "Absolute path to static local CONNECT-IP approvals (requires a privileged system service)")
+	cmd.Flags().StringVar(&o.localIPConfig, "local-ip-config", "", "Absolute path to CONNECT-IP approvals (system daemon or approved networking helper)")
 	cmd.Flags().Uint16Var(&o.port, "port", 47780, "Loopback HTTP port")
-	cmd.Flags().StringVar(&o.executable, "executable", "", "Path to datum-connect-daemon (defaults to PATH lookup)")
+	cmd.Flags().StringVar(&o.executable, "executable", "", "Path to datum-connectd (defaults to PATH lookup)")
 	return cmd
 }
 
@@ -77,27 +79,93 @@ func StatusCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		status, err := svc.Status()
-		if errors.Is(err, service.ErrNotInstalled) {
-			return output.Write(cmd, map[string]any{"service": serviceName, "status": "not installed", "system": system}, "Connect daemon service is not installed ("+scopeLabel(system)+").\nInstall: datumctl connect daemon install"+scopeFlag(system)+"\n")
-		} else if err != nil {
+		status, err := statusService(svc, system)
+		notInstalled := errors.Is(err, service.ErrNotInstalled)
+		if err != nil && !notInstalled {
 			return fmt.Errorf("daemon service status: %w", err)
 		}
-		label := "unknown"
-		switch status {
-		case service.StatusRunning:
-			label = "running"
-		case service.StatusStopped:
-			label = "stopped"
+		label := "not installed"
+		if !notInstalled {
+			label = "unknown"
+			switch status {
+			case service.StatusRunning:
+				label = "running"
+			case service.StatusStopped:
+				label = "stopped"
+			}
 		}
-		human := fmt.Sprintf("Connect daemon service is %s (%s).\n", label, scopeLabel(system))
+		baseURL, _ := cmd.InheritedFlags().GetString("daemon-url")
+		apiStatus := "unreachable"
+		if daemonAPIHealthy(cmd.Context(), baseURL) {
+			apiStatus = "reachable"
+		}
+		human := fmt.Sprintf("Connect daemon service is %s (%s).\nConnect daemon API is %s.\n", label, scopeLabel(system), apiStatus)
+		if label == "stopped" && apiStatus == "reachable" {
+			human += "The API is responding even though the service manager reports it stopped; check for a manually started daemon or stale service-manager state.\n"
+		} else if label == "not installed" && apiStatus == "reachable" {
+			human += "The API is responding outside the managed daemon service.\n"
+		}
 		if label == "stopped" {
 			human += "Start: datumctl connect daemon start" + scopeFlag(system) + "\n"
+		} else if label == "not installed" {
+			human += "Install: datumctl connect daemon install" + scopeFlag(system) + "\n"
 		}
-		return output.Write(cmd, map[string]any{"service": serviceName, "status": label, "system": system}, human)
+		return output.Write(cmd, map[string]any{"service": serviceName, "status": label, "api_status": apiStatus, "system": system}, human)
 	}}
 	addScopeFlag(cmd, &system)
 	return cmd
+}
+
+// statusService uses launchctl's structured job report on macOS. kardianos/service
+// parses `launchctl list`, which can omit a PID for a live job in some launchd
+// contexts and then incorrectly reports an installed LaunchAgent as stopped.
+func statusService(svc service.Service, system bool) (service.Status, error) {
+	if runtime.GOOS != "darwin" {
+		return svc.Status()
+	}
+	domain := fmt.Sprintf("gui/%d/%s", os.Getuid(), serviceName)
+	if system {
+		domain = "system/" + serviceName
+	}
+	output, err := exec.Command("launchctl", "print", domain).CombinedOutput()
+	if err != nil {
+		message := string(output)
+		if strings.Contains(message, "Could not find service") || strings.Contains(message, "Service not found") {
+			return svc.Status()
+		}
+		return service.StatusUnknown, fmt.Errorf("launchctl print %s: %w: %s", domain, err, strings.TrimSpace(message))
+	}
+	if launchdJobRunning(string(output)) {
+		return service.StatusRunning, nil
+	}
+	return service.StatusStopped, nil
+}
+
+func launchdJobRunning(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "pid = ") && strings.TrimPrefix(line, "pid = ") != "0" {
+			return true
+		}
+	}
+	return false
+}
+
+func daemonAPIHealthy(ctx context.Context, baseURL string) bool {
+	client, err := connectapi.New(baseURL, "", 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 700*time.Millisecond)
+	defer cancel()
+	data, err := client.Request(ctx, "GET", "/v1/health", "", nil)
+	if err != nil {
+		return false
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	return json.Unmarshal(data, &health) == nil && health.Status == "ok"
 }
 
 func lifecycleCommand(use, short string, action func(service.Service) error) *cobra.Command {
@@ -254,13 +322,32 @@ func validateLocalIPConfig(value string, system, hasCredentials bool) (string, e
 	if err != nil {
 		return "", fmt.Errorf("local IP config: %w", err)
 	}
-	if info.IsDir() {
-		return "", fmt.Errorf("local IP config %s is a directory", clean)
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("local IP config %s must be a regular file", clean)
 	}
 	if !system {
-		return "", fmt.Errorf("--local-ip-config creates a TUN interface and routes and requires a privileged system service; rerun install with --system (using sudo or an elevated shell as required by the OS)")
+		if info.Size() > 4<<20 {
+			return "", fmt.Errorf("local IP config exceeds 4 MiB")
+		}
+		file, err := os.Open(clean)
+		if err != nil {
+			return "", err
+		}
+		defer file.Close()
+		data, err := io.ReadAll(io.LimitReader(file, (4<<20)+1))
+		if err != nil {
+			return "", err
+		}
+		var shape struct {
+			NetworkHelper string            `json:"network_helper"`
+			Bindings      []json.RawMessage `json:"bindings"`
+			Peers         []json.RawMessage `json:"peer_bindings"`
+		}
+		if (runtime.GOOS != "darwin" && runtime.GOOS != "linux") || len(data) > 4<<20 || json.Unmarshal(data, &shape) != nil || !filepath.IsAbs(shape.NetworkHelper) || len(shape.Bindings) != 0 || len(shape.Peers) == 0 {
+			return "", fmt.Errorf("user CONNECT-IP requires network_helper with approved peer_bindings; install the networking helper first, or use a system daemon with credentials")
+		}
 	}
-	if runtime.GOOS == "darwin" && !hasCredentials {
+	if system && runtime.GOOS == "darwin" && !hasCredentials {
 		return "", fmt.Errorf("a macOS system service with --local-ip-config cannot use the current user's datumctl login; also pass --credentials-file with service-account credentials. For unprivileged L4 serve/dial with OIDC, omit --system and --local-ip-config")
 	}
 	return clean, nil
@@ -322,7 +409,7 @@ func validatePlatformScope(system bool) error {
 			return fmt.Errorf("user services require systemd; detected %s (use --system only if a system service is intended)", service.Platform())
 		}
 	default:
-		return fmt.Errorf("daemon service management is unsupported on %s; run datum-connect-daemon directly", runtime.GOOS)
+		return fmt.Errorf("daemon service management is unsupported on %s; run datum-connectd directly", runtime.GOOS)
 	}
 	return nil
 }
@@ -330,7 +417,7 @@ func validatePlatformScope(system bool) error {
 func daemonExecutable(explicit string) (string, error) {
 	if explicit == "" {
 		if self, err := os.Executable(); err == nil {
-			name := "datum-connect-daemon"
+			name := "datum-connectd"
 			if runtime.GOOS == "windows" {
 				name += ".exe"
 			}
@@ -341,9 +428,9 @@ func daemonExecutable(explicit string) (string, error) {
 		}
 		if explicit == "" {
 			var err error
-			explicit, err = exec.LookPath("datum-connect-daemon")
+			explicit, err = exec.LookPath("datum-connectd")
 			if err != nil {
-				return "", fmt.Errorf("find datum-connect-daemon next to the plugin or in PATH: %w", err)
+				return "", fmt.Errorf("find datum-connectd next to the plugin or in PATH: %w", err)
 			}
 		}
 	}

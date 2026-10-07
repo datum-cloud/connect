@@ -46,6 +46,22 @@ func TestFriendlyTransportError(t *testing.T) {
 	}
 }
 
+func TestServiceConflictKeepsRecoveryWithoutDiagnosticsHint(t *testing.T) {
+	for _, verbose := range []bool{false, true} {
+		cmd := &cobra.Command{}
+		var stderr bytes.Buffer
+		cmd.SetErr(&stderr)
+		message := "Cannot share datum.net:443: TCP port 443 is already shared as google.com:443.\nNothing changed.\n\nTo replace the existing share, stop it first:\n  datumctl connect unserve google.com:443 --project datum-cloud\nThen run your serve command again."
+		err := friendlyError(cmd, &options{verbose: verbose}, "datum-cloud", &connectapi.HTTPError{StatusCode: 409, Code: "service_conflict", Message: message, RequestID: "req-conflict"})
+		if err.Error() != message {
+			t.Fatalf("unexpected conflict output: %v", err)
+		}
+		if strings.Contains(stderr.String(), "req-conflict") != verbose {
+			t.Fatalf("verbose correlation = %q", stderr.String())
+		}
+	}
+}
+
 func TestNetworkApprovalErrorDoesNotBlameTheLocalToken(t *testing.T) {
 	for _, code := range []string{"local_ip_approval_required", "local_ip_grant_mismatch", "local_ip_gateway_approval_required", "local_ip_gateway_setup_failed", "local_ip_handshake_failed", "local_ip_datagrams_unsupported", "local_ip_datagram_mtu_insufficient"} {
 		err := friendlyError(&cobra.Command{}, &options{}, "p", &connectapi.HTTPError{StatusCode: 403, Code: code, Message: "Ask the gateway operator to correct the approved routes"})

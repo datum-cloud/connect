@@ -38,6 +38,32 @@ func TestWaitReadyDoesNotAcceptUnhealthyOrHang(t *testing.T) {
 	}
 }
 
+func TestLaunchdJobRunningUsesStructuredPrintOutput(t *testing.T) {
+	if !launchdJobRunning(`state = running
+pid = 35177
+`) {
+		t.Fatal("launchd process with a PID was not recognized as running")
+	}
+	for _, output := range []string{"state = waiting", "service not found", "pid = 0"} {
+		if launchdJobRunning(output) {
+			t.Fatalf("launchd output %q was recognized as running", output)
+		}
+	}
+}
+
+func TestDaemonAPIHealthy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/health" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+	if !daemonAPIHealthy(context.Background(), srv.URL) {
+		t.Fatal("healthy daemon API was reported unreachable")
+	}
+}
+
 func TestRunServiceActionTimesOut(t *testing.T) {
 	blocked := make(chan struct{})
 	err := runServiceAction(context.Background(), nil, func(service.Service) error {
@@ -51,7 +77,7 @@ func TestRunServiceActionTimesOut(t *testing.T) {
 }
 
 func TestServiceConfigIsExplicitAndScoped(t *testing.T) {
-	exe := filepath.Join(t.TempDir(), "datum-connect-daemon")
+	exe := filepath.Join(t.TempDir(), "datum-connectd")
 	if err := os.WriteFile(exe, []byte("binary"), 0700); err != nil {
 		t.Fatal(err)
 	}

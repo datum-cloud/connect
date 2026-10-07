@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,14 +29,31 @@ var interactiveTerminal = func(cmd *cobra.Command) bool {
 	return ok && term.IsTerminal(int(f.Fd()))
 }
 var ensureUserDaemon = daemonservice.EnsureUser
+var ensureCurrentUserDaemon = daemonservice.EnsureCurrentUser
 var guidedSetupEnabled = guidedSetup
 
 func guidedSetup(cmd *cobra.Command, opts *options) bool {
 	format, _ := cmd.Flags().GetString("output")
 	return interactiveTerminal(cmd) && (format == "" || format == "table") &&
 		runtime.GOOS != "windows" && os.Geteuid() != 0 &&
-		opts.baseURL == connectapi.DefaultBaseURL && opts.tokenFile == "" &&
+		localDaemonURL(opts.baseURL) && opts.tokenFile == "" &&
 		strings.TrimSpace(os.Getenv("DATUM_CONNECT_TOKEN")) == ""
+}
+
+func localDaemonURL(raw string) bool {
+	if raw == connectapi.DefaultBaseURL {
+		return true
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func confirmSetup(cmd *cobra.Command, question string) error {
@@ -60,6 +79,16 @@ func confirmSetup(cmd *cobra.Command, question string) error {
 }
 
 func ensureDaemonForUp(cmd *cobra.Command, opts *options) error {
+	if opts.baseURL == connectapi.DefaultBaseURL {
+		_, upgraded, err := ensureCurrentUserDaemon(cmd.Context(), cmd.Root().Version, "", opts.timeout, cmd.ErrOrStderr(), false)
+		if err != nil {
+			return err
+		}
+		if upgraded {
+			fmt.Fprintln(cmd.ErrOrStderr(), "Connect daemon is upgraded and ready.")
+			return nil
+		}
+	}
 	if !guidedSetupEnabled(cmd, opts) {
 		return nil
 	}
@@ -142,15 +171,15 @@ func hostSetup(cmd *cobra.Command, login bool) error {
 // API clients retain the explicit up requirement and never inherit setup rights.
 // handled means a host login/context picker redispatched the whole command.
 func prepareServe(cmd *cobra.Command, opts *options) (handled bool, err error) {
+	if err := ensureDaemonForUp(cmd, opts); err != nil {
+		return false, err
+	}
 	if !guidedSetupEnabled(cmd, opts) {
 		return false, nil
 	}
 	p, err := project(cmd)
 	if err != nil {
 		return true, hostSetup(cmd, strings.TrimSpace(os.Getenv("DATUM_SESSION")) == "")
-	}
-	if err := ensureDaemonForUp(cmd, opts); err != nil {
-		return false, err
 	}
 	client, err := opts.client(cmd, true)
 	if err != nil {

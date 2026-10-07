@@ -1,4 +1,4 @@
-// Package api implements the stateless HTTP client for datum-connect-daemon.
+// Package api implements the stateless HTTP client for datum-connectd.
 package api
 
 import (
