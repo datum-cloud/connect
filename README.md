@@ -8,6 +8,9 @@ This repository builds a preview. Managed VPC attachment uses the Connect API
 and controller, which are still a staging prototype. `serve` and `dial` continue
 to use the existing service publication APIs. See the
 [controller guide](connect-controller/README.md) for the current boundary.
+The Connector schema in this branch is a clean breaking `v1alpha1` change:
+preview Connectors from an older schema must be recreated, and no deprecated
+field aliases are served.
 
 For manual installation, follow the [installation guide](docs/INSTALL.txt).
 It covers plugin trust, checksum verification, first use, and upgrades.
@@ -111,10 +114,10 @@ pins that session and calls `datumctl auth get-token` to refresh authorization.
 It stores the session reference, not your access or refresh tokens. On first
 enrollment against a supported Datum API origin and a ConnectorClass advertising
 `connector-authentication`, it uses that session only as bootstrap authorization,
-creates a separate private RSA key, proves possession
-against the Connector UID through an immutable protected enrollment resource,
-and switches to the resulting platform-owned per-Connector Milo service account
-after verifying exact-Connector access. Existing migration
+generates separate iroh transport and RSA authentication keypairs, atomically
+creates the Connector with both public keys, and switches to the resulting
+platform-owned per-Connector Milo service account after verifying
+exact-Connector access. Existing migration
 enrollments and custom API origins without a trusted token-endpoint contract
 continue using their stored authorization.
 Use `up --credentials-file /absolute/credentials.json` for service-account
@@ -191,7 +194,7 @@ services, token scopes, diagnostics, platform requirements, and test limits.
 | `connect-lib/transport` | iroh 1.0, HTTP/3 CONNECT, CONNECT-UDP, local CONNECT-IP, and peer access policy |
 | `connect-lib/network-helper` | Separate privileged service executable; no cloud credentials or Connector keys |
 | `connect-lib/ip-adapter` | Native interfaces, authenticated helper IPC, and exact host-route enforcement |
-| `connect-lib/lib/src/successor` | Host-session or in-process file credentials and protected Connector enrollment requests |
+| `connect-lib/lib/src/successor` | Host-session or in-process file credentials, atomic Connector identity creation, and transport status reporting |
 
 The Rust workspace retains historical library code and the `connect-lib/bin`
 development harness. The CLI does not invoke that harness. Product builds and

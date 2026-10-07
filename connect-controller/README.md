@@ -16,11 +16,12 @@ project controllers with `WithEngageWithLocalCluster(false)`.
 The controller provisions the first single-project CONNECT-IP gateway slice:
 
 - ConnectorClass reports whether its transport configuration is valid.
-- Connector keeps its hex `spec.publicKey` as an immutable iroh transport
-  identity, independently of its control-plane authentication keys. It resolves
-  its class from the management cluster, verifies authentication-key proof of
-  possession when configured, and reports Accepted when the class advertises
-  `masque-v1`. The controller provisions one Milo ServiceAccount derived from
+- Connector atomically supplies distinct immutable identities in
+  `spec.transport.publicKey` (iroh transport) and
+  `spec.authentication.publicKey` (RSA control-plane authentication). It
+  resolves its class from the management cluster and reports Accepted when the
+  class advertises `masque-v1`. The controller provisions one Milo
+  ServiceAccount derived from
   the immutable Connector UID in the configured platform identity project and
   registers only client-supplied public keys there. The consumer project holds
   only an exact-UID PolicyBinding and the Connector status reference. It then
@@ -64,31 +65,11 @@ future child-resource creation remains a platform admission dependency.
 
 ## Connector control-plane authentication
 
-Authentication enrollment is intentionally two-step because a proof cannot be
-bound to `metadata.uid` until the API server has created the Connector:
-
-1. An already authenticated user or bootstrap identity creates the Connector,
-   then reads its immutable `metadata.uid`.
-2. The client generates a 2048- to 4096-bit RSA key and retains the private key
-   locally.
-3. The client signs the exact UTF-8 bytes below with RSA-PSS/SHA-256 and creates
-   an immutable, same-name `ConnectorEnrollment`. Create permission for this
-   protected bootstrap resource is separate from ordinary Connector update
-   permission. `PUBLIC_KEY_SHA256` is lowercase hex SHA-256 of the PKIX DER
-   encoding of the RSA public key, even for `RSA PUBLIC KEY` PEM.
-
-```text
-datum-connect-connector-enrollment-v1
-connector-uid:CONNECTOR_UID
-transport-public-key:LOWERCASE_IROH_PUBLIC_KEY
-key-id:KEY_ID
-authentication-public-key-sha256:PUBLIC_KEY_SHA256
-```
-
-The statement ends with a newline. `proof` is the unpadded base64url signature.
-The proof is not a credential or secret; it is retained in desired state so the
-controller can re-verify the binding after restart. Its UID and key digest make
-it unusable for a different Connector or key.
+The client generates the iroh key and a distinct 2048- to 4096-bit RSA key
+before creation, stores both private keys locally, and submits both public keys
+in the single Connector create. The API makes both public keys immutable. Key
+rotation or recovery therefore replaces the Connector; there is no secondary
+enrollment object or client-selected authentication key ID.
 
 The controller waits for the platform ServiceAccount to report `Ready=True`
 with both `status.clientID` and `status.email`, then publishes them separately
@@ -99,21 +80,9 @@ JWT `kid`. The service account name is derived from the Connector UID rather
 than its reusable resource name, but its UID is never used as the OAuth client
 ID.
 
-Ordinary Connector updates cannot add or rotate authentication keys because the
-Connector spec contains no authentication-key field, and ConnectorEnrollment
-is immutable. This repository does not expose a rotation endpoint: the platform
-must provide a protected operation that verifies a signature from the current
-active key, or an audited platform recovery path, before changing keys in the
-identity project. Until that exists, recovery is delete-and-reenroll.
-
-During migration, a Connector that has never enrolled can continue using
-existing external credentials and reports `AuthenticationReady=Unknown` with
-reason `LegacyCredentials`. Once enrollment has added the identity finalizer,
-loss of ConnectorEnrollment is treated as revocation: the controller removes
-the exact-resource bindings, keys, and platform ServiceAccount immediately,
-keeps the Connector finalizer for explicit recovery, and reports
-`EnrollmentMissing`. New enrollment clients should complete the two-step flow.
-Clients begin that flow only when their ConnectorClass advertises the
+Ordinary Connector updates cannot add or rotate authentication keys because
+the authentication public key is immutable. Clients use atomic identity
+creation only when their ConnectorClass advertises the
 `connector-authentication` capability. Operators must not advertise it until
 the token endpoint and UID-scoped access policy described below are live.
 Configure `--identity-project` with a platform-controlled project distinct from
@@ -125,7 +94,7 @@ current PolicyBinding API cannot express a name-scoped create grant for future
 ConnectorAdvertisement or ConnectNetworkBinding resources, so the platform role
 and admission layer must provide ownership-aware child-resource authorization
 before advertising the capability. The deletion finalizer removes the binding,
-keys, ServiceAccount, and enrollment before deletion completes. It remains on
+keys, and ServiceAccount before deletion completes. It remains on
 the Connector until each security object has been observed `NotFound`; merely
 accepting asynchronous delete requests is not considered successful revocation.
 
@@ -160,6 +129,10 @@ The liveness/readiness endpoints use port 8081. The metrics endpoint uses port
 non-root user with a read-only root filesystem and leader election enabled.
 
 ## Migration status
+
+This is a clean, breaking `v1alpha1` schema change. Preview Connectors using the
+old flat transport fields or a separate authentication bootstrap resource must
+be deleted and recreated. There are no deprecated aliases or conversion paths.
 
 This is a new API group, not an in-place change to NSO's
 `networking.datumapis.com` resources. `datumctl connect join` now discovers a

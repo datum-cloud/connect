@@ -4,6 +4,6 @@ metadata:
   name: connect-controller-config
 data:
   INTERNAL_SERVICE_DISCOVERY: "false"
-  # Leave empty to disable new Connector identity enrollment. Set this to a
-  # dedicated platform-controlled Milo project before advertising the class capability.
+  # Set this to the dedicated platform-controlled Milo project that owns
+  # Connector service accounts and authentication keys.
   IDENTITY_PROJECT: ""

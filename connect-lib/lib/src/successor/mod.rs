@@ -5,19 +5,15 @@ mod credentials;
 mod tests;
 pub use credentials::Credentials;
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use credentials::TokenProvider;
 use reqwest::{Method, StatusCode};
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
     pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding},
-    pss::BlindedSigningKey,
     rand_core::OsRng,
-    signature::{RandomizedSigner, SignatureEncoding},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -102,63 +98,35 @@ pub struct CloudConnector {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct PendingConnectorIdentity {
-    connector_uid: String,
     transport_public_key: String,
-    key_id: String,
     public_key: String,
-    proof: String,
     private_key: String,
 }
 
-fn generate_connector_identity(
-    connector_uid: &str,
-    transport_public_key: &str,
-) -> Result<PendingConnectorIdentity> {
+fn generate_connector_identity(transport_public_key: &str) -> Result<PendingConnectorIdentity> {
     let mut rng = OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, 2048)
         .map_err(|_| Error::Invalid("could not generate Connector authentication key".into()))?;
     let public_key = RsaPublicKey::from(&private_key);
-    let public_der = public_key
-        .to_public_key_der()
-        .map_err(|_| Error::Invalid("could not encode Connector authentication key".into()))?;
     let public_pem = public_key
         .to_public_key_pem(LineEnding::LF)
         .map_err(|_| Error::Invalid("could not encode Connector authentication key".into()))?;
-    let key_id = "initial";
-    let public_digest = hex::encode(Sha256::digest(public_der.as_ref()));
-    let statement = format!(
-        "datum-connect-connector-enrollment-v1\nconnector-uid:{connector_uid}\ntransport-public-key:{}\nkey-id:{key_id}\nauthentication-public-key-sha256:{public_digest}\n",
-        transport_public_key.to_ascii_lowercase()
-    );
-    let signing_key = BlindedSigningKey::<Sha256>::new(private_key.clone());
-    let proof = URL_SAFE_NO_PAD.encode(
-        signing_key
-            .sign_with_rng(&mut rng, statement.as_bytes())
-            .to_bytes(),
-    );
     let private_key = private_key
         .to_pkcs8_pem(LineEnding::LF)
         .map_err(|_| Error::Invalid("could not encode Connector authentication key".into()))?
         .to_string();
     Ok(PendingConnectorIdentity {
-        connector_uid: connector_uid.into(),
         transport_public_key: transport_public_key.into(),
-        key_id: key_id.into(),
         public_key: public_pem,
-        proof,
         private_key,
     })
 }
 
 fn validate_pending_connector_identity(
     identity: &PendingConnectorIdentity,
-    connector_uid: &str,
     transport_public_key: &str,
 ) -> Result<()> {
-    if identity.connector_uid != connector_uid
-        || identity.transport_public_key != transport_public_key
-        || identity.key_id != "initial"
-    {
+    if identity.transport_public_key != transport_public_key {
         return Err(Error::Ownership(
             "pending authentication key is bound to a different Connector identity".into(),
         ));
@@ -208,7 +176,7 @@ impl CloudConnector {
         credentials.validate()?;
         if credentials.project_id != project {
             return Err(Error::Invalid(
-                "credential project does not match enrollment".into(),
+                "credential project does not match Connector project".into(),
             ));
         }
         let key: iroh::EndpointId = public_key
@@ -237,7 +205,7 @@ impl CloudConnector {
         .then(|| credentials.clone());
         if credentials.credential_type == "datum_service_account" {
             // A crash after replacing credentials.json but before deleting the
-            // enrollment journal leaves only a redundant copy of this key.
+            // identity-creation journal leaves only a redundant copy of this key.
             credentials.clear_pending_identity_best_effort();
         }
         Ok(Self {
@@ -306,91 +274,30 @@ impl CloudConnector {
         }
     }
 
-    async fn prepare_connector_authentication(
-        &self,
-        connector: Value,
-    ) -> Result<(Value, Option<PendingConnectorIdentity>)> {
+    async fn pending_connector_identity(&self) -> Result<Option<PendingConnectorIdentity>> {
         let Some(bootstrap) = self.bootstrap_credentials.lock().await.clone() else {
-            return Ok((connector, None));
+            return Ok(None);
         };
-        let connector_uid = string(&connector, "/metadata/uid")?;
-        let existing_enrollment = self.connect_get("connectorenrollments", &self.name).await?;
         let saved_pending = bootstrap.load_pending_identity().await?;
-        if saved_pending.is_none() && existing_enrollment.is_none() {
-            let class_name = string(&connector, "/spec/classRef")?;
-            validate_name(&class_name)?;
-            let class_url = format!(
-                "{}/apis/{CONNECT_GROUP}/connectorclasses/{class_name}",
-                self.base
-            );
-            let class = self
-                .request(Method::GET, &class_url, None)
-                .await?
-                .ok_or(Error::Api(404))?;
-            let supported = class["spec"]["capabilities"]
-                .as_array()
-                .is_some_and(|values| {
-                    values
-                        .iter()
-                        .any(|value| value == "connector-authentication")
-                });
-            if !supported {
-                tracing::debug!(connector = %self.name, "connector_authentication_capability_unavailable");
-                return Ok((connector, None));
-            }
-        }
         let pending = match saved_pending {
             Some(bytes) => serde_json::from_slice::<PendingConnectorIdentity>(&bytes)
                 .map_err(|_| Error::Invalid("pending Connector identity is invalid".into()))?,
-            None if existing_enrollment.is_some() => {
-                return Err(Error::Ownership(
-                    "Connector enrollment exists without this daemon's pending private key".into(),
-                ));
-            }
             None => {
-                let uid = connector_uid.clone();
                 let transport = self.public_key.clone();
-                let pending = tokio::task::spawn_blocking(move || {
-                    generate_connector_identity(&uid, &transport)
-                })
-                .await
-                .map_err(|_| Error::Invalid("Connector authentication key task failed".into()))??;
+                let pending =
+                    tokio::task::spawn_blocking(move || generate_connector_identity(&transport))
+                        .await
+                        .map_err(|_| {
+                            Error::Invalid("Connector authentication key task failed".into())
+                        })??;
                 bootstrap
                     .save_pending_identity(&serde_json::to_vec(&pending)?)
                     .await?;
                 pending
             }
         };
-        validate_pending_connector_identity(&pending, &connector_uid, &self.public_key)?;
-
-        if existing_enrollment.is_none() {
-            self.connect_create(
-                "connectorenrollments",
-                &json!({
-                    "apiVersion": CONNECT_GROUP,
-                    "kind": "ConnectorEnrollment",
-                    "metadata": {"name": self.name},
-                    "spec": {
-                        "connectorRef": {"name": self.name, "uid": pending.connector_uid},
-                        "key": {"id": pending.key_id, "publicKey": pending.public_key, "proof": pending.proof, "state": "Active"}
-                    }
-                }),
-            )
-            .await?;
-        } else if let Some(enrollment) = existing_enrollment.as_ref() {
-            let matching = enrollment["spec"]["connectorRef"]["name"] == self.name
-                && enrollment["spec"]["connectorRef"]["uid"] == pending.connector_uid
-                && enrollment["spec"]["key"]["id"] == pending.key_id
-                && enrollment["spec"]["key"]["publicKey"] == pending.public_key
-                && enrollment["spec"]["key"]["proof"] == pending.proof
-                && enrollment["spec"]["key"]["state"] == "Active";
-            if !matching {
-                return Err(Error::Ownership(
-                    "Connector enrollment is not bound to this daemon's pending key".into(),
-                ));
-            }
-        }
-        Ok((connector, Some(pending)))
+        validate_pending_connector_identity(&pending, &self.public_key)?;
+        Ok(Some(pending))
     }
 
     async fn activate_connector_credentials(
@@ -418,12 +325,8 @@ impl CloudConnector {
         let client_id = string(connector, "/status/authentication/principalRef/clientID")?;
         let client_email = string(connector, "/status/authentication/principalRef/clientEmail")?;
         let provider_key_id = connector
-            .pointer("/status/authentication/registeredKeys")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .find(|key| key["id"] == pending.key_id)
-            .and_then(|key| key["authProviderKeyID"].as_str())
+            .pointer("/status/authentication/authProviderKeyID")
+            .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 Error::Unsupported(
@@ -457,7 +360,9 @@ impl CloudConnector {
         let value: Value = serde_json::from_slice(&bounded_body(response).await?)?;
         if value.pointer("/metadata/uid").and_then(Value::as_str)
             != connector.pointer("/metadata/uid").and_then(Value::as_str)
-            || value.pointer("/spec/publicKey").and_then(Value::as_str)
+            || value
+                .pointer("/spec/transport/publicKey")
+                .and_then(Value::as_str)
                 != Some(self.public_key.as_str())
         {
             return Err(Error::Ownership(
@@ -495,18 +400,38 @@ impl CloudConnector {
         details: &ConnectionDetails,
         allow_create: bool,
     ) -> Result<PeerIdentity> {
+        let pending_identity = self.pending_connector_identity().await?;
         let existing = self.connect_get("connectors", &self.name).await?;
         let connector = if let Some(value) = existing {
-            if value.pointer("/spec/publicKey").and_then(Value::as_str)
+            if value
+                .pointer("/spec/transport/publicKey")
+                .and_then(Value::as_str)
                 != Some(self.public_key.as_str())
             {
                 return Err(Error::Ownership(self.name.clone()));
+            }
+            if let Some(pending) = &pending_identity
+                && value
+                    .pointer("/spec/authentication/publicKey")
+                    .and_then(Value::as_str)
+                    != Some(pending.public_key.as_str())
+            {
+                return Err(Error::Ownership(
+                    "Connector authentication key does not match the locally retained private key"
+                        .into(),
+                ));
             }
             value
         } else {
             if !allow_create {
                 return Err(Error::Api(404));
             }
+            let pending = pending_identity.as_ref().ok_or_else(|| {
+                Error::Unsupported(
+                    "creating a v1alpha1 Connector requires bootstrap credentials and a locally retained authentication key"
+                        .into(),
+                )
+            })?;
             let classes_url = format!("{}/apis/{CONNECT_GROUP}/connectorclasses", self.base);
             let classes = self
                 .request(Method::GET, &classes_url, None)
@@ -523,54 +448,41 @@ impl CloudConnector {
                             transports.iter().any(|transport| transport == "masque-v1")
                         })
                         && current_condition(class, "Ready")
+                        && class["spec"]["capabilities"]
+                            .as_array()
+                            .is_some_and(|capabilities| {
+                                capabilities
+                                    .iter()
+                                    .any(|capability| capability == "connector-authentication")
+                            })
                 })
                 .collect::<Vec<_>>();
             if ready.len() != 1 {
                 return Err(Error::Unsupported(format!(
-                    "expected one Ready Connect ConnectorClass advertising masque-v1; found {}",
+                    "expected one Ready Connect ConnectorClass advertising masque-v1 and connector-authentication; found {}",
                     ready.len()
                 )));
             }
             let class = string(ready[0], "/metadata/name")?;
-            let relays = if details.relay_url.is_empty() {
-                Vec::new()
-            } else {
-                vec![details.relay_url.clone()]
-            };
-            let mut endpoint = iroh::EndpointAddr::new(
-                self.public_key
-                    .parse()
-                    .map_err(|_| Error::Invalid("invalid Connector public key".into()))?,
-            );
-            for address in &details.addresses {
-                endpoint = endpoint.with_ip_addr(*address);
-            }
-            if !details.relay_url.is_empty() {
-                endpoint = endpoint.with_relay_url(
-                    details
-                        .relay_url
-                        .parse()
-                        .map_err(|_| Error::Invalid("invalid relay URL".into()))?,
-                );
-            }
             let desired = json!({
                 "apiVersion": CONNECT_GROUP,
                 "kind": "Connector",
                 "metadata": {"name": self.name},
-                "spec": {"classRef": class, "publicKey": self.public_key, "relayURLs": relays, "endpoint": serde_json::to_string(&endpoint)?}
+                "spec": {
+                    "classRef": class,
+                    "transport": {"publicKey": self.public_key},
+                    "authentication": {"publicKey": pending.public_key}
+                }
             });
             self.connect_create("connectors", &desired).await?
         };
-        if connector.pointer("/spec/publicKey").and_then(Value::as_str)
+        if connector
+            .pointer("/spec/transport/publicKey")
+            .and_then(Value::as_str)
             != Some(self.public_key.as_str())
         {
             return Err(Error::Ownership(self.name.clone()));
         }
-        let (connector, pending_identity) = if allow_create {
-            self.prepare_connector_authentication(connector).await?
-        } else {
-            (connector, None)
-        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         let mut connector = connector;
         loop {
@@ -580,6 +492,7 @@ impl CloudConnector {
                     self.activate_connector_credentials(&connector, pending)
                         .await?;
                 }
+                let connector = self.report_connector_transport(&connector, details).await?;
                 return self.connect_identity(&connector, details);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -601,7 +514,9 @@ impl CloudConnector {
                 .connect_get("connectors", &self.name)
                 .await?
                 .ok_or(Error::Api(404))?;
-            if connector.pointer("/spec/publicKey").and_then(Value::as_str)
+            if connector
+                .pointer("/spec/transport/publicKey")
+                .and_then(Value::as_str)
                 != Some(self.public_key.as_str())
             {
                 return Err(Error::Ownership(self.name.clone()));
@@ -614,7 +529,7 @@ impl CloudConnector {
         connector: &Value,
         details: &ConnectionDetails,
     ) -> Result<PeerIdentity> {
-        let public_key = string(connector, "/spec/publicKey")?;
+        let public_key = string(connector, "/spec/transport/publicKey")?;
         if public_key != self.public_key {
             return Err(Error::Ownership(self.name.clone()));
         }
@@ -630,12 +545,12 @@ impl CloudConnector {
     fn connect_peer_identity(&self, connector: &Value) -> Result<PeerIdentity> {
         let name = string(connector, "/metadata/name")?;
         let uid = string(connector, "/metadata/uid")?;
-        let public_key = string(connector, "/spec/publicKey")?;
+        let public_key = string(connector, "/spec/transport/publicKey")?;
         let id: iroh::EndpointId = public_key.parse().map_err(|_| {
             Error::Invalid("control plane returned an invalid Connector key".into())
         })?;
         let address = connector
-            .pointer("/spec/endpoint")
+            .pointer("/status/transport/endpoint")
             .and_then(Value::as_str)
             .and_then(|value| serde_json::from_str::<iroh::EndpointAddr>(value).ok());
         let address = address.filter(|address| address.id == id);
@@ -645,7 +560,7 @@ impl CloudConnector {
             .map(ToString::to_string)
             .or_else(|| {
                 connector
-                    .pointer("/spec/relayURLs/0")
+                    .pointer("/status/transport/relayURLs/0")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })
@@ -661,6 +576,66 @@ impl CloudConnector {
             relay_url,
             addresses,
         })
+    }
+
+    async fn report_connector_transport(
+        &self,
+        connector: &Value,
+        details: &ConnectionDetails,
+    ) -> Result<Value> {
+        let expected_uid = string(connector, "/metadata/uid")?;
+        let mut endpoint = iroh::EndpointAddr::new(
+            self.public_key
+                .parse()
+                .map_err(|_| Error::Invalid("invalid Connector transport public key".into()))?,
+        );
+        for address in &details.addresses {
+            endpoint = endpoint.with_ip_addr(*address);
+        }
+        if !details.relay_url.is_empty() {
+            endpoint = endpoint.with_relay_url(
+                details
+                    .relay_url
+                    .parse()
+                    .map_err(|_| Error::Invalid("invalid relay URL".into()))?,
+            );
+        }
+        let relay_urls = if details.relay_url.is_empty() {
+            Vec::new()
+        } else {
+            vec![details.relay_url.clone()]
+        };
+        let status_url = format!("{}/status", self.connect_resource("connectors", &self.name));
+        for attempt in 0..4 {
+            let mut latest = self
+                .connect_get("connectors", &self.name)
+                .await?
+                .ok_or(Error::Api(404))?;
+            if latest.pointer("/metadata/uid").and_then(Value::as_str)
+                != Some(expected_uid.as_str())
+                || latest
+                    .pointer("/spec/transport/publicKey")
+                    .and_then(Value::as_str)
+                    != Some(self.public_key.as_str())
+            {
+                return Err(Error::Ownership(
+                    "Connector was replaced while reporting transport status".into(),
+                ));
+            }
+            latest["status"]["transport"] = json!({
+                "endpoint": serde_json::to_string(&endpoint)?,
+                "relayURLs": relay_urls,
+            });
+            match self.request(Method::PUT, &status_url, Some(&latest)).await {
+                Ok(Some(updated)) => return Ok(updated),
+                Ok(None) => return Err(Error::Api(500)),
+                Err(Error::Api(409)) if attempt < 3 => {
+                    tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("last transport status update attempt returns")
     }
 
     async fn renew_connect_connector_lease(&self, connector: &Value) -> Result<()> {
@@ -706,7 +681,9 @@ impl CloudConnector {
             .connect_get("connectors", &self.name)
             .await?
             .ok_or(Error::Api(404))?;
-        if connector.pointer("/spec/publicKey").and_then(Value::as_str)
+        if connector
+            .pointer("/spec/transport/publicKey")
+            .and_then(Value::as_str)
             != Some(self.public_key.as_str())
         {
             return Err(Error::Ownership(self.name.clone()));
@@ -1118,7 +1095,10 @@ impl CloudConnector {
             .connect_get("connectors", &self.name)
             .await?
             .ok_or(Error::Api(404))?;
-        if connector.pointer("/spec/publicKey").and_then(Value::as_str) != Some(&self.public_key)
+        if connector
+            .pointer("/spec/transport/publicKey")
+            .and_then(Value::as_str)
+            != Some(&self.public_key)
             || !connector["metadata"]["deletionTimestamp"].is_null()
         {
             return Err(Error::Ownership(self.name.clone()));
@@ -1194,7 +1174,9 @@ impl CloudConnector {
             .ok_or(Error::Api(500))?;
         self.renew_connect_connector_lease(&updated).await?;
         if let Some(connector) = self.connect_get("connectors", &self.name).await?
-            && connector.pointer("/spec/publicKey").and_then(Value::as_str)
+            && connector
+                .pointer("/spec/transport/publicKey")
+                .and_then(Value::as_str)
                 != Some(self.public_key.as_str())
         {
             return Err(Error::Ownership(self.name.clone()));
@@ -1235,7 +1217,9 @@ impl CloudConnector {
             .into_iter()
             .flatten()
             .filter(|value| {
-                value.pointer("/spec/publicKey").and_then(Value::as_str)
+                value
+                    .pointer("/spec/transport/publicKey")
+                    .and_then(Value::as_str)
                     == Some(public_key.as_str())
             })
             .collect();
@@ -1291,8 +1275,7 @@ impl CloudConnector {
             {
                 continue;
             }
-            // Pending enrollment has no usable identity yet.
-            if item.pointer("/spec/publicKey").is_none() {
+            if item.pointer("/spec/transport/publicKey").is_none() {
                 continue;
             }
             let identity = self.connect_peer_identity(item)?;

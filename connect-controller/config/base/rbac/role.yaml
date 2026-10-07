@@ -49,15 +49,6 @@ rules:
 - apiGroups:
   - connect.datumapis.com
   resources:
-  - connectorenrollments
-  verbs:
-  - delete
-  - get
-  - list
-  - watch
-- apiGroups:
-  - connect.datumapis.com
-  resources:
   - connectors
   verbs:
   - get

@@ -2,7 +2,6 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
 - bases/connect.datumapis.com_connectors.yaml
-- bases/connect.datumapis.com_connectorenrollments.yaml
 - bases/connect.datumapis.com_connectorclasses.yaml
 - bases/connect.datumapis.com_connectoradvertisements.yaml
 - bases/connect.datumapis.com_connectgateways.yaml

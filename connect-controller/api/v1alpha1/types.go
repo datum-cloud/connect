@@ -40,9 +40,9 @@ type ConnectorClassList struct {
 	Items           []ConnectorClass `json:"items"`
 }
 
-// Connector represents one Connect installation in one project. PublicKey is
-// the stable iroh transport identity. Authentication keys are independent
-// control-plane identities; private material must never be stored in the API.
+// Connector represents one Connect installation in one project. Its transport
+// and control-plane authentication public keys are distinct immutable
+// identities. Private material must never be stored in the API.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:metadata:annotations="discovery.miloapis.com/parent-contexts=Project"
@@ -58,74 +58,25 @@ type Connector struct {
 type ConnectorSpec struct {
 	// ClassRef names a cluster-scoped ConnectorClass in the management cluster.
 	// +kubebuilder:validation:Required
-	ClassRef string `json:"classRef"`
+	ClassRef       string                      `json:"classRef"`
+	Transport      ConnectorTransportSpec      `json:"transport"`
+	Authentication ConnectorAuthenticationSpec `json:"authentication"`
+}
+
+type ConnectorTransportSpec struct {
 	// PublicKey is the lowercase or uppercase hex-encoded 32-byte iroh public key.
 	// +kubebuilder:validation:Pattern=`^[a-fA-F0-9]{64}$`
 	// +kubebuilder:validation:XValidation:rule="oldSelf == null || self == oldSelf",message="publicKey is the immutable iroh transport identity; replace the Connector to rotate it"
 	PublicKey string `json:"publicKey"`
-	// Endpoint is the optional serialized iroh endpoint address for dialing.
-	Endpoint string `json:"endpoint,omitempty"`
-	// RelayURLs are optional relay URLs published by the Connector.
-	RelayURLs []string `json:"relayURLs,omitempty"`
 }
 
-type ConnectorAuthenticationKey struct {
-	// ID is a client-selected, DNS-label identifier for this key.
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
-	// +kubebuilder:validation:MaxLength=63
-	ID string `json:"id"`
-	// PublicKey is a PEM encoded RSA public key. The matching private key remains
-	// on the Connector and signs both enrollment proofs and OAuth JWT assertions.
+type ConnectorAuthenticationSpec struct {
+	// PublicKey is a PEM-encoded RSA public key. The matching private key remains
+	// on the Connector and signs OAuth JWT assertions.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=8192
-	// +kubebuilder:validation:XValidation:rule="oldSelf == null || self == oldSelf",message="publicKey is immutable in an enrollment"
+	// +kubebuilder:validation:XValidation:rule="oldSelf == null || self == oldSelf",message="publicKey is the immutable control-plane authentication identity; replace the Connector to rotate it"
 	PublicKey string `json:"publicKey"`
-	// Proof is an unpadded base64url RSA-PSS/SHA-256 signature over the canonical
-	// enrollment statement documented by the Connect API.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=2048
-	// +kubebuilder:validation:XValidation:rule="oldSelf == null || self == oldSelf",message="proof is immutable for an enrolled key"
-	Proof string `json:"proof"`
-	// State must be Active for the initial enrollment key. Revocation and
-	// rotation occur through a protected platform operation, not Connector edits.
-	// +kubebuilder:validation:Enum=Active
-	State string `json:"state"`
-}
-
-// ConnectorEnrollment is the protected bootstrap interface for a Connector's
-// platform-owned identity. Grant create permission independently from ordinary
-// Connector update permission. Its spec is immutable after creation.
-// +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
-// +kubebuilder:metadata:annotations="discovery.miloapis.com/parent-contexts=Project"
-// +kubebuilder:validation:XValidation:rule="oldSelf == null || self.spec == oldSelf.spec",message="enrollment spec is immutable; use the protected platform rotation or recovery API"
-type ConnectorEnrollment struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              ConnectorEnrollmentSpec   `json:"spec"`
-	Status            ConnectorEnrollmentStatus `json:"status,omitempty"`
-}
-
-type ConnectorEnrollmentSpec struct {
-	ConnectorRef ConnectorEnrollmentReference `json:"connectorRef"`
-	Key          ConnectorAuthenticationKey   `json:"key"`
-}
-
-type ConnectorEnrollmentReference struct {
-	Name string `json:"name"`
-	UID  string `json:"uid"`
-}
-
-type ConnectorEnrollmentStatus struct {
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
-}
-
-// +kubebuilder:object:root=true
-type ConnectorEnrollmentList struct {
-	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []ConnectorEnrollment `json:"items"`
 }
 
 type ConnectorStatus struct {
@@ -136,12 +87,28 @@ type ConnectorStatus struct {
 	// Authentication identifies the platform principal bound to this immutable
 	// Connector UID and the provider key IDs available for JWT assertions.
 	Authentication *ConnectorAuthenticationStatus `json:"authentication,omitempty"`
+	// Transport is Connector-reported observed reachability. The controller
+	// preserves it and does not interpret these URLs as user-selected policy.
+	Transport *ConnectorTransportStatus `json:"transport,omitempty"`
+}
+
+type ConnectorTransportStatus struct {
+	// Endpoint is the Connector's serialized iroh EndpointAddr observation.
+	// It is written by the Connector agent, not by users or the controller.
+	// +kubebuilder:validation:MaxLength=16384
+	Endpoint string `json:"endpoint,omitempty"`
+	// RelayURLs are the relay addresses actually used by the Connector. They are
+	// observed status, not a user-selectable relay policy.
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=2048
+	RelayURLs []string `json:"relayURLs,omitempty"`
 }
 
 type ConnectorAuthenticationStatus struct {
-	ConnectorUID   string                      `json:"connectorUID"`
-	PrincipalRef   ConnectorPrincipalReference `json:"principalRef"`
-	RegisteredKeys []ConnectorRegisteredKey    `json:"registeredKeys,omitempty"`
+	ConnectorUID         string                      `json:"connectorUID"`
+	PrincipalRef         ConnectorPrincipalReference `json:"principalRef"`
+	ServiceAccountKeyRef string                      `json:"serviceAccountKeyRef,omitempty"`
+	AuthProviderKeyID    string                      `json:"authProviderKeyID,omitempty"`
 }
 
 type ConnectorPrincipalReference struct {
@@ -150,12 +117,6 @@ type ConnectorPrincipalReference struct {
 	UID         string `json:"uid,omitempty"`
 	ClientID    string `json:"clientID,omitempty"`
 	ClientEmail string `json:"clientEmail,omitempty"`
-}
-
-type ConnectorRegisteredKey struct {
-	ID                   string `json:"id"`
-	ServiceAccountKeyRef string `json:"serviceAccountKeyRef"`
-	AuthProviderKeyID    string `json:"authProviderKeyID,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -291,5 +252,5 @@ type ConnectNetworkBindingList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &Connector{}, &ConnectorList{}, &ConnectorEnrollment{}, &ConnectorEnrollmentList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{}, &ConnectNetworkBinding{}, &ConnectNetworkBindingList{})
+	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &Connector{}, &ConnectorList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{}, &ConnectNetworkBinding{}, &ConnectNetworkBindingList{})
 }

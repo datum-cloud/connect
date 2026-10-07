@@ -200,15 +200,20 @@ Use a user service for interactive login. Root/system daemons reject host-sessio
 enrollment; supply service-account credentials for those deployments.
 For a new Connector on a supported Datum origin whose ConnectorClass advertises
 `connector-authentication`, the session is bootstrap-only.
-The daemon creates the Connector, reads its immutable UID, generates and
-privately persists a separate RSA key, creates the protected immutable
-ConnectorEnrollment with its signed proof, and waits for the controller's
-external service-account client ID and provider key ID. It
+The daemon generates and privately persists both the iroh transport key and a
+separate RSA authentication key before atomically creating the Connector with
+both public keys. It then waits for the controller's external service-account
+client ID, email, and provider key ID. It
 then exchanges a short-lived JWT assertion and verifies that the issued token
 can read that exact Connector before atomically replacing the stored session
-descriptor with the private-key credential. A crash during enrollment reuses
+descriptor with the private-key credential. A crash during creation reuses
 the private pending key rather than orphaning or silently replacing it. Neither
 the API resource nor logs contain the private key.
+
+This is a clean `v1alpha1` break. Preview Connectors created with the previous
+flat transport fields or multi-step authentication shape must be deleted and
+recreated; the API intentionally exposes no deprecated aliases or automatic
+conversion.
 
 If token issuance or UID-scoped authorization is unavailable, `up` fails while
 preserving the bootstrap session and pending key for a safe retry. It does not
@@ -310,10 +315,10 @@ project-wide transport diagnostics.
 
 | Area | Current behavior | Required follow-up |
 | --- | --- | --- |
-| Enrollment | Requires exactly one ConnectorClass supporting `masque-v1`; per-Connector credential migration additionally requires its explicit `connector-authentication` capability and permission to create immutable ConnectorEnrollment resources | Advertise the authentication capability only after the platform identity project, protected bootstrap permission, UID-scoped IAM policy, and token endpoint are deployed |
+| Enrollment | Requires exactly one ConnectorClass supporting `masque-v1`; per-Connector credential migration additionally requires its explicit `connector-authentication` capability and permission to atomically create a Connector containing immutable transport and RSA authentication public keys | Advertise the authentication capability only after the platform identity project, bootstrap create permission, UID-scoped IAM policy, and token endpoint are deployed |
 | Public ingress | Requires approved gateway Connector identities in the class's `connect.datum.net/gateway-connectors` JSON-array annotation | Implement and deploy the gateway; certify HTTPProxy readiness |
-| Credentials | New supported-origin host-session enrollments generate a private RSA key, prove it against the Connector UID, register it in a configured platform identity project, wait for the ready ServiceAccount's provider `clientID` and email plus the key's provider ID, verify exact-Connector access, and switch to short-lived JWT assertions; existing/custom/imported paths remain compatible | Deploy Milo's ServiceAccount `status.clientID` contract and the Zitadel provider that populates it, plus the external identity project, exact-resource role/policy, ownership-aware child-resource admission, and token endpoint; never substitute email, Kubernetes UID, or project-wide admin |
-| Identity rotation | Connector updates cannot mutate keys and ConnectorEnrollment is immutable; loss of an established enrollment immediately deactivates and deletes its platform identity and UID-scoped grants, while deletion finalization waits until those security objects are observed absent | Add a protected rotation endpoint that requires the current active-key signature or an audited platform recovery path; Milo lacks a safe future-child selector for local implementation |
+| Credentials | New supported-origin host-session enrollments generate both keypairs before create, register the RSA public key in a configured platform identity project, wait for the ready ServiceAccount's provider `clientID` and email plus the key's provider ID, verify exact-Connector access, and switch to short-lived JWT assertions; existing/custom/imported paths remain compatible | Deploy Milo's ServiceAccount `status.clientID` contract and the Zitadel provider that populates it, plus the external identity project, exact-resource role/policy, ownership-aware child-resource admission, and token endpoint; never substitute email, Kubernetes UID, or project-wide admin |
+| Identity rotation | Both Connector public keys are immutable; deleting the Connector deactivates and deletes its platform identity and UID-scoped grants, and deletion finalization waits until those security objects are observed absent | Recreate preview Connectors to rotate either identity; a future protected rotation API would require an explicit new versioned contract |
 | VPC | Managed joins use `ConnectGateway` and `ConnectNetworkBinding`; the local adapter installs approved routes for the assigned address | Validate routing and packet forwarding on each supported host; the gateway and VPC firewall must allow the traffic |
 | Desktop | Existing app remains unchanged | Convert it into a daemon client in `datum-cloud/app` |
 | Packaging | Includes the daemon and architecture-matched pinned Wintun DLLs for Windows | Validate native services, Windows ACLs, signing, upgrades, and rollback on each OS |
