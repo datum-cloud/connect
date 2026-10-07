@@ -94,6 +94,7 @@ pub struct CloudConnector {
     public_key: String,
     lease_lock: Arc<tokio::sync::Mutex<()>>,
     bootstrap_credentials: Arc<tokio::sync::Mutex<Option<Credentials>>>,
+    identity_credentials: Credentials,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -209,13 +210,14 @@ impl CloudConnector {
             credentials.clear_pending_identity_best_effort();
         }
         Ok(Self {
-            tokens: TokenProvider::new(credentials, client.clone()),
+            tokens: TokenProvider::new(credentials.clone(), client.clone()),
             client,
             base: base.to_string(),
             name,
             public_key,
             lease_lock: Arc::new(tokio::sync::Mutex::new(())),
             bootstrap_credentials: Arc::new(tokio::sync::Mutex::new(bootstrap_credentials)),
+            identity_credentials: credentials,
         })
     }
 
@@ -274,14 +276,15 @@ impl CloudConnector {
         }
     }
 
-    async fn pending_connector_identity(&self) -> Result<Option<PendingConnectorIdentity>> {
-        let Some(bootstrap) = self.bootstrap_credentials.lock().await.clone() else {
-            return Ok(None);
-        };
-        let saved_pending = bootstrap.load_pending_identity().await?;
+    async fn pending_connector_identity(
+        &self,
+        generate_when_missing: bool,
+    ) -> Result<Option<PendingConnectorIdentity>> {
+        let saved_pending = self.identity_credentials.load_pending_identity().await?;
         let pending = match saved_pending {
             Some(bytes) => serde_json::from_slice::<PendingConnectorIdentity>(&bytes)
                 .map_err(|_| Error::Invalid("pending Connector identity is invalid".into()))?,
+            None if !generate_when_missing => return Ok(None),
             None => {
                 let transport = self.public_key.clone();
                 let pending =
@@ -290,7 +293,7 @@ impl CloudConnector {
                         .map_err(|_| {
                             Error::Invalid("Connector authentication key task failed".into())
                         })??;
-                bootstrap
+                self.identity_credentials
                     .save_pending_identity(&serde_json::to_vec(&pending)?)
                     .await?;
                 pending
@@ -400,8 +403,16 @@ impl CloudConnector {
         details: &ConnectionDetails,
         allow_create: bool,
     ) -> Result<PeerIdentity> {
-        let pending_identity = self.pending_connector_identity().await?;
         let existing = self.connect_get("connectors", &self.name).await?;
+        // Existing migration credentials remain valid without silently
+        // replacing their Connector key. A new Connector always gets a locally
+        // retained RSA identity, regardless of which credential authorized the
+        // create. Host-session bootstrap additionally generates/reloads the key
+        // before ownership checks so an interrupted atomic create is resumable.
+        let bootstrap_active = self.bootstrap_credentials.lock().await.is_some();
+        let pending_identity = self
+            .pending_connector_identity(existing.is_none() || bootstrap_active)
+            .await?;
         let connector = if let Some(value) = existing {
             if value
                 .pointer("/spec/transport/publicKey")
@@ -488,7 +499,7 @@ impl CloudConnector {
         loop {
             self.renew_connect_connector_lease(&connector).await?;
             if current_condition(&connector, "Ready") {
-                if let Some(pending) = &pending_identity {
+                if bootstrap_active && let Some(pending) = &pending_identity {
                     self.activate_connector_credentials(&connector, pending)
                         .await?;
                 }

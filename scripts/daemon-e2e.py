@@ -53,7 +53,7 @@ class Platform(http.server.BaseHTTPRequestHandler):
         if 'connectorclasses' in parts:
             item = {
                 'metadata': {'name': 'local-masque', 'generation': 1, 'annotations': {'connect.datum.net/transport': 'masque-v1'}},
-                'spec': {'transports': ['masque-v1']},
+                'spec': {'transports': ['masque-v1'], 'capabilities': ['connector-authentication']},
                 'status': {'conditions': [{'type': 'Ready', 'status': 'True', 'observedGeneration': 1}]},
             }
             if self.gateway_connectors:
@@ -94,7 +94,11 @@ class Platform(http.server.BaseHTTPRequestHandler):
                 if key not in self.objects:
                     return self.reply(404, {})
                 if plural == 'connectors':
-                    relay = value.get('status', {}).get('connectionDetails', {}).get('publicKey', {}).get('homeRelay', '')
+                    if group == 'connect.datumapis.com':
+                        relays = value.get('status', {}).get('transport', {}).get('relayURLs', [])
+                        relay = relays[0] if relays else ''
+                    else:
+                        relay = value.get('status', {}).get('connectionDetails', {}).get('publicKey', {}).get('homeRelay', '')
                     if not urllib.parse.urlparse(relay).hostname:
                         return self.reply(422, {'reason': 'Invalid', 'details': {'causes': [{'field': 'status.connectionDetails.publicKey.homeRelay'}]}})
                     # Model a controller's concurrent first status update. A retry

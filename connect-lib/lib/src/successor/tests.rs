@@ -778,6 +778,53 @@ async fn legacy_platform_fails_closed_before_connector_creation() {
 }
 
 #[tokio::test]
+async fn renewable_migration_credentials_create_atomic_connector_identity() {
+    let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let class = json!({
+        "metadata":{"name":"masque-class","generation":1},
+        "spec":{"transports":["masque-v1"],"capabilities":["connector-authentication"]},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let ready = json!({
+        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"service-uid","resourceVersion":"2","generation":1},
+        "spec":{"classRef":"masque-class","transport":{"publicKey":peer},"authentication":{"publicKey":"retained-locally"}},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(404, json!({})),
+        Reply::Json(200, json!({"items":[class]})),
+        Reply::EchoCreated,
+        Reply::Json(200, ready.clone()),
+        Reply::Json(200, ready),
+        Reply::EchoCreated,
+    ])
+    .await;
+
+    client(&base)
+        .ensure_connect_connector(&ConnectionDetails {
+            relay_url: "https://relay.example/".into(),
+            addresses: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    let created = &requests[3].1;
+    assert!(
+        created["spec"]["authentication"]["publicKey"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN PUBLIC KEY")
+    );
+    assert!(!created.to_string().contains("PRIVATE KEY"));
+    assert!(requests[6].0.starts_with("PUT "));
+    assert_eq!(
+        requests[6].1["status"]["transport"]["relayURLs"],
+        json!(["https://relay.example/"])
+    );
+}
+
+#[tokio::test]
 async fn private_service_creates_owned_advertisement_and_never_public_ingress() {
     let (base, task) = server(vec![
         token(),
