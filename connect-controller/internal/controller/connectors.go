@@ -49,7 +49,7 @@ type ConnectReconciler struct {
 // +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectgatewayclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectnetworkbindings/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloads,verbs=get;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=configmaps;secrets,verbs=get;create;update;patch
+// +kubebuilder:rbac:groups=core,resources=configmaps;secrets,verbs=get;list;watch;create;update;patch
 
 func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	local := mgr.GetLocalManager()
