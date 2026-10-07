@@ -15,11 +15,21 @@ default = []
 integration-tests = []
 
 [dependencies]
+chrono = { workspace = true }
+hex = { workspace = true }
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 rand = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
+
+iroh = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
