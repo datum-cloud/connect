@@ -1,0 +1,36 @@
+[package]
+name = "connect-transport"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+connect-ip = []
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+]
+
+[dependencies]
+arc-swap = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+h3 = { workspace = true }
+h3-datagram = { workspace = true }
+http = { workspace = true }
+iroh = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }
