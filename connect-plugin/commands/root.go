@@ -24,15 +24,17 @@ import (
 )
 
 type options struct {
-	baseURL   string
-	tokenFile string
-	timeout   time.Duration
-	verbose   bool
+	baseURL     string
+	tokenFile   string
+	timeout     time.Duration
+	verbose     bool
+	serviceGate func(*cobra.Command, string) error
 }
 
 // Add installs the daemon-backed commands on the plugin root.
 func Add(root *cobra.Command) {
 	opts := &options{}
+	opts.serviceGate = runConnectServiceGate
 	previousPreRun := root.PersistentPreRunE
 	previousPreRunPlain := root.PersistentPreRun
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
@@ -41,10 +43,16 @@ func Add(root *cobra.Command) {
 			return fmt.Errorf("unsupported output format %q (use table, json, or yaml)", format)
 		}
 		if previousPreRun != nil {
-			return previousPreRun(cmd, args)
+			if err := previousPreRun(cmd, args); err != nil {
+				return err
+			}
 		}
 		if previousPreRunPlain != nil {
 			previousPreRunPlain(cmd, args)
+		}
+		if connectServiceGateRequired(cmd) {
+			projectID, _ := cmd.Flags().GetString("project")
+			return opts.serviceGate(cmd, strings.TrimSpace(projectID))
 		}
 		return nil
 	}
