@@ -202,6 +202,7 @@ type ConnectGatewaySpec struct {
 	GatewayClassRef string `json:"gatewayClassRef"`
 	// +kubebuilder:validation:Required
 	NetworkRef string `json:"networkRef"`
+	// LocationRef is the fully qualified Compute Location name (for example, us-central-1).
 	// +kubebuilder:validation:Required
 	LocationRef string `json:"locationRef,omitempty"`
 	// +kubebuilder:validation:Required

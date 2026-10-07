@@ -168,7 +168,7 @@ metadata:
 spec:
   gatewayClassRef: standard
   networkRef: staging-vpc
-  locationRef: DFW
+  locationRef: us-central-1
   routes: [fd20:0:27::/48]
   peerRouting: true
   relayURLs: [https://<staging-relay-host>]

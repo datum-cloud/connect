@@ -727,18 +727,24 @@ impl CloudConnector {
         let body = String::from_utf8(body).map_err(|_| {
             Error::Unsupported("edge.datum.net returned an invalid location response".into())
         })?;
-        let colo = body
+        let location = body
             .lines()
-            .find_map(|line| line.trim().strip_prefix("colo="))
+            .find_map(|line| line.trim().strip_prefix("region="))
             .map(str::trim)
-            .filter(|colo| colo.len() == 3 && colo.bytes().all(|byte| byte.is_ascii_uppercase()))
-            .ok_or_else(|| Error::Unsupported("edge.datum.net did not return a valid three-letter colo; retry later or ask your administrator to check the edge location mapping".into()))?;
+            .filter(|location| {
+                !location.is_empty()
+                    && location.len() <= 63
+                    && location.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                    && !location.starts_with('-')
+                    && !location.ends_with('-')
+            })
+            .ok_or_else(|| Error::Unsupported("edge.datum.net did not return a valid location name; retry later or ask your administrator to check the edge location mapping".into()))?;
         tracing::info!(
-            colo,
+            location,
             stage = "edge_location_resolved",
             "resolved nearest Connect location"
         );
-        Ok(colo.to_owned())
+        Ok(location.to_owned())
     }
 
     async fn create_network_gateway(

@@ -88,7 +88,7 @@ fn set_edge_url(cloud: &mut CloudConnector, base: &str) {
 }
 
 fn edge_location() -> Reply {
-    Reply::Text(200, "colo=IAD\nloc=US\n".into())
+    Reply::Text(200, "colo=DAL\nloc=US\nregion=us-central-1\n".into())
 }
 
 fn connect_connector() -> Value {
@@ -133,7 +133,7 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
     });
     let gateway = json!({
         "metadata":{"name":"vpc-gateway","generation":2},
-        "spec":{"networkRef":"staging-vpc","locationRef":"IAD"},
+        "spec":{"networkRef":"staging-vpc","locationRef":"us-central-1"},
         "status":{"endpointID":iroh::SecretKey::from_bytes(&[9; 32]).public().to_string(),"conditions":[{"type":"Ready","status":"True","observedGeneration":2}]}
     });
     let binding_name = network_binding_name("staging-vpc", &format!("connect-{}", &peer[..40]));
@@ -200,7 +200,7 @@ async fn joining_network_creates_a_gateway_in_the_edge_selected_location() {
         },
         "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
     });
-    let gateway_name = network_gateway_name("staging-vpc", "IAD");
+    let gateway_name = network_gateway_name("staging-vpc", "us-central-1");
     let binding_name = network_binding_name("staging-vpc", &format!("connect-{}", &peer[..40]));
     let binding = json!({
         "metadata":{"name":binding_name,"uid":"binding-uid","resourceVersion":"1","generation":1},
@@ -231,7 +231,7 @@ async fn joining_network_creates_a_gateway_in_the_edge_selected_location() {
         .unwrap();
     assert_eq!(result["network"], "staging-vpc");
     assert_eq!(result["gateway"], gateway_name);
-    assert_eq!(result["gateway_location"], "IAD");
+    assert_eq!(result["gateway_location"], "us-central-1");
     assert_eq!(
         result["gatewayEndpointID"],
         iroh::SecretKey::from_bytes(&[9; 32]).public().to_string()
@@ -244,7 +244,7 @@ async fn joining_network_creates_a_gateway_in_the_edge_selected_location() {
     assert_eq!(create_gateway.1["metadata"]["name"], gateway_name);
     assert_eq!(create_gateway.1["spec"]["gatewayClassRef"], "standard");
     assert_eq!(create_gateway.1["spec"]["networkRef"], "staging-vpc");
-    assert_eq!(create_gateway.1["spec"]["locationRef"], "IAD");
+    assert_eq!(create_gateway.1["spec"]["locationRef"], "us-central-1");
     assert_eq!(
         create_gateway.1["spec"]["routes"],
         json!(["fd20:0:27::/48"])
@@ -381,7 +381,7 @@ async fn joining_managed_network_binds_while_gateway_is_provisioning() {
     let endpoint_id = iroh::SecretKey::from_bytes(&[9; 32]).public().to_string();
     let gateway = json!({
         "metadata":{"name":"vpc-gateway","generation":2},
-        "spec":{"networkRef":"staging-vpc","locationRef":"IAD"},
+        "spec":{"networkRef":"staging-vpc","locationRef":"us-central-1"},
         "status":{"endpointID":endpoint_id,"conditions":[{"type":"Ready","status":"True","observedGeneration":2}]}
     });
     let mut provisioning = gateway.clone();

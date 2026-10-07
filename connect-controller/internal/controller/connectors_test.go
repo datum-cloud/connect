@@ -244,7 +244,7 @@ func TestOnDemandGatewayScalesBetweenZeroAndOne(t *testing.T) {
 	}
 	gateway := &connectv1alpha1.ConnectGateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid"), Generation: 1},
-		Spec:       connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20::/48"}},
+		Spec:       connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "us-central-1", Routes: []string{"fd20::/48"}},
 	}
 	// The binding is intentionally not Ready. Workload activity derives from
 	// binding intent plus Connector conditions, never binding readiness.
@@ -314,7 +314,7 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	ctx := context.Background()
 	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
 	secondConnector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "phone", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("b", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
-	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}, PeerRouting: true}}
+	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "us-central-1", Routes: []string{"fd20:0:27::/48"}, PeerRouting: true}}
 	c := testClient(t, connector, secondConnector, gateway).Build()
 	reconcileTestGateway(t, ctx, c, gateway)
 	if gateway.Status.EndpointID == "" || gateway.Status.WorkloadRef == "" {
@@ -341,9 +341,9 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if !ok {
 		t.Fatalf("placement=%T, want map", placements[0])
 	}
-	selector, ok := placement["locationSelector"].(map[string]interface{})
-	if !ok || selector["matchLabels"].(map[string]interface{})["topology.datum.net/city-code"] != "DFW" {
-		t.Fatalf("locationSelector=%v, want DFW city-code selector", placement["locationSelector"])
+	locations, ok := placement["locations"].([]interface{})
+	if !ok || len(locations) != 1 || locations[0].(map[string]interface{})["name"] != "us-central-1" {
+		t.Fatalf("locations=%v, want us-central-1 location reference", placement["locations"])
 	}
 	scaleSettings, ok := placement["scaleSettings"].(map[string]interface{})
 	if !ok || scaleSettings["instanceManagementPolicy"] != "OrderedReady" {
@@ -544,7 +544,7 @@ func TestGatewayGrantPersistsWhenConnectorIsTemporarilyOffline(t *testing.T) {
 	}
 	gateway := &connectv1alpha1.ConnectGateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")},
-		Spec:       connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}},
+		Spec:       connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "us-central-1", Routes: []string{"fd20:0:27::/48"}},
 	}
 	binding := &connectv1alpha1.ConnectNetworkBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: "laptop-vpc", Namespace: "project"},
@@ -585,7 +585,7 @@ func TestPeerRoutingIsDisabledByDefault(t *testing.T) {
 	ctx := context.Background()
 	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
 	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
-	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20::/48"}}}
+	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "us-central-1", Routes: []string{"fd20::/48"}}}
 	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
 	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
 	c := testClient(t, first, second, gateway, firstBinding, secondBinding).Build()
@@ -621,7 +621,7 @@ func TestGatewayReportsPeerRouteCapacityExceeded(t *testing.T) {
 	}
 	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
 	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
-	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "DFW", Routes: routes, PeerRouting: true}}
+	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "us-central-1", Routes: routes, PeerRouting: true}}
 	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
 	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
 	c := testClient(t, first, second, gateway, firstBinding, secondBinding).Build()
@@ -671,7 +671,7 @@ func TestSortGatewayBindingsMakesGrantOrderDeterministic(t *testing.T) {
 }
 
 func TestGatewayRejectsDefaultRoute(t *testing.T) {
-	spec := connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "vpc", LocationRef: "DFW", Routes: []string{"::/0"}}
+	spec := connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "vpc", LocationRef: "us-central-1", Routes: []string{"::/0"}}
 	if err := validateGatewaySpec(spec); err == nil {
 		t.Fatal("expected default route to be rejected for relay-only gateway")
 	}
