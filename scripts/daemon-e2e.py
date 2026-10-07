@@ -106,7 +106,11 @@ class Platform(http.server.BaseHTTPRequestHandler):
                     if key not in self.conflicted_connectors:
                         self.conflicted_connectors.add(key)
                         self.objects[key]['metadata']['resourceVersion'] = '2'
-                        self.objects[key].setdefault('status', {})['conditions'] = [{'type': 'Accepted', 'status': 'True'}]
+                        # Preserve the Connect controller's Ready condition while
+                        # simulating its concurrent status update. The legacy NSO
+                        # renewal fixture intentionally publishes Accepted only.
+                        if group != 'connect.datumapis.com':
+                            self.objects[key].setdefault('status', {})['conditions'] = [{'type': 'Accepted', 'status': 'True'}]
                         return self.reply(409, {'reason': 'Conflict'})
                     if value['metadata'].get('resourceVersion') != self.objects[key]['metadata']['resourceVersion']:
                         return self.reply(409, {'reason': 'Conflict'})
