@@ -98,7 +98,6 @@ pub trait Control: Send + Sync + 'static {
     async fn networks(&self, _project: &str) -> serde_json::Value {
         serde_json::json!([])
     }
-    #[cfg(feature = "networking")]
     async fn prepare_network(
         &self,
         _project: &str,
