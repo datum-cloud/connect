@@ -4,7 +4,7 @@ metadata:
   name: connect.datumapis.com-connector
 spec:
   serviceRef:
-    name: connect-datumapis-com
+    name: connect.datumapis.com
   kind: Connector
   plural: connectors
   singular: connector

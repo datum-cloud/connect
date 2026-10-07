@@ -35,7 +35,7 @@ func readCatalogObject(t *testing.T, path string) catalogObject {
 	return object
 }
 
-func TestServiceCatalogReferencesUseResourceNames(t *testing.T) {
+func TestServiceCatalogReferencesUseResourceAndLogicalNames(t *testing.T) {
 	service := readCatalogObject(t, "components/service-catalog/service.yaml")
 	if errors := validation.IsDNS1123Label(service.Metadata.Name); len(errors) != 0 {
 		t.Fatalf("Service metadata.name %q is not a DNS label: %v", service.Metadata.Name, errors)
@@ -64,8 +64,8 @@ func TestServiceCatalogReferencesUseResourceNames(t *testing.T) {
 		if resource.Kind != "ProtectedResource" {
 			continue
 		}
-		if resource.Spec.ServiceRef.Name != service.Metadata.Name {
-			t.Errorf("%s serviceRef %q does not reference Service %q", path, resource.Spec.ServiceRef.Name, service.Metadata.Name)
+		if resource.Spec.ServiceRef.Name != service.Spec.ServiceName {
+			t.Errorf("%s serviceRef %q does not use logical service name %q", path, resource.Spec.ServiceRef.Name, service.Spec.ServiceName)
 		}
 	}
 }

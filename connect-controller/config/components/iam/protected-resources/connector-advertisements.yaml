@@ -4,7 +4,7 @@ metadata:
   name: connect.datumapis.com-connectoradvertisement
 spec:
   serviceRef:
-    name: connect-datumapis-com
+    name: connect.datumapis.com
   kind: ConnectorAdvertisement
   plural: connectoradvertisements
   singular: connectoradvertisement
