@@ -34,6 +34,19 @@ spec:
       defaultLimit: 3
   provisioning:
     resources:
+    - name: connector-classes
+      objects:
+      - apiVersion: connect.datumapis.com/v1alpha1
+        kind: ConnectorClass
+        metadata:
+          name: standard
+        spec:
+          capabilities:
+          - connect-tcp
+          - connect-udp
+          - connect-ip
+          transports:
+          - masque-v1
     - name: connect-gateway-classes
       objects:
       - apiVersion: connect.datumapis.com/v1alpha1
