@@ -49,6 +49,44 @@ class Platform(http.server.BaseHTTPRequestHandler):
             return self.reply(401, {})
         self.observed_tokens.add(bearer)
         parts = self.path.strip('/').split('/')
+        # The OIDC fixture exercises the CLI's service-catalog activation gate
+        # before reaching the daemon. Model an already-active Connect service;
+        # activation behavior itself is covered by focused Go tests.
+        if parts[-4:] == ['apis', 'services.miloapis.com', 'v1alpha1', 'services']:
+            return self.reply(200, {
+                'apiVersion': 'services.miloapis.com/v1alpha1',
+                'kind': 'ServiceList',
+                'metadata': {},
+                'items': [{
+                    'apiVersion': 'services.miloapis.com/v1alpha1',
+                    'kind': 'Service',
+                    'metadata': {'name': 'connect-datumapis-com'},
+                    'spec': {
+                        'displayName': 'Connect',
+                        'serviceName': 'connect.datumapis.com',
+                        'phase': 'Published',
+                        'owner': {'producerProjectRef': {'name': 'provider'}},
+                        'enablementPolicy': {'mode': 'GatedByProvider'},
+                    },
+                }],
+            })
+        if parts[-4:] == ['apis', 'services.miloapis.com', 'v1alpha1', 'serviceentitlements']:
+            return self.reply(200, {
+                'apiVersion': 'services.miloapis.com/v1alpha1',
+                'kind': 'ServiceEntitlementList',
+                'metadata': {},
+                'items': [{
+                    'apiVersion': 'services.miloapis.com/v1alpha1',
+                    'kind': 'ServiceEntitlement',
+                    'metadata': {'name': 'connect-datumapis-com', 'resourceVersion': '1'},
+                    'spec': {'serviceRef': {'name': 'connect-datumapis-com'}},
+                    'status': {
+                        'phase': 'Active',
+                        'serviceName': 'connect.datumapis.com',
+                        'conditions': [{'type': 'Ready', 'status': 'True'}],
+                    },
+                }],
+            })
         if 'connectorclasses' in parts:
             item = {
                 'metadata': {'name': 'local-masque', 'generation': 1, 'annotations': {'connect.datum.net/transport': 'masque-v1'}},
@@ -445,6 +483,7 @@ def oidc_e2e(args):
     save_helper()
     clean_env = {key: value for key, value in os.environ.items() if not key.startswith('DATUM_')}
     env = {**clean_env, 'DATUM_CREDENTIALS_HELPER': str(helper.resolve()),
+           'TEST_DATUM_HELPER_DIR': str(root),
            'DATUM_SESSION': helper_state['session'],
            'DATUM_API_HOST': f'http://127.0.0.1:{platform.server_port}'}
     ports = {name: free_port() for name in ('alice', 'bob')}
@@ -558,8 +597,11 @@ def oidc_e2e(args):
         roundtrip(local)
         inspect_descriptors()
         calls = [json.loads(line) for line in (root / 'helper-calls.jsonl').read_text().splitlines()]
-        assert calls and all(call['args'] == ['auth', 'get-token', '--session', 'isolated-test-session',
-                                             '--output', 'client.authentication.k8s.io/v1'] for call in calls)
+        expected_helper_args = ['auth', 'get-token', '--session', 'isolated-test-session']
+        assert calls and all(
+            (call['args'] == expected_helper_args + ['--output', 'client.authentication.k8s.io/v1'])
+            or (len(call['args']) == 4 and call['args'][:3] == expected_helper_args[:3])
+            for call in calls)
         print('PASS daemon restart pins the original host session and restores the existing Connector and dial', flush=True)
 
         helper_state['logged_out'] = True

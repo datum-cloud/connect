@@ -3,6 +3,8 @@ package commands
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"go.datum.net/datumctl/plugin"
@@ -92,7 +94,9 @@ func connectActivationIO(cmd *cobra.Command) activation.IOStreams {
 // resolveConnectService reads the live catalog entry so enablement policy and
 // user-facing service metadata stay owned by service-catalog.
 func resolveConnectService(ctx context.Context) (activation.ServiceInfo, error) {
-	cfg, err := connectRESTConfig(func(apiHost string) string { return "https://" + apiHost })
+	cfg, err := connectRESTConfig(func(apiHost string) (string, error) {
+		return connectAPIBaseURL(apiHost)
+	})
 	if err != nil {
 		return activation.ServiceInfo{}, err
 	}
@@ -108,8 +112,12 @@ func resolveConnectService(ctx context.Context) (activation.ServiceInfo, error) 
 }
 
 func newConnectEntitlementClient(project string) (activation.EntitlementClient, error) {
-	cfg, err := connectRESTConfig(func(apiHost string) string {
-		return fmt.Sprintf("https://%s/apis/resourcemanager.miloapis.com/v1alpha1/projects/%s/control-plane", apiHost, project)
+	cfg, err := connectRESTConfig(func(apiHost string) (string, error) {
+		baseURL, err := connectAPIBaseURL(apiHost)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s/apis/resourcemanager.miloapis.com/v1alpha1/projects/%s/control-plane", baseURL, url.PathEscape(project)), nil
 	})
 	if err != nil {
 		return nil, err
@@ -121,7 +129,23 @@ func newConnectEntitlementClient(project string) (activation.EntitlementClient, 
 	return client, nil
 }
 
-func connectRESTConfig(hostURL func(string) string) (*rest.Config, error) {
+func connectAPIBaseURL(apiHost string) (string, error) {
+	raw := strings.TrimSpace(apiHost)
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid DATUM_API_HOST %q: %w", apiHost, err)
+	}
+	if (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("invalid DATUM_API_HOST %q", apiHost)
+	}
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+	return parsed.String(), nil
+}
+
+func connectRESTConfig(hostURL func(string) (string, error)) (*rest.Config, error) {
 	host := plugin.Context()
 	if host.APIHost == "" {
 		return nil, fmt.Errorf("DATUM_API_HOST is not set; run this command through datumctl")
@@ -130,5 +154,9 @@ func connectRESTConfig(hostURL func(string) string) (*rest.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("getting datumctl credentials: %w", err)
 	}
-	return &rest.Config{Host: hostURL(host.APIHost), BearerToken: token}, nil
+	resolvedHost, err := hostURL(host.APIHost)
+	if err != nil {
+		return nil, err
+	}
+	return &rest.Config{Host: resolvedHost, BearerToken: token}, nil
 }

@@ -31,6 +31,32 @@ func TestConnectServiceGateRequired(t *testing.T) {
 	}
 }
 
+func TestConnectAPIBaseURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		want    string
+		wantErr bool
+	}{
+		{name: "datumctl hostname", host: "api.staging.env.datum.net", want: "https://api.staging.env.datum.net"},
+		{name: "explicit https", host: "https://api.staging.env.datum.net/", want: "https://api.staging.env.datum.net"},
+		{name: "local test server", host: "http://127.0.0.1:8443", want: "http://127.0.0.1:8443"},
+		{name: "unsupported scheme", host: "file:///tmp/api", wantErr: true},
+		{name: "query", host: "https://api.example.test?scope=other", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := connectAPIBaseURL(tt.host)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("connectAPIBaseURL(%q) error = %v, wantErr %v", tt.host, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("connectAPIBaseURL(%q) = %q, want %q", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestConnectServiceActivationAlreadyActive(t *testing.T) {
 	client := &fakeEntitlementClient{entitlements: activeConnectEntitlements()}
 	project := "test-project"
