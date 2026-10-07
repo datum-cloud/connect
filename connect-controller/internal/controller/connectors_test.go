@@ -12,6 +12,7 @@ import (
 	connectv1alpha1 "go.datum.net/connect-controller/api/v1alpha1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -39,7 +40,7 @@ func testClient(t *testing.T, objs ...runtime.Object) *fake.ClientBuilder {
 	return fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objs...).WithStatusSubresource(&connectv1alpha1.Connector{}, &connectv1alpha1.ConnectorClass{}, &connectv1alpha1.ConnectGatewayClass{}, &connectv1alpha1.ConnectorAdvertisement{}, &connectv1alpha1.ConnectGateway{}, &connectv1alpha1.ConnectNetworkBinding{})
 }
 
-func testGatewayClassClient(t *testing.T, mode string, idleTimeout time.Duration) client.Client {
+func testGatewayClass(t *testing.T, mode string, idleTimeout time.Duration) (*connectv1alpha1.ConnectGatewayClass, client.Client) {
 	t.Helper()
 	parameters := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "standard-gateway", Namespace: "connect-system"}, Data: map[string]string{
 		"image":        "ghcr.io/datum-cloud/iroh-gateway:connect-ip",
@@ -54,12 +55,16 @@ func testGatewayClassClient(t *testing.T, mode string, idleTimeout time.Duration
 		},
 		Status: connectv1alpha1.ConnectGatewayClassStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}},
 	}
-	return testClient(t, parameters, class).Build()
+	return class, testClient(t, parameters).Build()
 }
 
 func reconcileTestGateway(t *testing.T, ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway) {
 	t.Helper()
-	if err := reconcileGateway(ctx, c, testGatewayClassClient(t, "AlwaysOn", 0), "project-id", gateway, time.Now()); err != nil {
+	class, parameterClient := testGatewayClass(t, "AlwaysOn", 0)
+	if err := c.Create(ctx, class); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatal(err)
+	}
+	if err := reconcileGateway(ctx, c, parameterClient, "project-id", gateway, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -107,6 +112,81 @@ func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	}
 }
 
+func TestReconcileProjectedConnectorClassProjectsBackingReadiness(t *testing.T) {
+	ctx := context.Background()
+	spec := connectv1alpha1.ConnectorClassSpec{
+		Capabilities: []string{"connect-tcp", "connect-udp", "connect-ip"},
+		Transports:   []string{"masque-v1"},
+	}
+	projectClass := &connectv1alpha1.ConnectorClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "connect-staging-masque-v1", Generation: 2},
+		Spec:       spec,
+	}
+	backingClass := &connectv1alpha1.ConnectorClass{
+		ObjectMeta: metav1.ObjectMeta{Name: projectClass.Name, Generation: 4},
+		Spec:       spec,
+		Status: connectv1alpha1.ConnectorClassStatus{
+			ObservedGeneration: 4,
+			Conditions: []metav1.Condition{{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "Valid",
+				ObservedGeneration: 4,
+			}},
+		},
+	}
+	projectClient := testClient(t, projectClass).Build()
+	if err := reconcileProjectedClass(ctx, projectClient, testClient(t, backingClass).Build(), projectClass); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(projectClass.Status.Conditions, "Ready")
+	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "BackingClassReady" {
+		t.Fatalf("projected condition=%#v, want Ready=True with reason BackingClassReady", condition)
+	}
+	if condition.ObservedGeneration != projectClass.Generation || projectClass.Status.ObservedGeneration != projectClass.Generation {
+		t.Fatalf("projected status did not observe generation %d: %#v", projectClass.Generation, projectClass.Status)
+	}
+}
+
+func TestReconcileProjectedConnectorClassReportsUnavailableBackingClass(t *testing.T) {
+	ctx := context.Background()
+	projectClass := &connectv1alpha1.ConnectorClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "connect-staging-masque-v1", Generation: 1},
+		Spec: connectv1alpha1.ConnectorClassSpec{
+			Capabilities: []string{"connect-tcp", "connect-udp", "connect-ip"},
+			Transports:   []string{"masque-v1"},
+		},
+	}
+	projectClient := testClient(t, projectClass).Build()
+	if err := reconcileProjectedClass(ctx, projectClient, testClient(t).Build(), projectClass); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(projectClass.Status.Conditions, "Ready")
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "BackingClassNotFound" {
+		t.Fatalf("projected condition=%#v, want Ready=False with reason BackingClassNotFound", condition)
+	}
+}
+
+func TestReconcileProjectedConnectorClassRequiresCurrentReadyBackingStatus(t *testing.T) {
+	ctx := context.Background()
+	spec := connectv1alpha1.ConnectorClassSpec{Transports: []string{"masque-v1"}}
+	projectClass := &connectv1alpha1.ConnectorClass{ObjectMeta: metav1.ObjectMeta{Name: "masque", Generation: 1}, Spec: spec}
+	backingClass := &connectv1alpha1.ConnectorClass{
+		ObjectMeta: metav1.ObjectMeta{Name: projectClass.Name, Generation: 2},
+		Spec:       spec,
+		Status: connectv1alpha1.ConnectorClassStatus{Conditions: []metav1.Condition{{
+			Type: "Ready", Status: metav1.ConditionTrue, Reason: "Valid", ObservedGeneration: 1,
+		}}},
+	}
+	if err := reconcileProjectedClass(ctx, testClient(t, projectClass).Build(), testClient(t, backingClass).Build(), projectClass); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(projectClass.Status.Conditions, "Ready")
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "BackingClassNotReady" {
+		t.Fatalf("projected condition=%#v, want stale backing status to be not ready", condition)
+	}
+}
+
 func TestGatewayClassReportsParameterReadiness(t *testing.T) {
 	ctx := context.Background()
 	class := &connectv1alpha1.ConnectGatewayClass{
@@ -117,22 +197,37 @@ func TestGatewayClassReportsParameterReadiness(t *testing.T) {
 			Scaling:        connectv1alpha1.ConnectGatewayScalingPolicy{Mode: "OnDemand", IdleTimeout: metav1.Duration{Duration: 10 * time.Minute}},
 		},
 	}
-	c := testClient(t, class).Build()
-	if err := reconcileGatewayClass(ctx, c, class); err != nil {
+	projectClient := testClient(t, class).Build()
+	parameterClient := testClient(t).Build()
+	if err := reconcileGatewayClass(ctx, projectClient, parameterClient, class); err != nil {
 		t.Fatal(err)
 	}
 	if condition := meta.FindStatusCondition(class.Status.Conditions, "Ready"); condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "ParametersNotReady" {
 		t.Fatalf("class condition=%#v, want missing parameters to make it not ready", condition)
 	}
 	parameters := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "standard-gateway", Namespace: "connect-system"}, Data: map[string]string{"image": "gateway:v2", "instanceType": "datumcloud/d1-standard-4"}}
-	if err := c.Create(ctx, parameters); err != nil {
+	if err := parameterClient.Create(ctx, parameters); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileGatewayClass(ctx, c, class); err != nil {
+	if err := reconcileGatewayClass(ctx, projectClient, parameterClient, class); err != nil {
 		t.Fatal(err)
 	}
 	if !meta.IsStatusConditionTrue(class.Status.Conditions, "Accepted") || !meta.IsStatusConditionTrue(class.Status.Conditions, "Ready") || class.Status.ObservedGeneration != class.Generation {
 		t.Fatalf("class should be accepted and ready with valid operator parameters: %#v", class.Status)
+	}
+}
+
+func TestGatewayClassRejectsInvalidRelayURLs(t *testing.T) {
+	ctx := context.Background()
+	class, parameterClient := testGatewayClass(t, "OnDemand", 10*time.Minute)
+	class.Spec.RelayURLs = []string{"http://relay.example", "https://relay.example?token=secret"}
+	projectClient := testClient(t, class).Build()
+	if err := reconcileGatewayClass(ctx, projectClient, parameterClient, class); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(class.Status.Conditions, "Accepted")
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "InvalidParameters" {
+		t.Fatalf("class condition=%#v, want invalid relay URLs to be rejected", condition)
 	}
 }
 
@@ -158,9 +253,9 @@ func TestOnDemandGatewayScalesBetweenZeroAndOne(t *testing.T) {
 		Spec:       connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: connector.Name},
 		Status:     connectv1alpha1.ConnectNetworkBindingStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionFalse}}},
 	}
-	c := testClient(t, connector, gateway, binding).Build()
-	classClient := testGatewayClassClient(t, "OnDemand", 10*time.Minute)
-	if err := reconcileGateway(ctx, c, classClient, "project-id", gateway, t0); err != nil {
+	class, parameterClient := testGatewayClass(t, "OnDemand", 10*time.Minute)
+	c := testClient(t, connector, gateway, binding, class).Build()
+	if err := reconcileGateway(ctx, c, parameterClient, "project-id", gateway, t0); err != nil {
 		t.Fatal(err)
 	}
 	endpointID := gateway.Status.EndpointID
@@ -177,13 +272,13 @@ func TestOnDemandGatewayScalesBetweenZeroAndOne(t *testing.T) {
 	if err := c.Status().Update(ctx, storedConnector); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileGateway(ctx, c, classClient, "project-id", gateway, t0.Add(time.Minute)); err != nil {
+	if err := reconcileGateway(ctx, c, parameterClient, "project-id", gateway, t0.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if gateway.Status.IdleSince == nil || gateway.Status.WorkloadRef != workloadName {
 		t.Fatalf("idle grace period should retain the Workload: %#v", gateway.Status)
 	}
-	if err := reconcileGateway(ctx, c, classClient, "project-id", gateway, t0.Add(12*time.Minute)); err != nil {
+	if err := reconcileGateway(ctx, c, parameterClient, "project-id", gateway, t0.Add(12*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	workload := &unstructured.Unstructured{}
@@ -207,7 +302,7 @@ func TestOnDemandGatewayScalesBetweenZeroAndOne(t *testing.T) {
 	if err := c.Status().Update(ctx, storedConnector); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileGateway(ctx, c, classClient, "project-id", gateway, t0.Add(13*time.Minute)); err != nil {
+	if err := reconcileGateway(ctx, c, parameterClient, "project-id", gateway, t0.Add(13*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if gateway.Status.WorkloadRef != workloadName || gateway.Status.EndpointID != endpointID || gateway.Status.IdleSince != nil {

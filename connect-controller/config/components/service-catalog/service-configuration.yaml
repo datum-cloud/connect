@@ -1,0 +1,67 @@
+apiVersion: services.miloapis.com/v1alpha1
+kind: ServiceConfiguration
+metadata:
+  name: connect-datumapis-com
+spec:
+  serviceRef:
+    name: connect-datumapis-com
+  phase: Published
+  locations:
+    supportedClasses:
+    - datum-managed
+  metrics:
+  - name: connect.datumapis.com/connectgateways
+    displayName: Connect gateways
+    description: Number of managed Connect gateways in a project.
+    kind: Gauge
+    unit: '{gateway}'
+  quota:
+    metricRules:
+    - selector:
+        apiGroup: connect.datumapis.com
+        kind: ConnectGateway
+      metricCosts:
+        connect.datumapis.com/connectgateways: 1
+    limits:
+    - name: connect-gateways
+      displayName: Connect gateways
+      description: Maximum number of Connect gateways that can be created within a project.
+      metric: connect.datumapis.com/connectgateways
+      consumerType:
+        apiGroup: resourcemanager.miloapis.com
+        kind: Project
+      unit: gateway
+      defaultLimit: 3
+  provisioning:
+    resources:
+    - name: connector-classes
+      objects:
+      - apiVersion: connect.datumapis.com/v1alpha1
+        kind: ConnectorClass
+        metadata:
+          name: connect-staging-masque-v1
+        spec:
+          capabilities:
+          - connect-tcp
+          - connect-udp
+          - connect-ip
+          transports:
+          - masque-v1
+    - name: connect-gateway-classes
+      objects:
+      - apiVersion: connect.datumapis.com/v1alpha1
+        kind: ConnectGatewayClass
+        metadata:
+          name: standard
+        spec:
+          controllerName: connect.datum.net/gateway-controller
+          default: true
+          relayURLs:
+          - https://iroh-relay.us-central-1.datum-staging.net
+          - https://iroh-relay.us-east-1.datum-staging.net
+          parametersRef:
+            namespace: connect-system
+            name: standard-gateway
+          scaling:
+            mode: OnDemand
+            idleTimeout: 10m
