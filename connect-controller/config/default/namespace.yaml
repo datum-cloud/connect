@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: connect-system
+  labels:
+    app.kubernetes.io/name: connect-controller
+    infra.datum.net/inject-datum-control-plane-trust-bundle: ""

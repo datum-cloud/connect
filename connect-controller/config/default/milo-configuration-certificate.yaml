@@ -1,0 +1,22 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: connect-milo-configuration
+  namespace: connect-system
+spec:
+  commonName: system:control@connect.datumapis.com
+  duration: 720h
+  renewBefore: 528h
+  issuerRef:
+    kind: ClusterIssuer
+    name: datum-control-plane
+  secretName: connect-milo-configuration
+  secretTemplate:
+    labels:
+      resourcemanager.miloapis.com/core-control-plane-kubeconfig-certificate: "true"
+  subject:
+    organizations:
+    - system:masters
+    - system:datum-cloud
+  usages:
+  - client auth

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: connect-controller-metrics
+  labels:
+    app.kubernetes.io/name: connect-controller
+spec:
+  selector:
+    app.kubernetes.io/name: connect-controller
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: metrics

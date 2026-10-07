@@ -1,0 +1,35 @@
+apiVersion: iam.miloapis.com/v1alpha1
+kind: Role
+metadata:
+  name: connect.datumapis.com-admin
+  annotations:
+    kubernetes.io/display-name: Connect Admin
+    kubernetes.io/description: "Manage Connectors, advertisements, classes, gateways, and network bindings"
+spec:
+  launchStage: Beta
+  inheritedRoles:
+    - name: connect.datumapis.com-viewer
+  includedPermissions:
+    - connect.datumapis.com/connectors.create
+    - connect.datumapis.com/connectors.update
+    - connect.datumapis.com/connectors.patch
+    - connect.datumapis.com/connectors.delete
+    - connect.datumapis.com/connectoradvertisements.create
+    - connect.datumapis.com/connectoradvertisements.update
+    - connect.datumapis.com/connectoradvertisements.patch
+    - connect.datumapis.com/connectoradvertisements.delete
+    - connect.datumapis.com/connectorclasses.create
+    - connect.datumapis.com/connectorclasses.update
+    - connect.datumapis.com/connectorclasses.patch
+    - connect.datumapis.com/connectorclasses.delete
+    - connect.datumapis.com/connectorclasses/status.get
+    - connect.datumapis.com/connectorclasses/status.update
+    - connect.datumapis.com/connectorclasses/status.patch
+    - connect.datumapis.com/connectgateways.create
+    - connect.datumapis.com/connectgateways.update
+    - connect.datumapis.com/connectgateways.patch
+    - connect.datumapis.com/connectgateways.delete
+    - connect.datumapis.com/connectnetworkbindings.create
+    - connect.datumapis.com/connectnetworkbindings.update
+    - connect.datumapis.com/connectnetworkbindings.patch
+    - connect.datumapis.com/connectnetworkbindings.delete
