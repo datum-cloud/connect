@@ -15,8 +15,11 @@ type catalogObject struct {
 		Name string `json:"name"`
 	} `json:"metadata"`
 	Spec struct {
-		ServiceName string `json:"serviceName"`
-		ServiceRef  struct {
+		ServiceName      string `json:"serviceName"`
+		EnablementPolicy struct {
+			Mode string `json:"mode"`
+		} `json:"enablementPolicy"`
+		ServiceRef struct {
 			Name string `json:"name"`
 		} `json:"serviceRef"`
 	} `json:"spec"`
@@ -42,6 +45,9 @@ func TestServiceCatalogReferencesUseResourceAndLogicalNames(t *testing.T) {
 	}
 	if service.Spec.ServiceName != "connect.datumapis.com" {
 		t.Fatalf("Service spec.serviceName = %q, want API service name connect.datumapis.com", service.Spec.ServiceName)
+	}
+	if service.Spec.EnablementPolicy.Mode != "SelfService" {
+		t.Fatalf("Service enablement policy = %q, want SelfService", service.Spec.EnablementPolicy.Mode)
 	}
 
 	configuration := readCatalogObject(t, "components/service-catalog/service-configuration.yaml")

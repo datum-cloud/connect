@@ -16,4 +16,4 @@ spec:
     producerProjectRef:
       name: datum-cloud
   enablementPolicy:
-    mode: GatedByProvider
+    mode: SelfService
