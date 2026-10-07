@@ -53,14 +53,13 @@ type ConnectReconciler struct {
 
 func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	local := mgr.GetLocalManager()
-	if err := builder.ControllerManagedBy(local).Named("connectorclass-local").For(&connectv1alpha1.ConnectorClass{}).Complete(&ConnectorClassReconciler{client: local.GetClient()}); err != nil {
+	if err := builder.ControllerManagedBy(local).Named("connectorclass").For(&connectv1alpha1.ConnectorClass{}).Complete(&ConnectorClassReconciler{client: local.GetClient()}); err != nil {
 		return fmt.Errorf("register ConnectorClass controller: %w", err)
 	}
 	for _, item := range []struct {
 		name string
 		obj  client.Object
 	}{
-		{"connectorclass", &connectv1alpha1.ConnectorClass{}},
 		{"connectgatewayclass", &connectv1alpha1.ConnectGatewayClass{}},
 		{"connector", &connectv1alpha1.Connector{}},
 		{"connectoradvertisement", &connectv1alpha1.ConnectorAdvertisement{}},
@@ -89,19 +88,6 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 	key := req.NamespacedName
 	// Each registered controller reconciles its own kind; absent objects are normal.
 	switch r.kind {
-	case "connectorclass":
-		var obj connectv1alpha1.ConnectorClass
-		if err := c.Get(ctx, key, &obj); err != nil {
-			if apierrors.IsNotFound(err) {
-				return ctrl.Result{}, nil
-			}
-			return ctrl.Result{}, err
-		}
-		if err := reconcileClass(ctx, c, &obj); err != nil {
-			logger.Error(err, "reconcile ConnectorClass")
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
 	case "connectgatewayclass":
 		var obj connectv1alpha1.ConnectGatewayClass
 		if err := c.Get(ctx, key, &obj); err != nil {

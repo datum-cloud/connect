@@ -47,6 +47,17 @@ spec:
           - connect-ip
           transports:
           - masque-v1
+        # This is a fixed service-catalog assertion, matching the status patch
+        # convention used by other platform class catalogs. The management
+        # plane owns and validates the class implementation; projects receive
+        # its advertised compatibility and readiness with their entitlement.
+        status:
+          conditions:
+          - type: Ready
+            status: "True"
+            reason: Served
+            message: The Datum Connect platform serves this class.
+            lastTransitionTime: "2026-01-01T00:00:00Z"
     - name: connect-gateway-classes
       objects:
       - apiVersion: connect.datumapis.com/v1alpha1

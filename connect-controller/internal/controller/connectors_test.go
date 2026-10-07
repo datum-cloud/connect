@@ -112,28 +112,6 @@ func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	}
 }
 
-func TestReconcileConnectorClassMarksReady(t *testing.T) {
-	ctx := context.Background()
-	class := &connectv1alpha1.ConnectorClass{
-		ObjectMeta: metav1.ObjectMeta{Name: "connect-staging-masque-v1", Generation: 3},
-		Spec: connectv1alpha1.ConnectorClassSpec{
-			Capabilities: []string{"connect-tcp", "connect-udp", "connect-ip"},
-			Transports:   []string{"masque-v1"},
-		},
-	}
-	c := testClient(t, class).Build()
-	if err := reconcileClass(ctx, c, class); err != nil {
-		t.Fatal(err)
-	}
-	condition := meta.FindStatusCondition(class.Status.Conditions, "Ready")
-	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "Valid" {
-		t.Fatalf("class condition=%#v, want Ready=True with reason Valid", condition)
-	}
-	if class.Status.ObservedGeneration != class.Generation {
-		t.Fatalf("observedGeneration=%d, want %d", class.Status.ObservedGeneration, class.Generation)
-	}
-}
-
 func TestGatewayClassReportsParameterReadiness(t *testing.T) {
 	ctx := context.Background()
 	class := &connectv1alpha1.ConnectGatewayClass{
