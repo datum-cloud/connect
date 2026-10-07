@@ -112,6 +112,81 @@ func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	}
 }
 
+func TestReconcileProjectedConnectorClassProjectsBackingReadiness(t *testing.T) {
+	ctx := context.Background()
+	spec := connectv1alpha1.ConnectorClassSpec{
+		Capabilities: []string{"connect-tcp", "connect-udp", "connect-ip"},
+		Transports:   []string{"masque-v1"},
+	}
+	projectClass := &connectv1alpha1.ConnectorClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "connect-staging-masque-v1", Generation: 2},
+		Spec:       spec,
+	}
+	backingClass := &connectv1alpha1.ConnectorClass{
+		ObjectMeta: metav1.ObjectMeta{Name: projectClass.Name, Generation: 4},
+		Spec:       spec,
+		Status: connectv1alpha1.ConnectorClassStatus{
+			ObservedGeneration: 4,
+			Conditions: []metav1.Condition{{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "Valid",
+				ObservedGeneration: 4,
+			}},
+		},
+	}
+	projectClient := testClient(t, projectClass).Build()
+	if err := reconcileProjectedClass(ctx, projectClient, testClient(t, backingClass).Build(), projectClass); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(projectClass.Status.Conditions, "Ready")
+	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "BackingClassReady" {
+		t.Fatalf("projected condition=%#v, want Ready=True with reason BackingClassReady", condition)
+	}
+	if condition.ObservedGeneration != projectClass.Generation || projectClass.Status.ObservedGeneration != projectClass.Generation {
+		t.Fatalf("projected status did not observe generation %d: %#v", projectClass.Generation, projectClass.Status)
+	}
+}
+
+func TestReconcileProjectedConnectorClassReportsUnavailableBackingClass(t *testing.T) {
+	ctx := context.Background()
+	projectClass := &connectv1alpha1.ConnectorClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "connect-staging-masque-v1", Generation: 1},
+		Spec: connectv1alpha1.ConnectorClassSpec{
+			Capabilities: []string{"connect-tcp", "connect-udp", "connect-ip"},
+			Transports:   []string{"masque-v1"},
+		},
+	}
+	projectClient := testClient(t, projectClass).Build()
+	if err := reconcileProjectedClass(ctx, projectClient, testClient(t).Build(), projectClass); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(projectClass.Status.Conditions, "Ready")
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "BackingClassNotFound" {
+		t.Fatalf("projected condition=%#v, want Ready=False with reason BackingClassNotFound", condition)
+	}
+}
+
+func TestReconcileProjectedConnectorClassRequiresCurrentReadyBackingStatus(t *testing.T) {
+	ctx := context.Background()
+	spec := connectv1alpha1.ConnectorClassSpec{Transports: []string{"masque-v1"}}
+	projectClass := &connectv1alpha1.ConnectorClass{ObjectMeta: metav1.ObjectMeta{Name: "masque", Generation: 1}, Spec: spec}
+	backingClass := &connectv1alpha1.ConnectorClass{
+		ObjectMeta: metav1.ObjectMeta{Name: projectClass.Name, Generation: 2},
+		Spec:       spec,
+		Status: connectv1alpha1.ConnectorClassStatus{Conditions: []metav1.Condition{{
+			Type: "Ready", Status: metav1.ConditionTrue, Reason: "Valid", ObservedGeneration: 1,
+		}}},
+	}
+	if err := reconcileProjectedClass(ctx, testClient(t, projectClass).Build(), testClient(t, backingClass).Build(), projectClass); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(projectClass.Status.Conditions, "Ready")
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "BackingClassNotReady" {
+		t.Fatalf("projected condition=%#v, want stale backing status to be not ready", condition)
+	}
+}
+
 func TestGatewayClassReportsParameterReadiness(t *testing.T) {
 	ctx := context.Background()
 	class := &connectv1alpha1.ConnectGatewayClass{

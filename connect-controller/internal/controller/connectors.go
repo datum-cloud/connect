@@ -78,6 +78,19 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	return nil
 }
 
+// SetupProjectedConnectorClassesWithManager registers ConnectorClass status
+// reconciliation on an entitlement-scoped multicluster manager. The caller is
+// responsible for engaging only projects with an active Connect entitlement.
+func SetupProjectedConnectorClassesWithManager(mgr mcmanager.Manager, classClient client.Client) error {
+	if err := mcbuilder.ControllerManagedBy(mgr).
+		Named("connectorclass").
+		For(&connectv1alpha1.ConnectorClass{}, mcbuilder.WithEngageWithLocalCluster(false)).
+		Complete(&ConnectReconciler{mgr: mgr, kind: "connectorclass", classClient: classClient}); err != nil {
+		return fmt.Errorf("register projected ConnectorClass controller: %w", err)
+	}
+	return nil
+}
+
 func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("projectCluster", req.ClusterName)
 	cl, err := r.mgr.GetCluster(ctx, req.ClusterName)
@@ -88,6 +101,19 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 	key := req.NamespacedName
 	// Each registered controller reconciles its own kind; absent objects are normal.
 	switch r.kind {
+	case "connectorclass":
+		var obj connectv1alpha1.ConnectorClass
+		if err := c.Get(ctx, key, &obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		if err := reconcileProjectedClass(ctx, c, r.classClient, &obj); err != nil {
+			logger.Error(err, "reconcile projected ConnectorClass")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	case "connectgatewayclass":
 		var obj connectv1alpha1.ConnectGatewayClass
 		if err := c.Get(ctx, key, &obj); err != nil {
@@ -216,6 +242,29 @@ func reconcileClass(ctx context.Context, c client.Client, obj *connectv1alpha1.C
 		return nil
 	}
 	return c.Status().Update(ctx, obj)
+}
+
+func reconcileProjectedClass(ctx context.Context, projectClient, classClient client.Client, obj *connectv1alpha1.ConnectorClass) error {
+	before := obj.Status.DeepCopy()
+	status, reason, message := metav1.ConditionFalse, "BackingClassNotFound", "the platform ConnectorClass is not available"
+	var backing connectv1alpha1.ConnectorClass
+	if err := classClient.Get(ctx, types.NamespacedName{Name: obj.Name}, &backing); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+	} else if !reflect.DeepEqual(obj.Spec, backing.Spec) {
+		reason, message = "ProjectionMismatch", "the projected ConnectorClass does not match the platform class"
+	} else if condition := meta.FindStatusCondition(backing.Status.Conditions, "Ready"); condition == nil || condition.Status != metav1.ConditionTrue || condition.ObservedGeneration != backing.Generation {
+		reason, message = "BackingClassNotReady", "the platform ConnectorClass is not Ready"
+	} else {
+		status, reason, message = metav1.ConditionTrue, "BackingClassReady", "the platform ConnectorClass is Ready"
+	}
+	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Ready", Status: status, Reason: reason, Message: message, ObservedGeneration: obj.Generation})
+	obj.Status.ObservedGeneration = obj.Generation
+	if reflect.DeepEqual(before, &obj.Status) {
+		return nil
+	}
+	return projectClient.Status().Update(ctx, obj)
 }
 
 func reconcileConnector(ctx context.Context, c, classClient client.Client, obj *connectv1alpha1.Connector) error {

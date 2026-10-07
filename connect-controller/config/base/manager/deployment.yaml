@@ -29,6 +29,7 @@ spec:
         - --internal-service-discovery=$(INTERNAL_SERVICE_DISCOVERY)
         - --discovery-kubeconfig=/etc/kubernetes/projects/auth/milo-kubeconfig.yaml
         - --project-kubeconfig=/etc/kubernetes/projects/auth/milo-kubeconfig.yaml
+        - --provider-project=datum-cloud
         env:
         - name: INTERNAL_SERVICE_DISCOVERY
           valueFrom:
