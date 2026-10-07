@@ -3,11 +3,15 @@ package daemonservice
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestDaemonExecutableVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the synthetic daemon fixture is a POSIX shell script")
+	}
 	path := filepath.Join(t.TempDir(), "datum-connectd")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'datum-connectd v1.2.3-preview.4\\n'\n"), 0700); err != nil {
 		t.Fatal(err)

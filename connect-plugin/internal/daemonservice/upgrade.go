@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -233,7 +234,7 @@ func replaceLaunchdExecutable(content []byte, replacement string) (string, []byt
 	if err := xml.Unmarshal(append(append([]byte("<string>"), encoded...), []byte("</string>")...), &old); err != nil {
 		return "", nil, fmt.Errorf("decode the service executable path: %w", err)
 	}
-	if !filepath.IsAbs(old) || (filepath.Base(old) != "datum-connect-daemon" && filepath.Base(old) != "datum-connectd") {
+	if !path.IsAbs(old) || (path.Base(old) != "datum-connect-daemon" && path.Base(old) != "datum-connectd") {
 		return "", nil, fmt.Errorf("the service points to an unrecognized executable")
 	}
 	var escaped bytes.Buffer
@@ -264,7 +265,7 @@ func replaceSystemdExecutable(content []byte, replacement string) (string, []byt
 		}
 		old = strings.ReplaceAll(command[:end], `\x20`, " ")
 	}
-	if execStartCount != 1 || !filepath.IsAbs(old) || (filepath.Base(old) != "datum-connect-daemon" && filepath.Base(old) != "datum-connectd") {
+	if execStartCount != 1 || !path.IsAbs(old) || (path.Base(old) != "datum-connect-daemon" && path.Base(old) != "datum-connectd") {
 		return "", nil, fmt.Errorf("the service does not have one recognized ExecStart executable")
 	}
 	escapedOld := strings.ReplaceAll(old, " ", `\x20`)

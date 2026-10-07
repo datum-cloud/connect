@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"go.datum.net/datumctl-plugins/connect/commands"
 	"go.datum.net/datumctl-plugins/connect/internal/daemonservice"
 	"go.datum.net/datumctl/plugin"
+	"go.miloapis.com/service-catalog/pkg/activation"
 )
 
 // Overridden at build time via -ldflags "-X main.version=vX.Y.Z".
@@ -56,8 +58,14 @@ func main() {
 	})
 
 	if err := cmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		// The activation SDK writes its complete user-facing message itself.
+		// Avoid printing the typed error a second time, and retain the SDK's
+		// documented exit codes for automation.
+		var activationErr *activation.Error
+		if !errors.As(err, &activationErr) {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+		os.Exit(activation.ExitCodeOf(err))
 	}
 }
 
