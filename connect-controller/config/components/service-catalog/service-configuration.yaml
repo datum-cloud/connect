@@ -39,7 +39,7 @@ spec:
       - apiVersion: connect.datumapis.com/v1alpha1
         kind: ConnectorClass
         metadata:
-          name: standard
+          name: connect-staging-masque-v1
         spec:
           capabilities:
           - connect-tcp
