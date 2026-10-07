@@ -29,13 +29,11 @@ impl Default for DaemonState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectState {
     /// Saved peer approvals, not an instruction to reconnect after restart.
-    #[cfg(feature = "networking")]
     #[serde(default)]
     pub peer_networks: BTreeMap<String, crate::peer_ip::Binding>,
     /// Controller-managed VPC attachments that should be recreated whenever
     /// this project is running. The privileged helper remains the authority
     /// for the exact address and routes; this intent never expands approval.
-    #[cfg(feature = "networking")]
     #[serde(default)]
     pub managed_networks: BTreeMap<String, ManagedNetworkState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

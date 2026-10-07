@@ -3,29 +3,50 @@ name = "datum-connect-daemon"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
+autobins = false
+build = "build.rs"
+
+[[bin]]
+name = "datum-connectd"
+path = "src/main.rs"
 
 [lints]
 workspace = true
-
-[features]
-networking = []
 
 [dependencies]
 async-trait = "0.1"
 axum = "0.8"
 base64 = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
 connect-lib = { path = "../lib" }
-connect-transport = { path = "../transport" }
+connect-transport = { path = "../transport", features = ["otel"] }
+connect-ip-adapter = { path = "../ip-adapter" }
+connect-masque-edge = { path = "../masque-edge" }
 fs2 = { workspace = true }
 iroh = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
+reqwest = { workspace = true }
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_EventLog", "Win32_System_Services"] }
