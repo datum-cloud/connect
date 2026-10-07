@@ -1,0 +1,8 @@
+# iroh-relay 1.0.2 also builds a cdylib without a public C ABI. GNU ld
+# otherwise auto-exports its Rust dependency graph and exceeds PE's 65535
+# export-ordinal limit. Disable only implicit exports; explicit exports remain.
+# Connect links the Rust rlib and does not load the iroh-relay DLL.
+# This setting does not apply to the MSVC release targets.
+# https://sourceware.org/binutils/docs/ld/Options.html#index-_002d_002dexclude_002dall_002dsymbols
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--exclude-all-symbols"]

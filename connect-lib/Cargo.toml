@@ -1,0 +1,32 @@
+[workspace]
+members = ["transport"]
+resolver = "2"
+
+[workspace.package]
+rust-version = "1.98"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.dependencies]
+arc-swap = "1.8.0"
+http = "1"
+h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+h3-datagram = "0.0.2"
+futures-util = "0.3"
+bytes = "1"
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
+rand = "0.9"
+thiserror = "2"
+tokio = { version = "1.34.0", features = ["full"] }
+tokio-util = "0.7.10"
+tracing = "0.1.40"
+tracing-opentelemetry = "0.32"
+iroh = { version = "~1.0.0", default-features = false, features = ["tls-ring"] }
+
+[patch.crates-io]
+# h3 0.0.8 predates CONNECT-IP and the quarter-stream-id fix. Drop these
+# pins after a release containing hyperium/h3#273 and hyperium/h3#340.
+h3 = { git = "https://github.com/hyperium/h3", rev = "ebd426036d2a81ae9cee43337f43ae8ccc819404" }
+h3-datagram = { git = "https://github.com/hyperium/h3", rev = "ebd426036d2a81ae9cee43337f43ae8ccc819404" }
