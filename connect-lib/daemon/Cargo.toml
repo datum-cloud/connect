@@ -1,0 +1,31 @@
+[package]
+name = "datum-connect-daemon"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+networking = []
+
+[dependencies]
+async-trait = "0.1"
+axum = "0.8"
+base64 = { workspace = true }
+chrono = { workspace = true }
+connect-lib = { path = "../lib" }
+connect-transport = { path = "../transport" }
+fs2 = { workspace = true }
+iroh = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

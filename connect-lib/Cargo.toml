@@ -1,5 +1,5 @@
 [workspace]
-members = ["transport", "ip-adapter", "network-helper", "masque-edge", "lib"]
+members = ["transport", "ip-adapter", "network-helper", "masque-edge", "lib", "daemon"]
 resolver = "2"
 
 [workspace.package]
@@ -10,14 +10,15 @@ warnings = "deny"
 
 [workspace.dependencies]
 arc-swap = "1.8.0"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"] }
+fs2 = "0.4.3"
 hex = "0.4.3"
 http = "1"
 h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-datagram = "0.0.2"
 futures-util = "0.3"
 bytes = "1"
-fs2 = "0.4.3"
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
 rand = "0.9"
