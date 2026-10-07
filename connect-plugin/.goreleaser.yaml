@@ -19,19 +19,42 @@ release:
   prerelease: auto
   make_latest: false
   header: |
-    This is the headless Connect preview. It makes breaking CLI changes.
-    Each platform archive contains both datumctl-connect and datum-connectd.
-    With datumctl already installed, install this preview on macOS or Linux:
+    Datum Connect is a background networking agent for your Datum projects. It
+    enrolls this device, maintains its private connector identity and sessions,
+    lets teammates reach services on your machine, and attaches the machine to
+    managed VPCs. On first cloud use, the CLI now enables Connect automatically
+    or submits the provider approval request for the selected project.
+
+    Each archive contains the datumctl plugin and matching daemon. With datumctl
+    already installed, paste this into bash on macOS or Linux:
 
     ```sh
     bash -c 'set -e; v={{ .Tag }}; os=$(uname -s); case "$os" in Darwin|Linux) ;; *) echo "unsupported OS: $os" >&2; exit 1;; esac; arch=$(uname -m); case "$arch" in x86_64|amd64) arch=x86_64;; arm64|aarch64) arch=arm64;; *) echo "unsupported architecture: $arch" >&2; exit 1;; esac; asset="datumctl-connect_${os}_${arch}.tar.gz"; mkdir -p "$HOME/.local/bin"; curl -fsSL "https://github.com/datum-cloud/connect/releases/download/$v/$asset" | tar -xz -C "$HOME/.local/bin" datumctl-connect datum-connectd datum-connect-network-helper; export PATH="$HOME/.local/bin:$PATH"; datumctl plugin trust connect; datumctl connect version'
     ```
 
-    Add `~/.local/bin` to `PATH` in your shell startup file if needed. Read
-    INSTALL.txt for the detailed manual flow and troubleshooting.
-    Section 7 of INSTALL.txt covers joining a managed VPC and reaching a running
-    Compute instance by its VPC address. Join creates a ConnectGateway in the
-    nearest location when the Network does not already have one.
+    Or paste this into PowerShell on Windows:
+
+    ```powershell
+    $ErrorActionPreference='Stop'; $v='{{ .Tag }}'; $arch=switch([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()){'X64'{'x86_64'} 'Arm64'{'arm64'} default {throw "Unsupported architecture: $([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"}}; $dir=Join-Path $HOME '.local\bin'; New-Item -ItemType Directory -Force -Path $dir | Out-Null; $zip=Join-Path $env:TEMP "datumctl-connect-$v.zip"; Invoke-WebRequest -UseBasicParsing "https://github.com/datum-cloud/connect/releases/download/$v/datumctl-connect_Windows_$arch.zip" -OutFile $zip; Expand-Archive -Force $zip $dir; $env:PATH="$dir;$env:PATH"; datumctl plugin trust connect; datumctl connect version
+    ```
+
+    Join a project VPC (the nearest managed gateway is created automatically):
+
+    ```sh
+    datumctl connect join NETWORK --project PROJECT
+    ```
+
+    Expose a local TCP service privately to the project's other connectors:
+
+    ```sh
+    datumctl connect serve localhost:8080 --project PROJECT
+    # On another connector:
+    datumctl connect dial CONNECTOR:8080 --bind 18080 --project PROJECT
+    ```
+
+    Add the install directory to your persistent `PATH` if needed. Read
+    INSTALL.txt for privileged Windows service setup, detailed installation,
+    VPC access, and troubleshooting.
     Checksums are not publisher signatures. macOS notarization is not included.
   extra_files:
     - glob: ../docs/INSTALL.txt
