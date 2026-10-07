@@ -1,4 +1,4 @@
-Datum Connect v1.0.0-preview.27: installation with datumctl
+Datum Connect v1.0.0-preview.28: installation with datumctl
 ===========================================================
 
 This archive includes the datumctl plugin and its matching daemon. Install
@@ -14,7 +14,7 @@ Quick install on macOS or Linux
 Paste this into bash. It detects the operating system and CPU, installs the
 preview binaries in ~/.local/bin, and trusts the datumctl plugin:
 
-  bash -c 'set -e; v=v1.0.0-preview.27; os=$(uname -s); case "$os" in Darwin|Linux) ;; *) echo "unsupported OS: $os" >&2; exit 1;; esac; arch=$(uname -m); case "$arch" in x86_64|amd64) arch=x86_64;; arm64|aarch64) arch=arm64;; *) echo "unsupported architecture: $arch" >&2; exit 1;; esac; asset="datumctl-connect_${os}_${arch}.tar.gz"; mkdir -p "$HOME/.local/bin"; curl -fsSL "https://github.com/datum-cloud/connect/releases/download/$v/$asset" | tar -xz -C "$HOME/.local/bin" datumctl-connect datum-connectd datum-connect-network-helper; export PATH="$HOME/.local/bin:$PATH"; datumctl plugin trust connect; datumctl connect version'
+  bash -c 'set -e; v=v1.0.0-preview.28; os=$(uname -s); case "$os" in Darwin|Linux) ;; *) echo "unsupported OS: $os" >&2; exit 1;; esac; arch=$(uname -m); case "$arch" in x86_64|amd64) arch=x86_64;; arm64|aarch64) arch=arm64;; *) echo "unsupported architecture: $arch" >&2; exit 1;; esac; asset="datumctl-connect_${os}_${arch}.tar.gz"; mkdir -p "$HOME/.local/bin"; curl -fsSL "https://github.com/datum-cloud/connect/releases/download/$v/$asset" | tar -xz -C "$HOME/.local/bin" datumctl-connect datum-connectd datum-connect-network-helper; export PATH="$HOME/.local/bin:$PATH"; datumctl plugin trust connect; datumctl connect version'
 
 Add ~/.local/bin to PATH in your shell startup file if it is not already
 there. Continue with section 3. The detailed manual flow below includes archive
@@ -26,7 +26,7 @@ Paste this single command into PowerShell. It detects the CPU architecture,
 installs the preview bundle in %USERPROFILE%\.local\bin, trusts the plugin,
 and verifies the installed version:
 
-  $ErrorActionPreference='Stop'; $v='v1.0.0-preview.27'; $arch=switch([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()){'X64'{'x86_64'} 'Arm64'{'arm64'} default {throw "Unsupported architecture: $([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"}}; $dir=Join-Path $HOME '.local\bin'; New-Item -ItemType Directory -Force -Path $dir | Out-Null; $zip=Join-Path $env:TEMP "datumctl-connect-$v.zip"; Invoke-WebRequest -UseBasicParsing "https://github.com/datum-cloud/connect/releases/download/$v/datumctl-connect_Windows_$arch.zip" -OutFile $zip; Expand-Archive -Force $zip $dir; $env:PATH="$dir;$env:PATH"; datumctl plugin trust connect; datumctl connect version
+  $ErrorActionPreference='Stop'; $v='v1.0.0-preview.28'; $arch=switch([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()){'X64'{'x86_64'} 'Arm64'{'arm64'} default {throw "Unsupported architecture: $([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"}}; $dir=Join-Path $HOME '.local\bin'; New-Item -ItemType Directory -Force -Path $dir | Out-Null; $zip=Join-Path $env:TEMP "datumctl-connect-$v.zip"; Invoke-WebRequest -UseBasicParsing "https://github.com/datum-cloud/connect/releases/download/$v/datumctl-connect_Windows_$arch.zip" -OutFile $zip; Expand-Archive -Force $zip $dir; $env:PATH="$dir;$env:PATH"; datumctl plugin trust connect; datumctl connect version
 
 Add %USERPROFILE%\.local\bin to your user PATH for later PowerShell sessions.
 The Windows daemon still requires the privileged service setup described in
@@ -43,7 +43,7 @@ section 8 and docs/headless-preview.md.
    Example download for an Apple Silicon Mac. Change CONNECT_ARCHIVE for another
    platform. Check each command succeeds before continuing:
 
-     CONNECT_VERSION=v1.0.0-preview.27
+     CONNECT_VERSION=v1.0.0-preview.28
      CONNECT_ARCHIVE=datumctl-connect_Darwin_arm64.tar.gz
      CONNECT_RELEASE_URL="https://github.com/datum-cloud/connect/releases/download/$CONNECT_VERSION"
      CONNECT_DOWNLOAD_DIR=$(mktemp -d)
@@ -82,7 +82,7 @@ section 8 and docs/headless-preview.md.
      datumctl connect --version
      datumctl connect serve --help
 
-   Expected output: "connect version v1.0.0-preview.27". Check that the trust
+   Expected output: "connect version v1.0.0-preview.28". Check that the trust
    command identifies the executable inside CONNECT_PREVIEW_DIR.
    The daemon reports its release tag with `datumctl connect version`.
    Keep the two binaries from the same archive together.
@@ -96,7 +96,7 @@ section 8 and docs/headless-preview.md.
    To keep using this preview in new terminals, repeat these exports or add them
    to your shell startup file (~/.zshrc on macOS or ~/.bashrc on Linux):
 
-     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.27"
+     export CONNECT_PREVIEW_DIR="$HOME/.local/share/datum-connect/previews/v1.0.0-preview.28"
      export PATH="$CONNECT_PREVIEW_DIR:$PATH"
      export DATUMCTL_PLUGINS_DIR="$CONNECT_PREVIEW_DIR/plugin-registry"
 
@@ -298,7 +298,7 @@ section 8 and docs/headless-preview.md.
    protected executable location, and renewable credential-file authentication.
    Follow the matching version's Windows platform guide:
 
-   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.27/docs/headless-preview.md
+   https://github.com/datum-cloud/connect/blob/v1.0.0-preview.28/docs/headless-preview.md
 
 Local build qualification
 -------------------------

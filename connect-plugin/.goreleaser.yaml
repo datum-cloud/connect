@@ -22,8 +22,8 @@ release:
     Datum Connect is a background networking agent for your Datum projects. It
     enrolls this device, maintains its private connector identity and sessions,
     lets teammates reach services on your machine, and attaches the machine to
-    managed VPCs. On first cloud use, the CLI now enables Connect automatically
-    or submits the provider approval request for the selected project.
+    managed VPCs. This preview fixes automatic managed gateway placement by
+    using fully qualified Compute location names such as us-central-1.
 
     Each archive contains the datumctl plugin and matching daemon. With datumctl
     already installed, paste this into bash on macOS or Linux:
