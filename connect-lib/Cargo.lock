@@ -425,6 +425,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "connect-lib"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "connect-masque-edge"
 version = "0.1.0"
 dependencies = [
