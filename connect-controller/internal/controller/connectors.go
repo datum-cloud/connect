@@ -83,7 +83,7 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 // responsible for engaging only projects with an active Connect entitlement.
 func SetupProjectedConnectorClassesWithManager(mgr mcmanager.Manager, classClient client.Client) error {
 	if err := mcbuilder.ControllerManagedBy(mgr).
-		Named("connectorclass").
+		Named("connectorclass-projected").
 		For(&connectv1alpha1.ConnectorClass{}, mcbuilder.WithEngageWithLocalCluster(false)).
 		Complete(&ConnectReconciler{mgr: mgr, kind: "connectorclass", classClient: classClient}); err != nil {
 		return fmt.Errorf("register projected ConnectorClass controller: %w", err)
