@@ -1,5 +1,5 @@
 [workspace]
-members = ["transport", "ip-adapter", "network-helper", "masque-edge"]
+members = ["transport", "ip-adapter", "network-helper", "masque-edge", "lib"]
 resolver = "2"
 
 [workspace.package]

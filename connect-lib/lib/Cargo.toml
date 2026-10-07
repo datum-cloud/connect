@@ -1,0 +1,32 @@
+[package]
+name = "connect-lib"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Gate integration-style tests that require rustls CryptoProvider
+# (ring or aws-lc-rs feature) and external token helpers.
+# Run with: cargo test --lib --features integration-tests
+integration-tests = []
+
+[dependencies]
+rand = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
