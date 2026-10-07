@@ -22,9 +22,15 @@ import (
 func interactiveFixture(t *testing.T) {
 	t.Helper()
 	oldInteractive, oldGuided := interactiveTerminal, guidedSetupEnabled
+	oldCurrent := ensureCurrentUserDaemon
 	interactiveTerminal = func(*cobra.Command) bool { return true }
 	guidedSetupEnabled = func(*cobra.Command, *options) bool { return true }
-	t.Cleanup(func() { interactiveTerminal, guidedSetupEnabled = oldInteractive, oldGuided })
+	ensureCurrentUserDaemon = func(context.Context, string, string, time.Duration, io.Writer, bool) (bool, bool, error) {
+		return false, false, nil
+	}
+	t.Cleanup(func() {
+		interactiveTerminal, guidedSetupEnabled, ensureCurrentUserDaemon = oldInteractive, oldGuided, oldCurrent
+	})
 	t.Setenv("DATUM_CONNECT_TOKEN", "")
 	repo := t.TempDir()
 	t.Setenv("DATUM_CONNECT_DIR", repo)
@@ -101,28 +107,34 @@ func TestServeGuidedEnrollmentAndDownConsent(t *testing.T) {
 	}
 }
 
-func TestGuidedSetupNeverAppliesToAutomationOrCustomTargets(t *testing.T) {
+func TestGuidedSetupAllowsOnlyInteractiveLocalDaemonTargets(t *testing.T) {
 	old := interactiveTerminal
 	t.Cleanup(func() { interactiveTerminal = old })
 	t.Setenv("DATUM_CONNECT_TOKEN", "")
 	interactiveTerminal = func(*cobra.Command) bool { return true }
+	localDaemonTargetAllowed := runtime.GOOS != "windows"
 	for _, tt := range []struct {
 		format, url, token, env string
 		terminal                bool
+		want                    bool
 	}{
-		{"json", connectapi.DefaultBaseURL, "", "", true},
-		{"yaml", connectapi.DefaultBaseURL, "", "", true},
-		{"table", "http://127.0.0.1:48888", "", "", true},
-		{"table", connectapi.DefaultBaseURL, "/scoped-token", "", true},
-		{"table", connectapi.DefaultBaseURL, "", "scoped", true},
-		{"table", connectapi.DefaultBaseURL, "", "", false},
+		{"json", connectapi.DefaultBaseURL, "", "", true, false},
+		{"yaml", connectapi.DefaultBaseURL, "", "", true, false},
+		{"table", "http://127.0.0.1:48888", "", "", true, localDaemonTargetAllowed},
+		{"table", "http://localhost:48888", "", "", true, localDaemonTargetAllowed},
+		{"table", "http://[::1]:48888", "", "", true, localDaemonTargetAllowed},
+		{"table", "https://example.com", "", "", true, false},
+		{"table", "http://127.0.0.1.evil.example", "", "", true, false},
+		{"table", connectapi.DefaultBaseURL, "/scoped-token", "", true, false},
+		{"table", connectapi.DefaultBaseURL, "", "scoped", true, false},
+		{"table", connectapi.DefaultBaseURL, "", "", false, false},
 	} {
 		cmd := &cobra.Command{}
 		cmd.Flags().String("output", tt.format, "")
 		interactiveTerminal = func(*cobra.Command) bool { return tt.terminal }
 		t.Setenv("DATUM_CONNECT_TOKEN", tt.env)
-		if guidedSetup(cmd, &options{baseURL: tt.url, tokenFile: tt.token}) {
-			t.Errorf("unsafe guided setup: %#v", tt)
+		if got := guidedSetup(cmd, &options{baseURL: tt.url, tokenFile: tt.token}); got != tt.want {
+			t.Errorf("guided setup = %v, want %v: %#v", got, tt.want, tt)
 		}
 	}
 }
@@ -141,6 +153,25 @@ func TestUnexpectedListenerNeverInstallsAService(t *testing.T) {
 	cmd.SetContext(context.Background())
 	if err := ensureDaemonForUp(cmd, &options{baseURL: server.URL, timeout: time.Second}); err == nil {
 		t.Fatal("expected failure")
+	}
+}
+
+func TestEnsureDaemonForUpChecksManagedDaemonVersionFirst(t *testing.T) {
+	old, oldGuided := ensureCurrentUserDaemon, guidedSetupEnabled
+	t.Cleanup(func() { ensureCurrentUserDaemon, guidedSetupEnabled = old, oldGuided })
+	guidedSetupEnabled = func(*cobra.Command, *options) bool { return true }
+	checked := false
+	ensureCurrentUserDaemon = func(context.Context, string, string, time.Duration, io.Writer, bool) (bool, bool, error) {
+		checked = true
+		return true, true, nil
+	}
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	if err := ensureDaemonForUp(cmd, &options{baseURL: connectapi.DefaultBaseURL, timeout: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if !checked {
+		t.Fatal("did not check the installed daemon version before using it")
 	}
 }
 

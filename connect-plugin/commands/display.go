@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -41,23 +42,32 @@ type dialDisplay struct {
 }
 
 type networkDisplay struct {
-	Network            string   `json:"network"`
-	Mode               string   `json:"mode"`
-	Peer               string   `json:"peer"`
-	PeerAddress        string   `json:"peer_address"`
-	Connected          bool     `json:"connected"`
-	State              string   `json:"state"`
-	Address            string   `json:"assigned_address"`
-	Interface          string   `json:"interface_name"`
-	Routes             []string `json:"routes"`
-	Running            bool     `json:"running"`
-	LastError          string   `json:"last_error"`
-	LastConnectError   string   `json:"last_connect_error"`
-	ACLDrops           uint64   `json:"acl_drops"`
-	DeliveryMode       string   `json:"delivery_mode"`
-	DatagramCapacity   uint64   `json:"effective_datagram_ip_capacity"`
-	MTUErrors          uint64   `json:"mtu_errors"`
-	LastTransportError string   `json:"last_transport_error"`
+	Network                    string   `json:"network"`
+	Mode                       string   `json:"mode"`
+	Gateway                    string   `json:"gateway_resource"`
+	GatewayLocation            string   `json:"gateway_location"`
+	Peer                       string   `json:"peer"`
+	PeerAddress                string   `json:"peer_address"`
+	Connected                  *bool    `json:"connected"`
+	State                      string   `json:"state"`
+	Address                    string   `json:"assigned_address"`
+	Interface                  string   `json:"interface_name"`
+	Routes                     []string `json:"routes"`
+	AdvertiseRoutes            []string `json:"advertise_routes"`
+	Running                    bool     `json:"running"`
+	Persistent                 bool     `json:"persistent"`
+	DesiredAttached            bool     `json:"desired_attached"`
+	LastError                  string   `json:"last_error"`
+	LastConnectError           string   `json:"last_connect_error"`
+	ACLDrops                   uint64   `json:"acl_drops"`
+	DeliveryMode               string   `json:"delivery_mode"`
+	DatagramCapacity           uint64   `json:"effective_datagram_ip_capacity"`
+	MTUErrors                  uint64   `json:"mtu_errors"`
+	LastTransportError         string   `json:"last_transport_error"`
+	LocalTunToTransportPackets uint64   `json:"local_tun_to_transport_packets"`
+	TransportToLocalTunPackets uint64   `json:"transport_to_local_tun_packets"`
+	LastPacketSentAtUnixMS     *uint64  `json:"last_packet_sent_at_unix_ms"`
+	LastPacketReceivedAtUnixMS *uint64  `json:"last_packet_received_at_unix_ms"`
 }
 
 // writeHuman renders the daemon's observed state, never assuming that saved
@@ -78,7 +88,7 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 		} else {
 			fmt.Fprintf(&out, "Connect daemon health: %s\n", value.Status)
 		}
-	case "status", "up", "down":
+	case "status", "up", "down", "doctor":
 		var value struct {
 			Project              string `json:"project"`
 			DesiredUp            bool   `json:"desired_up"`
@@ -93,11 +103,18 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 				Name      string `json:"name"`
 				PublicKey string `json:"public_key"`
 			} `json:"connector"`
-			Services       []serviceDisplay `json:"services"`
-			Dials          []dialDisplay    `json:"dials"`
-			Networks       []networkDisplay `json:"networks"`
-			LastError      string           `json:"last_error"`
-			LastErrorStage string           `json:"last_error_stage"`
+			Services   []serviceDisplay `json:"services"`
+			Dials      []dialDisplay    `json:"dials"`
+			Networks   []networkDisplay `json:"networks"`
+			Networking *struct {
+				State     string `json:"state"`
+				LastError string `json:"last_error"`
+				Saved     []struct {
+					Network string `json:"network"`
+				} `json:"saved_attachments"`
+			} `json:"networking"`
+			LastError      string `json:"last_error"`
+			LastErrorStage string `json:"last_error_stage"`
 		}
 		if err := json.Unmarshal(data, &value); err != nil {
 			return err
@@ -125,6 +142,36 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 		}
 		if value.Connector != nil {
 			fmt.Fprintf(&out, "Connector: %s\n", value.Connector.Name)
+		}
+		shownNetworks := make(map[string]bool)
+		if value.Networking != nil && value.Networking.State != "not_required" {
+			fmt.Fprintf(&out, "IP networking helper: %s\n", strings.ReplaceAll(value.Networking.State, "_", " "))
+			if value.Networking.LastError != "" {
+				fmt.Fprintf(&out, "  %s\n", value.Networking.LastError)
+			}
+			for _, saved := range value.Networking.Saved {
+				shownNetworks[saved.Network] = true
+				active := false
+				for _, network := range value.Networks {
+					if network.Network == saved.Network && network.Running {
+						active = true
+					}
+				}
+				if !active {
+					fmt.Fprintf(&out, "  Saved attachment %s: approved, not attached on this device. Join: datumctl connect join %s%s\n", saved.Network, shellArg(saved.Network), displayProjectFlag(cmd))
+				}
+			}
+		}
+		for _, network := range value.Networks {
+			if network.Mode == "gateway" && !network.Running && network.Network != "" && !shownNetworks[network.Network] {
+				fmt.Fprintf(&out, "Saved VPC binding %s: approved, not attached on this device. Join: datumctl connect join %s%s\n", network.Network, shellArg(network.Network), displayProjectFlag(cmd))
+				if network.LastError != "" {
+					writeFailure(&out, "network", network.LastError)
+				}
+			}
+		}
+		if cmd.Name() == "doctor" {
+			out.WriteString("Read-only checks; no interface, service, or route was changed. Helper readiness does not prove peer reachability.\n")
 		}
 		if !value.CredentialConfigured {
 			fmt.Fprintf(&out, "\nNext: %s\n", setupCommand(value.Project))
@@ -176,17 +223,52 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			}
 		}
 		for _, network := range value.Networks {
+			connected := network.Running && network.Mode != "peer"
+			if network.Connected != nil {
+				connected = network.Running && *network.Connected
+			} else if network.Mode == "peer" {
+				connected = network.Running && network.Connected != nil && *network.Connected
+			}
 			state := "disconnected"
-			if network.Running && (network.Mode != "peer" || network.Connected) {
+			switch {
+			case network.State == "reconnecting" && network.Running:
+				state = "reconnecting"
+			case network.State == "reconnecting":
+				state = "waiting to reconnect"
+			case network.State == "approval_required":
+				state = "administrator approval required"
+			case !network.Running && network.Mode == "gateway" && network.State == "inactive":
+				state = "approved, not attached locally"
+			case !network.Running && network.LastError != "":
+				state = "failed"
+			case connected:
 				state = "connected"
-			} else if network.Running && network.Mode == "peer" {
+			case network.Running && network.Mode == "peer":
 				state = "waiting for peer"
 			}
-			fmt.Fprintf(&out, "Network %s: %s, %s on %s (ephemeral native preview).\n", network.Network, state, network.Address, network.Interface)
+			interfaceName := network.Interface
+			if !network.Running {
+				interfaceName = "no active interface"
+			}
+			lifetime := "ephemeral native preview"
+			if network.Persistent {
+				lifetime = "persistent managed attachment"
+			}
+			fmt.Fprintf(&out, "Network %s: %s, %s on %s (%s).\n", network.Network, state, network.Address, interfaceName, lifetime)
+			if network.Mode == "gateway" && network.Gateway != "" {
+				if network.GatewayLocation != "" {
+					fmt.Fprintf(&out, "  VPC gateway: %s (%s)\n", network.Gateway, network.GatewayLocation)
+				} else {
+					fmt.Fprintf(&out, "  VPC gateway: %s\n", network.Gateway)
+				}
+			}
 			fmt.Fprintf(&out, "  Routes: %s\n", strings.Join(network.Routes, ", "))
+			if len(network.AdvertiseRoutes) > 0 {
+				fmt.Fprintf(&out, "  Approved subnet access for peer: %s\n  Forwarding, firewall, and return routing are managed separately on this device.\n", strings.Join(network.AdvertiseRoutes, ", "))
+			}
 			if network.Mode == "peer" {
 				fmt.Fprintf(&out, "  Peer: %s (%s)\n", network.Peer, network.PeerAddress)
-				if network.Running && !network.Connected {
+				if network.Running && (network.Connected == nil || !*network.Connected) {
 					fmt.Fprintf(&out, "  The local attachment is ready, but peer traffic is not connected. Run datumctl connect join %s on the other device using its configured project. Both devices need matching peer approvals.\n", network.Network)
 				}
 				if network.LastConnectError != "" {
@@ -198,6 +280,11 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 			}
 			if network.DeliveryMode != "" {
 				fmt.Fprintf(&out, "  Transport: %s; IP datagram capacity: %d bytes; MTU errors: %d\n", network.DeliveryMode, network.DatagramCapacity, network.MTUErrors)
+			}
+			if cmd.Name() == "status" && network.Mode == "gateway" && network.DeliveryMode != "" {
+				fmt.Fprintf(&out, "  Packets: to gateway %d (last %s); from gateway %d (last %s)\n",
+					network.LocalTunToTransportPackets, packetAge(network.LastPacketSentAtUnixMS),
+					network.TransportToLocalTunPackets, packetAge(network.LastPacketReceivedAtUnixMS))
 			}
 			failure := network.LastError
 			if network.LastTransportError != "" {
@@ -314,18 +401,41 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 		if !network.Running {
 			return fmt.Errorf("network attachment is not running; inspect datumctl connect status%s", displayProjectFlag(cmd))
 		}
-		if network.Mode == "peer" && !network.Connected {
-			fmt.Fprintf(&out, "Prepared %s: %s on %s; waiting for peer %s (%s).\nPeer traffic is not connected yet. Run datumctl connect join %s on the other device using its configured project. Both devices need matching peer approvals.\nCheck: datumctl connect status%s\n", network.Network, network.Address, network.Interface, network.Peer, network.PeerAddress, network.Network, displayProjectFlag(cmd))
-			if network.LastConnectError != "" {
-				fmt.Fprintf(&out, "Last connection attempt: %s\n", network.LastConnectError)
+		connected := network.Connected == nil && network.Mode != "peer" || network.Connected != nil && *network.Connected
+		if network.State == "reconnecting" {
+			fmt.Fprintf(&out, "Reconnecting to %s; the approved routes remain installed.\n", network.Network)
+		} else if network.Mode == "peer" && !connected {
+			if hasSubnetRoutes(network) {
+				fmt.Fprintf(&out, "Waiting for the VPC connection to become ready for %s.\n", network.Network)
+			} else {
+				fmt.Fprintf(&out, "Waiting for the other device to join %s.\n", network.Network)
+				fmt.Fprintf(&out, "On the other device: datumctl connect join %s%s\n", shellArg(network.Network), displayProjectFlag(cmd))
 			}
+			if network.LastConnectError != "" {
+				fmt.Fprintf(&out, "Connection issue: %s\n", network.LastConnectError)
+			}
+		} else if network.Mode == "gateway" && !connected {
+			fmt.Fprintf(&out, "The VPC binding for %s is approved, but this device is not forwarding traffic.\n", network.Network)
 		} else {
-			fmt.Fprintf(&out, "Joined %s: %s on %s.\n", network.Network, network.Address, network.Interface)
-			if network.Mode == "peer" {
-				fmt.Fprintf(&out, "Peer: %s (%s). Only explicitly approved traffic is allowed.\n", network.Peer, network.PeerAddress)
+			fmt.Fprintf(&out, "Connected to %s.\n", network.Network)
+		}
+		if network.Mode == "gateway" && network.Gateway != "" && network.GatewayLocation != "" {
+			fmt.Fprintf(&out, "VPC gateway: %s (%s).\n", network.Gateway, network.GatewayLocation)
+		}
+		if len(network.Routes) > 0 {
+			if len(network.Routes) == 1 {
+				fmt.Fprintf(&out, "Route: %s\n", network.Routes[0])
+			} else {
+				out.WriteString("Routes:\n")
+				for _, route := range network.Routes {
+					fmt.Fprintf(&out, "  - %s\n", route)
+				}
 			}
 		}
-		fmt.Fprintf(&out, "Routes: %s\nEphemeral native preview: down or daemon restart removes this attachment.\nLeave: datumctl connect leave %s%s\n", strings.Join(network.Routes, ", "), network.Network, displayProjectFlag(cmd))
+		if len(network.AdvertiseRoutes) > 0 {
+			fmt.Fprintf(&out, "Shared with peer: %s\n", strings.Join(network.AdvertiseRoutes, ", "))
+		}
+		fmt.Fprintf(&out, "Leave: datumctl connect leave %s%s\n", shellArg(network.Network), displayProjectFlag(cmd))
 	case "leave":
 		var value struct {
 			Network string `json:"network"`
@@ -352,6 +462,20 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 	}
 	_, err := io.WriteString(w, out.String())
 	return err
+}
+
+func packetAge(timestamp *uint64) string {
+	if timestamp == nil || *timestamp == 0 {
+		return "never"
+	}
+	age := time.Since(time.UnixMilli(int64(*timestamp)))
+	if age < 0 {
+		return "clock skew"
+	}
+	if age < time.Second {
+		return "just now"
+	}
+	return fmt.Sprintf("%s ago", age.Truncate(time.Second))
 }
 
 // Suggest an unprivileged port on the other device, not an allocated local port.

@@ -62,6 +62,7 @@ func Add(root *cobra.Command) {
 	root.AddCommand(newDial(opts))
 	root.AddCommand(newHangup(opts))
 	root.AddCommand(newJoin(opts))
+	root.AddCommand(newDoctor(opts))
 	root.AddCommand(newLeave(opts))
 	root.AddCommand(newPing(opts))
 	root.AddCommand(newDaemon())
@@ -373,11 +374,10 @@ func newHangup(opts *options) *cobra.Command {
 	}}
 }
 
-func newJoin(opts *options) *cobra.Command  { return networkCommand(opts, "join", http.MethodPost) }
 func newLeave(opts *options) *cobra.Command { return networkCommand(opts, "leave", http.MethodDelete) }
 
 func networkCommand(opts *options, name, method string) *cobra.Command {
-	return &cobra.Command{Use: name + " NETWORK", Short: strings.Title(name) + " an approved local IP network (native preview)", Long: "Attach or detach an explicitly approved local CONNECT-IP network.\nRequires an enrolled project and a supported native daemon started with --local-ip-config.\nAttachments are ephemeral and disappear on down or daemon restart; this does not create a production NetworkBinding.\nUse serve and dial for individual TCP or UDP services when CONNECT-IP is unavailable.", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	return &cobra.Command{Use: name + " NETWORK", Short: strings.Title(name) + " a project VPC network", Long: "Join selects the ConnectGateway for NETWORK or creates one in the nearest location using the project's default ConnectGatewayClass, then creates this Connector's ConnectNetworkBinding. The daemon asks before installing the local interface and exact approved routes. Successful managed VPC joins persist and reconnect when the daemon or project resumes. Leave clears that intent and deletes the binding.\n\nWhen the managed Connect APIs are unavailable, join can use the direct Connector preview with\n--peer. Direct and legacy --local-ip-config attachments remain ephemeral. Use serve and dial\nfor individual TCP or UDP services.", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		p, err := project(cmd)
 		if err != nil {
 			return err
@@ -457,6 +457,6 @@ func parseProtocol(value string) (string, error) {
 
 func newDaemon() *cobra.Command {
 	cmd := &cobra.Command{Use: "daemon", Short: "Manage the local Datum Connect daemon service"}
-	cmd.AddCommand(daemonservice.InstallCommand(), daemonservice.UninstallCommand(), daemonservice.StartCommand(), daemonservice.StopCommand(), daemonservice.StatusCommand())
+	cmd.AddCommand(daemonservice.InstallCommand(), daemonservice.UninstallCommand(), daemonservice.StartCommand(), daemonservice.StopCommand(), daemonservice.StatusCommand(), daemonservice.HelperCommand())
 	return cmd
 }
