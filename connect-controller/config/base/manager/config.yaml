@@ -4,3 +4,6 @@ metadata:
   name: connect-controller-config
 data:
   INTERNAL_SERVICE_DISCOVERY: "false"
+  # Set this to the dedicated platform-controlled Milo project that owns
+  # Connector service accounts and authentication keys.
+  IDENTITY_PROJECT: ""

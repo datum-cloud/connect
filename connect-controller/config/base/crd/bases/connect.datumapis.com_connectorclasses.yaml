@@ -48,13 +48,16 @@ spec:
           spec:
             properties:
               capabilities:
-                description: Capabilities are named protocol features advertised to
-                  clients.
+                description: |-
+                  Capabilities are named protocol features advertised to clients.
+                  connector-authentication asserts that UID-scoped IAM policy and the trusted
+                  OAuth token endpoint are deployed, allowing clients to leave bootstrap auth.
                 items:
                   enum:
                   - connect-tcp
                   - connect-udp
                   - connect-ip
+                  - connector-authentication
                   type: string
                 type: array
               transports:

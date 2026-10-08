@@ -26,8 +26,9 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          Connector represents one Connect installation in one project. The public key
-          is the stable iroh identity; private material must never be stored in the API.
+          Connector represents one Connect installation in one project. Its transport
+          and control-plane authentication public keys are distinct immutable
+          identities. Private material must never be stored in the API.
         properties:
           apiVersion:
             description: |-
@@ -48,27 +49,44 @@ spec:
             type: object
           spec:
             properties:
+              authentication:
+                properties:
+                  publicKey:
+                    description: |-
+                      PublicKey is a PEM-encoded RSA public key. The matching private key remains
+                      on the Connector and signs OAuth JWT assertions.
+                    maxLength: 8192
+                    minLength: 1
+                    type: string
+                    x-kubernetes-validations:
+                    - message: publicKey is the immutable control-plane authentication
+                        identity; replace the Connector to rotate it
+                      rule: oldSelf == null || self == oldSelf
+                required:
+                - publicKey
+                type: object
               classRef:
                 description: ClassRef names a cluster-scoped ConnectorClass in the
                   management cluster.
                 type: string
-              endpoint:
-                description: Endpoint is the optional serialized iroh endpoint address
-                  for dialing.
-                type: string
-              publicKey:
-                description: PublicKey is the lowercase or uppercase hex-encoded 32-byte
-                  iroh public key.
-                pattern: ^[a-fA-F0-9]{64}$
-                type: string
-              relayURLs:
-                description: RelayURLs are optional relay URLs published by the Connector.
-                items:
-                  type: string
-                type: array
+              transport:
+                properties:
+                  publicKey:
+                    description: PublicKey is the lowercase or uppercase hex-encoded
+                      32-byte iroh public key.
+                    pattern: ^[a-fA-F0-9]{64}$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: publicKey is the immutable iroh transport identity;
+                        replace the Connector to rotate it
+                      rule: oldSelf == null || self == oldSelf
+                required:
+                - publicKey
+                type: object
             required:
+            - authentication
             - classRef
-            - publicKey
+            - transport
             type: object
           status:
             properties:
@@ -76,6 +94,37 @@ spec:
                 items:
                   type: string
                 type: array
+              authentication:
+                description: |-
+                  Authentication identifies the platform principal bound to this immutable
+                  Connector UID and the provider key IDs available for JWT assertions.
+                properties:
+                  authProviderKeyID:
+                    type: string
+                  connectorUID:
+                    type: string
+                  principalRef:
+                    properties:
+                      clientEmail:
+                        type: string
+                      clientID:
+                        type: string
+                      name:
+                        type: string
+                      project:
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - name
+                    - project
+                    type: object
+                  serviceAccountKeyRef:
+                    type: string
+                required:
+                - connectorUID
+                - principalRef
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -137,6 +186,27 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              transport:
+                description: |-
+                  Transport is Connector-reported observed reachability. The controller
+                  preserves it and does not interpret these URLs as user-selected policy.
+                properties:
+                  endpoint:
+                    description: |-
+                      Endpoint is the Connector's serialized iroh EndpointAddr observation.
+                      It is written by the Connector agent, not by users or the controller.
+                    maxLength: 16384
+                    type: string
+                  relayURLs:
+                    description: |-
+                      RelayURLs are the relay addresses actually used by the Connector. They are
+                      observed status, not a user-selectable relay policy.
+                    items:
+                      maxLength: 2048
+                      type: string
+                    maxItems: 8
+                    type: array
+                type: object
             type: object
         type: object
     served: true
