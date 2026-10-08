@@ -10,7 +10,7 @@ recovery role.
 | --- | --- | --- | --- |
 | `ConnectorClass` | Cluster | Allowed transports and capabilities | Valid configuration and Ready |
 | `ConnectGatewayClass` | Cluster | Controller, lifecycle policy, operator parameter reference | Accepted and Ready |
-| `Connector` | Project | Class, public key, endpoint, relay URLs | Ready, assigned addresses, Lease reference |
+| `Connector` | Project | Class, immutable iroh transport public key, immutable RSA authentication public key | Platform principal and provider key references, observed endpoint and relay URLs, Ready, assigned addresses, Lease reference |
 | `ConnectorAdvertisement` | Project | Connector reference and TCP/UDP ports | Accepted/Ready conditions |
 | `ConnectGateway` | Project | Gateway class, network, routes, relay policy, peer routing | Service assignment, phase, idle time, endpoint ID, Ready |
 | `ConnectNetworkBinding` | Project | Connector and gateway references | Assigned and peer addresses, routes, relays, Ready |
@@ -59,7 +59,10 @@ to that platform implementation and are not part of the client contract.
 Daemon-created child resources carry an owner label and a Connector owner
 reference. Before reuse or deletion, the client checks both the label and owner
 UID. Existing foreign resources and incompatible administrator edits are not
-adopted or overwritten.
+adopted or overwritten. Platform identity resources are controller-owned: the
+service account and registered RSA key live in a platform identity project,
+while the consumer project contains only an exact-Connector-UID authorization
+binding and status references.
 
 ## Local Durable State
 
@@ -67,7 +70,7 @@ The daemon's versioned state is organized by project:
 
 | State | Desired fields | Observed fields |
 | --- | --- | --- |
-| Project | device name, `desired_up`, auth source | running, enrolled, Connector identity, last error |
+| Project | device name, `desired_up`, bootstrap/auth source, transport and authentication keys | running, enrolled, Connector identity, last error |
 | Service | endpoint, protocol, public/hostname, pinned allowlist, `desired_active` | running, ready, hostnames, last error |
 | Dial | pinned key, remote port, requested bind, protocol, `desired_active` | actual local port, running, last error |
 | Managed network | network and `desired_attached` | running, lifecycle state, last error stage |
@@ -77,7 +80,9 @@ The daemon's versioned state is organized by project:
 
 Observed runtime flags are reset during process startup. Desired flags survive
 and drive reconciliation. Private keys and credentials live in protected files
-beside the state document rather than inside Kubernetes resources.
+beside the state document rather than inside Kubernetes resources. Endpoint and
+relay URLs are observed runtime reachability written under
+`Connector.status.transport`; they are not user-selected desired state.
 
 ## Live Runtime State
 
@@ -104,12 +109,13 @@ intent.
 - Deleting a service removes both its ConnectorAdvertisement and any HTTPProxy
   after verifying ownership.
 - Deleting a ConnectNetworkBinding removes the gateway grant on reconciliation.
-- Deleting a Connector revokes refresh; the daemon does not recreate it during
-  routine liveness refresh.
+- Deleting a Connector revokes refresh after its exact-UID grant, registered
+  authentication key, and platform service account are observed deleted; the
+  daemon does not recreate it during routine liveness refresh.
 - `leave` closes the local path before attempting remote deletion, so deletion
   failure cannot leave traffic flowing contrary to local intent.
-- Key rotation currently requires resource replacement rather than in-place
-  mutation.
+- Either-key rotation currently requires Connector replacement rather than
+  in-place mutation.
 
 ## Related Documentation
 

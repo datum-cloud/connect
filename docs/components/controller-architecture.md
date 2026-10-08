@@ -44,9 +44,19 @@ exactly one Ready class that advertises `masque-v1`.
 
 ### Connector
 
-Validates the 32-byte hex public key, resolves the class from the management
-cluster, creates a deterministic 30-second Lease, and publishes Accepted and
-Ready conditions. Ready depends on Lease renewal by the enrolled agent.
+Validates the immutable 32-byte hex iroh public key and the distinct immutable
+RSA authentication public key, then resolves a class that advertises both
+`masque-v1` and `connector-authentication`. It provisions a platform-owned Milo
+service account and registered public key, creates an exact-Connector-UID
+authorization binding in the consumer project, and publishes the provider
+identity references in status. It also creates a deterministic 30-second Lease
+and publishes Accepted and Ready conditions. Ready depends on identity
+provisioning and Lease renewal by the enrolled agent.
+
+The provider fields have intentionally separate meanings: `clientID` is the
+OAuth client ID and JWT issuer/subject, `clientEmail` is the service-account
+email, and `authProviderKeyID` is the JWT key ID. The service-account UID is an
+authorization subject identifier, not an OAuth client ID.
 
 ### ConnectorAdvertisement
 
@@ -115,6 +125,10 @@ control planes.
 ## Failure Semantics
 
 - Invalid specs produce conditions rather than partial child resources.
+- Identity provisioning remains unready until the service account exposes its
+  client ID and email and the registered key exposes its provider key ID.
+- The controller preserves connector-owned `status.transport` while writing
+  authentication and readiness status.
 - Lease expiry removes Connector readiness without forcing a disruptive gateway
   restart for every peer.
 - Route count, grant convergence, and gateway-service readiness are explicit
@@ -122,6 +136,16 @@ control planes.
 - Gateway Ready means the assigned endpoint and network attachment are
   available, not that an end-to-end destination probe succeeded.
 - Deleting a binding removes its grant on the next reconciliation.
+- Connector deletion remains pending until its UID-scoped binding, registered
+  key, and service account have each been observed absent.
+
+## Preview Compatibility
+
+This is a clean `v1alpha1` contract. Connectors created with the previous flat
+transport fields or a separate authentication-enrollment resource must be
+deleted and recreated. There are no deprecated field aliases or automatic
+conversion paths. A future key-rotation flow requires an explicit versioned
+contract rather than mutation of either current public key.
 
 ## External References
 

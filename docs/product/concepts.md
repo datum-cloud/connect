@@ -11,12 +11,23 @@ current `datumctl` context selects the project unless you pass
 ## Connector
 
 A Connector represents one enrolled device or workload. It has a project-local
-name and a cryptographic identity. Commands such as `dial`, `ping`, and
-`join --peer` accept a Connector name or public key.
+name and two cryptographic identities: an iroh identity for peer transport and
+a distinct RSA identity used by a platform-owned service account for project
+API authentication. Commands such as `dial`, `ping`, and `join --peer` accept a
+Connector name or transport public key.
 
 Names make interactive use convenient, but saved permissions and forwards pin
 the resolved public key. Reusing a name therefore does not silently redirect an
 existing grant.
+
+The daemon creates both keypairs before the Connector is created and keeps both
+private keys on the device. Only the public keys are submitted. The platform
+binds the resulting service account to the immutable Connector UID, while the
+daemon reports its currently observed endpoint and relay URLs in status.
+
+Both public keys are immutable in the preview API. Deleting a Connector revokes
+its platform credential and exact-resource grant; rotation or recovery requires
+creating a new Connector rather than editing the old identity.
 
 ## Local daemon
 

@@ -9,15 +9,18 @@ one boundary can authorize.
 
 | Identity | Stored where | Used for |
 | --- | --- | --- |
-| Datum user or service account | Host session reference or protected credential file | Project API authorization |
-| Connector keypair | Private daemon repository; public key in `Connector` | Peer authentication and stable device identity |
+| Bootstrap Datum principal | Host session reference or protected credential file | Authorize initial Connector creation |
+| Connector transport keypair | Private daemon repository; public key in `Connector.spec.transport` | Peer authentication and stable transport identity |
+| Connector authentication keypair and service account | RSA private key in daemon storage; public key and platform principal references in the control plane | Sign short-lived JWT assertions for ongoing project API access |
 | Daemon bearer token | Secret presented locally; salted hash in daemon state | Loopback API roles and scopes |
 | Gateway endpoint identity | Protected platform gateway state | Gateway endpoint authentication |
 | Networking-helper peer credentials | Protected local helper configuration and IPC | Authorize one user daemon and bounded adapter plans |
 
-No Connector private key is stored in the project API. Gateway status exposes
-only the public endpoint ID. The networking helper has no cloud credentials or
-Connector key.
+No Connector private key is stored in the project API. The transport and
+authentication keypairs are deliberately distinct so possession of one does
+not imply authority at the other boundary. Gateway status exposes only the
+public endpoint ID. The networking helper has no cloud credentials or Connector
+key.
 
 ## Cloud Credentials
 
@@ -25,6 +28,14 @@ Interactive enrollment pins a `datumctl` session identifier, not its access or
 refresh token. The daemon invokes `datumctl auth get-token` to refresh access
 using that session. `up --auth oidc` explicitly replaces stored authorization;
 `up --auth stored` reuses it.
+
+On a supported Datum origin, that session is used only to create the Connector
+with both public keys. The platform owns the resulting Milo service account and
+authentication-key registration. Its status reports three distinct values:
+`clientID` is the OAuth client ID and JWT issuer/subject, `clientEmail` is the
+service-account email used to register the public key, and
+`authProviderKeyID` is the JWT key ID. Neither the service-account UID nor its
+email substitutes for the client ID.
 
 Service deployments use an imported credential file. The daemon validates the
 source, copies it into private storage, and no longer depends on the original
@@ -55,7 +66,8 @@ authorization bodies are never written to diagnostic logs.
 
 | Action | Required authority |
 | --- | --- |
-| Enroll or refresh a Connector | Datum principal authorized in the project |
+| Create a Connector | Bootstrap principal authorized to create the complete atomic identity |
+| Refresh an enrolled Connector | Platform-owned service account bound to that exact Connector UID |
 | Advertise a service | Owner of the enrolled Connector and matching local daemon scope |
 | Reach a private service | Serving Connector policy resolves caller key as approved |
 | Create public ingress | Explicit `--public` plus permission to create the owned HTTPProxy |
@@ -76,9 +88,11 @@ daemon carry the Connector owner label and owner reference; reconciliation
 refuses to overwrite a foreign object or an administrator-edited incompatible
 specification.
 
-Deleting the Connector is an immediate revocation boundary. Refresh does not
-silently recreate a deleted Connector. Current key rotation requires resource
-replacement and is not yet a production-grade lifecycle.
+Deleting the Connector is the revocation boundary. Its finalizer deactivates
+and removes the service account, registered key, and UID-scoped grant before
+deletion completes. Refresh does not silently recreate a deleted Connector.
+Both public keys are immutable, so rotation or recovery requires deleting and
+recreating the preview Connector.
 
 ## Secret Handling
 

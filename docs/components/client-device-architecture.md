@@ -51,7 +51,8 @@ the daemon's durable intent.
 
 The daemon is the device's authority for:
 
-- one Connector identity and cloud authorization context per project;
+- distinct transport and control-plane authentication identities plus one cloud
+  authorization context per project;
 - atomic private storage of project, service, dial, and managed-network intent;
 - enrollment and Connector Lease renewal;
 - private service policy and exact local targets;
@@ -60,9 +61,12 @@ The daemon is the device's authority for:
 - CONNECT-IP session lifecycle and packet diagnostics;
 - restart reconciliation and fail-closed authorization refresh.
 
-Each running project has a separate cloud client, iroh endpoint, Connector key,
-transport policy, and cancellation tree. Project membership or policy in one
-runtime does not authorize another runtime on the same host.
+Each running project has a separate cloud client, iroh endpoint, Connector
+transport key, RSA authentication key, transport policy, and cancellation tree.
+The daemon generates and persists both keys before atomic Connector creation,
+retains both private keys locally, and reports only observed endpoint and relay
+reachability to `status.transport`. Project membership or policy in one runtime
+does not authorize another runtime on the same host.
 
 ## Application Connectivity
 
@@ -107,7 +111,7 @@ The device stores three kinds of information separately:
 | State | Owner | Persistence |
 | --- | --- | --- |
 | Desired Connect state and delegated token hashes | Daemon repository | Durable and atomically replaced |
-| Project Connector private keys and imported credentials | Daemon private files | Durable and never published to the project API |
+| Project Connector transport and authentication private keys plus imported credentials | Daemon private files | Durable and never published to the project API |
 | Live endpoints, listeners, associations, and interfaces | Daemon or helper memory/kernel state | Reconstructed or removed after process exit |
 
 A process lock prevents two daemons from owning one repository. Unsupported
