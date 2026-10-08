@@ -34,6 +34,13 @@ Complete any prompts for installation, login, project selection, or first
 enrollment. The result includes the Connector name and a command another device
 can use.
 
+When the platform advertises Connector authentication, your existing Datum
+login authorizes one atomic Connector creation. The daemon generates separate
+transport and authentication keys, keeps both private keys locally, and
+switches to the platform-issued per-Connector credential after verifying it can
+access that exact Connector. Do not delete the local daemon state: preview
+identity recovery requires deleting and recreating the Connector.
+
 Check the saved service at any time:
 
 ```sh
@@ -79,6 +86,11 @@ datumctl connect unserve localhost:8080
 ```
 
 These commands do not stop the application or the Connect daemon.
+
+The Connector itself is intentionally retained. Deleting it is a stronger
+revocation operation: the platform removes its service account, authentication
+key, and exact-resource authorization. The preview does not silently recreate a
+deleted Connector.
 
 ## Next steps
 

@@ -8,14 +8,16 @@ single credential or compromised component from authorizing an entire path.
 
 | Identity | Held by | Purpose |
 | --- | --- | --- |
-| Datum user or service account | User session or protected workload credentials | Authorize project API actions |
-| Connector keypair | Local daemon; public key in the project API | Authenticate a device transport endpoint |
+| Bootstrap Datum principal | User session or protected workload credentials | Authorize atomic Connector creation |
+| Connector transport keypair | Local daemon; public key in the project API | Authenticate a device transport endpoint |
+| Connector authentication keypair and service account | RSA private key on the device; platform-owned principal and public-key registration | Authorize ongoing actions by one exact Connector |
 | Local daemon token | CLI or approved local automation | Authorize loopback daemon operations |
 | Gateway endpoint key | Platform gateway service | Authenticate the selected Connect Gateway |
 | Helper IPC credentials | User daemon and privileged helper | Authenticate bounded local networking requests |
 
-Connector and gateway private keys do not belong in project resources. The
-networking helper receives neither cloud credentials nor Connector keys.
+Connector and gateway private keys do not belong in project resources. The two
+Connector keypairs remain separate and local. The networking helper receives
+neither cloud credentials nor Connector keys.
 
 ## Layered Authorization
 
@@ -24,6 +26,7 @@ An end-to-end path requires all applicable layers to agree:
 | Layer | Question |
 | --- | --- |
 | Project authorization | May this principal create or change the requested Connect resource? |
+| Connector authorization | Is this platform principal bound to the immutable Connector UID it is operating? |
 | Resource policy | Does the service, gateway, or binding grant this Connector access? |
 | Transport identity | Is the peer the exact key expected by the saved intent? |
 | Local daemon scope | May this caller operate this project or resource? |
@@ -39,7 +42,7 @@ The Connect API owns the resources that describe Connector behavior:
 | Resource | Scope | Responsibility |
 | --- | --- | --- |
 | `ConnectorClass` | Platform | Supported transports and platform-approved gateway identities |
-| `Connector` | Project | Device public identity, reachability, and readiness |
+| `Connector` | Project | Immutable transport and authentication public identities, observed reachability, and readiness |
 | `ConnectorAdvertisement` | Project | Services published by one Connector |
 | `ConnectGateway` | Project | Logical gateway policy and project-network selection |
 | `ConnectNetworkBinding` | Project | One Connector's approved attachment to one gateway |
@@ -51,6 +54,11 @@ cleanup cannot remove an unrelated resource.
 On the device, the daemon owns durable project, service, dial, and managed
 attachment intent. The helper owns only the native interfaces and routes that
 it creates. Neither component adopts unrelated host networking state.
+
+The platform owns the Connector service account and registered authentication
+key in a separate identity project. The consumer project contains only the
+exact-UID authorization binding and safe status references. A resource name is
+not sufficient for ownership because it can be reused after deletion.
 
 ## Project Isolation
 
@@ -101,9 +109,14 @@ does not map directly to Windows service and adapter ownership.
 - Leaving a network closes the local packet path before attempting remote
   cleanup.
 - Expired readiness prevents new admission; it does not transfer ownership.
+- Deleting a Connector does not complete until its exact-UID binding,
+  registered authentication key, and service account have been observed absent.
 - Replacing an address or route plan requires renewed local approval when the
   existing policy does not cover it.
 
 These rules make a partially failed cleanup restrictive: stale metadata may
 need reconciliation, but traffic is not kept open merely because remote
 deletion failed.
+
+Both public keys are immutable in the preview API. Rotation and recovery use a
+new Connector rather than an update or a secondary enrollment resource.

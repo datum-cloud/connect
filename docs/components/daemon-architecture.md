@@ -86,6 +86,7 @@ A running project owns:
 
 - the cloud client and renewable authorization;
 - one iroh endpoint and Connector identity;
+- one RSA authentication key and platform-issued per-Connector credential;
 - an atomic service destination policy;
 - live services, local dials, and CONNECT-IP attachments;
 - Lease/liveness and policy-refresh tasks;
@@ -95,6 +96,14 @@ The runtime renews the Connector Lease every 10 seconds and refreshes cloud
 authorization, resources, and policy every 30 seconds. If refresh fails, it
 marks authorization unavailable, empties service policy, cancels dials and
 network attachments, and records the error stage.
+
+During first enrollment, the runtime persists the iroh and RSA private keys
+before creating one Connector containing both public keys. Once the controller
+reports the platform service account's client ID and email and its registered
+provider key ID, the runtime exchanges signed JWT assertions for short-lived
+tokens and verifies access to that exact Connector. Transport reachability is
+reported independently under `status.transport` with conflict retries that
+preserve controller-owned authentication and conditions.
 
 ### Transport Policy
 

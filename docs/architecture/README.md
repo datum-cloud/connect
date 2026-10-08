@@ -52,7 +52,8 @@ Connect separates coordination from traffic:
 
 Connect owns:
 
-- Connector enrollment and public transport identity;
+- Connector enrollment, transport identity, and per-Connector control-plane
+  identity lifecycle;
 - private service advertisements and identity-pinned access policy;
 - local service dials;
 - project gateway and device-to-network binding intent;
