@@ -9,6 +9,7 @@ fn fixture(script: &str) -> (tempfile::TempDir, Credentials) {
     let credentials = Credentials::datumctl_session(
         "alpha",
         "https://api.datum.net",
+        "",
         helper.to_str().unwrap(),
         "pinned session; not shell syntax",
     )
@@ -203,12 +204,22 @@ async fn helper_permissions_are_revalidated_before_every_execution() {
 fn descriptors_reject_unsafe_configuration_and_root() {
     if !user_daemon() {
         assert!(
-            Credentials::datumctl_session("alpha", "https://api.datum.net", "/bin/sh", "session")
-                .is_err()
+            Credentials::datumctl_session(
+                "alpha",
+                "https://api.datum.net",
+                "",
+                "/bin/sh",
+                "session",
+            )
+            .is_err()
         );
         return;
     }
     let (_dir, mut credentials) = fixture("exit 1");
+    credentials.token_uri = "https://attacker.example/token".into();
+    assert!(credentials.validate().is_err());
+    credentials.token_uri = "https://auth.datum.net/oauth/v2/token".into();
+    assert!(credentials.validate().is_ok());
     credentials.session.clear();
     assert!(credentials.validate().is_err());
     credentials.session = "valid".into();
@@ -339,6 +350,7 @@ async fn installed_host_session_uses_private_snapshot() {
     let credentials = Credentials::datumctl_session(
         "local-validation",
         "https://api.datum.net",
+        "",
         &helper,
         &session,
     )

@@ -13,7 +13,11 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
     let task = tokio::spawn(async move {
         let mut requests = Vec::new();
         for reply in replies {
-            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            // Full native CI runs many CPU-heavy tests concurrently. Initial
+            // Connector identity creation also generates an RSA key on a blocking
+            // worker, so allow that work to finish before declaring the mock
+            // control plane abandoned.
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
                 .await
                 .unwrap()
                 .unwrap();
@@ -47,7 +51,13 @@ async fn server(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<(St
                 .next()
                 .unwrap()
                 .to_string();
-            let body = serde_json::from_slice::<Value>(&bytes[header_end..]).unwrap_or(Value::Null);
+            let body = serde_json::from_slice::<Value>(&bytes[header_end..]).unwrap_or_else(|_| {
+                let fields = url::form_urlencoded::parse(&bytes[header_end..])
+                    .into_owned()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect::<serde_json::Map<_, _>>();
+                Value::Object(fields)
+            });
             let (status, response) = match reply {
                 Reply::Json(status, value) => (status, value.to_string()),
                 Reply::Text(status, value) => (status, value),
@@ -93,7 +103,7 @@ fn edge_location() -> Reply {
 
 fn connect_connector() -> Value {
     let public = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
-    json!({"metadata":{"name":format!("connect-{}",&public[..40]),"uid":"connector-uid","generation":1},"spec":{"classRef":"masque","publicKey":public},"status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}})
+    json!({"metadata":{"name":format!("connect-{}",&public[..40]),"uid":"connector-uid","generation":1},"spec":{"classRef":"masque","transport":{"publicKey":public},"authentication":{"publicKey":"test"}},"status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}})
 }
 
 #[test]
@@ -123,12 +133,29 @@ fn network_binding_name_is_deterministic_and_scoped_to_connector_and_network() {
     assert!(first.len() <= 63);
 }
 
+#[test]
+fn generated_connector_identity_keeps_a_distinct_matching_private_key() {
+    let transport = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let identity = generate_connector_identity(&transport).unwrap();
+    validate_pending_connector_identity(&identity, &transport).unwrap();
+    assert!(
+        validate_pending_connector_identity(
+            &identity,
+            &iroh::SecretKey::from_bytes(&[8; 32]).public().to_string()
+        )
+        .is_err()
+    );
+    assert!(identity.public_key.contains("BEGIN PUBLIC KEY"));
+    assert!(identity.private_key.contains("BEGIN PRIVATE KEY"));
+    assert!(!identity.public_key.contains(&transport));
+}
+
 #[tokio::test]
 async fn joining_managed_network_waits_for_transient_connector_not_ready() {
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connect_connector = json!({
         "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
-        "spec":{"publicKey":peer},
+        "spec":{"transport":{"publicKey":peer}},
         "status":{"leaseRef":"connect-lease","conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
     });
     let gateway = json!({
@@ -151,8 +178,10 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
         Reply::Json(200, json!({"items":[gateway]})),
         Reply::Json(200, json!({"metadata":{"name":"staging-vpc"}})),
         edge_location(),
-        Reply::Json(200, connect_connector),
+        Reply::Json(200, connect_connector.clone()),
         Reply::Json(200, lease),
+        Reply::EchoCreated,
+        Reply::Json(200, connect_connector),
         Reply::EchoCreated,
         Reply::Json(404, json!({})),
         Reply::Json(201, created_binding.clone()),
@@ -188,7 +217,7 @@ async fn joining_network_creates_a_gateway_in_the_edge_selected_location() {
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connector = json!({
         "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
-        "spec":{"publicKey":peer},
+        "spec":{"transport":{"publicKey":peer}},
         "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
     });
     let class = json!({
@@ -217,7 +246,9 @@ async fn joining_network_creates_a_gateway_in_the_edge_selected_location() {
         edge_location(),
         Reply::Json(200, json!({"items":[class]})),
         Reply::EchoCreated,
+        Reply::Json(200, connector.clone()),
         Reply::Json(200, connector),
+        Reply::EchoCreated,
         Reply::Json(404, json!({})),
         Reply::Json(201, binding),
     ])
@@ -290,7 +321,7 @@ async fn liveness_renewal_updates_only_the_connect_connector_lease() {
     let public = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connector = json!({
         "metadata":{"name":format!("connect-{}", &public[..40])},
-        "spec":{"publicKey":public},
+        "spec":{"transport":{"publicKey":public}},
         "status":{"leaseRef":"connect-lease"}
     });
     let lease = json!({
@@ -336,7 +367,7 @@ async fn lease_renewal_retries_resource_version_conflicts() {
     let public = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connector = json!({
         "metadata":{"name":format!("connect-{}", &public[..40])},
-        "spec":{"publicKey":public},
+        "spec":{"transport":{"publicKey":public}},
         "status":{"leaseRef":"connect-lease"}
     });
     let lease = |resource_version| {
@@ -375,7 +406,7 @@ async fn joining_managed_network_binds_while_gateway_is_provisioning() {
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connect_connector = json!({
         "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
-        "spec":{"publicKey":peer},
+        "spec":{"transport":{"publicKey":peer}},
         "status":{"leaseRef":"connect-lease","conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
     });
     let endpoint_id = iroh::SecretKey::from_bytes(&[9; 32]).public().to_string();
@@ -399,8 +430,10 @@ async fn joining_managed_network_binds_while_gateway_is_provisioning() {
         Reply::Json(200, json!({"items":[provisioning]})),
         Reply::Json(200, json!({"metadata":{"name":"staging-vpc"}})),
         edge_location(),
-        Reply::Json(200, connect_connector),
+        Reply::Json(200, connect_connector.clone()),
         Reply::Json(200, lease),
+        Reply::EchoCreated,
+        Reply::Json(200, connect_connector),
         Reply::EchoCreated,
         Reply::Json(404, json!({})),
         Reply::Json(201, created_binding),
@@ -415,50 +448,187 @@ async fn joining_managed_network_binds_while_gateway_is_provisioning() {
         .unwrap();
     assert_eq!(result["gateway"], "vpc-gateway");
     assert_eq!(result["assignedAddress"], "fd79::1/128");
-    assert_eq!(task.await.unwrap().len(), 9);
+    assert_eq!(task.await.unwrap().len(), 11);
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn connect_enrollment_uses_only_the_connect_api() {
+async fn host_session_creates_atomic_identity_reports_status_and_switches_credentials() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::os::unix::fs::PermissionsExt;
+
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let class = json!({
         "metadata":{"name":"masque-class","generation":1},
-        "spec":{"transports":["masque-v1"]},
+        "spec":{"transports":["masque-v1"],"capabilities":["connector-authentication"]},
         "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
     });
-    let connector = json!({
-        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"connect-uid","generation":1},
-        "spec":{"classRef":"masque-class","publicKey":peer,"relayURLs":["https://relay.example/"]},
-        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    let ready_connector = json!({
+        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"service-uid","resourceVersion":"2","generation":2},
+        "spec":{"classRef":"masque-class","transport":{"publicKey":peer},"authentication":{"publicKey":"controller-does-not-return-private-material"}},
+        "status":{
+            "authentication":{
+                "connectorUID":"service-uid",
+                "principalRef":{"name":"connect-principal","uid":"service-account-uid","clientID":"provider-client-id","clientEmail":"connect-client@example.invalid","project":"platform-identities"},
+                "serviceAccountKeyRef":"provider-resource",
+                "authProviderKeyID":"provider-key-id"
+            },
+            "conditions":[{"type":"Ready","status":"True","observedGeneration":2}]
+        }
     });
     let (base, task) = server(vec![
-        token(),
         Reply::Json(404, json!({})),
-        Reply::Json(200, json!({"items":[class]})),
-        Reply::Json(201, connector),
+        Reply::Json(200, json!({"items":[class.clone()]})),
+        Reply::EchoCreated,
+        Reply::Json(200, ready_connector.clone()),
+        token(),
+        Reply::Json(200, ready_connector.clone()),
+        token(),
+        Reply::Json(200, ready_connector.clone()),
+        Reply::EchoCreated,
+        Reply::Json(200, ready_connector.clone()),
+        Reply::Json(200, ready_connector),
+        Reply::EchoCreated,
     ])
     .await;
-    let cloud = client(&base);
-    let identity = cloud
-        .ensure_connect_connector(&ConnectionDetails {
-            relay_url: "https://relay.example/".into(),
-            addresses: vec![],
-        })
-        .await
-        .unwrap();
-    assert_eq!(identity.uid, "connect-uid");
-    assert_eq!(identity.public_key, peer);
-    let requests = task.await.unwrap();
-    assert!(requests.iter().any(|(line, body)| {
-        line.starts_with("POST ")
-            && line.contains("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectors ")
-            && body["spec"]["classRef"] == "masque-class"
-    }));
+    let directory = tempfile::tempdir().unwrap();
+    let helper = directory.path().join("datumctl");
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf '%s' '{{\"apiVersion\":\"client.authentication.k8s.io/v1\",\"kind\":\"ExecCredential\",\"status\":{{\"token\":\"bootstrap-token\",\"expirationTimestamp\":\"{expiry}\"}}}}'\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let credentials = Credentials::datumctl_session(
+        "demo",
+        &base,
+        &format!("{base}/token"),
+        helper.to_str().unwrap(),
+        "test-session",
+    )
+    .unwrap();
+    let credential_path = directory.path().join("credentials.json");
+    std::fs::write(&credential_path, serde_json::to_vec(&credentials).unwrap()).unwrap();
+    std::fs::set_permissions(&credential_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let credentials = Credentials::load(&credential_path).await.unwrap();
+    let cloud = CloudConnector::new(credentials, "demo".into(), peer.clone()).unwrap();
+    let details = ConnectionDetails {
+        relay_url: "https://relay.example/".into(),
+        addresses: vec!["192.0.2.10:443".parse().unwrap()],
+    };
+    let identity = cloud.ensure_connect_connector(&details).await.unwrap();
+    assert_eq!(identity.uid, "service-uid");
+    let repeated = cloud.ensure_connect_connector(&details).await.unwrap();
+    assert_eq!(repeated.uid, "service-uid");
+    let saved: Value = serde_json::from_slice(&std::fs::read(&credential_path).unwrap()).unwrap();
+    assert_eq!(saved["type"], "datum_service_account");
+    assert_eq!(saved["client_id"], "provider-client-id");
+    assert_eq!(saved["client_email"], "connect-client@example.invalid");
+    assert_eq!(saved["private_key_id"], "provider-key-id");
     assert!(
+        saved["private_key"]
+            .as_str()
+            .unwrap()
+            .contains("PRIVATE KEY")
+    );
+    assert!(
+        !directory
+            .path()
+            .join("connector-identity.pending.json")
+            .exists()
+    );
+    let pending_path = directory.path().join("connector-identity.pending.json");
+    std::fs::write(&pending_path, b"stale identity journal").unwrap();
+    let restarted_credentials = Credentials::load(&credential_path).await.unwrap();
+    let _restarted =
+        CloudConnector::new(restarted_credentials, "demo".into(), peer.clone()).unwrap();
+    assert!(!pending_path.exists());
+
+    let requests = task.await.unwrap();
+    let creation = requests
+        .iter()
+        .find(|(line, body)| {
+            line.starts_with("POST ")
+                && line
+                    .contains("/apis/connect.datumapis.com/v1alpha1/namespaces/default/connectors ")
+                && body["spec"]["classRef"] == "masque-class"
+        })
+        .map(|(_, body)| body)
+        .unwrap();
+    assert_eq!(creation["kind"], "Connector");
+    assert_eq!(creation["spec"]["transport"]["publicKey"], peer);
+    assert!(
+        creation["spec"]["authentication"]["publicKey"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN PUBLIC KEY")
+    );
+    assert!(!creation.to_string().contains("PRIVATE KEY"));
+    assert!(creation["spec"].get("endpoint").is_none());
+    assert!(creation["spec"].get("relayURLs").is_none());
+    assert_eq!(
         requests
             .iter()
-            .all(|(line, _)| !line.contains("networking.datumapis.com"))
+            .filter(|(line, _)| line.starts_with("POST ") && line.contains("/apis/"))
+            .count(),
+        1
     );
+
+    let status_updates: Vec<_> = requests
+        .iter()
+        .filter(|(line, _)| {
+            line.starts_with("PUT ") && line.contains("/connectors/") && line.contains("/status")
+        })
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(status_updates.len(), 2);
+    for status in status_updates {
+        assert_eq!(
+            status["status"]["authentication"]["authProviderKeyID"],
+            "provider-key-id"
+        );
+        assert_eq!(status["status"]["conditions"][0]["type"], "Ready");
+        assert_eq!(
+            status["status"]["transport"]["relayURLs"],
+            json!(["https://relay.example/"])
+        );
+        assert!(
+            status["status"]["transport"]["endpoint"]
+                .as_str()
+                .unwrap()
+                .contains("192.0.2.10:443")
+        );
+    }
+
+    let token_request = requests
+        .iter()
+        .find(|(line, body)| line.contains("/token") && body["assertion"].is_string())
+        .map(|(_, body)| body)
+        .unwrap();
+    assert_eq!(
+        token_request["grant_type"],
+        "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    );
+    let assertion = token_request["assertion"].as_str().unwrap();
+    assert_eq!(
+        jsonwebtoken::decode_header(assertion)
+            .unwrap()
+            .kid
+            .as_deref(),
+        Some("provider-key-id")
+    );
+    let claims: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(assertion.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claims["iss"], "provider-client-id");
+    assert_eq!(claims["sub"], "provider-client-id");
+    assert_eq!(claims["aud"], base);
 }
 
 #[tokio::test]
@@ -481,7 +651,8 @@ async fn connect_peer_lookup_uses_connect_connector_identity_and_addresses() {
         .with_ip_addr("192.0.2.10:1234".parse().unwrap());
     let connector = json!({
         "metadata":{"name":"bob-mac","uid":"bob-uid"},
-        "spec":{"publicKey":peer.to_string(),"relayURLs":["https://relay.example/"],"endpoint":serde_json::to_string(&endpoint).unwrap()}
+        "spec":{"transport":{"publicKey":peer.to_string()}},
+        "status":{"transport":{"relayURLs":["https://relay.example/"],"endpoint":serde_json::to_string(&endpoint).unwrap()}}
     });
     let (base, task) = server(vec![
         token(),
@@ -508,7 +679,10 @@ async fn connect_peer_lookup_uses_connect_connector_identity_and_addresses() {
 async fn named_connector_is_resolved_by_name_and_by_exact_public_key() {
     let mut named = connect_connector();
     named["metadata"]["name"] = json!("alice-mac");
-    let key = named["spec"]["publicKey"].as_str().unwrap().to_owned();
+    let key = named["spec"]["transport"]["publicKey"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let (base, task) = server(vec![
         token(),
         Reply::Json(200, named.clone()),
@@ -528,8 +702,12 @@ async fn named_connector_is_resolved_by_name_and_by_exact_public_key() {
 async fn reused_name_cannot_resolve_a_previously_pinned_key() {
     let mut reused = connect_connector();
     reused["metadata"]["name"] = json!("alice-mac");
-    let old_key = reused["spec"]["publicKey"].as_str().unwrap().to_owned();
-    reused["spec"]["publicKey"] = json!(iroh::SecretKey::from_bytes(&[8; 32]).public().to_string());
+    let old_key = reused["spec"]["transport"]["publicKey"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    reused["spec"]["transport"]["publicKey"] =
+        json!(iroh::SecretKey::from_bytes(&[8; 32]).public().to_string());
     let (base, task) = server(vec![token(), Reply::Json(200, json!({"items":[reused]}))]).await;
     assert!(matches!(
         client(&base).resolve_peer(&old_key).await,
@@ -541,7 +719,10 @@ async fn reused_name_cannot_resolve_a_previously_pinned_key() {
 #[tokio::test]
 async fn ambiguous_key_discovery_fails_closed() {
     let value = connect_connector();
-    let key = value["spec"]["publicKey"].as_str().unwrap().to_owned();
+    let key = value["spec"]["transport"]["publicKey"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let (base, task) = server(vec![
         token(),
         Reply::Json(200, json!({"items":[value.clone(),value]})),
@@ -552,6 +733,53 @@ async fn ambiguous_key_discovery_fails_closed() {
         Err(Error::Invalid(_))
     ));
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn renewable_migration_credentials_create_atomic_connector_identity() {
+    let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+    let class = json!({
+        "metadata":{"name":"masque-class","generation":1},
+        "spec":{"transports":["masque-v1"],"capabilities":["connector-authentication"]},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let ready = json!({
+        "metadata":{"name":format!("connect-{}", &peer[..40]),"uid":"service-uid","resourceVersion":"2","generation":1},
+        "spec":{"classRef":"masque-class","transport":{"publicKey":peer},"authentication":{"publicKey":"retained-locally"}},
+        "status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1}]}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(404, json!({})),
+        Reply::Json(200, json!({"items":[class]})),
+        Reply::EchoCreated,
+        Reply::Json(200, ready.clone()),
+        Reply::Json(200, ready),
+        Reply::EchoCreated,
+    ])
+    .await;
+
+    client(&base)
+        .ensure_connect_connector(&ConnectionDetails {
+            relay_url: "https://relay.example/".into(),
+            addresses: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    let created = &requests[3].1;
+    assert!(
+        created["spec"]["authentication"]["publicKey"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN PUBLIC KEY")
+    );
+    assert!(!created.to_string().contains("PRIVATE KEY"));
+    assert!(requests[6].0.starts_with("PUT "));
+    assert_eq!(
+        requests[6].1["status"]["transport"]["relayURLs"],
+        json!(["https://relay.example/"])
+    );
 }
 
 #[tokio::test]
@@ -724,7 +952,7 @@ async fn default_private_scope_excludes_approved_gateway_key_and_aliases() {
     let mut gateway = device.clone();
     gateway["metadata"]["name"] = json!("approved-gateway");
     let key = iroh::SecretKey::from_bytes(&[8; 32]).public().to_string();
-    gateway["spec"]["publicKey"] = json!(key);
+    gateway["spec"]["transport"]["publicKey"] = json!(key);
     let mut alias = gateway.clone();
     alias["metadata"]["name"] = json!("gateway-alias");
     let (base, task) = server(vec![
