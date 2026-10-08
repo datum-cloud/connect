@@ -20,6 +20,7 @@ hex = { workspace = true }
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 rand = { workspace = true }
 reqwest = { workspace = true }
+rsa = { version = "0.9", features = ["pem", "sha2"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
@@ -38,5 +39,6 @@ libc = "0.2"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [dev-dependencies]
+base64 = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
