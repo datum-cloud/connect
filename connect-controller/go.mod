@@ -3,7 +3,7 @@ module go.datum.net/connect-controller
 go 1.26.1
 
 require (
-	go.miloapis.com/milo v0.32.1
+	go.miloapis.com/milo v0.36.2-0.20261006165928-7e9f9a771915
 	go.miloapis.com/service-catalog v0.13.1
 	k8s.io/api v0.36.1
 	k8s.io/apimachinery v0.36.1

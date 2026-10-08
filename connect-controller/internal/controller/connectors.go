@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	iamv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
+	identityv1alpha1 "go.miloapis.com/milo/pkg/apis/identity/v1alpha1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	connectv1alpha1 "go.datum.net/connect-controller/api/v1alpha1"
@@ -43,13 +46,19 @@ type ConnectReconciler struct {
 	mgr         mcmanager.Manager
 	kind        string
 	classClient client.Client
+	Identity    ConnectorIdentityConfig
 }
 
 // +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectgatewayclasses;connectors;connectoradvertisements;connectgateways;connectnetworkbindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectors,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectors/finalizers,verbs=update
 // +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectgatewayclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectnetworkbindings/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloads,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps;secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=iam.miloapis.com,resources=serviceaccounts,verbs=get;create;update;patch;delete
+// +kubebuilder:rbac:groups=iam.miloapis.com,resources=policybindings,verbs=get;create;delete
+// +kubebuilder:rbac:groups=identity.miloapis.com,resources=serviceaccountkeys,verbs=get;list;watch;create;delete
 
 func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	local := mgr.GetLocalManager()
@@ -71,7 +80,7 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		if item.name == "connector" {
 			builder = builder.Owns(&coordinationv1.Lease{})
 		}
-		if err := builder.Complete(&ConnectReconciler{mgr: mgr, kind: item.name, classClient: local.GetClient()}); err != nil {
+		if err := builder.Complete(&ConnectReconciler{mgr: mgr, kind: item.name, classClient: local.GetClient(), Identity: r.Identity}); err != nil {
 			return fmt.Errorf("register %s controller: %w", item.name, err)
 		}
 	}
@@ -135,7 +144,14 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 			}
 			return ctrl.Result{}, err
 		}
-		if err := reconcileConnector(ctx, c, r.classClient, &obj); err != nil {
+		if r.Identity.Project == "" || r.Identity.Project == req.ClusterName.String() {
+			return ctrl.Result{}, fmt.Errorf("platform identity project must be configured and distinct from consumer project %q", req.ClusterName)
+		}
+		identityCluster, err := r.mgr.GetCluster(ctx, multicluster.ClusterName(r.Identity.Project))
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("get platform identity project %q: %w", r.Identity.Project, err)
+		}
+		if err := reconcileConnector(ctx, c, r.classClient, identityCluster.GetClient(), r.Identity, req.ClusterName.String(), &obj); err != nil {
 			logger.Error(err, "reconcile Connector")
 			return ctrl.Result{}, err
 		}
@@ -267,32 +283,76 @@ func reconcileProjectedClass(ctx context.Context, projectClient, classClient cli
 	return projectClient.Status().Update(ctx, obj)
 }
 
-func reconcileConnector(ctx context.Context, c, classClient client.Client, obj *connectv1alpha1.Connector) error {
-	before := obj.Status.DeepCopy()
+func reconcileConnector(ctx context.Context, c, classClient, identityClient client.Client, identityConfig ConnectorIdentityConfig, consumerProject string, obj *connectv1alpha1.Connector) error {
+	if !obj.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(obj, connectorIdentityFinalizer) {
+			complete, err := cleanupConnectorIdentity(ctx, c, identityClient, identityConfig, obj)
+			if err != nil {
+				return err
+			}
+			if !complete {
+				return nil
+			}
+			controllerutil.RemoveFinalizer(obj, connectorIdentityFinalizer)
+			return c.Update(ctx, obj)
+		}
+		return nil
+	}
+	if !controllerutil.ContainsFinalizer(obj, connectorIdentityFinalizer) {
+		controllerutil.AddFinalizer(obj, connectorIdentityFinalizer)
+		return c.Update(ctx, obj)
+	}
+	beforeObject := obj.DeepCopy()
+	beforeStatus := obj.Status.DeepCopy()
+	var reconcileErr error
 	accepted, acceptedReason, acceptedMessage := metav1.ConditionTrue, "Accepted", "Connector class and identity are valid"
-	if _, err := hex.DecodeString(obj.Spec.PublicKey); err != nil || len(obj.Spec.PublicKey) != 64 {
-		accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidPublicKey", "publicKey must be a 32-byte hexadecimal iroh public key"
-	} else if errs := validation.IsDNS1123Subdomain(obj.Spec.ClassRef); len(errs) > 0 {
-		accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidClassReference", "classRef must be a DNS subdomain resource name"
-	} else {
-		var class connectv1alpha1.ConnectorClass
-		err := classClient.Get(ctx, types.NamespacedName{Name: obj.Spec.ClassRef}, &class)
-		if apierrors.IsNotFound(err) {
-			accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "ClassNotFound", "referenced ConnectorClass does not exist in the management cluster"
-		} else if err != nil {
-			return err
-		} else if !contains(class.Spec.Transports, "masque-v1") {
-			accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "TransportUnsupported", "ConnectorClass does not advertise masque-v1"
+	if _, err := hex.DecodeString(obj.Spec.Transport.PublicKey); err != nil || len(obj.Spec.Transport.PublicKey) != 64 {
+		accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidTransportIdentity", "spec.transport.publicKey must be a 32-byte hexadecimal iroh public key"
+	} else if err := validateConnectorAuthentication(obj); err != nil {
+		accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidAuthenticationIdentity", "spec.authentication.publicKey "+err.Error()
+	}
+	if accepted == metav1.ConditionTrue {
+		if errs := validation.IsDNS1123Subdomain(obj.Spec.ClassRef); len(errs) > 0 {
+			accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "InvalidClassReference", "classRef must be a DNS subdomain resource name"
+		} else {
+			var class connectv1alpha1.ConnectorClass
+			err := classClient.Get(ctx, types.NamespacedName{Name: obj.Spec.ClassRef}, &class)
+			if apierrors.IsNotFound(err) {
+				accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "ClassNotFound", "referenced ConnectorClass does not exist in the management cluster"
+			} else if err != nil {
+				return err
+			} else if !contains(class.Spec.Transports, "masque-v1") {
+				accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "TransportUnsupported", "ConnectorClass does not advertise masque-v1"
+			} else if !contains(class.Spec.Capabilities, "connector-authentication") {
+				accepted, acceptedReason, acceptedMessage = metav1.ConditionFalse, "AuthenticationUnsupported", "ConnectorClass does not advertise connector-authentication"
+			}
 		}
 	}
 	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Accepted", Status: accepted, Reason: acceptedReason, Message: acceptedMessage, ObservedGeneration: obj.Generation})
-	ready, readyReason, readyMessage := metav1.ConditionFalse, "NotReady", "waiting for a valid Connector configuration"
+	var lease *coordinationv1.Lease
 	if accepted == metav1.ConditionTrue {
-		lease, err := ensureConnectorLease(ctx, c, obj)
+		var err error
+		lease, err = ensureConnectorLease(ctx, c, obj)
 		if err != nil {
 			return err
 		}
 		obj.Status.LeaseRef = lease.Name
+	}
+	identityReady := accepted == metav1.ConditionTrue
+	identityStatus, identityReason, identityMessage := metav1.ConditionFalse, "NotAccepted", "waiting for a valid Connector configuration"
+	if accepted == metav1.ConditionTrue {
+		var err error
+		identityReady, identityReason, identityMessage, err = ensureConnectorIdentity(ctx, c, identityClient, identityConfig, consumerProject, obj)
+		if identityReady {
+			identityStatus = metav1.ConditionTrue
+		}
+		if err != nil {
+			reconcileErr = err
+		}
+	}
+	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "AuthenticationReady", Status: identityStatus, Reason: identityReason, Message: identityMessage, ObservedGeneration: obj.Generation})
+	ready, readyReason, readyMessage := metav1.ConditionFalse, "NotReady", "waiting for a valid Connector configuration"
+	if accepted == metav1.ConditionTrue && identityReady && lease != nil {
 		if lease.Spec.RenewTime == nil || lease.Spec.LeaseDurationSeconds == nil {
 			readyReason, readyMessage = "AgentOffline", "Connector has not renewed its liveness lease"
 		} else {
@@ -306,10 +366,16 @@ func reconcileConnector(ctx context.Context, c, classClient client.Client, obj *
 	}
 	meta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{Type: "Ready", Status: ready, Reason: readyReason, Message: readyMessage, ObservedGeneration: obj.Generation})
 	obj.Status.ObservedGeneration = obj.Generation
-	if reflect.DeepEqual(before, &obj.Status) {
-		return nil
+	if reflect.DeepEqual(beforeStatus, &obj.Status) {
+		return reconcileErr
 	}
-	return c.Status().Update(ctx, obj)
+	// The Connector agent exclusively owns status.transport. A merge patch from
+	// the object read at the start of reconciliation changes only controller-
+	// owned status fields, so concurrent reachability reports are not erased.
+	if err := c.Status().Patch(ctx, obj, client.MergeFrom(beforeObject)); err != nil {
+		return err
+	}
+	return reconcileErr
 }
 
 func ensureConnectorLease(ctx context.Context, c client.Client, connector *connectv1alpha1.Connector) (*coordinationv1.Lease, error) {
@@ -343,6 +409,8 @@ func schemeForConnector() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = corev1.AddToScheme(s)
 	_ = coordinationv1.AddToScheme(s)
+	_ = iamv1alpha1.AddToScheme(s)
+	_ = identityv1alpha1.AddToScheme(s)
 	_ = connectv1alpha1.AddToScheme(s)
 	return s
 }
@@ -727,7 +795,7 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 		} else if gateway.Status.EndpointID == "" {
 			status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway identity to be created"
 		} else {
-			clientAddress, peerAddress, _ := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, strings.ToLower(connector.Spec.PublicKey), strings.ToLower(gateway.Status.EndpointID))
+			clientAddress, peerAddress, _ := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, strings.ToLower(connector.Spec.Transport.PublicKey), strings.ToLower(gateway.Status.EndpointID))
 			binding.Status.EndpointID = gateway.Status.EndpointID
 			binding.Status.AssignedAddress = clientAddress + "/128"
 			binding.Status.PeerAddress = peerAddress + "/128"
@@ -738,7 +806,7 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 				if grantsErr != nil {
 					return grantsErr
 				}
-				connectorPeerRoutes := peerRoutes(peerGrants, strings.ToLower(connector.Spec.PublicKey))
+				connectorPeerRoutes := peerRoutes(peerGrants, strings.ToLower(connector.Spec.Transport.PublicKey))
 				if len(binding.Status.Routes)+len(connectorPeerRoutes) > 32 {
 					capacityExceeded = true
 					binding.Status.Routes = nil
@@ -758,7 +826,7 @@ func reconcileNetworkBinding(ctx context.Context, c client.Client, project strin
 						return err
 					}
 					status, reason, message = metav1.ConditionUnknown, "GatewayProvisioning", "waiting for the gateway Workload to be created"
-				} else if !gatewayWorkloadReady(workload) || !gatewayWorkloadConfigApplied(ctx, c, &gateway, workload) || !gatewayConfigIncludesConnector(ctx, c, &gateway, strings.ToLower(connector.Spec.PublicKey)) {
+				} else if !gatewayWorkloadReady(workload) || !gatewayWorkloadConfigApplied(ctx, c, &gateway, workload) || !gatewayConfigIncludesConnector(ctx, c, &gateway, strings.ToLower(connector.Spec.Transport.PublicKey)) {
 					status, reason, message = metav1.ConditionUnknown, "GatewayApplyingGrant", "waiting for the gateway Workload to apply this Connector grant and become available"
 				} else {
 					status, reason, message = metav1.ConditionTrue, "Approved", "gateway Workload is available with this Connector approved for its configured routes"
@@ -819,7 +887,7 @@ func readyGatewayGrants(ctx context.Context, c client.Client, project string, ga
 		if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Accepted") {
 			continue
 		}
-		peer := strings.ToLower(connector.Spec.PublicKey)
+		peer := strings.ToLower(connector.Spec.Transport.PublicKey)
 		clientAddress, gatewayAddress, interfaceName := gatewayPeerAddresses(project, gateway.Spec.NetworkRef, peer, strings.ToLower(endpointID))
 		byPeer[peer] = gatewayGrant{peer: peer, clientAddress: clientAddress + "/128", gatewayAddress: gatewayAddress + "/128", interfaceName: interfaceName}
 	}

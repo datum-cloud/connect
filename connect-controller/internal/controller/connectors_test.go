@@ -2,7 +2,11 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"reflect"
 	"strings"
@@ -10,6 +14,8 @@ import (
 	"time"
 
 	connectv1alpha1 "go.datum.net/connect-controller/api/v1alpha1"
+	iamv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
+	identityv1alpha1 "go.miloapis.com/milo/pkg/apis/identity/v1alpha1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,6 +27,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 func testClient(t *testing.T, objs ...runtime.Object) *fake.ClientBuilder {
@@ -35,9 +43,15 @@ func testClient(t *testing.T, objs ...runtime.Object) *fake.ClientBuilder {
 	if err := coordinationv1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
+	if err := iamv1alpha1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := identityv1alpha1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
 	s.AddKnownTypeWithName(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "Workload"}, &unstructured.Unstructured{})
 	s.AddKnownTypeWithName(schema.GroupVersionKind{Group: "compute.datumapis.com", Version: "v1alpha", Kind: "WorkloadList"}, &unstructured.UnstructuredList{})
-	return fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objs...).WithStatusSubresource(&connectv1alpha1.Connector{}, &connectv1alpha1.ConnectorClass{}, &connectv1alpha1.ConnectGatewayClass{}, &connectv1alpha1.ConnectorAdvertisement{}, &connectv1alpha1.ConnectGateway{}, &connectv1alpha1.ConnectNetworkBinding{})
+	return fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objs...).WithStatusSubresource(&connectv1alpha1.Connector{}, &connectv1alpha1.ConnectorClass{}, &connectv1alpha1.ConnectGatewayClass{}, &connectv1alpha1.ConnectorAdvertisement{}, &connectv1alpha1.ConnectGateway{}, &connectv1alpha1.ConnectNetworkBinding{}, &iamv1alpha1.ServiceAccount{}, serviceAccountKeyObject())
 }
 
 func testGatewayClass(t *testing.T, mode string, idleTimeout time.Duration) (*connectv1alpha1.ConnectGatewayClass, client.Client) {
@@ -69,46 +83,178 @@ func reconcileTestGateway(t *testing.T, ctx context.Context, c client.Client, ga
 	}
 }
 
-func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
-	ctx := context.Background()
-	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", UID: types.UID("laptop-uid")}, Spec: connectv1alpha1.ConnectorSpec{ClassRef: "masque", PublicKey: strings.Repeat("a", 64)}}
-	projectClient := testClient(t, connector).Build()
-	classClient := testClient(t).Build()
-	if err := reconcileConnector(ctx, projectClient, classClient, connector); err != nil {
+func authenticationPublicKey(t *testing.T) string {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := meta.FindStatusCondition(connector.Status.Conditions, "Accepted").Reason; got != "ClassNotFound" {
-		t.Fatalf("reason=%q, want ClassNotFound", got)
+	der, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+}
 
+func serviceAccountKeyObject() *identityv1alpha1.ServiceAccountKey {
+	object := &identityv1alpha1.ServiceAccountKey{}
+	object.SetGroupVersionKind(identityv1alpha1.SchemeGroupVersion.WithKind("ServiceAccountKey"))
+	return object
+}
+
+func testConnector(t *testing.T) *connectv1alpha1.Connector {
+	t.Helper()
+	return &connectv1alpha1.Connector{
+		ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project", UID: types.UID("connector-uid"), Generation: 1},
+		Spec: connectv1alpha1.ConnectorSpec{
+			ClassRef:       "masque",
+			Transport:      connectv1alpha1.ConnectorTransportSpec{PublicKey: strings.Repeat("a", 64)},
+			Authentication: connectv1alpha1.ConnectorAuthenticationSpec{PublicKey: authenticationPublicKey(t)},
+		},
+		Status: connectv1alpha1.ConnectorStatus{Transport: &connectv1alpha1.ConnectorTransportStatus{Endpoint: "agent-endpoint", RelayURLs: []string{"https://relay.example/"}}},
+	}
+}
+
+func TestConnectorAuthenticationUsesAtomicIdentitiesAndPlatformPrincipal(t *testing.T) {
+	ctx := context.Background()
+	connector := testConnector(t)
+	class := &connectv1alpha1.ConnectorClass{ObjectMeta: metav1.ObjectMeta{Name: "masque"}, Spec: connectv1alpha1.ConnectorClassSpec{Transports: []string{"masque-v1"}, Capabilities: []string{"connector-authentication"}}}
+	projectClient := testClient(t, connector).Build()
+	classClient := testClient(t, class).Build()
+	identityClient := testClient(t).Build()
+	config := ConnectorIdentityConfig{Project: "platform-identities", KeyNamespace: "connector-keys", RoleName: "connector-agent", RoleNamespace: "milo-system"}
+
+	if err := reconcileConnector(ctx, projectClient, classClient, identityClient, config, "consumer-project", connector); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(connector, connectorIdentityFinalizer) {
+		t.Fatal("Connector identity finalizer was not added before provisioning")
+	}
+	if err := reconcileConnector(ctx, projectClient, classClient, identityClient, config, "consumer-project", connector); err != nil {
+		t.Fatal(err)
+	}
+	if connector.Status.Transport == nil || connector.Status.Transport.Endpoint != "agent-endpoint" {
+		t.Fatalf("controller clobbered agent-owned transport status: %#v", connector.Status.Transport)
+	}
+	serviceAccount := &iamv1alpha1.ServiceAccount{}
+	serviceAccountKey := types.NamespacedName{Name: connectorIdentityName(connector.UID)}
+	if err := identityClient.Get(ctx, serviceAccountKey, serviceAccount); err != nil {
+		t.Fatal(err)
+	}
+	serviceAccount.UID = types.UID("service-account-uid")
+	serviceAccount.Status.ClientID = "provider-client-id"
+	serviceAccount.Status.Email = "connector@example.invalid"
+	meta.SetStatusCondition(&serviceAccount.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Reconciled"})
+	if err := identityClient.Status().Update(ctx, serviceAccount); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileConnector(ctx, projectClient, classClient, identityClient, config, "consumer-project", connector); err != nil {
+		t.Fatal(err)
+	}
+	var keys identityv1alpha1.ServiceAccountKeyList
+	keys.SetGroupVersionKind(identityv1alpha1.SchemeGroupVersion.WithKind("ServiceAccountKeyList"))
+	if err := identityClient.List(ctx, &keys, client.MatchingLabels{connectorUIDLabel: connectorUIDHash(connector.UID)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys.Items) != 1 || keys.Items[0].Spec.PublicKey != connector.Spec.Authentication.PublicKey || keys.Items[0].Spec.ServiceAccountUserName != serviceAccount.Status.Email {
+		t.Fatalf("platform key does not exactly reflect the atomic authentication identity: %#v", keys.Items)
+	}
+	// The identity provider is allowed to replace the requested Kubernetes name
+	// with its provider resource ID. Reconciliation discovers the key by its
+	// immutable Connector UID label rather than assuming the create-time name.
+	providerKey := keys.Items[0].DeepCopy()
+	providerKey.SetGroupVersionKind(identityv1alpha1.SchemeGroupVersion.WithKind("ServiceAccountKey"))
+	if err := identityClient.Delete(ctx, providerKey); err != nil {
+		t.Fatal(err)
+	}
+	providerKey.Name = "provider-key-resource"
+	providerKey.ResourceVersion = ""
+	providerKey.UID = ""
+	providerKey.Status = identityv1alpha1.ServiceAccountKeyStatus{}
+	if err := identityClient.Create(ctx, providerKey); err != nil {
+		t.Fatal(err)
+	}
+	providerKey.SetGroupVersionKind(identityv1alpha1.SchemeGroupVersion.WithKind("ServiceAccountKey"))
+	providerKey.Status.AuthProviderKeyID = "provider-key-id"
+	if err := identityClient.Status().Update(ctx, providerKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileConnector(ctx, projectClient, classClient, identityClient, config, "consumer-project", connector); err != nil {
+		t.Fatal(err)
+	}
+	auth := connector.Status.Authentication
+	if auth == nil || auth.ConnectorUID != string(connector.UID) || auth.PrincipalRef.ClientID != "provider-client-id" || auth.PrincipalRef.ClientEmail != "connector@example.invalid" || auth.ServiceAccountKeyRef != providerKey.Name || auth.AuthProviderKeyID != "provider-key-id" {
+		t.Fatalf("authentication status does not use provider contracts exactly: %#v", auth)
+	}
+	if condition := meta.FindStatusCondition(connector.Status.Conditions, "AuthenticationReady"); condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("authentication condition=%#v, want ready", condition)
+	}
+	var binding iamv1alpha1.PolicyBinding
+	if err := projectClient.Get(ctx, types.NamespacedName{Name: connectorIdentityName(connector.UID), Namespace: connector.Namespace}, &binding); err != nil {
+		t.Fatal(err)
+	}
+	if ref := binding.Spec.ResourceSelector.ResourceRef; ref == nil || ref.UID != string(connector.UID) || ref.Name != connector.Name {
+		t.Fatalf("Connector binding is not immutable-UID scoped: %#v", binding.Spec)
+	}
+}
+
+func TestConnectorAuthenticationRejectsInvalidRSAKey(t *testing.T) {
+	connector := testConnector(t)
+	connector.Spec.Authentication.PublicKey = "not a public key"
 	class := &connectv1alpha1.ConnectorClass{ObjectMeta: metav1.ObjectMeta{Name: "masque"}, Spec: connectv1alpha1.ConnectorClassSpec{Transports: []string{"masque-v1"}}}
-	classClient = testClient(t, class).Build()
-	if err := reconcileConnector(ctx, projectClient, classClient, connector); err != nil {
+	projectClient := testClient(t, connector).Build()
+	classClient := testClient(t, class).Build()
+	identityClient := testClient(t).Build()
+	config := ConnectorIdentityConfig{Project: "platform-identities"}
+	if err := reconcileConnector(context.Background(), projectClient, classClient, identityClient, config, "consumer", connector); err != nil {
 		t.Fatal(err)
 	}
-	if got := meta.FindStatusCondition(connector.Status.Conditions, "Accepted").Status; got != metav1.ConditionTrue {
-		t.Fatalf("accepted=%q, want True", got)
-	}
-	if got := meta.FindStatusCondition(connector.Status.Conditions, "Ready").Reason; got != "AgentOffline" {
-		t.Fatalf("ready reason=%q, want AgentOffline until the agent renews its Lease", got)
-	}
-	if got, want := connector.Status.LeaseRef, connectorLeaseName(connector.Name); got != want {
-		t.Fatalf("leaseRef=%q, want Connect-specific Lease %q", got, want)
-	}
-	var lease coordinationv1.Lease
-	if err := projectClient.Get(ctx, types.NamespacedName{Name: connectorLeaseName(connector.Name)}, &lease); err != nil {
+	if err := reconcileConnector(context.Background(), projectClient, classClient, identityClient, config, "consumer", connector); err != nil {
 		t.Fatal(err)
 	}
-	now := metav1.NewMicroTime(time.Now())
-	lease.Spec.RenewTime = &now
-	if err := projectClient.Update(ctx, &lease); err != nil {
+	condition := meta.FindStatusCondition(connector.Status.Conditions, "Accepted")
+	if condition == nil || condition.Reason != "InvalidAuthenticationIdentity" {
+		t.Fatalf("invalid authentication key condition=%#v", condition)
+	}
+}
+
+func TestConnectorFinalizerWaitsForConfirmedCredentialDeletion(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	connector := testConnector(t)
+	connector.Finalizers = []string{connectorIdentityFinalizer}
+	connector.DeletionTimestamp = &now
+	name := connectorIdentityName(connector.UID)
+	uidLabel := map[string]string{connectorUIDLabel: connectorUIDHash(connector.UID)}
+	binding := &iamv1alpha1.PolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: connector.Namespace}}
+	leaseBinding := &iamv1alpha1.PolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: name + "-lease", Namespace: connector.Namespace}}
+	serviceAccount := &iamv1alpha1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: iamv1alpha1.ServiceAccountSpec{State: "Active"}}
+	serviceAccountKey := serviceAccountKeyObject()
+	serviceAccountKey.Name = connectorAuthenticationKeyName(connector.UID)
+	serviceAccountKey.Namespace = "connector-keys"
+	serviceAccountKey.Labels = uidLabel
+	deletionsPersist := true
+	deleteInterceptor := interceptor.Funcs{Delete: func(ctx context.Context, underlying client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+		if deletionsPersist {
+			return nil
+		}
+		return underlying.Delete(ctx, obj, opts...)
+	}}
+	projectClient := testClient(t, connector, binding, leaseBinding).WithInterceptorFuncs(deleteInterceptor).Build()
+	identityClient := testClient(t, serviceAccount, serviceAccountKey).WithInterceptorFuncs(deleteInterceptor).Build()
+	config := ConnectorIdentityConfig{Project: "platform-identities", KeyNamespace: "connector-keys"}
+	if err := reconcileConnector(ctx, projectClient, nil, identityClient, config, "consumer", connector); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileConnector(ctx, projectClient, classClient, connector); err != nil {
+	if !controllerutil.ContainsFinalizer(connector, connectorIdentityFinalizer) {
+		t.Fatal("finalizer was removed while credential deletion was pending")
+	}
+	deletionsPersist = false
+	if err := reconcileConnector(ctx, projectClient, nil, identityClient, config, "consumer", connector); err != nil {
 		t.Fatal(err)
 	}
-	if got := meta.FindStatusCondition(connector.Status.Conditions, "Ready").Status; got != metav1.ConditionTrue {
-		t.Fatalf("ready=%q after Lease renewal, want True", got)
+	if controllerutil.ContainsFinalizer(connector, connectorIdentityFinalizer) {
+		t.Fatal("finalizer remains after credentials and bindings were confirmed absent")
 	}
 }
 
@@ -236,7 +382,7 @@ func TestOnDemandGatewayScalesBetweenZeroAndOne(t *testing.T) {
 	t0 := time.Date(2026, time.October, 5, 12, 0, 0, 0, time.UTC)
 	connector := &connectv1alpha1.Connector{
 		ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"},
-		Spec:       connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)},
+		Spec:       connectv1alpha1.ConnectorSpec{Transport: connectv1alpha1.ConnectorTransportSpec{PublicKey: strings.Repeat("a", 64)}},
 		Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{
 			{Type: "Accepted", Status: metav1.ConditionTrue},
 			{Type: "Ready", Status: metav1.ConditionTrue},
@@ -294,7 +440,7 @@ func TestOnDemandGatewayScalesBetweenZeroAndOne(t *testing.T) {
 		t.Fatalf("gateway identity was not preserved while dormant: %v", err)
 	}
 	config := &corev1.ConfigMap{}
-	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: gateway.Namespace}, config); err != nil || !strings.Contains(config.Data["grants.json"], connector.Spec.PublicKey) {
+	if err := c.Get(ctx, types.NamespacedName{Name: gatewayChildName(gateway.Name, "config"), Namespace: gateway.Namespace}, config); err != nil || !strings.Contains(config.Data["grants.json"], connector.Spec.Transport.PublicKey) {
 		t.Fatalf("durable grants were not preserved while dormant: config=%#v err=%v", config.Data, err)
 	}
 
@@ -312,8 +458,8 @@ func TestOnDemandGatewayScalesBetweenZeroAndOne(t *testing.T) {
 
 func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *testing.T) {
 	ctx := context.Background()
-	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
-	secondConnector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "phone", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("b", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
+	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{Transport: connectv1alpha1.ConnectorTransportSpec{PublicKey: strings.Repeat("a", 64)}}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
+	secondConnector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "phone", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{Transport: connectv1alpha1.ConnectorTransportSpec{PublicKey: strings.Repeat("b", 64)}}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "vpc-gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20:0:27::/48"}, PeerRouting: true}}
 	c := testClient(t, connector, secondConnector, gateway).Build()
 	reconcileTestGateway(t, ctx, c, gateway)
@@ -437,7 +583,7 @@ func TestReconcileGatewayCreatesComputeWorkloadAndApprovesConnectorBinding(t *te
 	if len(config.Grants) != 2 {
 		t.Fatalf("grants=%v, want both approved Connector grants", config.Grants)
 	}
-	if config.Grants[0]["peer"] != connector.Spec.PublicKey || config.Grants[1]["peer"] != secondConnector.Spec.PublicKey {
+	if config.Grants[0]["peer"] != connector.Spec.Transport.PublicKey || config.Grants[1]["peer"] != secondConnector.Spec.Transport.PublicKey {
 		t.Fatalf("grants are not sorted by peer identity: %v", config.Grants)
 	}
 	firstPeerRoutes, ok := config.Grants[0]["peer_routes"].([]interface{})
@@ -536,7 +682,7 @@ func TestGatewayGrantPersistsWhenConnectorIsTemporarilyOffline(t *testing.T) {
 	ctx := context.Background()
 	connector := &connectv1alpha1.Connector{
 		ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project"},
-		Spec:       connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("a", 64)},
+		Spec:       connectv1alpha1.ConnectorSpec{Transport: connectv1alpha1.ConnectorTransportSpec{PublicKey: strings.Repeat("a", 64)}},
 		Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{
 			{Type: "Accepted", Status: metav1.ConditionTrue},
 			{Type: "Ready", Status: metav1.ConditionFalse, Reason: "AgentOffline"},
@@ -566,8 +712,8 @@ func TestGatewayGrantPersistsWhenConnectorIsTemporarilyOffline(t *testing.T) {
 	if err := json.Unmarshal([]byte(configMap.Data["grants.json"]), &config); err != nil {
 		t.Fatal(err)
 	}
-	if len(config.Grants) != 1 || config.Grants[0].Peer != connector.Spec.PublicKey {
-		t.Fatalf("gateway grants=%v, want offline but authorized Connector %q to retain its grant", config.Grants, connector.Spec.PublicKey)
+	if len(config.Grants) != 1 || config.Grants[0].Peer != connector.Spec.Transport.PublicKey {
+		t.Fatalf("gateway grants=%v, want offline but authorized Connector %q to retain its grant", config.Grants, connector.Spec.Transport.PublicKey)
 	}
 	if !meta.IsStatusConditionTrue(connector.Status.Conditions, "Accepted") || meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
 		t.Fatalf("test Connector conditions=%v, want Accepted=True and Ready=False", connector.Status.Conditions)
@@ -583,8 +729,8 @@ func TestGatewayGrantPersistsWhenConnectorIsTemporarilyOffline(t *testing.T) {
 
 func TestPeerRoutingIsDisabledByDefault(t *testing.T) {
 	ctx := context.Background()
-	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
-	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
+	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{Transport: connectv1alpha1.ConnectorTransportSpec{PublicKey: strings.Repeat("1", 64)}}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
+	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{Transport: connectv1alpha1.ConnectorTransportSpec{PublicKey: strings.Repeat("2", 64)}}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "DFW", Routes: []string{"fd20::/48"}}}
 	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
 	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}
@@ -619,8 +765,8 @@ func TestGatewayReportsPeerRouteCapacityExceeded(t *testing.T) {
 	for index := range routes {
 		routes[index] = fmt.Sprintf("fd20::%x/128", index+1)
 	}
-	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("1", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
-	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{PublicKey: strings.Repeat("2", 64)}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
+	first := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{Transport: connectv1alpha1.ConnectorTransportSpec{PublicKey: strings.Repeat("1", 64)}}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
+	second := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "project"}, Spec: connectv1alpha1.ConnectorSpec{Transport: connectv1alpha1.ConnectorTransportSpec{PublicKey: strings.Repeat("2", 64)}}, Status: connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}, {Type: "Ready", Status: metav1.ConditionTrue}}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project", UID: types.UID("gateway-uid")}, Spec: connectv1alpha1.ConnectGatewaySpec{GatewayClassRef: "standard", NetworkRef: "private-net", LocationRef: "DFW", Routes: routes, PeerRouting: true}}
 	firstBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "first-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: first.Name}}
 	secondBinding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "second-vpc", Namespace: "project"}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: gateway.Name, ConnectorRef: second.Name}}

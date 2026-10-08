@@ -30,12 +30,18 @@ spec:
         - --discovery-kubeconfig=/etc/kubernetes/projects/auth/milo-kubeconfig.yaml
         - --project-kubeconfig=/etc/kubernetes/projects/auth/milo-kubeconfig.yaml
         - --provider-project=datum-cloud
+        - --identity-project=$(IDENTITY_PROJECT)
         env:
         - name: INTERNAL_SERVICE_DISCOVERY
           valueFrom:
             configMapKeyRef:
               name: connect-controller-config
               key: INTERNAL_SERVICE_DISCOVERY
+        - name: IDENTITY_PROJECT
+          valueFrom:
+            configMapKeyRef:
+              name: connect-controller-config
+              key: IDENTITY_PROJECT
         ports:
         - name: metrics
           containerPort: 8080

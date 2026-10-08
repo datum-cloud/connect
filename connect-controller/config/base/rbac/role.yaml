@@ -34,7 +34,6 @@ rules:
   - connectnetworkbindings
   - connectoradvertisements
   - connectorclasses
-  - connectors
   verbs:
   - get
   - list
@@ -53,6 +52,22 @@ rules:
   - patch
   - update
 - apiGroups:
+  - connect.datumapis.com
+  resources:
+  - connectors
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - connect.datumapis.com
+  resources:
+  - connectors/finalizers
+  verbs:
+  - update
+- apiGroups:
   - coordination.k8s.io
   resources:
   - leases
@@ -62,4 +77,32 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - iam.miloapis.com
+  resources:
+  - policybindings
+  verbs:
+  - create
+  - delete
+  - get
+- apiGroups:
+  - iam.miloapis.com
+  resources:
+  - serviceaccounts
+  verbs:
+  - create
+  - delete
+  - get
+  - patch
+  - update
+- apiGroups:
+  - identity.miloapis.com
+  resources:
+  - serviceaccountkeys
+  verbs:
+  - create
+  - delete
+  - get
+  - list
   - watch
