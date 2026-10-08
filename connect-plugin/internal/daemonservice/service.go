@@ -487,6 +487,7 @@ func copyCredential(source, destination string) error {
 		ClientID     string `json:"client_id"`
 		RefreshToken string `json:"refresh_token"`
 		PrivateKey   string `json:"private_key"`
+		PrivateKeyID string `json:"private_key_id"`
 		ClientEmail  string `json:"client_email"`
 	}
 	decoder := json.NewDecoder(io.LimitReader(in, 4<<20))
@@ -499,8 +500,8 @@ func copyCredential(source, destination string) error {
 			return fmt.Errorf("connector credentials require project_id, client_id, and refresh_token")
 		}
 	case "datum_service_account":
-		if shape.ProjectID == "" || shape.ClientID == "" || shape.PrivateKey == "" || shape.ClientEmail == "" {
-			return fmt.Errorf("service-account credentials require project_id, client_id, private_key, and client_email")
+		if shape.ProjectID == "" || shape.ClientID == "" || shape.PrivateKey == "" || shape.PrivateKeyID == "" || shape.ClientEmail == "" {
+			return fmt.Errorf("service-account credentials require project_id, client_id, client_email, private_key_id, and private_key")
 		}
 	default:
 		return fmt.Errorf("unsupported credentials type %q", shape.Type)

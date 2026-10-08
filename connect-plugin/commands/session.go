@@ -18,6 +18,7 @@ type datumctlSession struct {
 	HelperPath  string `json:"helper_path"`
 	Session     string `json:"session"`
 	APIEndpoint string `json:"api_endpoint"`
+	TokenURI    string `json:"token_uri,omitempty"`
 }
 
 func hostSession() (*datumctlSession, error) {
@@ -56,7 +57,24 @@ func hostSession() (*datumctlSession, error) {
 	if u.Scheme != "https" && !(u.Scheme == "http" && loopback) {
 		return nil, fmt.Errorf("datumctl API host must use HTTPS (HTTP is allowed only on loopback for local testing)")
 	}
-	return &datumctlSession{HelperPath: helper, Session: ctx.Session, APIEndpoint: strings.TrimRight(endpoint, "/")}, nil
+	return &datumctlSession{HelperPath: helper, Session: ctx.Session, APIEndpoint: strings.TrimRight(endpoint, "/"), TokenURI: connectorTokenURI(u)}, nil
+}
+
+// connectorTokenURI is intentionally an allowlist, not hostname string
+// rewriting. A service-account private key must never be sent to an endpoint
+// inferred from an arbitrary custom API host.
+func connectorTokenURI(api *url.URL) string {
+	if api.Scheme != "https" {
+		return ""
+	}
+	switch strings.ToLower(api.Hostname()) {
+	case "api.datum.net":
+		return "https://auth.datum.net/oauth/v2/token"
+	case "api.staging.env.datum.net":
+		return "https://auth.staging.env.datum.net/oauth/v2/token"
+	default:
+		return ""
+	}
 }
 
 func addUpAuthentication(body map[string]any, auth, credentialsFile string) error {
