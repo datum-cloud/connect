@@ -4,21 +4,38 @@ Status: proposal. Base: `v1.0.0-preview.28`.
 
 ## Goal
 
-Anyone with `datumctl` and the Connect plugin installed can run:
+Anyone with `datumctl` and the Connect plugin can share a local service with
+their own devices without a Datum account, organization, or project:
 
 ```sh
 datumctl connect local --port 9999
 ```
 
-and receive a public HTTPS URL that forwards to `localhost:9999` for as long as
-the command runs. It needs no `datumctl login`, no organization, and no project.
-This is the same experience as `cloudflared tunnel --url` or anonymous ngrok.
+The command prints a ticket and a QR code. A phone running the Datum Connect
+Android app scans it and opens `http://localhost:8888` in its browser. Another
+computer runs `datumctl connect dial TICKET --bind 8888`. Traffic goes peer to
+peer over iroh with the same MASQUE CONNECT-TCP transport as project-scoped
+Connect. It falls back to a relay only when a direct path fails.
+
+In scope:
+
+- `datumctl connect local` (sharer) and project-less `datumctl connect dial
+  TICKET` (peer).
+- A new Android app that pairs by QR code and serves the shared service on a
+  phone-local port. No login.
+- The `connect-share` Rust crate that both use.
+
+Later, not in this proposal's first phase:
+
+- iOS. It needs a Network Extension; see [iOS](#ios).
+- Public URLs for browsers without an iroh client. See
+  [Public URLs](#later-public-urls).
 
 Non-goals:
 
-- Persistent or custom hostnames. Those stay with `serve --public`.
-- Raw TCP, UDP, or VPC (`join`) access without an account.
-- Private or peer-to-peer sharing (`dial`) without an account.
+- Persistent identities or hostnames without an account. Signed-in users keep
+  `serve`, `dial`, and `serve --public`.
+- Raw UDP and VPC (`join`) without an account.
 
 ## What exists today
 
@@ -29,309 +46,249 @@ Connect has no project-less mode. Every cloud-facing path needs a project:
 | Plugin | `project()` errors if neither `--project` nor the datumctl context names one (`connect-plugin/commands/root.go:80`). `serve`, `up`, `dial`, `join`, and `ping` also run the service-catalog gate (`connect-plugin/commands/activation.go:20`). |
 | Daemon credentials | Every credential kind carries `project_id`. `CloudConnector::new` rejects a mismatch (`connect-lib/lib/src/successor/mod.rs:156`). |
 | API paths | Every call goes to `/apis/resourcemanager.miloapis.com/v1alpha1/projects/{p}/control-plane` (`successor/mod.rs:168`). |
-| Edge allowlist | The serving daemon looks up approved edge Connectors by name inside the user's project (`successor/mod.rs:1125`). |
-| Architecture | `docs/architecture/multi-tenancy.md` says there is "no host-global service publication". |
+| Peer allowlists | The daemon resolves allowed peers from Connector objects in the project (`successor/mod.rs:1017`). |
 
 datumctl itself does not block anonymous use. Plugin dispatch exports empty
 `DATUM_SESSION` and `DATUM_PROJECT` values and leaves it to the plugin to decide
 (`datumctl/internal/plugindispatch/dispatch.go:149`). No datumctl change is
 required.
 
-The closest prior work is the removed legacy `datum-connect tunnel` path. It
-used codename hostnames under `iroh.datum.net` (`connect-lib/lib/src/lib.rs:35`),
-but it also required a project.
+The project gives Connect two things: a place to publish a Connector's address,
+and an authority for which peers may connect. Without a project, the ticket
+carries the address and the pairing secret replaces the authority.
 
-## Design summary
-
-The platform runs one shared **Quick Tunnel Gateway** as a Datum Compute
-Workload that receives traffic directly from the internet. It serves every
-anonymous tunnel. Each instance runs two containers:
-
-1. **`quick-tunnel-front`** (new). Serves the broker API, which registers a
-   tunnel for an anonymous client, assigns a hostname, and tracks a short
-   lease. It also terminates HTTPS for `*.<quick-domain>`, maps the `Host`
-   header to the client's iroh EndpointId, and applies abuse controls.
-2. **`iroh-gateway`** (existing, branch `feat/masque-connect`). Receives the
-   rewritten request on loopback and opens a MASQUE CONNECT-TCP stream to the
-   client over iroh.
-
-This is the same split the edge already uses: Envoy picks the target and sets
-headers, and an `iroh-gateway` sidecar carries the bytes
-(`infra/apps/network-services-operator/downstream/base/downstream-gateway.yaml`).
+## Design
 
 ```
-                               Quick Tunnel Gateway (Compute Workload, N instances)
-                              ┌───────────────────────────────────────────────────────────┐
-browser ──HTTPS──────────────▶│ quick-tunnel-front                                        │
-  *.<quick-domain>            │   TLS, Host → tunnel, limits, interstitial                │
-                              │   sets x-iroh-endpoint-id, x-datum-target-{host,port}     │
-datumctl connect local ─HTTPS▶│   broker API: register / renew / delete                  │
-  (register, renew)           │        │ loopback HTTP                                    │
-                              │        ▼                                                  │
-                              │ iroh-gateway --transport masque                           │──iroh/QUIC──▶ datumctl connect local ──TCP──▶ localhost:9999
-                              │   connect-transport connect_tcp                           │  CONNECT-TCP   (Access::Peers = gateway IDs)
-                              └───────────────────────────────────────────────────────────┘
-                                       │ QuickTunnel objects (shared state)
-                                       ▼
-                              platform project control plane
+  laptop                                                     phone or second computer
+┌──────────────────────────────┐                           ┌──────────────────────────────┐
+│ datumctl connect local       │   1. ticket (QR / text)   │ Android app or               │
+│   └ datum-connectd local     │ ────────────────────────▶ │ datumctl connect dial TICKET │
+│       in-memory iroh key     │                           │   iroh key                   │
+│       pairing ALPN           │ ◀── 2. pair: secret ───── │                              │
+│       MASQUE listener        │     (peer ID from TLS)    │                              │
+│         allow: paired IDs    │                           │                              │
+│                              │ ◀── 3. CONNECT-TCP ────── │ localhost:8888 ◀── browser   │
+│   └ localhost:9999           │     direct or via relay   │                              │
+└──────────────────────────────┘                           └──────────────────────────────┘
 ```
 
-The client holds no control-plane credential. It holds:
+No Datum service is in the path except iroh relays, and only when hole punching
+fails.
 
-1. an ephemeral iroh keypair, generated in memory and discarded on exit, and
-2. an opaque lease token that can renew or delete exactly one tunnel.
+### Ticket
 
-### Why one shared gateway
+`connect-lib/share/src/ticket.rs`. Text form: `dcshare1` followed by
+unpadded base64url of a JSON object:
 
-This creates no per-tunnel Connector, ConnectorAdvertisement, or HTTPProxy.
-That removes three problems the earlier draft had:
+| Field | Meaning |
+|---|---|
+| `id` | Sharer's iroh EndpointId (hex). |
+| `relays` | Sharer's home relay URL(s). |
+| `addrs` | Sharer's direct UDP addresses, including LAN addresses. |
+| `port` | Shared port; the MASQUE destination is `tcp-<port>`. |
+| `secret` | 32 random bytes. |
 
-- HTTPProxy does not support wildcard hostnames
-  (`network-services-operator/api/v1alpha/httpproxy_types.go:47`), and NSO
-  assigns default hostnames from one global target domain. A per-tunnel
-  HTTPProxy would need NSO changes to use a separate domain.
-- Project quota on Connectors and HTTPProxies would have to scale with
-  anonymous traffic.
-- Each tunnel would wait for NSO to program Envoy and report
-  CertificatesReady. The gateway can route a new hostname as soon as it is
-  registered.
+A ticket is about 400 characters, which fits in a QR code. A binary encoding
+(postcard plus base32) would make the code smaller and denser to scan, and is a
+follow-up.
 
-The cost is that this ingress does not sit behind the edge Envoy fleet, so the
-gateway must do its own rate limiting and abuse controls.
+The ticket is a bearer secret for as long as the sharer runs. Anyone who has
+it can pair, up to the peer limit. It also reveals the sharer's IP addresses.
+The CLI and the app say so when they display it.
+
+### Pairing
+
+`connect-lib/share/src/pair.rs`, ALPN `datum-connect/share-pair/1`.
+
+1. The peer connects to the sharer on the pairing ALPN from the same iroh key
+   it will use for traffic.
+2. It sends `{"secret": "...", "name": "Pixel 8"}` on one stream.
+3. The sharer compares the secret in constant time. It takes the peer's
+   EndpointId from the authenticated QUIC connection, never from the request.
+4. On success, the sharer adds that EndpointId to the destination's
+   `Access::Peers` and replies `{"ok": true}`. It reports the pairing on stdout
+   so the user sees which device joined.
+
+Until a peer pairs, the destination's allowlist is empty and every MASQUE
+request is refused. Pairing closes after `--max-peers` distinct devices
+(default 4). A device that pairs again is accepted and does not count twice.
+
+Why pair instead of putting the secret in each CONNECT request: the transport
+already authorizes by peer EndpointId (`Access::Peers`). Pairing keeps that
+model unchanged, needs no new header, and means a ticket leaked after the
+limit is reached grants nothing.
+
+The pairing handler shares the transport's endpoint and identity. To allow
+this, `connect-transport` gained `TransportConfig::protocol(alpn, handler)`,
+which registers an extra ALPN on the transport's own accept loop. The MASQUE
+and CONNECT-IP ALPNs cannot be replaced.
+
+### Lifetime
+
+Everything lives in memory. The sharer generates a new key on each run, so
+every run prints a new ticket, and stopping the command revokes all pairings.
+Nothing is written to disk on the sharer.
+
+### Relays
+
+Without `--relay-urls`, the transport uses n0's public relays
+(`connect-lib/transport/src/lib.rs:246`), as `serve` already does outside
+staging. Before release, choose one:
+
+- Datum relays, which then serve anonymous clients and need the relay's
+  access controls and rate limits, or
+- n0's relays, with that dependency documented.
+
+An empty relay list disables relays. Then only direct addresses are used,
+which suits a phone on the same Wi-Fi and offline tests.
 
 ## Components
 
-### 1. CLI: `datumctl connect local`
+### `connect-share` crate (new, implemented)
+
+`connect-lib/share`. No cloud, auth, or storage dependencies. Depends only on
+`connect-transport`, `iroh`, `tokio`, and serde.
+
+| API | Purpose |
+|---|---|
+| `share(ShareOptions, cancel, on_event)` | Sharer. Emits `Ready { ticket }` and `Paired { peer, name }`. |
+| `dial(DialOptions, cancel, on_ready)` | Peer. Pairs, binds a local TCP listener, forwards each connection. Accepts a caller-supplied key so a device can keep one identity. |
+| `ShareTicket` | `Display` and `FromStr` for the text form. |
+
+### `datum-connectd` foreground modes (implemented)
+
+```text
+datum-connectd local HOST:PORT [--max-peers N] [--relay-urls URLS]
+datum-connectd local-dial TICKET [--bind ADDR] [--name NAME] [--relay-urls URLS]
+```
+
+Both write one JSON event per line on stdout (`share_ready` with the ticket,
+`share_paired`, `dial_ready`) and JSON logs on stderr. Neither opens the
+daemon repository, credentials, or the loopback API.
+
+### Plugin commands (next)
 
 ```text
 datumctl connect local --port PORT [--host HOST]
 datumctl connect local HOST:PORT
+datumctl connect dial TICKET [--bind PORT]
 ```
 
-Behavior:
+- `local` skips `project()` and the service-catalog gate. Add it to the
+  ungated list in `activation.go`.
+- `dial` keeps its project behavior when the argument is `CONNECTOR:PORT`. When
+  the argument starts with `dcshare1`, it skips the project and runs
+  `local-dial`.
+- Both run in the foreground and exec `datum-connectd`, which the plugin
+  already downloads and verifies. They do not install the background daemon.
+- `local` prints the ticket, a terminal QR code, and each device that pairs.
+- Both ignore any datumctl session. The output is the same whether or not the
+  user is signed in.
 
-- Runs in the foreground. Ctrl+C deletes the tunnel. It does not install or
-  require the background daemon, and it writes no files under the repo dir.
-- Skips `project()` and the service-catalog gate. Add `local` to the
-  "no gate" list in `activation.go`.
-- Ignores any datumctl session, even if one exists. The output is the same
-  whether or not the user is logged in.
-- Prints the URL, the expiry, and a hint:
-  `For a stable hostname, sign in and run: datumctl connect serve localhost:9999 --public`.
-- HTTP only, including WebSocket upgrades.
+### Android app (new)
 
-Where the code runs: the Go plugin cannot speak iroh. Add a foreground
-subcommand to the Rust daemon binary, `datum-connectd local`, and have the
-plugin exec it. The plugin already downloads and verifies `datum-connectd`.
-The subcommand:
+A new, standalone app. It has no login and no Datum Cloud dependency, so it
+does not build on the existing desktop-app port
+(`datum-cloud/app`, branch `feat/android-build`), which requires an account.
 
-1. creates an iroh endpoint with the gateway's relay URLs,
-2. registers with the gateway's broker API,
-3. starts a `connect-transport` server with one destination,
-   `DestinationId::tcp(port)` → `localhost:PORT`, and
-   `Access::Peers(gatewayPeers)`,
-4. renews every 15 s and updates `gatewayPeers` from each renewal response,
-5. deletes the tunnel on exit.
+**Architecture**
 
-It does not open the store, the loopback API, or the control-plane client.
-`Access::Peers` keeps the existing rule from
-`connect-lib/daemon/src/runtime.rs:209`: public means approved gateway
-identities, never arbitrary peers.
-
-### 2. Quick Tunnel Gateway
-
-#### `iroh-gateway` sidecar (existing)
-
-The `ConnectGateway` image `ghcr.io/datum-cloud/iroh-gateway:v0.0.0-357f82b`
-is built from `iroh-gateway` branch `feat/masque-connect`. That branch:
-
-- depends on `connect-transport` from this repository;
-- accepts an HTTP origin request with `x-iroh-endpoint-id`,
-  `x-datum-target-host`, and `x-datum-target-port`, strips those headers, and
-  forwards the request with `connect_tcp` to `DestinationId::tcp(port)` on
-  that endpoint (`src/gateway.rs:304`, `src/gateway/masque.rs:358`);
-- binds to `127.0.0.1` by default in MASQUE mode, and can also serve a Unix
-  socket (`masque::serve_uds`);
-- has no authorization of its own, so it must stay on loopback behind the
-  front.
-
-Run it with `--transport masque` and the instance's key from a Secret.
-
-Two gaps to close in `iroh-gateway`:
-
-1. **Merge `feat/masque-connect` to `main`.** The production `ConnectGateway`
-   image is already built from it.
-2. **Address hints.** The gateway finds a peer's address through iroh
-   discovery (`default`, `dns`, or `hybrid`). Quick-tunnel clients have no
-   Connector, so NSO publishes no `_iroh` DNS record for them, and we do not
-   want to depend on n0's discovery. Add a trusted request header, for example
-   `x-iroh-endpoint-addr`, that carries the client's relay URL and direct
-   addresses. The gateway strips it like the other Datum headers. The front
-   sets it from the address the client registered.
-
-#### `quick-tunnel-front` (new)
-
-A new binary, built in this repository. It has no iroh code of its own; all
-iroh traffic goes through the sidecar.
-
-#### Broker API
-
-| Method and path | Auth | Purpose |
+| Layer | Choice | Why |
 |---|---|---|
-| `POST /v1/challenges` | none | Returns `{nonce, difficulty, expiresAt}`. |
-| `POST /v1/tunnels` | signed nonce plus proof of work | Creates a tunnel. |
-| `PUT /v1/tunnels/{id}/lease` | lease token | Renews. Returns current `gatewayPeers`. |
-| `DELETE /v1/tunnels/{id}` | lease token | Deletes immediately. |
-| `POST /v1/abuse` | none | Reports a hostname. |
+| Core | `connect-share` through a thin `connect-share-ffi` crate with UniFFI bindings | One implementation of the ticket, pairing, and wire protocol for CLI and phone. |
+| UI | Kotlin, Jetpack Compose | Foreground services, camera, and notifications are native Android APIs. |
+| QR scanning | CameraX plus ML Kit barcode scanning, or ZXing for a build with no Google Play services | Standard, works offline. |
+| Native build | `cargo-ndk` for `arm64-v8a`, `armeabi-v7a`, `x86_64` | `x86_64` for the emulator. |
 
-Served at a fixed name, for example `https://quick.connect.datum.net`.
+The FFI surface is small: parse a ticket, start a dial with a key and a bind
+port, stop it, and a callback for state changes.
 
-Create request:
+**Behavior**
 
-```json
-{
-  "publicKey": "<64 hex iroh EndpointId>",
-  "endpoint": "<serialized EndpointAddr: relay URL plus direct addrs>",
-  "port": 9999,
-  "nonce": "...",
-  "signature": "<ed25519 signature of nonce || publicKey by the iroh key>",
-  "work": "<proof-of-work solution>",
-  "client": {"version": "1.0.0-preview.29", "os": "linux", "arch": "amd64"}
-}
-```
+- Scan a QR code or paste a ticket. Show the sharer's port and EndpointId
+  prefix before connecting.
+- Run the dial in a foreground service with a persistent notification, so the
+  local port stays open while the user switches to the browser. Android 14
+  requires a foreground service type; use `specialUse` with a description of
+  the local proxy.
+- Bind `127.0.0.1` on a chosen or random port, and offer "Open in browser".
+  Android shares loopback between apps, so Chrome can reach the port.
+- Keep one device key in the Android Keystore-backed app storage, so a dropped
+  connection can resume against the same sharer run without pairing again.
+- Keep recent tickets until their sharer stops answering, then mark them
+  expired.
+- Stop the service when the user taps Stop, or when the sharer has been
+  unreachable for a set time.
 
-The signature proves the caller owns the key. Without it, a caller could
-register someone else's EndpointId and send them unwanted traffic.
+**Distribution**
 
-Create response:
+Signed APK on the GitHub release first, then Play Store. Keep signing keys in
+CI secrets. The existing app branch commits keystore passwords in
+`ui/Dioxus.toml`; do not repeat that.
 
-```json
-{
-  "id": "qt-7f3c...",
-  "url": "https://amber-otter-k2x9.<quick-domain>",
-  "leaseToken": "<opaque, 256-bit>",
-  "leaseSeconds": 30,
-  "expiresAt": "2026-10-16T23:00:00Z",
-  "gatewayPeers": ["<replica EndpointId>", "..."]
-}
-```
+**Where it lives**
 
-#### Ingress
+`connect-mobile/android/` in this repository, beside `connect-lib`, so the
+wire protocol and the app change in the same pull request. The FFI crate goes
+in the Rust workspace as `connect-lib/share-ffi`.
 
-- Listens on TCP 443 with a wildcard certificate for `*.<quick-domain>`.
-- Looks up `Host` in the tunnel table. An unknown host gets 404. An expired
-  lease gets 502 with a short "tunnel offline" page.
-- Strips any client-supplied `x-iroh-*` and `x-datum-*` headers, then sets
-  `x-iroh-endpoint-id`, `x-iroh-endpoint-addr`, `x-datum-target-host:
-  localhost`, and `x-datum-target-port` from the tunnel record, and forwards
-  to the sidecar on loopback. HTTP/1.1, HTTP/2, and upgrades pass through.
-- Adds `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`.
-- Shows an interstitial page on the first browser visit to each hostname. It
-  says the site is an anonymous tunnel and sets a cookie. API clients skip it
-  by sending a documented header. This is the main phishing deterrent that
-  ngrok and others use.
-- Applies per-hostname request-rate, concurrent-stream, bandwidth, and body
-  size limits.
+### iOS
 
-#### State
+iOS suspends an app's sockets soon after it leaves the foreground. A local
+port served by the app stops working when the user switches to Safari. The
+working option is a `NEPacketTunnelProvider` Network Extension, which makes the
+phone a CONNECT-IP client like `join`. That is a larger, separate design.
 
-Store each tunnel as a `QuickTunnel` object in the platform project:
-`{hostname, publicKey, endpoint, port, sha256(leaseToken), sourceIP, created,
-expires, renewedAt}`. Every replica watches the objects and keeps an in-memory
-Host → tunnel map. Any replica can then serve any tunnel, because the gateway
-dials the client through iroh. Operators can inspect and delete tunnels with
-`datumctl get` and `datumctl delete`.
+## Later: public URLs
 
-A sweeper deletes objects whose lease is more than 30 s old (two missed
-renewals) or that are past the hard TTL.
+For viewers without an iroh client, a shared Quick Tunnel Gateway on Datum
+Compute can bridge HTTPS to the same transport. An earlier revision of this
+document proposed it in detail. In summary:
 
-#### Identity
+- A Compute Workload runs a front that terminates HTTPS for
+  `*.<quick-domain>` and serves a broker API. Behind it runs an `iroh-gateway`
+  sidecar from branch `feat/masque-connect`, which already forwards HTTP
+  origin requests over MASQUE CONNECT-TCP when given `x-iroh-endpoint-id` and
+  target headers. A laptop test on 2026-10-16 confirmed that path.
+- It depends on Compute Workloads receiving traffic directly from the
+  internet, which is planned.
+- It needs a separate registrable domain, abuse controls, and a gateway
+  address-hint header in `iroh-gateway`.
 
-Each instance's `iroh-gateway` has its own iroh key, mounted from a Secret,
-the way connect-controller provisions `ConnectGateway` keys
-(`connect-controller/internal/controller/connectors.go:565`). Do not share one
-key across instances, because two live endpoints with the same EndpointId
-conflict at the relay. The front reads the sidecar's EndpointId at startup and
-records it, so the broker can return every instance's EndpointId in
-`gatewayPeers`. Because clients re-read it on each renewal, instances can be
-added or replaced without dropping tunnels.
+`datumctl connect local --public` would register with that gateway and add its
+identities to the allowlist, alongside paired peers.
 
-### 3. Deployment on Datum Compute
+## Security summary
 
-- A platform project, for example `datum-quick-tunnels`, under a platform org.
-  Do not reuse `datum-cloud`; it already holds shared infrastructure
-  credentials (`infra/apps/external-dns-webhook/production/webhook-kubeconfig.yaml`).
-- A Compute Workload with the two containers above, in several locations,
-  managed from `infra`. This assumes Compute Workloads can receive traffic
-  directly from the internet, which is planned. Each instance needs inbound
-  TCP 443 and UDP for iroh.
-- A service account for the workload, with a role that can only manage
-  `QuickTunnel` objects in that project.
-- Datum relays only (`iroh-relay.*`). The gateway passes its relay URLs to
-  clients so tunnels do not fall back to n0's public relays
-  (`connect-lib/transport/src/lib.rs:246`).
-- DNS: `*.<quick-domain>` resolves to the gateway instances, for example by
-  GeoDNS to the nearest location.
-
-### 4. Domain
-
-Use a separate registrable domain for quick tunnels, not `datumproxy.net`.
-Anonymous tunnels attract phishing. Blocklists act on whole registrable
-domains, so a shared domain would put paying customers' hostnames at risk.
-Submit the domain to the Public Suffix List so browsers isolate cookies between
-tunnels. Staging can use a subdomain of a staging domain.
-
-### 5. Abuse handling
-
-| Control | Default |
+| Risk | Control |
 |---|---|
-| Hard TTL per tunnel | 8 hours |
-| Lease timeout | 30 s without renewal |
-| Concurrent tunnels per client IP (/64 for IPv6) | 2 |
-| Creates per client IP per hour | 10 |
-| Proof-of-work difficulty | Raised automatically when the create rate spikes |
-| Global kill switch | Config flag that rejects all creates |
-| Takedown | `POST /v1/abuse` plus an operator command that deletes the tunnel and blocks its key and source IP |
-| Record retention | Hostname, public key, source IP, and timestamps, kept 30 days for abuse response |
+| Ticket leaks | Pairing limit; ticket dies when the sharer stops; the UI warns that the ticket is a secret |
+| Peer impersonation | Peer identity comes from the iroh TLS handshake, not from the request |
+| Secret guessing | 256-bit secret, constant-time comparison |
+| Exposure of the sharer's other ports | Only `tcp-<port>` is advertised; the transport refuses other destinations |
+| IP address disclosure | Ticket includes direct addresses; documented in the UI |
+| Anonymous relay use | Decide relay policy before release (see [Relays](#relays)) |
 
-The FraudProvider proposal
-(`enhancements/enhancements/platform/fraud-and-abuse/README.md`) scores users at
-signup and does not cover unauthenticated traffic. The gateway can call it with
-the source IP later, if it gains an IP-scoring API.
+## Implementation status
 
-## Open questions
+On branch `feat/projectless-local-tunnel`:
 
-1. **Direct internet ingress on Compute.** This design assumes it, and it is
-   planned. Until it ships, staging can front the workload with a single
-   HTTPProxy per test hostname, because HTTPProxy has no wildcard hostnames.
-2. **Proof of work vs. a challenge page.** A CLI cannot show a CAPTCHA. Proof
-   of work raises the cost of mass creation but does not stop a determined
-   abuser. Per-IP limits and takedown do the rest.
-3. **Should a logged-in user get more?** This proposal says no. Logged-in users
-   should use `serve --public`, which already gives a stable hostname under
-   their own project and quota.
+| Piece | Status |
+|---|---|
+| `connect-transport` extra ALPN handlers | Done |
+| `connect-share`: ticket, pairing, share, dial | Done; 5 unit and 3 loopback end-to-end tests |
+| `datum-connectd local` and `local-dial` | Done; tested across two processes over n0 relays, including a tampered-secret refusal |
+| Plugin `local` and ticket `dial` | Next |
+| `connect-share-ffi` and Android app | Next |
+| Relay policy decision | Open |
 
 ## Work breakdown
 
-| Repo | Change | New? |
-|---|---|---|
-| `connect` | `datumctl connect local` in the plugin; skip project and catalog gate | Change |
-| `connect` | `datum-connectd local` foreground mode with broker client | New code |
-| `connect` | `quick-tunnel-front` binary: broker API, HTTPS ingress, header rewrite, limits, sweeper | New service |
-| `connect` | `QuickTunnel` CRD | New API |
-| `iroh-gateway` | Merge `feat/masque-connect`; add the `x-iroh-endpoint-addr` address-hint header | Change |
-| `infra` | Platform project, service account, role, Compute Workload, Secrets, domain, DNS, wildcard certificate | New config |
-| `enhancements` | Enhancement proposal, abuse policy, and terms of use for anonymous tunnels | New doc |
-
-Suggested order:
-
-1. On a laptop: run `iroh-gateway --transport masque` from
-   `feat/masque-connect` and send it hand-written headers to reach
-   `datum-connectd local` with a hard-coded gateway peer. This proves the data
-   path before any new service exists.
-2. Address-hint header in `iroh-gateway`.
-3. `quick-tunnel-front` with a static tunnel table, then the broker API and
-   `QuickTunnel` state.
-4. Staging deployment on Compute with a staging domain.
-5. Plugin `local` command.
-6. Abuse controls, production domain, and launch.
+1. Plugin commands, terminal QR code, and plugin e2e tests.
+2. `connect-share-ffi` with UniFFI; Kotlin bindings built by `cargo-ndk`.
+3. Android app: ticket scan, foreground service, open-in-browser, release
+   signing in CI.
+4. Relay policy and, if Datum relays, relay rate limits.
+5. Binary ticket encoding for smaller QR codes.
+6. Later: public URLs through the Quick Tunnel Gateway; iOS Network Extension.
