@@ -1,0 +1,21 @@
+[package]
+name = "connect-share"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Project-less sharing of one local TCP service over Datum Connect's MASQUE transport"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+connect-transport = { path = "../transport" }
+iroh = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

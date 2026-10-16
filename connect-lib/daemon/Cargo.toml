@@ -22,6 +22,7 @@ chrono = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 connect-lib = { path = "../lib" }
 connect-transport = { path = "../transport", features = ["otel"] }
+connect-share = { path = "../share" }
 connect-ip-adapter = { path = "../ip-adapter" }
 connect-masque-edge = { path = "../masque-interop-lab" }
 fs2 = { workspace = true }

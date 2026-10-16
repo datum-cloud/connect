@@ -617,6 +617,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "connect-share"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "connect-transport",
+ "iroh",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "connect-transport"
 version = "0.1.0"
 dependencies = [
@@ -965,6 +981,7 @@ dependencies = [
  "connect-ip-adapter",
  "connect-lib",
  "connect-masque-edge",
+ "connect-share",
  "connect-transport",
  "fs2",
  "iroh",

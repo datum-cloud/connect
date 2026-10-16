@@ -6,7 +6,6 @@ use datum_connect_daemon::{
     auth,
     control::Control,
     error::ApiError,
-    local,
     runtime::RealControl,
     store::Store,
 };
@@ -63,28 +62,50 @@ struct Args {
     windows_service: bool,
 }
 
-/// Foreground, project-less publication of one local service (prototype).
+/// Project-less foreground modes. They use no repository, credentials, or
+/// loopback API, and print line-delimited JSON events on stdout.
 #[derive(Clone, Debug, Parser)]
-#[command(name = "datum-connectd local", version = env!("DATUM_CONNECT_RELEASE_VERSION"))]
-struct LocalArgs {
-    /// Local HOST:PORT to publish.
-    target: String,
+#[command(name = "datum-connectd", version = env!("DATUM_CONNECT_RELEASE_VERSION"))]
+struct ProjectlessArgs {
+    #[command(subcommand)]
+    command: Projectless,
+}
 
-    /// Approved gateway EndpointId. Repeat for each gateway instance.
-    #[arg(long = "gateway-peer", required = true)]
-    gateway_peers: Vec<iroh::EndpointId>,
-
-    /// Comma-separated HTTPS relay origins. Defaults to the transport preset.
-    #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
-    relay_urls: Option<String>,
+#[derive(Clone, Debug, clap::Subcommand)]
+enum Projectless {
+    /// Share one local TCP service and print a pairing ticket.
+    Local {
+        /// Local HOST:PORT to share.
+        target: String,
+        /// Distinct devices that may pair before pairing closes.
+        #[arg(long, default_value_t = 4)]
+        max_peers: usize,
+        /// Comma-separated HTTPS relay origins. Defaults to the transport preset.
+        #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
+        relay_urls: Option<String>,
+    },
+    /// Pair with a share ticket and serve the shared service on a local port.
+    LocalDial {
+        /// Ticket printed by `local`.
+        ticket: connect_share::ShareTicket,
+        /// Local listener address.
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: std::net::SocketAddr,
+        /// Name shown to the sharer.
+        #[arg(long)]
+        name: Option<String>,
+        /// Comma-separated HTTPS relay origins. Defaults to the transport preset.
+        #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
+        relay_urls: Option<String>,
+    },
 }
 
 fn main() {
-    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if argv.get(1).is_some_and(|arg| arg == "local") {
-        let local = LocalArgs::parse_from(
-            std::iter::once("datum-connectd local".into()).chain(argv[2..].iter().cloned()),
-        );
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "local" || arg == "local-dial")
+    {
+        let args = ProjectlessArgs::parse();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -92,7 +113,7 @@ fn main() {
                 eprintln!("failed to initialize async runtime: {error}");
                 std::process::exit(1);
             });
-        runtime.block_on(run_local(local));
+        runtime.block_on(run_projectless(args.command));
         return;
     }
     let args = Args::parse();
@@ -114,7 +135,12 @@ fn main() {
     runtime.block_on(run_console(args));
 }
 
-async fn run_local(args: LocalArgs) {
+/// One machine-readable event per stdout line; the plugin parses these.
+fn emit(event: serde_json::Value) {
+    println!("{event}");
+}
+
+async fn run_projectless(command: Projectless) {
     let (_log_guard, _otel_guard) = match init_tracing(None).await {
         Ok(guard) => guard,
         Err(error) => {
@@ -122,10 +148,7 @@ async fn run_local(args: LocalArgs) {
             std::process::exit(1);
         }
     };
-    let relay_urls = match args
-        .relay_urls
-        .as_deref()
-        .map(datum_connect_daemon::relays::parse)
+    let relays = |raw: Option<String>| match raw.as_deref().map(datum_connect_daemon::relays::parse)
     {
         Some(Ok(relays)) => Some(relays),
         Some(Err(error)) => {
@@ -142,21 +165,56 @@ async fn run_local(args: LocalArgs) {
             cancel.cancel();
         }
     });
-    let options = local::LocalOptions {
-        target: args.target,
-        gateway_peers: args.gateway_peers,
-        relay_urls,
-    };
-    let result = local::run(options, cancel, |ready| {
-        // Machine-readable on stdout; the plugin parses this line.
-        match serde_json::to_string(ready) {
-            Ok(line) => println!("{line}"),
-            Err(error) => tracing::error!(%error, "local_ready_encode_failed"),
+    let result = match command {
+        Projectless::Local {
+            target,
+            max_peers,
+            relay_urls,
+        } => {
+            let options = connect_share::ShareOptions {
+                target,
+                relay_urls: relays(relay_urls),
+                max_peers,
+            };
+            connect_share::share(options, cancel, |event| match event {
+                connect_share::ShareEvent::Ready { ticket, target } => emit(serde_json::json!({
+                    "event": "share_ready",
+                    "endpoint_id": ticket.endpoint.id.to_string(),
+                    "target": target,
+                    "ticket": ticket.to_string(),
+                })),
+                connect_share::ShareEvent::Paired { peer, name } => emit(serde_json::json!({
+                    "event": "share_paired",
+                    "peer": peer.to_string(),
+                    "name": name,
+                })),
+            })
+            .await
         }
-    })
-    .await;
+        Projectless::LocalDial {
+            ticket,
+            bind,
+            name,
+            relay_urls,
+        } => {
+            let options = connect_share::DialOptions {
+                ticket,
+                bind,
+                secret_key: None,
+                name,
+                relay_urls: relays(relay_urls),
+            };
+            connect_share::dial(options, cancel, |ready| {
+                emit(serde_json::json!({
+                    "event": "dial_ready",
+                    "local_addr": ready.local_addr,
+                }))
+            })
+            .await
+        }
+    };
     if let Err(error) = result {
-        tracing::error!(stage = "local", error = %error, "local_failed");
+        tracing::error!(stage = "projectless", error = %error, "projectless_failed");
         std::process::exit(1);
     }
 }

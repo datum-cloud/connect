@@ -1,5 +1,5 @@
 [workspace]
-members = ["lib", "bin", "transport", "daemon", "ip-adapter", "network-helper", "masque-interop-lab"]
+members = ["lib", "bin", "transport", "share", "daemon", "ip-adapter", "network-helper", "masque-interop-lab"]
 resolver = "2"
 
 [workspace.package]
