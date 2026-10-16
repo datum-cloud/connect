@@ -132,13 +132,12 @@ Nothing is written to disk on the sharer.
 
 ### Relays
 
-Without `--relay-urls`, the transport uses n0's public relays
-(`connect-lib/transport/src/lib.rs:246`), as `serve` already does outside
-staging. Before release, choose one:
-
-- Datum relays, which then serve anonymous clients and need the relay's
-  access controls and rate limits, or
-- n0's relays, with that dependency documented.
+Decision (2026-10-16): use n0's public relays for now. Without
+`--relay-urls`, the transport uses them already
+(`connect-lib/transport/src/lib.rs:246`), as `serve` does outside staging, so
+anonymous clients add no load to Datum relays. Revisit if n0's relays become a
+reliability or policy concern. Moving to Datum relays would then need relay
+access controls and rate limits for anonymous clients.
 
 An empty relay list disables relays. Then only direct addresses are used,
 which suits a phone on the same Wi-Fi and offline tests.
@@ -167,7 +166,7 @@ Both write one JSON event per line on stdout (`share_ready` with the ticket,
 `share_paired`, `dial_ready`) and JSON logs on stderr. Neither opens the
 daemon repository, credentials, or the loopback API.
 
-### Plugin commands (next)
+### Plugin commands (implemented)
 
 ```text
 datumctl connect local --port PORT [--host HOST]
@@ -229,8 +228,9 @@ CI secrets. The existing app branch commits keystore passwords in
 
 **Where it lives**
 
-`connect-mobile/android/` in this repository, beside `connect-lib`, so the
-wire protocol and the app change in the same pull request. The FFI crate goes
+Decision (2026-10-16): in this repository, at `connect-mobile/android/`
+beside `connect-lib`, so the wire protocol and the app change in the same pull
+request. The FFI crate goes
 in the Rust workspace as `connect-lib/share-ffi`.
 
 ### iOS
@@ -268,7 +268,7 @@ identities to the allowlist, alongside paired peers.
 | Secret guessing | 256-bit secret, constant-time comparison |
 | Exposure of the sharer's other ports | Only `tcp-<port>` is advertised; the transport refuses other destinations |
 | IP address disclosure | Ticket includes direct addresses; documented in the UI |
-| Anonymous relay use | Decide relay policy before release (see [Relays](#relays)) |
+| Anonymous relay use | n0's public relays carry it for now (see [Relays](#relays)) |
 
 ## Implementation status
 
@@ -279,16 +279,16 @@ On branch `feat/projectless-local-tunnel`:
 | `connect-transport` extra ALPN handlers | Done |
 | `connect-share`: ticket, pairing, share, dial | Done; 5 unit and 3 loopback end-to-end tests |
 | `datum-connectd local` and `local-dial` | Done; tested across two processes over n0 relays, including a tampered-secret refusal |
-| Plugin `local` and ticket `dial` | Next |
+| Plugin `local` and ticket `dial`, terminal QR code | Done |
 | `connect-share-ffi` and Android app | Next |
-| Relay policy decision | Open |
+| Relay policy | Decided: n0 public relays for now |
 
 ## Work breakdown
 
-1. Plugin commands, terminal QR code, and plugin e2e tests.
-2. `connect-share-ffi` with UniFFI; Kotlin bindings built by `cargo-ndk`.
-3. Android app: ticket scan, foreground service, open-in-browser, release
-   signing in CI.
-4. Relay policy and, if Datum relays, relay rate limits.
-5. Binary ticket encoding for smaller QR codes.
-6. Later: public URLs through the Quick Tunnel Gateway; iOS Network Extension.
+1. `connect-share-ffi` with UniFFI; Kotlin bindings built by `cargo-ndk`.
+2. Android app in `connect-mobile/android/`: ticket scan, foreground service,
+   open-in-browser, release signing in CI.
+3. Plugin e2e test that runs `local` and ticket `dial` against a real
+   `datum-connectd`.
+4. Binary ticket encoding for smaller QR codes.
+5. Later: public URLs through the Quick Tunnel Gateway; iOS Network Extension.
