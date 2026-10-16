@@ -131,12 +131,42 @@ pub struct Policy {
     pub destinations: HashMap<DestinationId, DestinationPolicy>,
 }
 
+/// Accepts connections for an additional ALPN on the transport's endpoint.
+///
+/// The transport owns the endpoint's accept loop, so other protocols that must
+/// share the endpoint identity register here instead of accepting directly.
+pub trait ProtocolHandler: Send + Sync + 'static {
+    /// Serves one authenticated connection. Errors are counted and logged.
+    fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+}
+
+type Protocols = HashMap<Vec<u8>, Arc<dyn ProtocolHandler>>;
+
 /// Endpoint construction settings.
-#[derive(Debug)]
 pub struct TransportConfig {
     secret_key: SecretKey,
     bind_addr: Option<SocketAddr>,
     relay_mode: Option<iroh::RelayMode>,
+    protocols: Protocols,
+}
+
+impl std::fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut alpns: Vec<_> = self
+            .protocols
+            .keys()
+            .map(|alpn| String::from_utf8_lossy(alpn))
+            .collect();
+        alpns.sort();
+        f.debug_struct("TransportConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("relay_mode", &self.relay_mode)
+            .field("protocols", &alpns)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TransportConfig {
@@ -146,6 +176,7 @@ impl TransportConfig {
             secret_key,
             bind_addr: None,
             relay_mode: None,
+            protocols: HashMap::new(),
         }
     }
     /// Overrides the UDP bind address.
@@ -157,6 +188,15 @@ impl TransportConfig {
     /// Overrides the preset's relay network without changing the device identity.
     pub fn relay_mode(mut self, relay_mode: iroh::RelayMode) -> Self {
         self.relay_mode = Some(relay_mode);
+        self
+    }
+
+    /// Accepts `alpn` on the same endpoint and hands its connections to
+    /// `handler`. The MASQUE and CONNECT-IP ALPNs cannot be replaced.
+    pub fn protocol(mut self, alpn: &[u8], handler: Arc<dyn ProtocolHandler>) -> Self {
+        if alpn != ALPN && alpn != ip::ALPN {
+            self.protocols.insert(alpn.to_vec(), handler);
+        }
         self
     }
 }
@@ -232,6 +272,7 @@ struct Inner {
     metrics: Metrics,
     peer_diagnostics: RwLock<HashMap<EndpointId, PeerDiagnostics>>,
     ip_registry: Arc<ip::Registry>,
+    protocols: Protocols,
 }
 
 /// A clonable, long-lived transport endpoint.
@@ -243,9 +284,11 @@ pub struct Transport {
 impl Transport {
     /// Binds and immediately starts accepting sessions.
     pub async fn bind(config: TransportConfig) -> Result<Self, Error> {
+        let mut alpns = vec![ALPN.to_vec(), ip::ALPN.to_vec()];
+        alpns.extend(config.protocols.keys().cloned());
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(config.secret_key)
-            .alpns(vec![ALPN.to_vec(), ip::ALPN.to_vec()]);
+            .alpns(alpns);
         if let Some(mode) = config.relay_mode {
             builder = builder.relay_mode(mode);
         }
@@ -258,7 +301,7 @@ impl Transport {
                 .map_err(error_debug)?;
         }
         let endpoint = builder.bind().await.map_err(error_debug)?;
-        let transport = Self::client(endpoint);
+        let transport = Self::with_protocols(endpoint, config.protocols);
         let task_transport = transport.clone();
         let task = tokio::spawn(async move { task_transport.accept_loop().await });
         *transport.inner.accept_task.lock().await = Some(task);
@@ -277,6 +320,10 @@ impl Transport {
     /// its tunnels and closes the supplied endpoint, including any external
     /// clones. Do not call shutdown while another owner still needs it.
     pub fn client(endpoint: Endpoint) -> Self {
+        Self::with_protocols(endpoint, HashMap::new())
+    }
+
+    fn with_protocols(endpoint: Endpoint, protocols: Protocols) -> Self {
         let shutdown = CancellationToken::new();
         let ip_registry = Arc::new(ip::Registry::new(shutdown.clone()));
         Self {
@@ -290,6 +337,7 @@ impl Transport {
                 metrics: Metrics::default(),
                 peer_diagnostics: RwLock::new(HashMap::new()),
                 ip_registry,
+                protocols,
             }),
         }
     }
@@ -620,6 +668,12 @@ impl Transport {
                             .map_err(error_display)
                     } else if conn.alpn() == ALPN {
                         transport.serve_connection(conn).await
+                    } else if let Some(handler) = transport.inner.protocols.get(conn.alpn()) {
+                        let served = handler.accept(conn);
+                        tokio::select! {
+                            _ = cancel.cancelled() => Err(Error::Closed),
+                            result = served => result.map_err(Error::Protocol),
+                        }
                     } else {
                         Err(Error::Protocol("unregistered ALPN".into()))
                     }
