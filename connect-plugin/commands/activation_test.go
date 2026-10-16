@@ -17,17 +17,27 @@ import (
 func TestConnectServiceGateRequired(t *testing.T) {
 	for _, name := range []string{"up", "serve", "dial", "join", "ping"} {
 		t.Run(name, func(t *testing.T) {
-			if !connectServiceGateRequired(&cobra.Command{Use: name}) {
+			if !connectServiceGateRequired(&cobra.Command{Use: name}, nil) {
 				t.Fatalf("%s should require Connect service access", name)
 			}
 		})
 	}
-	for _, name := range []string{"status", "down", "unserve", "hangup", "leave", "health", "doctor", "daemon", "install"} {
+	for _, name := range []string{"status", "down", "unserve", "hangup", "leave", "health", "doctor", "daemon", "install", "local"} {
 		t.Run(name, func(t *testing.T) {
-			if connectServiceGateRequired(&cobra.Command{Use: name}) {
+			if connectServiceGateRequired(&cobra.Command{Use: name}, nil) {
 				t.Fatalf("%s should remain available without Connect service access", name)
 			}
 		})
+	}
+}
+
+func TestTicketDialSkipsServiceGate(t *testing.T) {
+	dial := &cobra.Command{Use: "dial"}
+	if connectServiceGateRequired(dial, []string{"dcshare1abc"}) {
+		t.Fatal("a share-ticket dial must not require Connect service access")
+	}
+	if !connectServiceGateRequired(dial, []string{"server:22"}) {
+		t.Fatal("a Connector dial must still require Connect service access")
 	}
 }
 

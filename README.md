@@ -41,10 +41,18 @@ datumctl connect
   unserve HOST:PORT | NAME
   dial CONNECTOR:PORT --bind LOCALPORT
   hangup LOCALPORT
+  local HOST:PORT | --port PORT    (no login or project; prints a pairing ticket)
+  dial TICKET [--bind LOCALPORT]   (no login or project; pairs with a local share)
   install (optional; serve guides first-time user setup)
   daemon install | uninstall | start | stop | status
   doctor | health | version
 ```
+
+To share a local service with your own devices without a Datum account, run
+`datumctl connect local --port 9999`. It prints a ticket and a QR code. Run the
+printed `datumctl connect dial TICKET` on another computer. Anyone with the
+ticket can pair until you stop the command. See
+[project-less local tunnels](docs/design/project-less-local-tunnels.md).
 
 Services are private by default. Use `--public` to request an HTTPProxy.
 Default private access includes project devices, excluding gateway identities

@@ -17,7 +17,11 @@ const connectServiceName = "connect.datumapis.com"
 // connectServiceGateRequired identifies commands that establish or use a
 // cloud-side Connect session. Inspection, cleanup, and local daemon lifecycle
 // commands remain usable when service access is pending or unavailable.
-func connectServiceGateRequired(cmd *cobra.Command) bool {
+// A share-ticket dial is project-less and never touches Datum Cloud.
+func connectServiceGateRequired(cmd *cobra.Command, args []string) bool {
+	if cmd.Name() == "dial" && len(args) == 1 && isShareTicket(args[0]) {
+		return false
+	}
 	switch cmd.Name() {
 	case "up", "serve", "dial", "join", "ping":
 		return true

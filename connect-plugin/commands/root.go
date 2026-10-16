@@ -50,7 +50,7 @@ func Add(root *cobra.Command) {
 		if previousPreRunPlain != nil {
 			previousPreRunPlain(cmd, args)
 		}
-		if connectServiceGateRequired(cmd) {
+		if connectServiceGateRequired(cmd, args) {
 			projectID, _ := cmd.Flags().GetString("project")
 			return opts.serviceGate(cmd, strings.TrimSpace(projectID))
 		}
@@ -68,6 +68,7 @@ func Add(root *cobra.Command) {
 	root.AddCommand(newServe(opts))
 	root.AddCommand(newUnserve(opts))
 	root.AddCommand(newDial(opts))
+	root.AddCommand(newLocal(opts))
 	root.AddCommand(newHangup(opts))
 	root.AddCommand(newJoin(opts))
 	root.AddCommand(newDoctor(opts))
@@ -347,7 +348,14 @@ func newUnserve(opts *options) *cobra.Command {
 func newDial(opts *options) *cobra.Command {
 	var bind uint16
 	var protocol string
-	cmd := &cobra.Command{Use: "dial CONNECTOR:PORT", Short: "Forward a local port to a service on another Connector", Long: "Open a loopback-only local port that forwards to a service shared by another\nConnector in your project. CONNECTOR is its name or public key, not an IP\naddress. Its service must allow your Connector. Use the same protocol as serve.\n\nRun datumctl connect up first. If you omit --bind, the daemon chooses a port\nand reports it. Traffic connects when your application uses that local port.\nThe forward persists after this command exits; use hangup LOCALPORT to remove it.", Example: "  datumctl connect dial SERVER_CONNECTOR:22 --bind 2222\n  ssh -p 2222 localhost\n  datumctl connect dial SERVER_CONNECTOR:5353 --protocol udp --bind 5353\n  datumctl connect hangup 2222", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "dial CONNECTOR:PORT | TICKET", Short: "Forward a local port to a service on another Connector", Long: "Open a loopback-only local port that forwards to a service shared by another\nConnector in your project. CONNECTOR is its name or public key, not an IP\naddress. Its service must allow your Connector. Use the same protocol as serve.\n\nRun datumctl connect up first. If you omit --bind, the daemon chooses a port\nand reports it. Traffic connects when your application uses that local port.\nThe forward persists after this command exits; use hangup LOCALPORT to remove it.\n\nWith a TICKET printed by datumctl connect local, dial needs no login or\nproject. It pairs with the sharer and forwards the port until you press Ctrl+C.", Example: "  datumctl connect dial SERVER_CONNECTOR:22 --bind 2222\n  ssh -p 2222 localhost\n  datumctl connect dial SERVER_CONNECTOR:5353 --protocol udp --bind 5353\n  datumctl connect hangup 2222\n  datumctl connect dial dcshare1... --bind 9999", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if isShareTicket(args[0]) {
+			protocol, err := parseProtocol(protocol)
+			if err != nil {
+				return err
+			}
+			return runTicketDial(cmd, opts, args[0], bind, protocol)
+		}
 		connector, port, err := splitConnector(args[0])
 		if err != nil {
 			return err
