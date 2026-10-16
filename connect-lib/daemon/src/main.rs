@@ -6,6 +6,7 @@ use datum_connect_daemon::{
     auth,
     control::Control,
     error::ApiError,
+    local,
     runtime::RealControl,
     store::Store,
 };
@@ -62,7 +63,38 @@ struct Args {
     windows_service: bool,
 }
 
+/// Foreground, project-less publication of one local service (prototype).
+#[derive(Clone, Debug, Parser)]
+#[command(name = "datum-connectd local", version = env!("DATUM_CONNECT_RELEASE_VERSION"))]
+struct LocalArgs {
+    /// Local HOST:PORT to publish.
+    target: String,
+
+    /// Approved gateway EndpointId. Repeat for each gateway instance.
+    #[arg(long = "gateway-peer", required = true)]
+    gateway_peers: Vec<iroh::EndpointId>,
+
+    /// Comma-separated HTTPS relay origins. Defaults to the transport preset.
+    #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
+    relay_urls: Option<String>,
+}
+
 fn main() {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.get(1).is_some_and(|arg| arg == "local") {
+        let local = LocalArgs::parse_from(
+            std::iter::once("datum-connectd local".into()).chain(argv[2..].iter().cloned()),
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| {
+                eprintln!("failed to initialize async runtime: {error}");
+                std::process::exit(1);
+            });
+        runtime.block_on(run_local(local));
+        return;
+    }
     let args = Args::parse();
     #[cfg(windows)]
     if args.windows_service {
@@ -80,6 +112,53 @@ fn main() {
             std::process::exit(1);
         });
     runtime.block_on(run_console(args));
+}
+
+async fn run_local(args: LocalArgs) {
+    let (_log_guard, _otel_guard) = match init_tracing(None).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("failed to initialize logging: {error}");
+            std::process::exit(1);
+        }
+    };
+    let relay_urls = match args
+        .relay_urls
+        .as_deref()
+        .map(datum_connect_daemon::relays::parse)
+    {
+        Some(Ok(relays)) => Some(relays),
+        Some(Err(error)) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        None => None,
+    };
+    let cancel = CancellationToken::new();
+    tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            let _ = tokio::signal::ctrl_c().await;
+            cancel.cancel();
+        }
+    });
+    let options = local::LocalOptions {
+        target: args.target,
+        gateway_peers: args.gateway_peers,
+        relay_urls,
+    };
+    let result = local::run(options, cancel, |ready| {
+        // Machine-readable on stdout; the plugin parses this line.
+        match serde_json::to_string(ready) {
+            Ok(line) => println!("{line}"),
+            Err(error) => tracing::error!(%error, "local_ready_encode_failed"),
+        }
+    })
+    .await;
+    if let Err(error) = result {
+        tracing::error!(stage = "local", error = %error, "local_failed");
+        std::process::exit(1);
+    }
 }
 
 async fn run_console(args: Args) {

@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod control;
 pub mod error;
+pub mod local;
 pub mod local_ip;
 pub mod masque;
 pub mod model;
