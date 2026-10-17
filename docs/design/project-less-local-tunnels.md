@@ -78,20 +78,23 @@ fails.
 
 ### Ticket
 
-`connect-lib/share/src/ticket.rs`. Text form: `dcshare1` followed by
-unpadded base64url of a JSON object:
+`connect-lib/share/src/ticket.rs`. Text form: `DCSHARE2` followed by
+unpadded RFC 4648 base32 of a compact binary encoding. Parsing ignores case.
 
-| Field | Meaning |
+| Field | Encoding |
 |---|---|
-| `id` | Sharer's iroh EndpointId (hex). |
-| `relays` | Sharer's home relay URL(s). |
-| `addrs` | Sharer's direct UDP addresses, including LAN addresses. |
-| `port` | Shared port; the MASQUE destination is `tcp-<port>`. |
-| `secret` | 32 random bytes. |
+| version | 1 byte (`1`) |
+| endpoint id | Sharer's iroh EndpointId, 32 bytes |
+| secret | 32 random bytes |
+| port | Shared port, 2 bytes; the MASQUE destination is `tcp-<port>` |
+| relays | Count, then length-prefixed URLs (at most 4) |
+| addresses | Count, then IPv4 or IPv6 address and port (at most 6), including LAN addresses |
 
-A ticket is about 400 characters, which fits in a QR code. A binary encoding
-(postcard plus base32) would make the code smaller and denser to scan, and is a
-follow-up.
+A typical ticket is about 230 characters, all uppercase letters and digits.
+That is the QR alphanumeric set, so the QR code uses alphanumeric mode and fits
+in about version 9 (53 modules) instead of version 13 (69 modules) for the
+earlier JSON-and-base64url form. The first device test showed the larger code
+did not scan from a terminal.
 
 The ticket is a bearer secret for as long as the sharer runs. Anyone who has
 it can pair, up to the peer limit. It also reveals the sharer's IP addresses.
@@ -177,7 +180,7 @@ datumctl connect dial TICKET [--bind PORT]
 - `local` skips `project()` and the service-catalog gate. Add it to the
   ungated list in `activation.go`.
 - `dial` keeps its project behavior when the argument is `CONNECTOR:PORT`. When
-  the argument starts with `dcshare1`, it skips the project and runs
+  the argument starts with `DCSHARE2`, it skips the project and runs
   `local-dial`.
 - Both run in the foreground and exec `datum-connectd`, which the plugin
   already downloads and verifies. They do not install the background daemon.
@@ -197,7 +200,7 @@ does not build on the existing desktop-app port
 |---|---|---|
 | Core | `connect-share` through a thin `connect-share-ffi` crate with UniFFI bindings | One implementation of the ticket, pairing, and wire protocol for CLI and phone. |
 | UI | Kotlin, Jetpack Compose | Foreground services, camera, and notifications are native Android APIs. |
-| QR scanning | CameraX plus ML Kit barcode scanning, or ZXing for a build with no Google Play services | Standard, works offline. |
+| QR scanning | ZXing (`zxing-android-embedded`) | Works offline and without Google Play services. ML Kit is an option for a Play-only build. |
 | Native build | `cargo-ndk` for `arm64-v8a`, `armeabi-v7a`, `x86_64` | `x86_64` for the emulator. |
 
 The FFI surface is small: parse a ticket, start a dial with a key and a bind
@@ -213,8 +216,9 @@ port, stop it, and a callback for state changes.
   the local proxy.
 - Bind `127.0.0.1` on a chosen or random port, and offer "Open in browser".
   Android shares loopback between apps, so Chrome can reach the port.
-- Keep one device key in the Android Keystore-backed app storage, so a dropped
-  connection can resume against the same sharer run without pairing again.
+- Keep one device key in app-private, no-backup storage (`noBackupFilesDir`),
+  so a dropped connection can resume against the same sharer run without
+  pairing again. The key never leaves the phone and is excluded from backups.
 - Keep recent tickets until their sharer stops answering, then mark them
   expired.
 - Stop the service when the user taps Stop, or when the sharer has been
@@ -280,15 +284,16 @@ On branch `feat/projectless-local-tunnel`:
 | `connect-share`: ticket, pairing, share, dial | Done; 5 unit and 3 loopback end-to-end tests |
 | `datum-connectd local` and `local-dial` | Done; tested across two processes over n0 relays, including a tampered-secret refusal |
 | Plugin `local` and ticket `dial`, terminal QR code | Done |
-| `connect-share-ffi` and Android app | Next |
+| `connect-share-ffi` (UniFFI) | Done; Kotlin bindings tested on the host JVM, including a dial through a real `datum-connectd local` |
+| Android app (`connect-mobile/android`) | First version builds for arm64-v8a, armeabi-v7a, and x86_64. On 2026-10-16 a Pixel 9a pasted a ticket, paired with `datum-connectd local` over n0 relays, and loaded the shared page in Chrome. On 2026-10-17 it scanned a `DCSHARE2` QR code from a terminal and connected. Network changes not yet tested |
+| `nix develop .#android` shell | Done |
 | Relay policy | Decided: n0 public relays for now |
 
 ## Work breakdown
 
-1. `connect-share-ffi` with UniFFI; Kotlin bindings built by `cargo-ndk`.
-2. Android app in `connect-mobile/android/`: ticket scan, foreground service,
-   open-in-browser, release signing in CI.
+1. Finish device testing: behavior across network changes and long app
+   switches.
+2. Release signing and APK publishing in CI; remembered tickets.
 3. Plugin e2e test that runs `local` and ticket `dial` against a real
    `datum-connectd`.
-4. Binary ticket encoding for smaller QR codes.
-5. Later: public URLs through the Quick Tunnel Gateway; iOS Network Extension.
+4. Later: public URLs through the Quick Tunnel Gateway; iOS Network Extension.
