@@ -28,6 +28,8 @@ pub struct DialOptions {
 #[derive(Clone, Debug)]
 pub struct DialReady {
     pub local_addr: SocketAddr,
+    /// The sharer's name for the service, when it sent one.
+    pub sharer_name: Option<String>,
 }
 
 /// Pairs, then forwards each local connection over MASQUE CONNECT-TCP until
@@ -70,7 +72,7 @@ async fn run(
     if relays && ticket.endpoint.relay_urls().next().is_some() {
         wait_online(transport).await?;
     }
-    request_pairing(
+    let sharer_name = request_pairing(
         &transport.endpoint(),
         ticket.endpoint.clone(),
         &ticket.secret,
@@ -83,7 +85,10 @@ async fn run(
     let local_addr = listener
         .local_addr()
         .map_err(|source| Error::Bind { addr: bind, source })?;
-    on_ready(&DialReady { local_addr });
+    on_ready(&DialReady {
+        local_addr,
+        sharer_name,
+    });
     tracing::info!(%local_addr, sharer = %ticket.endpoint.id, "dial_ready");
 
     let destination = DestinationId::tcp(ticket.port);

@@ -80,6 +80,9 @@ enum Projectless {
         /// Distinct devices that may pair before pairing closes.
         #[arg(long, default_value_t = 4)]
         max_peers: usize,
+        /// Name sent to devices when they pair. They may rename it.
+        #[arg(long)]
+        name: Option<String>,
         /// Comma-separated HTTPS relay origins, or `none` for direct addresses
         /// only. Defaults to the transport preset.
         #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
@@ -174,16 +177,19 @@ async fn run_projectless(command: Projectless) {
         Projectless::Local {
             target,
             max_peers,
+            name,
             relay_urls,
         } => {
             let options = connect_share::ShareOptions {
                 target,
                 relay_urls: relays(relay_urls),
                 max_peers,
+                name: name.clone(),
             };
             connect_share::share(options, cancel, |event| match event {
                 connect_share::ShareEvent::Ready { ticket, target } => emit(serde_json::json!({
                     "event": "share_ready",
+                    "name": name,
                     "endpoint_id": ticket.endpoint.id.to_string(),
                     "target": target,
                     "ticket": ticket.to_string(),
@@ -213,6 +219,7 @@ async fn run_projectless(command: Projectless) {
                 emit(serde_json::json!({
                     "event": "dial_ready",
                     "local_addr": ready.local_addr,
+                    "sharer_name": ready.sharer_name,
                 }))
             })
             .await

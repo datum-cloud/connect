@@ -48,6 +48,20 @@ func TestLocalTarget(t *testing.T) {
 	}
 }
 
+func TestShareName(t *testing.T) {
+	if got, err := shareName("", "localhost:9999", false); err != nil || got != deviceNameHint()+":9999" {
+		t.Fatalf("default = %q, %v", got, err)
+	}
+	if got, err := shareName("  API  ", "localhost:9999", true); err != nil || got != "API" {
+		t.Fatalf("trimmed = %q, %v", got, err)
+	}
+	for _, bad := range []string{" ", "a\x1b[31m", strings.Repeat("x", 65)} {
+		if _, err := shareName(bad, "localhost:1", true); err == nil {
+			t.Errorf("%q: expected error", bad)
+		}
+	}
+}
+
 func TestForegroundEnvDropsCredentials(t *testing.T) {
 	env := foregroundEnv([]string{"PATH=/bin", "DATUM_SESSION=s", "DATUM_CREDENTIALS_HELPER=/x", "DATUM_CONNECT_TOKEN=t"}, false)
 	for _, entry := range env {
@@ -121,19 +135,20 @@ func TestLocalCommandRunsProjectless(t *testing.T) {
 	stdout := `{"event":"share_ready","endpoint_id":"ab","target":"127.0.0.1:9999","ticket":"DCSHARE2TICKET"}
 {"event":"share_paired","peer":"66ed43143f88520ba7cae1b7f7eb10b9","name":"pixel"}`
 	exe, argsFile := fakeDaemon(t, stdout, "", 0)
-	out, err := runCommand(t, exe, "local", "--port", "9999")
+	out, err := runCommand(t, exe, "local", "--port", "9999", "--name", "API dev server")
 	if err != nil {
 		t.Fatal(err)
 	}
 	args, _ := os.ReadFile(argsFile)
-	if got := strings.Fields(string(args)); !slices.Equal(got, []string{"local", "localhost:9999", "--max-peers", "4"}) {
-		t.Fatalf("daemon args = %v", got)
+	want := []string{"local", "localhost:9999", "--max-peers", "4", "--name", "API dev server"}
+	if got := strings.Split(strings.TrimSpace(string(args)), "\n"); !slices.Equal(got, want) {
+		t.Fatalf("daemon args = %q", got)
 	}
 	env, _ := os.ReadFile(argsFile + ".env")
 	if strings.Contains(string(env), "DATUM_SESSION") {
 		t.Fatal("DATUM_SESSION leaked to the child")
 	}
-	for _, want := range []string{"Sharing localhost:9999", "datumctl connect dial DCSHARE2TICKET --bind 9999", "✓ Paired pixel (66ed43143f88…)"} {
+	for _, want := range []string{"Sharing localhost:9999 as \"API dev server\"", "datumctl connect dial DCSHARE2TICKET --bind 9999", "✓ Paired pixel (66ed43143f88…)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}

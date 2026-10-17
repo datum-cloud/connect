@@ -27,6 +27,9 @@ pub struct ShareOptions {
     pub relay_urls: Option<Vec<RelayUrl>>,
     /// Distinct peers that may pair before pairing closes.
     pub max_peers: usize,
+    /// Display name sent to peers when they pair, for example
+    /// `laptop:9999`. Peers may rename it locally.
+    pub name: Option<String>,
 }
 
 /// Progress reported to the caller.
@@ -60,7 +63,7 @@ pub async fn share(
         .ok_or_else(|| Error::Unresolved(options.target.clone()))?;
 
     let secret: [u8; 32] = rand::random();
-    let (handler, mut paired) = PairingHandler::new(secret, options.max_peers);
+    let (handler, mut paired) = PairingHandler::new(secret, options.name, options.max_peers);
     let (config, relays) = configure_relays(
         TransportConfig::new(SecretKey::generate())
             .protocol(PAIR_ALPN, Arc::new(PairingProtocol(handler))),

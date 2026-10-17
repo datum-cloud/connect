@@ -62,6 +62,7 @@ async fn start_share(
                     target: target.to_string(),
                     relay_urls: Some(Vec::new()),
                     max_peers,
+                    name: Some("test\u{1b}[31m service".into()),
                 },
                 cancel,
                 |event| {
@@ -81,7 +82,7 @@ async fn start_share(
 async fn start_dial(
     ticket: ShareTicket,
 ) -> (
-    tokio::sync::oneshot::Receiver<std::net::SocketAddr>,
+    tokio::sync::oneshot::Receiver<(std::net::SocketAddr, Option<String>)>,
     tokio::task::JoinHandle<Result<(), connect_share::Error>>,
     CancellationToken,
 ) {
@@ -100,7 +101,7 @@ async fn start_dial(
                 },
                 cancel,
                 |ready| {
-                    let _ = tx.send(ready.local_addr);
+                    let _ = tx.send((ready.local_addr, ready.sharer_name.clone()));
                 },
             )
             .await
@@ -113,10 +114,12 @@ async fn start_dial(
 async fn paired_peer_reaches_shared_service() {
     let (ticket, mut events, share_cancel) = start_share(4).await;
     let (ready, _task, dial_cancel) = start_dial(ticket).await;
-    let local = tokio::time::timeout(Duration::from_secs(20), ready)
+    let (local, sharer_name) = tokio::time::timeout(Duration::from_secs(20), ready)
         .await
         .expect("dial ready")
         .unwrap();
+    // Control characters from the sharer never reach the peer's display.
+    assert_eq!(sharer_name.as_deref(), Some("test[31m service"));
 
     match events.recv().await {
         Some(ShareEvent::Paired { name, .. }) => assert_eq!(name.as_deref(), Some("test-phone")),

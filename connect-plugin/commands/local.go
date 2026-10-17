@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -36,6 +38,7 @@ func newLocal(opts *options) *cobra.Command {
 	var port uint16
 	var host string
 	var maxPeers int
+	var name string
 	cmd := &cobra.Command{
 		Use:   "local [HOST:PORT]",
 		Short: "Share a local service with your own devices, without signing in",
@@ -47,8 +50,11 @@ func newLocal(opts *options) *cobra.Command {
 			"a public iroh relay.\n\n" +
 			"Anyone with the ticket can pair, up to --max-peers devices, until you stop\n" +
 			"this command. The ticket also contains this computer's IP addresses. Each run\n" +
-			"prints a new ticket.",
+			"prints a new ticket.\n\n" +
+			"Devices show the share as --name, which defaults to HOSTNAME:PORT. Each device\n" +
+			"can rename it.",
 		Example: "  datumctl connect local --port 9999\n" +
+			"  datumctl connect local --port 3000 --name \"API dev server\"\n" +
 			"  datumctl connect local 127.0.0.1:3000 --max-peers 1",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -59,13 +65,39 @@ func newLocal(opts *options) *cobra.Command {
 			if maxPeers < 1 {
 				return fmt.Errorf("--max-peers must be at least 1")
 			}
-			return runLocal(cmd, opts, target, maxPeers)
+			name, err = shareName(name, target, cmd.Flags().Changed("name"))
+			if err != nil {
+				return err
+			}
+			return runLocal(cmd, opts, target, name, maxPeers)
 		},
 	}
 	cmd.Flags().Uint16Var(&port, "port", 0, "Local port to share")
 	cmd.Flags().StringVar(&host, "host", "localhost", "Local host to share with --port")
 	cmd.Flags().IntVar(&maxPeers, "max-peers", 4, "Devices that may pair before pairing closes")
+	cmd.Flags().StringVar(&name, "name", "", "Name devices show for this share (default HOSTNAME:PORT)")
 	return cmd
+}
+
+// maxShareName matches the limit connect-share applies to names.
+const maxShareName = 64
+
+// shareName validates an explicit --name or derives HOSTNAME:PORT.
+func shareName(name, target string, set bool) (string, error) {
+	if !set {
+		_, port, _ := net.SplitHostPort(target)
+		return deviceNameHint() + ":" + port, nil
+	}
+	name = strings.TrimSpace(name)
+	switch {
+	case name == "":
+		return "", fmt.Errorf("--name must not be empty")
+	case utf8.RuneCountInString(name) > maxShareName:
+		return "", fmt.Errorf("--name must be at most %d characters", maxShareName)
+	case strings.IndexFunc(name, unicode.IsControl) >= 0:
+		return "", fmt.Errorf("--name must not contain control characters")
+	}
+	return name, nil
 }
 
 func localTarget(args []string, host string, port uint16, portSet bool) (string, error) {
@@ -82,10 +114,10 @@ func localTarget(args []string, host string, port uint16, portSet bool) (string,
 	}
 }
 
-func runLocal(cmd *cobra.Command, opts *options, target string, maxPeers int) error {
+func runLocal(cmd *cobra.Command, opts *options, target, name string, maxPeers int) error {
 	out := cmd.OutOrStdout()
 	jsonOut := outputFormat(cmd) == "json"
-	daemonArgs := []string{"local", target, "--max-peers", strconv.Itoa(maxPeers)}
+	daemonArgs := []string{"local", target, "--max-peers", strconv.Itoa(maxPeers), "--name", name}
 	return runForeground(cmd, opts, daemonArgs, func(line []byte, event foregroundEvent) {
 		if jsonOut {
 			fmt.Fprintln(out, string(line))
@@ -94,7 +126,7 @@ func runLocal(cmd *cobra.Command, opts *options, target string, maxPeers int) er
 		switch event.Event {
 		case "share_ready":
 			_, port, _ := net.SplitHostPort(target)
-			fmt.Fprintf(out, "Sharing %s. Anyone with this ticket can connect until you press Ctrl+C.\n", target)
+			fmt.Fprintf(out, "Sharing %s as %q. Anyone with this ticket can connect until you press Ctrl+C.\n", target, name)
 			fmt.Fprintln(out, "The ticket also contains this computer's IP addresses.")
 			if terminalWriter(out) {
 				fmt.Fprintln(out)
@@ -134,18 +166,23 @@ func runTicketDial(cmd *cobra.Command, opts *options, ticket string, bind uint16
 			return
 		}
 		if event.Event == "dial_ready" {
-			fmt.Fprintf(out, "✓ Paired. The shared service is at %s until you press Ctrl+C.\n", event.LocalAddr)
+			if event.SharerName != "" {
+				fmt.Fprintf(out, "✓ Paired with %q. The shared service is at %s until you press Ctrl+C.\n", event.SharerName, event.LocalAddr)
+			} else {
+				fmt.Fprintf(out, "✓ Paired. The shared service is at %s until you press Ctrl+C.\n", event.LocalAddr)
+			}
 		}
 	})
 }
 
 // foregroundEvent is one stdout line from a project-less datum-connectd mode.
 type foregroundEvent struct {
-	Event     string `json:"event"`
-	Ticket    string `json:"ticket,omitempty"`
-	Peer      string `json:"peer,omitempty"`
-	Name      string `json:"name,omitempty"`
-	LocalAddr string `json:"local_addr,omitempty"`
+	Event      string `json:"event"`
+	Ticket     string `json:"ticket,omitempty"`
+	Peer       string `json:"peer,omitempty"`
+	Name       string `json:"name,omitempty"`
+	LocalAddr  string `json:"local_addr,omitempty"`
+	SharerName string `json:"sharer_name,omitempty"`
 }
 
 // runForeground runs datum-connectd in a project-less foreground mode until it

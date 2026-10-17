@@ -37,6 +37,10 @@ struct Response {
     ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The sharer's display name for the shared service. Sent only on
+    /// success; older peers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 /// A peer that presented the right secret.
@@ -49,16 +53,25 @@ pub(crate) struct Paired {
 /// Sharer-side handler registered on the transport for [`PAIR_ALPN`].
 pub(crate) struct PairingHandler {
     secret: [u8; 32],
+    name: Option<String>,
     max_peers: usize,
     paired: Mutex<HashSet<EndpointId>>,
     events: mpsc::UnboundedSender<Paired>,
 }
 
 impl PairingHandler {
-    pub fn new(secret: [u8; 32], max_peers: usize) -> (Arc<Self>, mpsc::UnboundedReceiver<Paired>) {
+    pub fn new(
+        secret: [u8; 32],
+        name: Option<String>,
+        max_peers: usize,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<Paired>) {
         let (events, rx) = mpsc::unbounded_channel();
         let handler = Arc::new(Self {
             secret,
+            name: name
+                .as_deref()
+                .map(clean_name)
+                .filter(|name| !name.is_empty()),
             max_peers,
             paired: Mutex::new(HashSet::new()),
             events,
@@ -83,12 +96,7 @@ impl PairingHandler {
             return Err("pairing limit reached");
         }
         paired.insert(peer);
-        let name = request.name.as_deref().map(|name| {
-            name.chars()
-                .filter(|c| !c.is_control())
-                .take(MAX_NAME)
-                .collect()
-        });
+        let name = request.name.as_deref().map(clean_name);
         Ok(Some(Paired { peer, name }))
     }
 
@@ -107,10 +115,12 @@ impl PairingHandler {
             Ok(_) => Response {
                 ok: true,
                 error: None,
+                name: self.name.clone(),
             },
             Err(error) => Response {
                 ok: false,
                 error: Some((*error).to_owned()),
+                name: None,
             },
         };
         let reply = serde_json::to_vec(&response).map_err(|e| e.to_string())?;
@@ -144,13 +154,14 @@ impl ProtocolHandler for PairingProtocol {
     }
 }
 
-/// Peer side: presents `secret` to `sharer` from `endpoint`'s identity.
+/// Peer side: presents `secret` to `sharer` from `endpoint`'s identity and
+/// returns the sharer's display name, if it sent one.
 pub(crate) async fn request_pairing(
     endpoint: &Endpoint,
     sharer: EndpointAddr,
     secret: &[u8; 32],
     name: Option<&str>,
-) -> Result<(), Error> {
+) -> Result<Option<String>, Error> {
     let conn = endpoint
         .connect(sharer, PAIR_ALPN)
         .await
@@ -170,7 +181,11 @@ pub(crate) async fn request_pairing(
             .map_err(|e| e.to_string())?;
         let response: Response = serde_json::from_slice(&reply).map_err(|e| e.to_string())?;
         if response.ok {
-            Ok(())
+            Ok(response
+                .name
+                .as_deref()
+                .map(clean_name)
+                .filter(|name| !name.is_empty()))
         } else {
             Err(response.error.unwrap_or_else(|| "rejected".into()))
         }
@@ -178,6 +193,17 @@ pub(crate) async fn request_pairing(
     .await;
     conn.close(0u32.into(), b"done");
     result.map_err(Error::Pairing)
+}
+
+/// Bounds a display name and drops control characters, which could rewrite
+/// the other side's terminal output.
+pub(crate) fn clean_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NAME)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -197,7 +223,7 @@ mod tests {
 
     #[test]
     fn admits_right_secret_once_and_enforces_limit() {
-        let (handler, _rx) = PairingHandler::new([1; 32], 1);
+        let (handler, _rx) = PairingHandler::new([1; 32], None, 1);
         let a = iroh::SecretKey::generate().public();
         let b = iroh::SecretKey::generate().public();
         assert_eq!(
@@ -218,7 +244,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_secret() {
-        let (handler, _rx) = PairingHandler::new([1; 32], 4);
+        let (handler, _rx) = PairingHandler::new([1; 32], None, 4);
         let a = iroh::SecretKey::generate().public();
         assert_eq!(
             handler.admit(a, &request(&[2; 32], None)).unwrap_err(),

@@ -46,7 +46,7 @@ func TestLocalShareAndTicketDial(t *testing.T) {
 	}
 	env := []string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + t.TempDir(), "DATUM_CONNECT_RELAY_URLS=none"}
 
-	share := startForeground(t, env, "local", origin, "--max-peers", "1", "-o", "json")
+	share := startForeground(t, env, "local", origin, "--max-peers", "1", "--name", "E2E service", "-o", "json")
 	ready := share.next(t, "share_ready")
 	ticket, _ := ready["ticket"].(string)
 	if !strings.HasPrefix(ticket, "DCSHARE2") {
@@ -54,7 +54,11 @@ func TestLocalShareAndTicketDial(t *testing.T) {
 	}
 
 	dial := startForeground(t, env, "dial", ticket, "-o", "json")
-	local, _ := dial.next(t, "dial_ready")["local_addr"].(string)
+	dialReady := dial.next(t, "dial_ready")
+	local, _ := dialReady["local_addr"].(string)
+	if dialReady["sharer_name"] != "E2E service" {
+		t.Fatalf("dial_ready sharer_name = %v", dialReady["sharer_name"])
+	}
 	if paired := share.next(t, "share_paired"); paired["peer"] == "" {
 		t.Fatalf("share_paired without peer: %v", paired)
 	}
