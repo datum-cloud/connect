@@ -6,7 +6,8 @@
 #
 # Uploads, under s3://$BUCKET/connect/android/:
 #   datum-connect-YYYYMMDD-<sha256[:12]>.apk   immutable; date is the APK's build date (UTC)
-#   index.html                                 download page for the newest build
+#   index.html                                 download page for the newest build,
+#                                              with every earlier build listed below
 #   latest.json                                newest build's name, version, and checksum
 #
 # Environment:
@@ -54,6 +55,53 @@ logo=$(grep -v '^<!--' scripts/datum-logo.svg)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+aws() { command aws --region "$region" "$@"; }
+
+# The version and full checksum ride along as object metadata so later pages
+# can list this build without the APK at hand.
+aws s3 cp "$apk" "s3://$bucket/$prefix/$name" \
+  --content-type application/vnd.android.package-archive \
+  --cache-control "public, max-age=31536000, immutable" \
+  --metadata "version-code=$version_code,version-name=$version_name,sha256=$sha" \
+  --only-show-errors
+
+# Every other published APK, newest first, as list items.
+aws s3api list-objects-v2 --bucket "$bucket" --prefix "$prefix/datum-connect-" \
+  --query 'Contents[].[Key,Size,LastModified]' --output json > "$work/objects.json"
+python3 - "$work/objects.json" "$bucket" "$region" "$prefix/$name" > "$work/past.html" <<'PY'
+import html, json, subprocess, sys
+objects, bucket, region, current = sys.argv[1:]
+rows = []
+for key, size, modified in json.load(open(objects)) or []:
+    if key == current or not key.endswith(".apk"):
+        continue
+    meta = json.loads(subprocess.check_output(
+        ["aws", "--region", region, "s3api", "head-object", "--bucket", bucket,
+         "--key", key, "--query", "Metadata", "--output", "json"])) or {}
+    name = key.rsplit("/", 1)[1]
+    built = name.split("-")[2]
+    rows.append((built, modified, name, size, meta))
+rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
+for built, _, name, size, meta in rows:
+    version = html.escape(meta.get("version-name", ""))
+    sha = html.escape(meta.get("sha256", ""))
+    details = [f"Built {built[:4]}-{built[4:6]}-{built[6:]}"]
+    if version:
+        details.append(f"version <code>{version}</code>")
+    print(f'<li><a href="{html.escape(name)}">{html.escape(name)}</a> ({size // 1048576} MB)'
+          f'<br><small>{", ".join(details)}'
+          + (f'<br>SHA-256 <code>{sha}</code>' if sha else '') + '</small></li>')
+PY
+if [[ -s "$work/past.html" ]]; then
+  past="<h2>Past builds</h2>
+<p><small>Older builds stay available. Android installs one over a newer build only after you uninstall it.</small></p>
+<ul class="builds">
+$(cat "$work/past.html")
+</ul>"
+else
+  past=""
+fi
+
 cat > "$work/latest.json" <<JSON
 {
   "name": "$name",
@@ -79,6 +127,9 @@ h1{font-weight:600;letter-spacing:-.01em}
 a.btn{display:inline-block;font-size:1.1rem;padding:.7rem 1rem;border-radius:8px;background:#4f46e5;color:#fff;text-decoration:none}
 code{word-break:break-all}
 small{opacity:.75}
+h2{font-weight:600;font-size:1.1rem;margin-top:2.5rem}
+ul.builds{list-style:none;padding:0;margin:0}
+ul.builds li{padding:.6rem 0;border-top:1px solid color-mix(in srgb,currentColor 20%,transparent);overflow-wrap:anywhere}
 </style></head>
 <body>
 <header><a href="https://www.datum.net/" style="color:inherit">$logo</a></header>
@@ -92,13 +143,10 @@ SHA-256 <code>$sha</code><br>
 Signing certificate SHA-256 <code>$cert</code></small></p>
 <p><small>After installing, get newer builds from a computer with
 <code>connect-mobile/android/scripts/share-apk.sh</code>.</small></p>
+$past
 </body></html>
 HTML
 
-aws() { command aws --region "$region" "$@"; }
-aws s3 cp "$apk" "s3://$bucket/$prefix/$name" \
-  --content-type application/vnd.android.package-archive \
-  --cache-control "public, max-age=31536000, immutable" --only-show-errors
 aws s3 cp "$work/latest.json" "s3://$bucket/$prefix/latest.json" \
   --content-type application/json --cache-control no-cache --only-show-errors
 aws s3 cp "$work/index.html" "s3://$bucket/$prefix/index.html" \

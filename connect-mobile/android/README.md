@@ -121,9 +121,11 @@ AWS_PROFILE=datum-admin scripts/publish-apk.sh
 ```
 
 `publish-apk.sh` refuses debug-signed APKs. It uploads
-`datum-connect-YYYYMMDD-<sha256[:12]>.apk` (build date in UTC), then replaces
-`index.html` and `latest.json`, which point at the newest build. APK objects
-are immutable; the page and JSON are served with `no-cache`.
+`datum-connect-YYYYMMDD-<sha256[:12]>.apk` (build date in UTC) with its
+version and full SHA-256 as object metadata, then replaces `index.html` and
+`latest.json`, which point at the newest build. The page lists every earlier
+APK in the bucket under "Past builds", newest first, using that metadata. APK
+objects are immutable; the page and JSON are served with `no-cache`.
 
 The bucket is in AWS account 007091975061, us-east-2. Block Public Access is
 on except for a bucket policy that allows public `s3:GetObject`. ACLs are
