@@ -80,7 +80,8 @@ enum Projectless {
         /// Distinct devices that may pair before pairing closes.
         #[arg(long, default_value_t = 4)]
         max_peers: usize,
-        /// Comma-separated HTTPS relay origins. Defaults to the transport preset.
+        /// Comma-separated HTTPS relay origins, or `none` for direct addresses
+        /// only. Defaults to the transport preset.
         #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
         relay_urls: Option<String>,
     },
@@ -94,7 +95,8 @@ enum Projectless {
         /// Name shown to the sharer.
         #[arg(long)]
         name: Option<String>,
-        /// Comma-separated HTTPS relay origins. Defaults to the transport preset.
+        /// Comma-separated HTTPS relay origins, or `none` for direct addresses
+        /// only. Defaults to the transport preset.
         #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
         relay_urls: Option<String>,
     },
@@ -148,14 +150,17 @@ async fn run_projectless(command: Projectless) {
             std::process::exit(1);
         }
     };
-    let relays = |raw: Option<String>| match raw.as_deref().map(datum_connect_daemon::relays::parse)
-    {
-        Some(Ok(relays)) => Some(relays),
-        Some(Err(error)) => {
-            eprintln!("{error}");
-            std::process::exit(2);
-        }
+    // `none` disables relays: same-LAN use and hermetic tests.
+    let relays = |raw: Option<String>| match raw.as_deref() {
         None => None,
+        Some("none") => Some(Vec::new()),
+        Some(raw) => match datum_connect_daemon::relays::parse(raw) {
+            Ok(relays) => Some(relays),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        },
     };
     let cancel = CancellationToken::new();
     tokio::spawn({

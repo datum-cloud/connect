@@ -137,6 +137,13 @@ tasks:
       - cmd: 'python3 {{.E2E_SCRIPT}} --daemon {{.CARGO_TARGET_DIR}}/debug/{{.DAEMON_BINARY}} --plugin {{.ROOT_DIR}}/{{.GO_PROJECT}}/{{.PLUGIN_BINARY}} --oidc'
         silent: false
 
+  test:e2e:local:
+    desc: "Run connect local and ticket dial against a real datum-connectd, relays disabled"
+    cmds:
+      - cargo build -p datum-connect-daemon
+      - GOFLAGS=-buildvcs=false DATUM_CONNECTD={{.CARGO_TARGET_DIR}}/debug/{{.DAEMON_BINARY}} go -C {{.ROOT_DIR}}/{{.GO_PROJECT}} test -count=1 -run TestLocalShareAndTicketDial .
+    dir: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}'
+
   test:masque-interop:
     desc: "Run an independent masque-go client through standard H3 and the real Connect UDP transport"
     vars:
