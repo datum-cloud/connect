@@ -23,6 +23,13 @@ import net.datum.connect.share.DialSession
 class DialService : Service() {
     private var session: DialSession? = null
 
+    /**
+     * Increments whenever a session starts or stops. Callbacks from a session
+     * carry the generation it started with; any other generation is stale and
+     * ignored. Accessed only on the main thread.
+     */
+    private var generation = 0L
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -45,13 +52,14 @@ class DialService : Service() {
             notification(getString(R.string.app_name), "Pairing…"),
             if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
         )
+        val current = generation
         try {
             session = DialSession.start(
                 ticket,
                 port.toUShort(),
                 DeviceKey.load(this),
                 Build.MODEL,
-                Listener(),
+                Listener(current),
             )
         } catch (e: Exception) {
             finish(DialState.Failed(e.message ?: "Could not start"))
@@ -64,6 +72,7 @@ class DialService : Service() {
     }
 
     private fun stopSession() {
+        generation++
         session?.let {
             it.stop()
             it.close()
@@ -82,22 +91,26 @@ class DialService : Service() {
         super.onDestroy()
     }
 
-    private inner class Listener : DialListener {
-        override fun onReady(localAddr: String) {
+    /** Forwards callbacks for one session to the main thread, if still current. */
+    private inner class Listener(private val sessionGeneration: Long) : DialListener {
+        private fun onMain(block: () -> Unit) {
+            ContextCompat.getMainExecutor(this@DialService).execute {
+                if (sessionGeneration == generation) block()
+            }
+        }
+
+        override fun onReady(localAddr: String) = onMain {
             DialStatus.set(DialState.Ready(localAddr))
             getSystemService(NotificationManager::class.java)
                 .notify(NOTIFICATION_ID, notification("Open at http://$localAddr", "Tap to manage"))
         }
 
-        override fun onStopped(error: String?) {
-            // Only report a session that is still current; stop() already
-            // handled a user-initiated stop.
-            if (error != null) {
-                ContextCompat.getMainExecutor(this@DialService).execute {
-                    session = null
-                    finish(DialState.Failed(error))
-                }
-            }
+        override fun onStopped(error: String?) = onMain {
+            // A current session only stops on its own after an error; stop()
+            // advances the generation before cancelling, so its own stop
+            // callback is already stale here.
+            stopSession()
+            finish(DialState.Failed(error ?: "Connection closed"))
         }
     }
 
