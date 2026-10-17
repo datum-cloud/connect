@@ -226,7 +226,11 @@ port, stop it, and a callback for state changes.
 
 **Distribution**
 
-Signed APK on the GitHub release first, then Play Store. Keep signing keys in
+During development, `connect-mobile/android/scripts/share-apk.sh` serves a
+new build to a phone that already has the app, over a project-less share. No
+public URL is needed after the first install.
+
+For users: signed APK on the GitHub release first, then Play Store. Keep signing keys in
 CI secrets. The existing app branch commits keystore passwords in
 `ui/Dioxus.toml`; do not repeat that.
 
@@ -283,7 +287,7 @@ On branch `feat/projectless-local-tunnel`:
 | `connect-transport` extra ALPN handlers | Done |
 | `connect-share`: ticket, pairing, share, dial | Done; 5 unit and 3 loopback end-to-end tests |
 | `datum-connectd local` and `local-dial` | Done; tested across two processes over n0 relays, including a tampered-secret refusal |
-| Plugin `local` and ticket `dial`, terminal QR code | Done |
+| Plugin `local` and ticket `dial`, terminal QR code | Done; e2e test against a real `datum-connectd` with relays disabled (`task test:e2e:local`) |
 | `connect-share-ffi` (UniFFI) | Done; Kotlin bindings tested on the host JVM, including a dial through a real `datum-connectd local` |
 | Android app (`connect-mobile/android`) | First version builds for arm64-v8a, armeabi-v7a, and x86_64. On 2026-10-16 a Pixel 9a pasted a ticket, paired with `datum-connectd local` over n0 relays, and loaded the shared page in Chrome. On 2026-10-17 it scanned a `DCSHARE2` QR code from a terminal and connected. Network changes not yet tested |
 | `nix develop .#android` shell | Done |
@@ -294,6 +298,4 @@ On branch `feat/projectless-local-tunnel`:
 1. Finish device testing: behavior across network changes and long app
    switches.
 2. Release signing and APK publishing in CI; remembered tickets.
-3. Plugin e2e test that runs `local` and ticket `dial` against a real
-   `datum-connectd`.
-4. Later: public URLs through the Quick Tunnel Gateway; iOS Network Extension.
+3. Later: public URLs through the Quick Tunnel Gateway; iOS Network Extension.

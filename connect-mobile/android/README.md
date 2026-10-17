@@ -50,6 +50,28 @@ In the emulator, paste the ticket instead of scanning: run
 `adb shell input text 'DCSHARE2…'` with the field focused, or use **Paste**
 after copying the ticket into the emulator's clipboard.
 
+## Update the app without a public URL
+
+Once the app is installed, use it to download newer builds. The script builds
+an APK, serves it from a loopback web server, and shares that port with
+`datumctl connect local`:
+
+```sh
+nix develop .#android
+cd connect-mobile/android
+scripts/share-apk.sh              # build arm64-v8a, then share
+scripts/share-apk.sh --no-build   # share the last debug APK
+```
+
+In the app, scan the QR code, tap **Connect**, then **Open in browser**, and
+tap **Download APK**. Android installs it over the current app only when both
+are signed with the same key. Debug builds use each machine's
+`~/.android/debug.keystore`, so build updates on the machine that built the
+installed app. The share allows one device and stops with Ctrl+C.
+
+Set `CONNECT` to run a different plugin binary, for example
+`CONNECT=../../connect-plugin/datumctl-connect scripts/share-apk.sh`.
+
 ## Layout
 
 | Path | Purpose |
