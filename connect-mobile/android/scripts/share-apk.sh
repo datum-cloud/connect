@@ -22,6 +22,13 @@ fi
 apk="${1:-app/build/outputs/apk/debug/app-debug.apk}"
 connect="${CONNECT:-datumctl connect}"
 
+# Fail before building if the plugin predates project-less sharing.
+if ! $connect local --help >/dev/null 2>&1; then
+  echo "\`$connect\` has no local command. Install a newer Connect plugin, or set" >&2
+  echo "CONNECT to one, for example CONNECT=../../connect-plugin/datumctl-connect" >&2
+  exit 1
+fi
+
 if [[ $build == 1 ]]; then
   gradle -q assembleDebug -PrustProfile=release -PrustAbis="${RUST_ABIS:-arm64-v8a}"
 fi
@@ -65,4 +72,4 @@ server_pid=$!
 
 echo "Serving $apk on 127.0.0.1:$port"
 # Not exec: the trap must run to stop the server and remove the copy.
-$connect local --port "$port" --max-peers 1
+$connect local --port "$port" --max-peers 1 --name "Datum Connect APK"

@@ -1,8 +1,12 @@
 # Datum Connect for Android
 
-Opens a service shared with `datumctl connect local` on this phone. Scan the QR
-code that `local` prints, tap **Connect**, then **Open in browser**. No Datum
-account or login is needed.
+Opens services shared with `datumctl connect local` on this phone. Scan the QR
+code that `local` prints, tap **Connect**, then **Open**. No Datum account or
+login is needed.
+
+The app holds several connections at once, each on its own local port. Each
+takes the name set with `datumctl connect local --name` (default
+`HOSTNAME:PORT`), and you can rename it in the app.
 
 The app is a thin Kotlin UI over the Rust `connect-share` crate, the same code
 `datumctl connect dial TICKET` uses. See
@@ -63,8 +67,8 @@ scripts/share-apk.sh              # build arm64-v8a, then share
 scripts/share-apk.sh --no-build   # share the last debug APK
 ```
 
-In the app, scan the QR code, tap **Connect**, then **Open in browser**, and
-tap **Download APK**. Android installs it over the current app only when both
+In the app, scan the QR code, tap **Connect**, then **Open** on the
+"Datum Connect APK" card, and tap **Download APK**. Android installs it over the current app only when both
 are signed with the same key. Debug builds use each machine's
 `~/.android/debug.keystore`, so build updates on the machine that built the
 installed app. The share allows one device and stops with Ctrl+C.
@@ -76,8 +80,9 @@ Set `CONNECT` to run a different plugin binary, for example
 
 | Path | Purpose |
 |---|---|
-| `app/src/main/java/.../MainActivity.kt` | Ticket entry, QR scan, status, open in browser |
-| `app/src/main/java/.../DialService.kt` | Foreground service that owns the running dial |
+| `app/src/main/java/.../MainActivity.kt` | Connection cards, add form, QR scan, rename |
+| `app/src/main/java/.../Connections.kt` | Connection list, unique names, port choice |
+| `app/src/main/java/.../DialService.kt` | Foreground service that runs one dial per connection |
 | `app/src/main/java/.../DeviceKey.kt` | This phone's iroh key, in app-private no-backup storage |
 | `../../connect-lib/share-ffi` | UniFFI surface: `parseTicket`, `generateDeviceKey`, `DialSession` |
 

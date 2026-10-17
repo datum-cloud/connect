@@ -10,6 +10,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -17,7 +18,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
@@ -25,9 +29,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -55,7 +59,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             Theme {
                 Surface(Modifier.fillMaxSize()) {
-                    App(initialTicket = sharedTicket.value)
+                    App(sharedTicket = sharedTicket.value)
                 }
             }
         }
@@ -92,122 +96,213 @@ private fun parse(ticket: String): Parsed {
 }
 
 @Composable
-private fun App(initialTicket: String?) {
+private fun App(sharedTicket: String?) {
+    val connections by Connections.list.collectAsStateWithLifecycle()
+    var renaming by remember { mutableStateOf<Connection?>(null) }
+
+    LazyColumn(
+        Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            Column(Modifier.padding(top = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Datum Connect", style = MaterialTheme.typography.headlineSmall)
+                Text(
+                    "Open services shared from your computers with datumctl connect local. " +
+                        "No account needed.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
+        items(connections, key = { it.id }) { connection ->
+            ConnectionCard(connection, onRename = { renaming = connection })
+        }
+        item {
+            AddConnection(sharedTicket, connections)
+        }
+        item {
+            Text(
+                "Anyone with a ticket can connect until the computer stops sharing. " +
+                    "Tickets contain that computer's IP addresses.",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(bottom = 16.dp),
+            )
+        }
+    }
+
+    renaming?.let { connection ->
+        RenameDialog(connection, onDismiss = { renaming = null })
+    }
+}
+
+@Composable
+private fun ConnectionCard(connection: Connection, onRename: () -> Unit) {
     val context = LocalContext.current
-    val state by DialStatus.state.collectAsStateWithLifecycle()
-    var ticket by remember(initialTicket) { mutableStateOf(initialTicket.orEmpty()) }
+    val status = connection.status
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(connection.name, style = MaterialTheme.typography.titleMedium)
+            Text(
+                when (status) {
+                    Status.Connecting -> "Pairing…"
+                    is Status.Ready -> "Open at http://${status.localAddr}"
+                    is Status.Failed -> "Could not connect: ${status.message}"
+                    Status.Stopped -> "Stopped"
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (status is Status.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (status is Status.Ready) {
+                    Button(onClick = {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://${status.localAddr}/")))
+                    }) { Text("Open") }
+                }
+                if (status.active) {
+                    OutlinedButton(onClick = { DialService.stop(context, connection.id) }) { Text("Stop") }
+                } else {
+                    Button(onClick = { DialService.start(context, connection.id) }) { Text("Reconnect") }
+                    OutlinedButton(onClick = { Connections.remove(connection.id) }) { Text("Remove") }
+                }
+                TextButton(onClick = onRename) { Text("Rename") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RenameDialog(connection: Connection, onDismiss: () -> Unit) {
+    var name by remember { mutableStateOf(connection.name) }
+    var error by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename connection") },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = {
+                    name = it.take(MAX_NAME)
+                    error = null
+                },
+                singleLine = true,
+                isError = error != null,
+                supportingText = { error?.let { Text(it) } },
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                error = Connections.rename(connection.id, name)
+                if (error == null) onDismiss()
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun AddConnection(sharedTicket: String?, connections: List<Connection>) {
+    val context = LocalContext.current
+    var ticket by remember(sharedTicket) { mutableStateOf(sharedTicket.orEmpty()) }
+    var name by remember { mutableStateOf("") }
     var port by remember { mutableStateOf("") }
     val parsed = remember(ticket) { parse(ticket.trim()) }
+    val sharedPort = (parsed as? Parsed.Valid)?.info?.port?.toInt()
+    val chosenPort = port.toIntOrNull()
+    val nameProblem = name.trim().takeIf { it.isNotEmpty() }?.let { nameError(it, connections.map(Connection::name)) }
+    val portProblem = when {
+        port.isEmpty() -> null
+        chosenPort == null || chosenPort !in 1..65535 -> "Use a port from 1 to 65535"
+        chosenPort in usedPorts(connections) -> "Another connection uses port $chosenPort"
+        else -> null
+    }
 
     val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
         result.contents?.let { scanned -> extractTicket(scanned)?.let { ticket = it } }
     }
     val notifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
-    Column(
-        Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text("Datum Connect", style = MaterialTheme.typography.headlineSmall)
-        Text(
-            "Open a service shared from your computer with datumctl connect local. " +
-                "No account needed.",
-            style = MaterialTheme.typography.bodyMedium,
-        )
-
-        when (val current = state) {
-            is DialState.Connecting -> StatusCard("Pairing…", "Reaching the computer that shared this ticket.") {
-                OutlinedButton(onClick = { DialService.stop(context) }) { Text("Cancel") }
-            }
-            is DialState.Ready -> StatusCard("Connected", "Open http://${current.localAddr} in any app on this phone.") {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://${current.localAddr}/")))
-                    }) { Text("Open in browser") }
-                    OutlinedButton(onClick = { DialService.stop(context) }) { Text("Stop") }
-                }
-            }
-            DialState.Idle, is DialState.Failed -> {
-                if (current is DialState.Failed) {
-                    StatusCard("Could not connect", current.message) {}
-                }
-                OutlinedTextField(
-                    value = ticket,
-                    onValueChange = { ticket = extractTicket(it) ?: it },
-                    label = { Text("Ticket") },
-                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                    maxLines = 4,
-                    isError = parsed is Parsed.Invalid,
-                    supportingText = {
-                        when (parsed) {
-                            is Parsed.Valid -> Text("Port ${parsed.info.port} on ${parsed.info.endpointId.take(12)}…")
-                            is Parsed.Invalid -> Text(parsed.message)
-                            Parsed.Empty -> Text("Scan the QR code or paste the ticket")
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = {
-                        scanner.launch(
-                            ScanOptions()
-                                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                                .setPrompt("Scan the QR code from datumctl connect local")
-                                .setBeepEnabled(false)
-                                // Terminals may draw the code light on dark.
-                                .addExtra(Intents.Scan.SCAN_TYPE, Intents.Scan.MIXED_SCAN),
-                        )
-                    }) { Text("Scan QR code") }
-                    OutlinedButton(onClick = {
-                        val clip = context.getSystemService(ClipboardManager::class.java).primaryClip
-                        val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)
-                        text?.let { extractTicket(it.toString()) }?.let { ticket = it }
-                    }) { Text("Paste") }
-                }
-                OutlinedTextField(
-                    value = port,
-                    onValueChange = { value -> port = value.filter(Char::isDigit).take(5) },
-                    label = { Text("Local port (optional)") },
-                    placeholder = {
-                        Text((parsed as? Parsed.Valid)?.info?.port?.let(::defaultPort)?.toString() ?: "any")
-                    },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Button(
-                    enabled = parsed is Parsed.Valid,
-                    onClick = {
-                        if (Build.VERSION.SDK_INT >= 33) {
-                            notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        }
-                        val info = (parsed as Parsed.Valid).info
-                        val chosen = port.toIntOrNull()?.takeIf { it in 1..65535 } ?: defaultPort(info.port)
-                        DialService.start(context, ticket.trim(), chosen)
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Connect") }
-                Text(
-                    "Anyone with a ticket can connect until the computer stops sharing. " +
-                        "Tickets contain that computer's IP addresses.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-        }
-    }
-}
-
-/** Use the shared port when an app may bind it; otherwise let the system pick. */
-private fun defaultPort(sharedPort: UShort): Int =
-    sharedPort.toInt().takeIf { it >= 1024 } ?: 0
-
-@Composable
-private fun StatusCard(title: String, body: String, actions: @Composable () -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(title, style = MaterialTheme.typography.titleMedium)
-            Text(body, style = MaterialTheme.typography.bodyMedium)
-            actions()
+            Text(
+                if (connections.isEmpty()) "Connect" else "Add another connection",
+                style = MaterialTheme.typography.titleMedium,
+            )
+            OutlinedTextField(
+                value = ticket,
+                onValueChange = { ticket = extractTicket(it) ?: it },
+                label = { Text("Ticket") },
+                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                maxLines = 4,
+                isError = parsed is Parsed.Invalid,
+                supportingText = {
+                    when (parsed) {
+                        is Parsed.Valid -> Text("Port ${parsed.info.port} on ${parsed.info.endpointId.take(12)}…")
+                        is Parsed.Invalid -> Text(parsed.message)
+                        Parsed.Empty -> Text("Scan the QR code or paste the ticket")
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
+                    scanner.launch(
+                        ScanOptions()
+                            .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            .setPrompt("Scan the QR code from datumctl connect local")
+                            .setBeepEnabled(false)
+                            // Terminals may draw the code light on dark.
+                            .addExtra(Intents.Scan.SCAN_TYPE, Intents.Scan.MIXED_SCAN),
+                    )
+                }) { Text("Scan QR code") }
+                OutlinedButton(onClick = {
+                    val clip = context.getSystemService(ClipboardManager::class.java).primaryClip
+                    val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)
+                    text?.let { extractTicket(it.toString()) }?.let { ticket = it }
+                }) { Text("Paste") }
+            }
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it.take(MAX_NAME) },
+                label = { Text("Name (optional)") },
+                placeholder = { Text("Name from the computer") },
+                singleLine = true,
+                isError = nameProblem != null,
+                supportingText = nameProblem?.let { { Text(it) } },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = port,
+                onValueChange = { value -> port = value.filter(Char::isDigit).take(5) },
+                label = { Text("Local port (optional)") },
+                placeholder = {
+                    Text(sharedPort?.let { defaultPort(it, connections) }?.takeIf { it != 0 }?.toString() ?: "any")
+                },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true,
+                isError = portProblem != null,
+                supportingText = portProblem?.let { { Text(it) } },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                enabled = parsed is Parsed.Valid && nameProblem == null && portProblem == null,
+                onClick = {
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    val shared = (parsed as Parsed.Valid).info.port.toInt()
+                    val id = Connections.add(
+                        ticket = ticket.trim(),
+                        port = chosenPort ?: defaultPort(shared, connections),
+                        name = name,
+                        sharedPort = shared,
+                    )
+                    DialService.start(context, id)
+                    ticket = ""
+                    name = ""
+                    port = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Connect") }
         }
     }
 }

@@ -59,7 +59,7 @@ class BindingsTest {
                 }
             }
         }
-        val sharer = ProcessBuilder(connectd, "local", "127.0.0.1:${origin.localPort}")
+        val sharer = ProcessBuilder(connectd, "local", "127.0.0.1:${origin.localPort}", "--name", "jvm-share")
             .redirectError(File.createTempFile("connectd", ".log"))
             .start()
         try {
@@ -70,9 +70,11 @@ class BindingsTest {
             val ready = CountDownLatch(1)
             val stopped = CountDownLatch(1)
             val readyAddr = AtomicReference<String>()
+            val readySharer = AtomicReference<String?>()
             val stopError = AtomicReference<String?>("not stopped")
             val session = DialSession.start(ticket, 0u, generateDeviceKey(), "jvm-test", object : DialListener {
-                override fun onReady(localAddr: String) {
+                override fun onReady(localAddr: String, sharerName: String?) {
+                    readySharer.set(sharerName)
                     readyAddr.set(localAddr)
                     ready.countDown()
                 }
@@ -84,6 +86,7 @@ class BindingsTest {
             })
             assertTrue("dial ready", ready.await(30, TimeUnit.SECONDS))
             val localAddr = readyAddr.get()
+            assertEquals("jvm-share", readySharer.get())
             assertEquals(localAddr, session.localAddr())
 
             val (host, port) = localAddr.split(":").let { it[0] to it[1].toInt() }

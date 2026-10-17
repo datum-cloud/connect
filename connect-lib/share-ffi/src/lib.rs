@@ -79,7 +79,8 @@ pub fn device_endpoint_id(device_key: Vec<u8>) -> Result<String, ShareError> {
 #[uniffi::export(with_foreign)]
 pub trait DialListener: Send + Sync {
     /// Pairing succeeded and `local_addr` accepts connections.
-    fn on_ready(&self, local_addr: String);
+    /// `sharer_name` is the sharer's name for the service, if it sent one.
+    fn on_ready(&self, local_addr: String, sharer_name: Option<String>);
     /// The dial ended. `error` is `None` after [`DialSession::stop`].
     fn on_stopped(&self, error: Option<String>);
 }
@@ -123,7 +124,7 @@ impl DialSession {
             let result = dial(options, task_session.cancel.clone(), move |ready| {
                 let addr = ready.local_addr.to_string();
                 *ready_session.local_addr.lock().expect("local_addr lock") = Some(addr.clone());
-                ready_listener.on_ready(addr);
+                ready_listener.on_ready(addr, ready.sharer_name.clone());
             })
             .await;
             if let Err(error) = &result {

@@ -110,8 +110,14 @@ The CLI and the app say so when they display it.
 3. The sharer compares the secret in constant time. It takes the peer's
    EndpointId from the authenticated QUIC connection, never from the request.
 4. On success, the sharer adds that EndpointId to the destination's
-   `Access::Peers` and replies `{"ok": true}`. It reports the pairing on stdout
-   so the user sees which device joined.
+   `Access::Peers` and replies `{"ok": true, "name": "laptop:9999"}`. It
+   reports the pairing on stdout so the user sees which device joined.
+
+The `name` in the reply is the share's display name, set with
+`datumctl connect local --name` and defaulting to `HOSTNAME:PORT`. It travels
+in the pairing reply rather than the ticket, so tickets and QR codes stay the
+same size and older apps keep working. Both sides drop control characters and
+cap names at 64 characters.
 
 Until a peer pairs, the destination's allowlist is empty and every MASQUE
 request is refused. Pairing closes after `--max-peers` distinct devices
@@ -172,8 +178,8 @@ daemon repository, credentials, or the loopback API.
 ### Plugin commands (implemented)
 
 ```text
-datumctl connect local --port PORT [--host HOST]
-datumctl connect local HOST:PORT
+datumctl connect local --port PORT [--host HOST] [--name NAME]
+datumctl connect local HOST:PORT [--name NAME]
 datumctl connect dial TICKET [--bind PORT]
 ```
 
@@ -210,12 +216,19 @@ port, stop it, and a callback for state changes.
 
 - Scan a QR code or paste a ticket. Show the sharer's port and EndpointId
   prefix before connecting.
-- Run the dial in a foreground service with a persistent notification, so the
-  local port stays open while the user switches to the browser. Android 14
-  requires a foreground service type; use `specialUse` with a description of
-  the local proxy.
-- Bind `127.0.0.1` on a chosen or random port, and offer "Open in browser".
-  Android shares loopback between apps, so Chrome can reach the port.
+- Hold any number of connections at once, each on its own local port. Adding
+  one never stops another. Each card offers Open, Stop, Rename, and, once
+  stopped or failed, Reconnect and Remove.
+- Name each connection. A new connection takes the name the sharer sends,
+  made unique with a " (2)" suffix if needed, unless the user typed one when
+  adding it. Names can be changed later and must be unique, ignoring case.
+- Bind `127.0.0.1` on the shared port when it is 1024 or higher and no other
+  connection uses it, otherwise on a port the user picks or the system
+  assigns. Android shares loopback between apps, so Chrome can reach it.
+- Run every dial in one foreground service with a persistent notification that
+  lists the open connections and has a Stop all action. Android 14 requires a
+  foreground service type; use `specialUse` with a description of the local
+  proxy. The service stops when no connection is active.
 - Keep one device key in app-private, no-backup storage (`noBackupFilesDir`),
   so a dropped connection can resume against the same sharer run without
   pairing again. The key never leaves the phone and is excluded from backups.
