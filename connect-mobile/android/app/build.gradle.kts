@@ -22,7 +22,7 @@ fun git(vararg args: String): String? = runCatching {
 val buildNumber = providers.gradleProperty("versionCode").orNull?.toInt()
     ?: git("rev-list", "--count", "HEAD")?.toInt()
     ?: 1
-val buildName = git("describe", "--always", "--dirty") ?: "dev"
+val buildName = git("describe", "--tags", "--always", "--dirty") ?: "dev"
 
 // Release signing comes from a properties file outside the repository:
 // storeFile, storePassword, keyAlias, keyPassword. Without it, release

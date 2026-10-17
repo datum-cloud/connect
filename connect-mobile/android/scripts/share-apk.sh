@@ -51,7 +51,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-version=$(git -C . describe --always --dirty 2>/dev/null || echo unknown)
+version=$(git -C . describe --tags --always --dirty 2>/dev/null || echo unknown)
 cp "$apk" "$dir/datum-connect.apk"
 size=$(du -m "$dir/datum-connect.apk" | cut -f1)
 sha=$(sha256sum "$dir/datum-connect.apk" | cut -c1-16)
