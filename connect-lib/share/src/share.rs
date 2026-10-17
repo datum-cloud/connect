@@ -53,13 +53,12 @@ pub async fn share(
     cancel: CancellationToken,
     mut on_event: impl FnMut(ShareEvent),
 ) -> Result<(), Error> {
-    let target = tokio::net::lookup_host(&options.target)
+    let target = connect_transport::resolve_tcp_target(&options.target)
         .await
         .map_err(|source| Error::Resolve {
             target: options.target.clone(),
             source,
         })?
-        .next()
         .ok_or_else(|| Error::Unresolved(options.target.clone()))?;
 
     let secret: [u8; 32] = rand::random();

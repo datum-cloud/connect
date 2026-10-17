@@ -1166,6 +1166,24 @@ fn validate_connect_udp_request(request: &Request<()>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Resolves `target` to the address a TCP service is actually listening on.
+///
+/// A name such as `localhost` can resolve to both `::1` and `127.0.0.1`, while
+/// a service usually listens on only one. Returns the first resolved address
+/// that accepts a connection, or the first resolved address when none does
+/// (the service may simply not be up yet). `None` means the name did not
+/// resolve at all.
+pub async fn resolve_tcp_target(target: &str) -> std::io::Result<Option<std::net::SocketAddr>> {
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+    let candidates: Vec<_> = tokio::net::lookup_host(target).await?.collect();
+    for address in &candidates {
+        if let Ok(Ok(_)) = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(address)).await {
+            return Ok(Some(*address));
+        }
+    }
+    Ok(candidates.into_iter().next())
+}
+
 /// Validates an RFC 9298 HTTP/3 CONNECT-UDP request using the default URI
 /// template and returns its decoded target tuple.
 ///
@@ -1521,6 +1539,30 @@ mod tests {
         net::{TcpListener, UdpSocket},
         time::{sleep, timeout},
     };
+
+    #[tokio::test]
+    async fn resolve_tcp_target_prefers_the_listening_address() {
+        // Listen on IPv4 loopback only; `localhost` may resolve to `::1` first.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resolved = resolve_tcp_target(&format!("localhost:{port}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, listener.local_addr().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_tcp_target_falls_back_when_nothing_listens() {
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let resolved = resolve_tcp_target(&format!("localhost:{port}"))
+            .await
+            .unwrap();
+        assert_eq!(resolved.map(|address| address.port()), Some(port));
+    }
 
     async fn endpoint() -> Transport {
         Transport::bind(

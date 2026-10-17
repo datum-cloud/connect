@@ -1562,12 +1562,14 @@ async fn resolve_service_peers(
 }
 
 async fn resolve_target(service: &ServiceState) -> Result<Target, ApiError> {
-    let mut resolved = tokio::net::lookup_host(&service.endpoint)
-        .await
-        .map_err(|error| ApiError::bad_request(format!("resolving service endpoint: {error}")))?;
-    let address = resolved
-        .next()
-        .ok_or_else(|| ApiError::bad_request("service endpoint did not resolve"))?;
+    let address = match service.protocol {
+        Protocol::Tcp => connect_transport::resolve_tcp_target(&service.endpoint).await,
+        Protocol::Udp => tokio::net::lookup_host(&service.endpoint)
+            .await
+            .map(|mut resolved| resolved.next()),
+    }
+    .map_err(|error| ApiError::bad_request(format!("resolving service endpoint: {error}")))?
+    .ok_or_else(|| ApiError::bad_request("service endpoint did not resolve"))?;
     Ok(match service.protocol {
         Protocol::Tcp => Target::Tcp(address),
         Protocol::Udp => Target::Udp(address),
