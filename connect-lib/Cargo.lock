@@ -725,6 +725,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iroh",
+ "libc",
  "reqwest 0.12.28",
  "tokio",
  "tokio-util",

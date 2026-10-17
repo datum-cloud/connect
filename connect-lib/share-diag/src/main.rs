@@ -71,7 +71,19 @@ async fn main() {
         ..State::default()
     }));
     log(&format!("Datum Connect diagnostics {VERSION}: {name}"));
-    let checks = self_checks().await;
+    // Confirm why localhost fails here: check, bring lo up the way
+    // `ip link set lo up` does, and check again.
+    let mut checks = vec![("lo before".to_string(), loopback_state())];
+    checks.extend(self_checks("before bringing lo up").await);
+    let up = match bring_up_loopback() {
+        Ok(()) => "set IFF_UP on lo".to_string(),
+        Err(error) => format!("failed: {error}"),
+    };
+    log(&format!("bring up lo: {up}"));
+    checks.push(("Bring up lo".to_string(), up));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    checks.push(("lo after".to_string(), loopback_state()));
+    checks.extend(self_checks("after bringing lo up").await);
     set(&state, |s| s.self_checks = checks);
 
     let app = Router::new()
@@ -132,7 +144,7 @@ async fn main() {
 /// Whether this process can reach itself over TCP: loopback IPv4 and IPv6,
 /// then the instance's own global IPv6 addresses. Shown on the page, because
 /// a missing loopback breaks any program that talks to localhost.
-async fn self_checks() -> Vec<(String, String)> {
+async fn self_checks(when: &str) -> Vec<(String, String)> {
     let mut candidates: Vec<std::net::IpAddr> = vec![
         std::net::Ipv4Addr::LOCALHOST.into(),
         std::net::Ipv6Addr::LOCALHOST.into(),
@@ -156,10 +168,59 @@ async fn self_checks() -> Vec<(String, String)> {
                 }
             }
         };
-        log(&format!("self-check {ip}: {result}"));
-        results.push((format!("TCP to itself at {ip}"), result));
+        log(&format!("self-check {when} {ip}: {result}"));
+        results.push((format!("TCP to itself at {ip}, {when}"), result));
     }
     results
+}
+
+/// lo's operstate, flags, and addresses, as the kernel reports them.
+fn loopback_state() -> String {
+    let addresses: Vec<String> = read("/proc/net/if_inet6")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.ends_with(" lo"))
+        .map(|_| "::1".to_string())
+        .collect();
+    format!(
+        "operstate {}, flags {}, IPv6 {}",
+        or_na(read("/sys/class/net/lo/operstate")),
+        or_na(read("/sys/class/net/lo/flags")),
+        if addresses.is_empty() {
+            "none".to_string()
+        } else {
+            addresses.join(", ")
+        },
+    )
+}
+
+/// Sets IFF_UP on lo with SIOCSIFFLAGS, as `ip link set lo up` does. The
+/// kernel then assigns 127.0.0.1 and ::1 itself.
+fn bring_up_loopback() -> std::io::Result<()> {
+    // SAFETY: a plain socket used only for interface ioctls; `ifreq` is
+    // zeroed, its name is NUL-terminated, and the fd is closed on every path.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut request: libc::ifreq = std::mem::zeroed();
+        for (slot, byte) in request.ifr_name.iter_mut().zip(b"lo\0") {
+            *slot = *byte as libc::c_char;
+        }
+        let result = if libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut request) < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            request.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+            if libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &request) < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        libc::close(fd);
+        result
+    }
 }
 
 fn global_ipv6() -> Vec<std::net::IpAddr> {
@@ -631,7 +692,8 @@ iroh is handed straight to this page's HTTP server.
 <h2>Share</h2>{share}
 <h2>Network</h2>{network}
 <h2>Network probes</h2>{probes}
-<h2>Local TCP self-checks</h2><small>Whether this process can reach a TCP port of its own.</small>{self_checks}
+<h2>Local TCP self-checks</h2><small>Whether this process can reach a TCP port of its own,
+before and after bringing the loopback interface up.</small>{self_checks}
 <h2>Machine</h2>{machine}
 <h2>Recent share events</h2>{events}
 <h2>Environment</h2><small>Names containing TOKEN, SECRET, PASSWORD, or KEY are hidden.</small>{env}
