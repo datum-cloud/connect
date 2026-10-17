@@ -2,31 +2,46 @@
 # Shares the Android APK with a phone that already has the Datum Connect app,
 # over the same project-less share the app uses. No public URL is involved.
 #
-#   scripts/share-apk.sh [--no-build] [APK]
+#   scripts/share-apk.sh [--debug] [--no-build] [APK]
 #
 # Scan the printed QR code in the app, tap Connect, then Open in browser and
 # download the APK. Run from connect-mobile/android inside `nix develop .#android`
 # unless you pass a prebuilt APK with --no-build.
 #
+# Shares a release build by default: it updates the app installed from the
+# download page. --debug shares a debug build instead. Debug builds are a
+# separate app ("Datum Connect (dev)", net.datum.connect.share.debug) that
+# installs alongside the release app and never blocks its updates.
+#
 # Environment:
 #   RUST_ABIS             ABIs to build (default arm64-v8a)
 #   CONNECT               command that runs `connect local` (default: datumctl connect)
-#   DATUM_CONNECT_SIGNING release signing properties; when set, builds and shares
-#                         the release APK, which phones that installed from the
-#                         download bucket require. Otherwise shares a debug build.
+#   DATUM_CONNECT_SIGNING release signing properties (default
+#                         ~/.config/datum-connect/android-release/signing.properties)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+variant=Release
 build=1
-if [[ "${1:-}" == "--no-build" ]]; then
-  build=0
+while [[ "${1:-}" == --* ]]; do
+  case $1 in
+    --debug) variant=Debug ;;
+    --no-build) build=0 ;;
+    *) echo "unknown option $1" >&2; exit 2 ;;
+  esac
   shift
-fi
-if [[ -n "${DATUM_CONNECT_SIGNING:-}" ]]; then
-  variant=Release
+done
+if [[ $variant == Release ]]; then
+  default_signing="$HOME/.config/datum-connect/android-release/signing.properties"
+  export DATUM_CONNECT_SIGNING="${DATUM_CONNECT_SIGNING:-$default_signing}"
+  if [[ $build == 1 && ! -f "$DATUM_CONNECT_SIGNING" ]]; then
+    echo "No release signing key at $DATUM_CONNECT_SIGNING." >&2
+    echo "Phones with the app from the download page accept only release-signed updates." >&2
+    echo "Set DATUM_CONNECT_SIGNING, or pass --debug to share the separate dev app." >&2
+    exit 1
+  fi
   apk="${1:-app/build/outputs/apk/release/app-release.apk}"
 else
-  variant=Debug
   apk="${1:-app/build/outputs/apk/debug/app-debug.apk}"
 fi
 connect="${CONNECT:-datumctl connect}"

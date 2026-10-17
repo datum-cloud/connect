@@ -62,6 +62,15 @@ android {
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.findByName("release")
+            resValue("string", "app_name", "Datum Connect")
+        }
+        // Debug builds are a separate app, signed with each machine's debug
+        // key. Sharing the release package name would make Android refuse
+        // the next release update, and an uninstall would lose its data.
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+            resValue("string", "app_name", "Datum Connect (dev)")
         }
     }
 
