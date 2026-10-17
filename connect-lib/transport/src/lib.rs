@@ -100,7 +100,106 @@ impl std::str::FromStr for DestinationId {
 pub enum Target {
     Tcp(SocketAddr),
     Udp(SocketAddr),
+    /// A [`LocalListener`] in this process. Authorized CONNECT-TCP sessions
+    /// are handed to it as [`LocalStream`]s instead of opening a socket, for
+    /// services with no reachable address of their own, such as a unikernel
+    /// without a loopback interface.
+    Local(LocalTargetId),
 }
+
+/// Identifies a [`LocalListener`] registered on one [`Transport`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct LocalTargetId(u64);
+
+/// A byte stream from a peer's CONNECT-TCP session, delivered in process.
+pub struct LocalStream {
+    peer: EndpointId,
+    destination: DestinationId,
+    io: DuplexStream,
+}
+
+impl LocalStream {
+    /// The authenticated peer that opened the session.
+    pub fn peer(&self) -> EndpointId {
+        self.peer
+    }
+
+    pub fn destination(&self) -> &DestinationId {
+        &self.destination
+    }
+}
+
+impl std::fmt::Debug for LocalStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalStream")
+            .field("peer", &self.peer)
+            .field("destination", &self.destination)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for LocalStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for LocalStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// Receives the sessions for a [`Target::Local`] destination. Dropping it
+/// unregisters the target; later sessions get 502 Bad Gateway, as a TCP
+/// target that refuses connections would.
+pub struct LocalListener {
+    id: LocalTargetId,
+    streams: mpsc::Receiver<LocalStream>,
+    inner: Arc<Inner>,
+}
+
+impl LocalListener {
+    /// The target to put in a [`DestinationPolicy`].
+    pub fn target(&self) -> Target {
+        Target::Local(self.id)
+    }
+
+    /// The next authorized session, or `None` once the transport shuts down.
+    pub async fn accept(&mut self) -> Option<LocalStream> {
+        self.streams.recv().await
+    }
+}
+
+impl Drop for LocalListener {
+    fn drop(&mut self) {
+        if let Ok(mut targets) = self.inner.local_targets.lock() {
+            targets.remove(&self.id);
+        }
+    }
+}
+
+/// Sessions waiting for a slow [`LocalListener::accept`] before new ones are
+/// refused with 502.
+const LOCAL_BACKLOG: usize = 64;
+/// In-memory buffer per direction between a session and its local stream.
+const LOCAL_BUFFER: usize = 64 * 1024;
 
 /// Peer authorization for one destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -274,6 +373,8 @@ struct Inner {
     /// Last path report published per peer, and when, for throttling.
     published_paths: std::sync::Mutex<HashMap<EndpointId, (PeerDiagnostics, Instant)>>,
     path_updates: broadcast::Sender<(EndpointId, PeerDiagnostics)>,
+    local_targets: std::sync::Mutex<HashMap<LocalTargetId, mpsc::Sender<LocalStream>>>,
+    next_local_target: AtomicU64,
     ip_registry: Arc<ip::Registry>,
     protocols: Protocols,
 }
@@ -341,6 +442,8 @@ impl Transport {
                 peer_diagnostics: RwLock::new(HashMap::new()),
                 published_paths: std::sync::Mutex::new(HashMap::new()),
                 path_updates: broadcast::channel(64).0,
+                local_targets: std::sync::Mutex::new(HashMap::new()),
+                next_local_target: AtomicU64::new(1),
                 ip_registry,
                 protocols,
             }),
@@ -426,6 +529,22 @@ impl Transport {
     /// an idle connection costs nothing extra on the network.
     pub fn path_updates(&self) -> broadcast::Receiver<(EndpointId, PeerDiagnostics)> {
         self.inner.path_updates.subscribe()
+    }
+
+    /// Registers an in-process target. Advertise it with
+    /// [`LocalListener::target`]; policy and peer authorization apply exactly
+    /// as for a TCP target.
+    pub fn local_listener(&self) -> LocalListener {
+        let id = LocalTargetId(self.inner.next_local_target.fetch_add(1, Ordering::Relaxed));
+        let (sender, streams) = mpsc::channel(LOCAL_BACKLOG);
+        if let Ok(mut targets) = self.inner.local_targets.lock() {
+            targets.insert(id, sender);
+        }
+        LocalListener {
+            id,
+            streams,
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     /// Verifies QUIC reachability and returns handshake latency.
@@ -747,6 +866,7 @@ impl Transport {
             return Ok(());
         };
         let cancel = CancellationToken::new();
+        let local_destination = destination.clone();
         let Some(session_id) = self
             .register_session(
                 peer,
@@ -833,6 +953,37 @@ impl Transport {
                 }
                 stream.stop_stream(Code::H3_REQUEST_CANCELLED);
             }
+            Target::Local(id) if kind == SessionKind::Tcp => {
+                let sender = self
+                    .inner
+                    .local_targets
+                    .lock()
+                    .ok()
+                    .and_then(|targets| targets.get(&id).cloned());
+                let (near, far) = tokio::io::duplex(LOCAL_BUFFER);
+                let delivered = match sender {
+                    Some(sender) => sender
+                        .try_send(LocalStream {
+                            peer,
+                            destination: local_destination,
+                            io: far,
+                        })
+                        .is_ok(),
+                    None => false,
+                };
+                if !delivered {
+                    stream
+                        .send_response(response(StatusCode::BAD_GATEWAY))
+                        .await
+                        .map_err(error_display)?;
+                    return Err(Error::Protocol("local target unavailable or busy".into()));
+                }
+                stream
+                    .send_response(response(StatusCode::OK))
+                    .await
+                    .map_err(error_display)?;
+                bridge_server_tcp(near, stream, cancel, &self.inner.metrics).await;
+            }
             _ => return Err(Error::Protocol("destination kind changed".into())),
         }
         Ok(())
@@ -879,28 +1030,31 @@ impl Transport {
     }
 
     /// Records the connection's selected path now, then follows it until the
-    /// connection closes or the transport shuts down.
+    /// connection closes or the transport shuts down. The watcher holds only
+    /// iroh's path event stream and a weak handle: a strong `Connection`
+    /// clone would keep the connection, and its sessions, open after every
+    /// real user is done with it.
     fn observe_connection(&self, conn: &iroh::endpoint::Connection) {
         let peer = conn.remote_id();
         self.record_path(peer, path_diagnostics(conn.paths().iter()));
         let transport = self.clone();
-        let conn = conn.clone();
+        let weak = conn.weak_handle();
+        let mut events = conn.path_events();
         let shutdown = self.inner.shutdown.clone();
         tokio::spawn(async move {
             use futures_util::StreamExt;
-            let mut changes = conn.paths_stream();
             let mut sample = tokio::time::interval(PATH_RTT_SAMPLE_INTERVAL);
             sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             sample.tick().await;
             loop {
-                let diagnostics = tokio::select! {
+                tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    paths = changes.next() => match paths {
-                        Some(paths) => path_diagnostics(paths.iter()),
-                        None => break,
-                    },
-                    _ = sample.tick() => path_diagnostics(conn.paths().iter()),
-                };
+                    event = events.next() => if event.is_none() { break },
+                    _ = sample.tick() => {}
+                }
+                let Some(conn) = weak.upgrade() else { break };
+                let diagnostics = path_diagnostics(conn.paths().iter());
+                drop(conn);
                 transport.record_path(peer, diagnostics);
             }
         });
@@ -1342,7 +1496,7 @@ fn authorized_request(
                     || (target_host == destination.as_str()
                         && canonical_udp_port(&destination) == Some(target_port))
             }
-            Target::Tcp(_) => false,
+            Target::Tcp(_) | Target::Local(_) => false,
         };
         if !target_matches {
             return Err(Error::Protocol(
@@ -1366,7 +1520,7 @@ fn authorized_request(
                     || (named_destination.as_ref() == Some(destination)
                         && target.port() == target_port)
             }
-            Target::Tcp(_) => false,
+            Target::Tcp(_) | Target::Local(_) => false,
         };
         (target_matches && entry.access.allows(peer)).then(|| (destination.clone(), entry.clone()))
     }))
@@ -1481,7 +1635,7 @@ fn authorized_policy(
     let entry = policy.destinations.get(destination)?;
     let kind_matches = matches!(
         (entry.target, kind),
-        (Target::Tcp(_), SessionKind::Tcp) | (Target::Udp(_), SessionKind::Udp)
+        (Target::Tcp(_) | Target::Local(_), SessionKind::Tcp) | (Target::Udp(_), SessionKind::Udp)
     );
     (kind_matches && entry.access.allows(peer)).then(|| entry.clone())
 }
@@ -1983,6 +2137,76 @@ mod tests {
         );
         server.shutdown().await;
         echo.abort();
+    }
+
+    #[tokio::test]
+    async fn local_target_receives_authorized_sessions_in_process() {
+        let server = endpoint().await;
+        let client = endpoint().await;
+        let stranger = endpoint().await;
+        let mut listener = server.local_listener();
+        let destination = DestinationId::tcp(80);
+        server
+            .replace_policy(Policy {
+                destinations: HashMap::from([(
+                    destination.clone(),
+                    DestinationPolicy {
+                        target: listener.target(),
+                        access: Access::Peers(HashSet::from([client.endpoint_id()])),
+                    },
+                )]),
+            })
+            .await
+            .expect("install policy");
+
+        let mut tunnel = client
+            .connect_tcp(
+                address(&server),
+                destination.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("connect to local target");
+        let mut local = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("session delivered")
+            .expect("listener open");
+        assert_eq!(local.peer(), client.endpoint_id());
+        assert_eq!(local.destination(), &destination);
+        tunnel.write_all(b"ping").await.expect("tunnel write");
+        let mut buffer = [0u8; 4];
+        local.read_exact(&mut buffer).await.expect("local read");
+        assert_eq!(&buffer, b"ping");
+        local.write_all(b"pong").await.expect("local write");
+        tunnel.read_exact(&mut buffer).await.expect("tunnel read");
+        assert_eq!(&buffer, b"pong");
+
+        // Policy still decides who gets in.
+        assert!(
+            stranger
+                .connect_tcp(
+                    address(&server),
+                    destination.clone(),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+
+        // A dropped listener refuses new sessions rather than hanging them.
+        drop(listener);
+        assert!(
+            timeout(
+                Duration::from_secs(5),
+                client.connect_tcp(address(&server), destination, CancellationToken::new())
+            )
+            .await
+            .expect("refused promptly")
+            .is_err()
+        );
+        server.shutdown().await;
+        client.shutdown().await;
+        stranger.shutdown().await;
     }
 
     #[tokio::test]
