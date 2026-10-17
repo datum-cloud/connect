@@ -717,6 +717,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "connect-share-diag"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "connect-share",
+ "iroh",
+ "reqwest 0.12.28",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "connect-share-ffi"
 version = "0.1.0"
 dependencies = [

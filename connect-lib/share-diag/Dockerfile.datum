@@ -1,0 +1,27 @@
+# Unikraft-ready image for datum-connect-diag: one static-PIE binary in an
+# empty filesystem. Build from connect-lib so the workspace is in context:
+#
+#   datumctl compute build -f share-diag/Dockerfile.datum \
+#     --build-arg DATUM_CONNECT_RELEASE_VERSION=$(git describe --tags --always --dirty) .
+#
+# Alpine's musl toolchain links statically; relocation-model=pie makes the
+# result static-PIE, which the Unikraft loader requires. The explicit --target
+# keeps RUSTFLAGS off host proc-macros, which cannot be built static.
+FROM docker.io/library/rust:1.98-alpine AS build
+RUN apk add --no-cache musl-dev
+# Use the image's toolchain rather than downloading the components that
+# rust-toolchain.toml lists for development.
+ENV RUSTUP_TOOLCHAIN=1.98.0
+WORKDIR /src
+COPY . .
+ARG DATUM_CONNECT_RELEASE_VERSION=dev
+ENV DATUM_CONNECT_RELEASE_VERSION=${DATUM_CONNECT_RELEASE_VERSION}
+RUN --mount=type=cache,id=connect-diag-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=connect-diag-target,target=/src/target \
+    RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie" \
+    cargo build --locked --release -p connect-share-diag --target x86_64-unknown-linux-musl \
+ && install -D -m 755 target/x86_64-unknown-linux-musl/release/datum-connect-diag /out/datum-connect-diag
+
+FROM scratch
+COPY --from=build /out/datum-connect-diag /datum-connect-diag
+ENTRYPOINT ["/datum-connect-diag"]

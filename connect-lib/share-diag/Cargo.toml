@@ -1,0 +1,22 @@
+[package]
+name = "connect-share-diag"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Test share for Datum Compute: a diagnostics page shared with connect-share, in one static process"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "datum-connect-diag"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+connect-share = { path = "../share" }
+iroh = { workspace = true }
+# rustls with bundled roots only: no OpenSSL, so the binary links statically.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

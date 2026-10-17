@@ -1,0 +1,3 @@
+# Container builds (share-diag/Dockerfile.datum) only need sources.
+target/
+**/target/
