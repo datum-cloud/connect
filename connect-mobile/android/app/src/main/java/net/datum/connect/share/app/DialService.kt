@@ -171,7 +171,7 @@ class DialService : Service() {
             PendingIntent.FLAG_IMMUTABLE,
         )
         return Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_link)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .setContentText(lines.joinToString(" · "))
             .setStyle(Notification.BigTextStyle().bigText(lines.joinToString("\n")))
