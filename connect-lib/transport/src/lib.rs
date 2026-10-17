@@ -943,7 +943,13 @@ fn path_diagnostics<'a>(
             } else {
                 ConnectionPath::Unknown
             },
-            detail: Some(path.remote_addr().to_string()),
+            // Plain "1.2.3.4:5" or relay URL, without iroh's "ip:" or
+            // "relay:" display prefix.
+            detail: Some(match path.remote_addr() {
+                iroh::TransportAddr::Ip(addr) => addr.to_string(),
+                iroh::TransportAddr::Relay(url) => url.to_string(),
+                other => other.to_string(),
+            }),
             latency: Some(path.rtt()),
         },
         None => PeerDiagnostics {
