@@ -1,3 +1,6 @@
 # Container builds (share-diag/Dockerfile.datum) only need sources.
 target/
 **/target/
+# Container builds use the image's toolchain; this file would make rustup
+# download development components.
+rust-toolchain.toml

@@ -9,9 +9,8 @@
 # keeps RUSTFLAGS off host proc-macros, which cannot be built static.
 FROM docker.io/library/rust:1.98-alpine AS build
 RUN apk add --no-cache musl-dev
-# Use the image's toolchain rather than downloading the components that
-# rust-toolchain.toml lists for development.
-ENV RUSTUP_TOOLCHAIN=1.98.0
+# .dockerignore leaves out rust-toolchain.toml, so the image's own 1.98
+# toolchain builds without rustup downloading development components.
 WORKDIR /src
 COPY . .
 ARG DATUM_CONNECT_RELEASE_VERSION=dev
