@@ -4,6 +4,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 // The Rust workspace that builds libconnect_share_ffi.so and its Kotlin bindings.
@@ -151,6 +152,11 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation("${libs.jna.get()}@aar")
     implementation(libs.zxing.embedded)
+    implementation(libs.androidx.biometric)
+    // biometric 1.1.0 brings Fragment 1.2.5, whose FragmentActivity breaks
+    // the ActivityResult APIs the export and import pickers use.
+    implementation(libs.androidx.fragment)
+    implementation(libs.kotlinx.serialization.json)
 
     testImplementation(libs.junit)
     testImplementation(libs.jna)

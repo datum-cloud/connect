@@ -63,15 +63,38 @@ an APK, serves it from a loopback web server, and shares that port with
 ```sh
 nix develop .#android
 cd connect-mobile/android
-scripts/share-apk.sh              # build arm64-v8a, then share
-scripts/share-apk.sh --no-build   # share the last debug APK
+scripts/share-apk.sh              # release build for arm64-v8a, then share
+scripts/share-apk.sh --no-build   # share the last release APK
+scripts/share-apk.sh --debug      # share a debug build of the dev app
 ```
 
 In the app, scan the QR code, tap **Connect**, then **Open** on the
-"Datum Connect APK" card, and tap **Download APK**. Android installs it over the current app only when both
-are signed with the same key. Debug builds use each machine's
-`~/.android/debug.keystore`, so build updates on the machine that built the
-installed app. The share allows one device and stops with Ctrl+C.
+"Datum Connect APK" card, and tap **Download APK**. The script builds
+release-signed APKs by default, using the keystore at
+`~/.config/datum-connect/android-release/` unless `DATUM_CONNECT_SIGNING`
+points elsewhere, so they update the app installed from the download page.
+It refuses to build when no release key is available. The share allows one
+device and stops with Ctrl+C.
+
+Debug builds are a separate app: package `net.datum.connect.share.debug`,
+labeled "Datum Connect (dev)", signed with each machine's
+`~/.android/debug.keystore`. They install alongside the release app and can
+never block its updates.
+
+## Saved connections
+
+Connections are saved after every change to `connections.json` in the app's
+private storage, so they survive restarts, reboots, and updates. They come
+back stopped, because their sharers may have restarted; tap **Reconnect**.
+Backups are off (`android:allowBackup="false"`), so the saved tickets never
+leave the phone, and uninstalling deletes them.
+
+**Export connections** writes the names, tickets, and ports to a JSON file
+you choose, after a fingerprint or screen lock check. A phone without a
+screen lock cannot export. **Import connections** adds the connections from
+such a file, stopped, with names made unique. The device key is never
+exported, so an imported phone pairs as a new device. Tickets only work
+while their `datumctl connect local` runs.
 
 Set `CONNECT` to run a different plugin binary, for example
 `CONNECT=../../connect-plugin/datumctl-connect scripts/share-apk.sh`.
@@ -81,7 +104,8 @@ Set `CONNECT` to run a different plugin binary, for example
 | Path | Purpose |
 |---|---|
 | `app/src/main/java/.../MainActivity.kt` | Connection cards, add form, QR scan, rename |
-| `app/src/main/java/.../Connections.kt` | Connection list, unique names, port choice |
+| `app/src/main/java/.../Connections.kt` | Connection list, unique names, port choice, saving |
+| `app/src/main/java/.../ConnectionsFile.kt` | Saved and exported file format |
 | `app/src/main/java/.../DialService.kt` | Foreground service that runs one dial per connection |
 | `app/src/main/java/.../DeviceKey.kt` | This phone's iroh key, in app-private no-backup storage |
 | `../../connect-lib/share-ffi` | UniFFI surface: `parseTicket`, `generateDeviceKey`, `DialSession` |

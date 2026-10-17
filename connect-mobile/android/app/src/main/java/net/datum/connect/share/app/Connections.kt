@@ -1,5 +1,6 @@
 package net.datum.connect.share.app
 
+import java.io.File
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -31,11 +32,79 @@ data class Connection(
     val status: Status,
 )
 
-/** The connections list. Updated by the UI and [DialService] on the main thread. */
+/**
+ * The connections list. Updated by the UI and [DialService] on the main thread.
+ * Names, tickets, and ports are saved to app-private storage after every
+ * change, so they survive restarts and updates; statuses are not saved.
+ */
 object Connections {
     private val mutable = MutableStateFlow<List<Connection>>(emptyList())
     val list: StateFlow<List<Connection>> = mutable.asStateFlow()
     private var nextId = 1L
+    private var file: File? = null
+
+    /**
+     * Loads the saved list from [file] and saves every later change there.
+     * Saved connections come back stopped: their sharers may have restarted.
+     */
+    @Synchronized
+    fun attach(file: File) {
+        if (this.file != null) return
+        this.file = file
+        val saved = try {
+            file.takeIf(File::isFile)?.readText()?.let(ConnectionsFile::decode).orEmpty()
+        } catch (e: IllegalArgumentException) {
+            emptyList()
+        }
+        mutable.value = saved.mapIndexed { index, s ->
+            Connection(index + 1L, s.name, s.nameFromUser, s.ticket, s.port, Status.Stopped)
+        }
+        nextId = saved.size + 1L
+    }
+
+    /** Stops saving and clears the list. Tests only; the app attaches once. */
+    @Synchronized
+    internal fun detach() {
+        file = null
+        mutable.value = emptyList()
+        nextId = 1L
+    }
+
+    /**
+     * Writes the list atomically: a crash mid-write leaves the old copy. A
+     * failed write (for example a full disk) keeps the in-memory list and
+     * retries on the next change rather than crashing the app.
+     */
+    private fun persist() {
+        val target = file ?: return
+        val tmp = File(target.parentFile, target.name + ".tmp")
+        try {
+            tmp.writeText(ConnectionsFile.encode(mutable.value))
+            if (!tmp.renameTo(target)) tmp.delete()
+        } catch (e: java.io.IOException) {
+            tmp.delete()
+        }
+    }
+
+    /**
+     * Adds imported connections, stopped, with names made unique. Entries whose
+     * ticket fails [validTicket] are skipped. Returns (added, skipped).
+     */
+    fun importSaved(saved: List<ConnectionsFile.Saved>, validTicket: (String) -> Boolean): Pair<Int, Int> {
+        var added = 0
+        mutable.update { current ->
+            val names = current.map { it.name }.toMutableList()
+            val incoming = saved.filter { validTicket(it.ticket) }.map { s ->
+                val name = uniqueName(s.name.trim().take(MAX_NAME).ifEmpty { "Imported" }, names)
+                names += name
+                Connection(nextId++, name, s.nameFromUser, s.ticket, s.port.coerceIn(0, 65535), Status.Stopped)
+            }
+            added = incoming.size
+            current + incoming
+        }
+        persist()
+        return added to (saved.size - added)
+    }
 
     /** Adds a connection in [Status.Connecting] and returns its id. */
     fun add(ticket: String, port: Int, name: String?, sharedPort: Int): Long {
@@ -52,6 +121,7 @@ object Connections {
                 status = Status.Connecting,
             )
         }
+        persist()
         return id
     }
 
@@ -60,11 +130,14 @@ object Connections {
     fun setStatus(id: Long, status: Status) = modify(id) { it.copy(status = status) }
 
     /** Adopts the sharer's name unless the user already chose one. */
-    fun offerSharerName(id: Long, sharerName: String) = mutable.update { current ->
-        current.map { c ->
-            if (c.id != id || c.nameFromUser) c
-            else c.copy(name = uniqueName(sharerName.take(MAX_NAME), current.filter { it.id != id }.map { it.name }))
+    fun offerSharerName(id: Long, sharerName: String) {
+        mutable.update { current ->
+            current.map { c ->
+                if (c.id != id || c.nameFromUser) c
+                else c.copy(name = uniqueName(sharerName.take(MAX_NAME), current.filter { it.id != id }.map { it.name }))
+            }
         }
+        persist()
     }
 
     /** Renames a connection. Returns an error message, or null on success. */
@@ -72,10 +145,14 @@ object Connections {
         val trimmed = name.trim()
         nameError(trimmed, mutable.value.filter { it.id != id }.map { it.name })?.let { return it }
         modify(id) { it.copy(name = trimmed, nameFromUser = true) }
+        persist()
         return null
     }
 
-    fun remove(id: Long) = mutable.update { current -> current.filter { it.id != id } }
+    fun remove(id: Long) {
+        mutable.update { current -> current.filter { it.id != id } }
+        persist()
+    }
 
     private fun modify(id: Long, change: (Connection) -> Connection) =
         mutable.update { current -> current.map { if (it.id == id) change(it) else it } }

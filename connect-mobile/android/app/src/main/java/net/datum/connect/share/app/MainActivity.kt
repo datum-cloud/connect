@@ -6,10 +6,14 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -53,8 +57,17 @@ import net.datum.connect.share.ShareException
 import net.datum.connect.share.TicketInfo
 import net.datum.connect.share.parseTicket
 
-class MainActivity : ComponentActivity() {
+/** FragmentActivity, not ComponentActivity: BiometricPrompt needs fragments. */
+class MainActivity : FragmentActivity() {
     private val sharedTicket = mutableStateOf<String?>(null)
+
+    private val exportTo = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri -> uri?.let(::writeExport) }
+
+    private val importFrom = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> uri?.let(::readImport) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,11 +75,75 @@ class MainActivity : ComponentActivity() {
         setContent {
             Theme {
                 Surface(Modifier.fillMaxSize()) {
-                    App(sharedTicket = sharedTicket.value)
+                    App(
+                        sharedTicket = sharedTicket.value,
+                        onExport = ::export,
+                        onImport = { importFrom.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) },
+                    )
                 }
             }
         }
     }
+
+    /**
+     * Exports after the user proves they can unlock the phone. Unlike a
+     * fingerprint-or-nothing check, a phone with no screen lock cannot export:
+     * the file holds tickets, which are bearer secrets.
+     */
+    private fun export() {
+        val count = Connections.list.value.size
+        if (count == 0) {
+            toast("No connections to export")
+            return
+        }
+        val allowed = BiometricManager.Authenticators.BIOMETRIC_WEAK or BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        if (BiometricManager.from(this).canAuthenticate(allowed) != BiometricManager.BIOMETRIC_SUCCESS) {
+            toast("Set a screen lock to export connections")
+            return
+        }
+        val prompt = BiometricPrompt(
+            this,
+            ContextCompat.getMainExecutor(this),
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    exportTo.launch("datum-connect-connections.json")
+                }
+            },
+        )
+        prompt.authenticate(
+            BiometricPrompt.PromptInfo.Builder()
+                .setTitle("Export connections")
+                .setSubtitle("The file contains tickets. Anyone with it can connect while those shares run.")
+                .setAllowedAuthenticators(allowed)
+                .build(),
+        )
+    }
+
+    private fun writeExport(uri: Uri) {
+        val connections = Connections.list.value
+        try {
+            contentResolver.openOutputStream(uri, "wt")?.use { it.write(ConnectionsFile.encode(connections).toByteArray()) }
+                ?: error("could not open the file")
+            toast("Exported ${connections.size} connection${if (connections.size == 1) "" else "s"}")
+        } catch (e: Exception) {
+            toast("Export failed: ${e.message}")
+        }
+    }
+
+    private fun readImport(uri: Uri) {
+        try {
+            val text = contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
+                ?: error("could not open the file")
+            val (added, skipped) = Connections.importSaved(ConnectionsFile.decode(text)) { ticket ->
+                runCatching { parseTicket(ticket) }.isSuccess
+            }
+            toast("Imported $added connection${if (added == 1) "" else "s"}" + if (skipped > 0) ", skipped $skipped with invalid tickets" else "")
+        } catch (e: Exception) {
+            toast("Import failed: ${e.message}")
+        }
+    }
+
+    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -99,7 +176,7 @@ private fun parse(ticket: String): Parsed {
 }
 
 @Composable
-private fun App(sharedTicket: String?) {
+private fun App(sharedTicket: String?, onExport: () -> Unit, onImport: () -> Unit) {
     val connections by Connections.list.collectAsStateWithLifecycle()
     var renaming by remember { mutableStateOf<Connection?>(null) }
 
@@ -128,6 +205,12 @@ private fun App(sharedTicket: String?) {
         }
         item {
             AddConnection(sharedTicket, connections)
+        }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onExport) { Text("Export connections") }
+                TextButton(onClick = onImport) { Text("Import connections") }
+            }
         }
         item {
             Text(

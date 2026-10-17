@@ -232,8 +232,16 @@ port, stop it, and a callback for state changes.
 - Keep one device key in app-private, no-backup storage (`noBackupFilesDir`),
   so a dropped connection can resume against the same sharer run without
   pairing again. The key never leaves the phone and is excluded from backups.
-- Keep recent tickets until their sharer stops answering, then mark them
-  expired.
+- Save every connection's name, ticket, and port to app-private storage after
+  each change, so the list survives restarts and updates. Saved connections
+  come back stopped. Backups stay off, as in the WireGuard app, so tickets
+  never leave the phone; uninstalling deletes them.
+- Export and import the list as a JSON file. Export requires a fingerprint or
+  the screen lock and refuses on a phone without one. The device key is never
+  exported.
+- Build debug versions as a separate app (`net.datum.connect.share.debug`) so
+  a debug build signed with a developer's key can never block a release
+  update and force an uninstall.
 - Stop the service when the user taps Stop, or when the sharer has been
   unreachable for a set time.
 
