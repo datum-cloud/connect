@@ -29,7 +29,7 @@ const VERSION: u8 = 1;
 const MAX_RELAYS: usize = 4;
 /// Direct addresses beyond this are dropped to keep the QR code scannable;
 /// the relay still reaches the sharer.
-const MAX_ADDRS: usize = 6;
+pub(crate) const MAX_ADDRS: usize = 6;
 
 /// A bearer capability to pair with one sharer for as long as it runs.
 ///

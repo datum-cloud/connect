@@ -66,6 +66,8 @@ async fn start_share(
                     relay_urls: Some(Vec::new()),
                     max_peers,
                     name: Some("test\u{1b}[31m service".into()),
+                    udp_port: None,
+                    public_addrs: Vec::new(),
                 },
                 cancel,
                 |event| {
@@ -247,6 +249,8 @@ async fn in_process_target_serves_without_a_socket() {
                     relay_urls: Some(Vec::new()),
                     max_peers: 4,
                     name: Some("in-process".into()),
+                    udp_port: None,
+                    public_addrs: Vec::new(),
                 },
                 cancel,
                 |event| {
@@ -275,6 +279,67 @@ async fn in_process_target_serves_without_a_socket() {
             });
         }
     });
+
+    let (ready, _task, dial_cancel) = start_dial(loopback_only(ticket)).await;
+    let (local, _) = tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("dial ready")
+        .unwrap();
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"pong");
+    dial_cancel.cancel();
+    cancel.cancel();
+}
+
+/// A fixed UDP port and a public address show up in the ticket, and the
+/// share still pairs and serves over it.
+#[tokio::test]
+async fn fixed_port_and_public_address_are_advertised() {
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let public: std::net::SocketAddr = "[2001:db8::1]:4433".parse().unwrap();
+    let target = origin().await;
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            share(
+                ShareOptions {
+                    target: target.to_string().into(),
+                    relay_urls: Some(Vec::new()),
+                    max_peers: 4,
+                    name: None,
+                    udp_port: Some(port),
+                    public_addrs: vec![public],
+                },
+                cancel,
+                |event| {
+                    let _ = tx.send(event);
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let Some(ShareEvent::Ready { ticket, .. }) = rx.recv().await else {
+        panic!("share did not become ready");
+    };
+    let addrs: Vec<_> = ticket.endpoint.ip_addrs().copied().collect();
+    assert!(addrs.contains(&public), "{addrs:?}");
+    assert!(
+        addrs.iter().any(|a| *a != public && a.port() == port),
+        "{addrs:?}"
+    );
+    // The ticket survives encoding with the public address intact.
+    let decoded: ShareTicket = ticket.to_string().parse().unwrap();
+    assert!(decoded.endpoint.ip_addrs().any(|a| *a == public));
 
     let (ready, _task, dial_cancel) = start_dial(loopback_only(ticket)).await;
     let (local, _) = tokio::time::timeout(Duration::from_secs(20), ready)

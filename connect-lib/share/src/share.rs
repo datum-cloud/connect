@@ -1,6 +1,7 @@
 //! Sharer side: publish one local TCP service and admit paired peers.
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     sync::Arc,
 };
 
@@ -8,13 +9,14 @@ use connect_transport::{
     Access, DestinationId, DestinationPolicy, LocalStream, Policy, Target, Transport,
     TransportConfig,
 };
-use iroh::{EndpointId, RelayUrl, SecretKey};
+use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     Error, PathInfo, ShareTicket, configure_relays,
     pair::{PAIR_ALPN, PairingHandler, PairingProtocol},
+    ticket::MAX_ADDRS,
     wait_online,
 };
 
@@ -31,6 +33,14 @@ pub struct ShareOptions {
     /// Display name sent to peers when they pair, for example
     /// `laptop:9999`. Peers may rename it locally.
     pub name: Option<String>,
+    /// Binds iroh's UDP socket to this port, for IPv4 and IPv6, instead of a
+    /// random one, so a load balancer or firewall rule can forward to it.
+    pub udp_port: Option<u16>,
+    /// Addresses peers can reach this share at directly, such as a load
+    /// balancer that forwards to `udp_port`. iroh only discovers the address
+    /// it sends from, so these go in the ticket alongside the discovered ones,
+    /// and are never dropped to fit its address limit.
+    pub public_addrs: Vec<SocketAddr>,
 }
 
 /// Progress reported to the caller.
@@ -98,11 +108,13 @@ pub async fn share(
 
     let secret: [u8; 32] = rand::random();
     let (handler, mut paired) = PairingHandler::new(secret, options.name, options.max_peers);
-    let (config, relays) = configure_relays(
-        TransportConfig::new(SecretKey::generate())
-            .protocol(PAIR_ALPN, Arc::new(PairingProtocol(handler))),
-        options.relay_urls,
-    );
+    let mut config = TransportConfig::new(SecretKey::generate())
+        .protocol(PAIR_ALPN, Arc::new(PairingProtocol(handler)));
+    if let Some(port) = options.udp_port {
+        config = config.bind_port(port);
+    }
+    let (config, relays) = configure_relays(config, options.relay_urls);
+    let public_addrs = options.public_addrs;
     let transport = Transport::bind(config)
         .await
         .map_err(|error| Error::Transport(error.to_string()))?;
@@ -112,6 +124,7 @@ pub async fn share(
                 port: address.port(),
                 target: Target::Tcp(address),
                 description: address.to_string(),
+                public_addrs: public_addrs.clone(),
             },
             None,
         ),
@@ -121,6 +134,7 @@ pub async fn share(
                 port,
                 target: listener.target(),
                 description: "in-process".into(),
+                public_addrs: public_addrs.clone(),
             };
             // Hand each authorized session to the caller until either side
             // goes away.
@@ -152,12 +166,35 @@ pub async fn share(
     result
 }
 
+/// The endpoint's address with `public` added. Public addresses always fit
+/// in the ticket; discovered direct addresses fill the remaining slots.
+fn advertised(discovered: EndpointAddr, public: &[SocketAddr]) -> EndpointAddr {
+    let mut out = EndpointAddr::new(discovered.id);
+    for relay in discovered.relay_urls() {
+        out = out.with_relay_url(relay.clone());
+    }
+    for addr in public.iter().take(MAX_ADDRS) {
+        out = out.with_ip_addr(*addr);
+    }
+    let room = MAX_ADDRS.saturating_sub(out.ip_addrs().count());
+    for addr in discovered
+        .ip_addrs()
+        .filter(|a| !public.contains(a))
+        .take(room)
+    {
+        out = out.with_ip_addr(*addr);
+    }
+    out
+}
+
 /// What the share's single destination forwards to.
 struct Served {
     /// Names the destination (`tcp-<port>`) and goes in the ticket.
     port: u16,
     target: Target,
     description: String,
+    /// Advertised in the ticket ahead of discovered addresses.
+    public_addrs: Vec<SocketAddr>,
 }
 
 async fn run(
@@ -182,7 +219,7 @@ async fn run(
         .map_err(|error| Error::Transport(error.to_string()))?;
     on_event(ShareEvent::Ready {
         ticket: ShareTicket {
-            endpoint: transport.endpoint().addr(),
+            endpoint: advertised(transport.endpoint().addr(), &served.public_addrs),
             port: served.port,
             secret,
         },
@@ -241,5 +278,30 @@ fn share_policy(served: &Served, peers: &HashSet<EndpointId>) -> Policy {
                 access: Access::Peers(peers.clone()),
             },
         )]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_addresses_always_fit_in_the_ticket() {
+        let id = SecretKey::generate().public();
+        let mut discovered =
+            EndpointAddr::new(id).with_relay_url("https://relay.example.net".parse().unwrap());
+        for port in 1..=10 {
+            discovered = discovered.with_ip_addr(SocketAddr::from(([10, 0, 0, 1], port)));
+        }
+        // Sorts after every discovered address, so a plain cap would drop it.
+        let public: Vec<SocketAddr> = vec![
+            "[2001:db8::1]:4433".parse().unwrap(),
+            "203.0.113.9:4433".parse().unwrap(),
+        ];
+        let out = advertised(discovered, &public);
+        let addrs: Vec<_> = out.ip_addrs().copied().collect();
+        assert_eq!(addrs.len(), MAX_ADDRS);
+        assert!(public.iter().all(|p| addrs.contains(p)), "{addrs:?}");
+        assert_eq!(out.relay_urls().count(), 1);
     }
 }

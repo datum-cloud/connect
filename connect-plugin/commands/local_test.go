@@ -82,6 +82,32 @@ func TestLocalCommandShowsDevicePaths(t *testing.T) {
 	}
 }
 
+func TestLocalPassesUDPPortAndPublicAddrs(t *testing.T) {
+	exe, argsFile := fakeDaemon(t, `{"event":"share_ready","ticket":"DCSHARE2T"}`, "", 0)
+	if _, err := runCommand(t, exe, "local", "--port", "9999", "--name", "n", "--udp-port", "4433",
+		"--public-addr", "[2001:db8::1]:4433", "--public-addr", "203.0.113.9:4433"); err != nil {
+		t.Fatal(err)
+	}
+	args, _ := os.ReadFile(argsFile)
+	got := strings.Split(strings.TrimSpace(string(args)), "\n")
+	want := []string{"local", "localhost:9999", "--max-peers", "4", "--name", "n", "--udp-port", "4433",
+		"--public-addr", "[2001:db8::1]:4433", "--public-addr", "203.0.113.9:4433"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("daemon args = %q", got)
+	}
+}
+
+func TestValidatePublicAddrs(t *testing.T) {
+	if err := validatePublicAddrs([]string{"[2001:db8::1]:4433", "203.0.113.9:1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"lb.example.com:4433", "2001:db8::1:4433", "203.0.113.9", "203.0.113.9:0"} {
+		if err := validatePublicAddrs([]string{bad}); err == nil {
+			t.Errorf("%q: expected error", bad)
+		}
+	}
+}
+
 func TestShareName(t *testing.T) {
 	if got, err := shareName("", "localhost:9999", false); err != nil || got != deviceNameHint()+":9999" {
 		t.Fatalf("default = %q, %v", got, err)

@@ -8,7 +8,8 @@
 //! events are printed to stdout, so `datumctl compute logs` shows them.
 //! Nothing listens on a public address.
 //!
-//! Optional environment: SHARE_NAME, and DATUM_ACCOUNT, DATUM_ORG,
+//! Optional environment: SHARE_NAME; UDP_PORT and PUBLIC_ADDRS for a fixed
+//! iroh port behind a load balancer; and DATUM_ACCOUNT, DATUM_ORG,
 //! DATUM_PROJECT, WORKLOAD, LOCATION, RUNTIME, which only label the page.
 use std::{
     collections::BTreeMap,
@@ -124,6 +125,8 @@ async fn main() {
             relay_urls: None,
             max_peers: 8,
             name: Some(name.clone()),
+            udp_port: udp_port(),
+            public_addrs: public_addrs(),
         };
         let events = state.clone();
         let result = share(options, CancellationToken::new(), move |event| {
@@ -238,6 +241,23 @@ fn global_ipv6() -> Vec<std::net::IpAddr> {
                 .collect();
             Some(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?).into())
         })
+        .collect()
+}
+
+/// UDP_PORT: a fixed port for iroh, so a load balancer can forward to it.
+fn udp_port() -> Option<u16> {
+    std::env::var("UDP_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse().ok())
+}
+
+/// PUBLIC_ADDRS: comma-separated addresses peers can reach this share at
+/// directly, such as a load balancer forwarding to UDP_PORT.
+fn public_addrs() -> Vec<SocketAddr> {
+    std::env::var("PUBLIC_ADDRS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|a| a.trim().parse().ok())
         .collect()
 }
 

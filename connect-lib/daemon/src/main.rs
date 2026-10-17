@@ -83,6 +83,14 @@ enum Projectless {
         /// Name sent to devices when they pair. They may rename it.
         #[arg(long)]
         name: Option<String>,
+        /// Bind iroh's UDP socket to this port instead of a random one, so a
+        /// load balancer or firewall rule can forward to it.
+        #[arg(long)]
+        udp_port: Option<u16>,
+        /// An address peers can reach this share at directly, such as a load
+        /// balancer forwarding to --udp-port. Repeat for each address.
+        #[arg(long = "public-addr")]
+        public_addrs: Vec<std::net::SocketAddr>,
         /// Comma-separated HTTPS relay origins, or `none` for direct addresses
         /// only. Defaults to the transport preset.
         #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
@@ -189,6 +197,8 @@ async fn run_projectless(command: Projectless) {
             target,
             max_peers,
             name,
+            udp_port,
+            public_addrs,
             relay_urls,
         } => {
             let options = connect_share::ShareOptions {
@@ -196,6 +206,8 @@ async fn run_projectless(command: Projectless) {
                 relay_urls: relays(relay_urls),
                 max_peers,
                 name: name.clone(),
+                udp_port,
+                public_addrs,
             };
             connect_share::share(options, cancel, |event| match event {
                 connect_share::ShareEvent::Ready { ticket, target } => emit(serde_json::json!({

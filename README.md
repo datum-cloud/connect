@@ -41,7 +41,8 @@ datumctl connect
   unserve HOST:PORT | NAME
   dial CONNECTOR:PORT --bind LOCALPORT
   hangup LOCALPORT
-  local HOST:PORT | --port PORT [--name NAME]   (no login or project; prints a pairing ticket)
+  local HOST:PORT | --port PORT [--name NAME] [--udp-port PORT] [--public-addr IP:PORT]
+                                                (no login or project; prints a pairing ticket)
   dial TICKET [--bind LOCALPORT]                (no login or project; pairs with a local share)
   install (optional; serve guides first-time user setup)
   daemon install | uninstall | start | stop | status

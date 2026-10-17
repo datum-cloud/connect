@@ -148,7 +148,28 @@ anonymous clients add no load to Datum relays. Revisit if n0's relays become a
 reliability or policy concern. Moving to Datum relays would then need relay
 access controls and rate limits for anonymous clients.
 
-An empty relay list disables relays. Then only direct addresses are used,
+An empty relay list disables relays.
+
+### Direct paths behind a load balancer
+
+A share on Datum Compute is reached through a relay today. The instance sends
+from a translated public IPv6 address, and unsolicited inbound UDP does not
+reach it, so iroh cannot set up a direct path. A tested share on a unikernel
+instance stayed relayed at about 70 ms.
+
+Two share options prepare for a regional Layer 4 load balancer
+(datum-cloud/galactic#698), which forwards TCP and UDP to a backend without a
+proxy and answers from its public address:
+
+- `--udp-port PORT` binds iroh's UDP socket to a fixed port, for IPv4 and
+  IPv6, instead of a random one, so a load balancer rule can forward to it.
+- `--public-addr IP:PORT` (repeatable) adds the load balancer's address to the
+  ticket. iroh only discovers the address it sends from, so it cannot find
+  this one itself. Public addresses always fit in the ticket's six-address
+  limit; discovered addresses fill the remaining slots.
+
+The diagnostics program reads the same settings from `UDP_PORT` and
+`PUBLIC_ADDRS`. Then only direct addresses are used,
 which suits a phone on the same Wi-Fi and offline tests.
 
 ## Components

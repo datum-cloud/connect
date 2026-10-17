@@ -39,6 +39,8 @@ func newLocal(opts *options) *cobra.Command {
 	var host string
 	var maxPeers int
 	var name string
+	var udpPort uint16
+	var publicAddrs []string
 	cmd := &cobra.Command{
 		Use:   "local [HOST:PORT]",
 		Short: "Share a local service with your own devices, without signing in",
@@ -69,14 +71,41 @@ func newLocal(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runLocal(cmd, opts, target, name, maxPeers)
+			if err := validatePublicAddrs(publicAddrs); err != nil {
+				return err
+			}
+			extra := []string{}
+			if udpPort != 0 {
+				extra = append(extra, "--udp-port", strconv.Itoa(int(udpPort)))
+			}
+			for _, addr := range publicAddrs {
+				extra = append(extra, "--public-addr", addr)
+			}
+			return runLocal(cmd, opts, target, name, maxPeers, extra)
 		},
 	}
 	cmd.Flags().Uint16Var(&port, "port", 0, "Local port to share")
 	cmd.Flags().StringVar(&host, "host", "localhost", "Local host to share with --port")
 	cmd.Flags().IntVar(&maxPeers, "max-peers", 4, "Devices that may pair before pairing closes")
 	cmd.Flags().StringVar(&name, "name", "", "Name devices show for this share (default HOSTNAME:PORT)")
+	cmd.Flags().Uint16Var(&udpPort, "udp-port", 0, "Bind iroh's UDP socket to this port, so a load balancer or firewall can forward to it (default random)")
+	cmd.Flags().StringArrayVar(&publicAddrs, "public-addr", nil, "IP:PORT where peers can reach this share directly, such as a load balancer forwarding to --udp-port; repeatable")
 	return cmd
+}
+
+// validatePublicAddrs requires literal IP:PORT addresses, because they go
+// into the ticket as-is and peers dial them without a DNS lookup.
+func validatePublicAddrs(addrs []string) error {
+	for _, addr := range addrs {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || net.ParseIP(host) == nil {
+			return fmt.Errorf("--public-addr %q must be IP:PORT, with IPv6 in brackets, such as [2001:db8::1]:4433", addr)
+		}
+		if _, err := parsePort(port); err != nil {
+			return fmt.Errorf("--public-addr %q: %w", addr, err)
+		}
+	}
+	return nil
 }
 
 // maxShareName matches the limit connect-share applies to names.
@@ -114,10 +143,10 @@ func localTarget(args []string, host string, port uint16, portSet bool) (string,
 	}
 }
 
-func runLocal(cmd *cobra.Command, opts *options, target, name string, maxPeers int) error {
+func runLocal(cmd *cobra.Command, opts *options, target, name string, maxPeers int, extra []string) error {
 	out := cmd.OutOrStdout()
 	jsonOut := outputFormat(cmd) == "json"
-	daemonArgs := []string{"local", target, "--max-peers", strconv.Itoa(maxPeers), "--name", name}
+	daemonArgs := append([]string{"local", target, "--max-peers", strconv.Itoa(maxPeers), "--name", name}, extra...)
 	names := map[string]string{}
 	return runForeground(cmd, opts, daemonArgs, func(line []byte, event foregroundEvent) {
 		if jsonOut {

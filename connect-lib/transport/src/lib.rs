@@ -247,7 +247,7 @@ type Protocols = HashMap<Vec<u8>, Arc<dyn ProtocolHandler>>;
 /// Endpoint construction settings.
 pub struct TransportConfig {
     secret_key: SecretKey,
-    bind_addr: Option<SocketAddr>,
+    bind_addrs: Vec<SocketAddr>,
     relay_mode: Option<iroh::RelayMode>,
     protocols: Protocols,
 }
@@ -261,7 +261,7 @@ impl std::fmt::Debug for TransportConfig {
             .collect();
         alpns.sort();
         f.debug_struct("TransportConfig")
-            .field("bind_addr", &self.bind_addr)
+            .field("bind_addrs", &self.bind_addrs)
             .field("relay_mode", &self.relay_mode)
             .field("protocols", &alpns)
             .finish_non_exhaustive()
@@ -273,14 +273,24 @@ impl TransportConfig {
     pub fn new(secret_key: SecretKey) -> Self {
         Self {
             secret_key,
-            bind_addr: None,
+            bind_addrs: Vec::new(),
             relay_mode: None,
             protocols: HashMap::new(),
         }
     }
     /// Overrides the UDP bind address.
     pub fn bind_addr(mut self, bind_addr: SocketAddr) -> Self {
-        self.bind_addr = Some(bind_addr);
+        self.bind_addrs = vec![bind_addr];
+        self
+    }
+
+    /// Binds UDP on `port` for both IPv4 and IPv6 instead of a random port,
+    /// so a load balancer or firewall rule can forward to it.
+    pub fn bind_port(mut self, port: u16) -> Self {
+        self.bind_addrs = vec![
+            SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)),
+        ];
         self
     }
 
@@ -396,13 +406,13 @@ impl Transport {
         if let Some(mode) = config.relay_mode {
             builder = builder.relay_mode(mode);
         }
-        if let Some(addr) = config.bind_addr {
+        if !config.bind_addrs.is_empty() {
             // Explicit binding is an underlay restriction, not an additional
             // socket alongside the preset's wildcard IPv4/IPv6 transports.
-            builder = builder
-                .clear_ip_transports()
-                .bind_addr(addr)
-                .map_err(error_debug)?;
+            builder = builder.clear_ip_transports();
+            for addr in config.bind_addrs {
+                builder = builder.bind_addr(addr).map_err(error_debug)?;
+            }
         }
         let endpoint = builder.bind().await.map_err(error_debug)?;
         let transport = Self::with_protocols(endpoint, config.protocols);
