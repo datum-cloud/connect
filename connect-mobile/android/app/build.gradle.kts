@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -11,6 +13,24 @@ val rustAbis = providers.gradleProperty("rustAbis")
     .orElse("arm64-v8a,armeabi-v7a,x86_64")
     .map { it.split(",").map(String::trim).filter(String::isNotEmpty) }
 val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
+
+// Every build must have a higher versionCode than the one it replaces, or
+// Android refuses the update. The commit count only grows on one branch.
+fun git(vararg args: String): String? = runCatching {
+    providers.exec { commandLine("git", *args) }.standardOutput.asText.get().trim()
+}.getOrNull()?.takeIf { it.isNotEmpty() }
+val buildNumber = providers.gradleProperty("versionCode").orNull?.toInt()
+    ?: git("rev-list", "--count", "HEAD")?.toInt()
+    ?: 1
+val buildName = git("describe", "--always", "--dirty") ?: "dev"
+
+// Release signing comes from a properties file outside the repository:
+// storeFile, storePassword, keyAlias, keyPassword. Without it, release
+// builds are unsigned. See connect-mobile/android/README.md.
+val signingProperties = System.getenv("DATUM_CONNECT_SIGNING")
+    ?.let(::File)
+    ?.takeIf(File::isFile)
+    ?.let { file -> Properties().apply { file.inputStream().use { load(it) } } }
 val bindingsDir = layout.buildDirectory.dir("generated/uniffi/kotlin")
 
 android {
@@ -21,16 +41,27 @@ android {
         applicationId = "net.datum.connect.share"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = buildNumber
+        versionName = "0.1.0+$buildName"
         // Only ABIs that have libconnect_share_ffi.so; others would crash on load.
         ndk { abiFilters += rustAbis.get() }
+    }
+
+    signingConfigs {
+        if (signingProperties != null) {
+            create("release") {
+                storeFile = File(signingProperties.getProperty("storeFile"))
+                storePassword = signingProperties.getProperty("storePassword")
+                keyAlias = signingProperties.getProperty("keyAlias")
+                keyPassword = signingProperties.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Release signing is configured by CI; see connect-mobile/android/README.md.
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 

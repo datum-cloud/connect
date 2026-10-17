@@ -88,5 +88,47 @@ Set `CONNECT` to run a different plugin binary, for example
 
 ## Release signing
 
-Not configured yet. Release builds will be signed in CI from secrets. Never
-commit a keystore or its passwords.
+Release builds are signed when `DATUM_CONNECT_SIGNING` names a properties file
+outside the repository:
+
+```properties
+storeFile=/home/you/.config/datum-connect/android-release/release.jks
+storePassword=...
+keyAlias=datum-connect
+keyPassword=...
+```
+
+Without it, release builds are unsigned. The current key is an EC P-256 key
+with certificate SHA-256
+`2c3ad24e6b2900002bbaf2ca78208bc2337ab1cb5600481f085e3ef8d0336724`. Every
+update must be signed with it, so back it up somewhere other than the build
+machine. Never commit a keystore or its password.
+
+`versionCode` is the branch's commit count, so each build installs over the
+previous one. Override it with `-PversionCode=N`.
+
+## Publish for new users
+
+People without the app download it from the public `datum-download` bucket:
+<https://datum-download.s3.us-east-2.amazonaws.com/connect/android/index.html>.
+
+```sh
+nix develop .#android
+cd connect-mobile/android
+export DATUM_CONNECT_SIGNING=~/.config/datum-connect/android-release/signing.properties
+gradle assembleRelease
+AWS_PROFILE=datum-admin scripts/publish-apk.sh
+```
+
+`publish-apk.sh` refuses debug-signed APKs. It uploads
+`datum-connect-YYYYMMDD-<sha256[:12]>.apk` (build date in UTC), then replaces
+`index.html` and `latest.json`, which point at the newest build. APK objects
+are immutable; the page and JSON are served with `no-cache`.
+
+The bucket is in AWS account 007091975061, us-east-2. Block Public Access is
+on except for a bucket policy that allows public `s3:GetObject`. ACLs are
+disabled, objects are encrypted with SSE-S3, and listing and uploads are
+denied to the public.
+
+Once installed from the bucket, a phone takes updates only from release-signed
+builds. Run `share-apk.sh` with `DATUM_CONNECT_SIGNING` set to share one.

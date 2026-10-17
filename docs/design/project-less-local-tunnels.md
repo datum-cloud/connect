@@ -243,7 +243,12 @@ During development, `connect-mobile/android/scripts/share-apk.sh` serves a
 new build to a phone that already has the app, over a project-less share. No
 public URL is needed after the first install.
 
-For users: signed APK on the GitHub release first, then Play Store. Keep signing keys in
+For users without the app: a release-signed APK in the public `datum-download`
+S3 bucket (account 007091975061, us-east-2), published with
+`scripts/publish-apk.sh` as `datum-connect-YYYYMMDD-<sha256[:12]>.apk` with a
+download page at
+<https://datum-download.s3.us-east-2.amazonaws.com/connect/android/index.html>.
+GitHub releases and the Play Store can follow. Keep signing keys in
 CI secrets. The existing app branch commits keystore passwords in
 `ui/Dioxus.toml`; do not repeat that.
 
@@ -310,5 +315,6 @@ On branch `feat/projectless-local-tunnel`:
 
 1. Finish device testing: behavior across network changes and long app
    switches.
-2. Release signing and APK publishing in CI; remembered tickets.
+2. Move the release keystore into a secrets store and publish from CI;
+   remembered tickets.
 3. Later: public URLs through the Quick Tunnel Gateway; iOS Network Extension.

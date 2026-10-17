@@ -9,8 +9,11 @@
 # unless you pass a prebuilt APK with --no-build.
 #
 # Environment:
-#   RUST_ABIS       ABIs to build (default arm64-v8a)
-#   CONNECT         command that runs `connect local` (default: datumctl connect)
+#   RUST_ABIS             ABIs to build (default arm64-v8a)
+#   CONNECT               command that runs `connect local` (default: datumctl connect)
+#   DATUM_CONNECT_SIGNING release signing properties; when set, builds and shares
+#                         the release APK, which phones that installed from the
+#                         download bucket require. Otherwise shares a debug build.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -19,7 +22,13 @@ if [[ "${1:-}" == "--no-build" ]]; then
   build=0
   shift
 fi
-apk="${1:-app/build/outputs/apk/debug/app-debug.apk}"
+if [[ -n "${DATUM_CONNECT_SIGNING:-}" ]]; then
+  variant=Release
+  apk="${1:-app/build/outputs/apk/release/app-release.apk}"
+else
+  variant=Debug
+  apk="${1:-app/build/outputs/apk/debug/app-debug.apk}"
+fi
 connect="${CONNECT:-datumctl connect}"
 
 # Fail before building if the plugin predates project-less sharing.
@@ -30,7 +39,7 @@ if ! $connect local --help >/dev/null 2>&1; then
 fi
 
 if [[ $build == 1 ]]; then
-  gradle -q assembleDebug -PrustProfile=release -PrustAbis="${RUST_ABIS:-arm64-v8a}"
+  gradle -q "assemble$variant" -PrustProfile=release -PrustAbis="${RUST_ABIS:-arm64-v8a}"
 fi
 [[ -f "$apk" ]] || { echo "APK not found: $apk" >&2; exit 1; }
 
