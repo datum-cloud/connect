@@ -48,6 +48,40 @@ func TestLocalTarget(t *testing.T) {
 	}
 }
 
+func TestDescribePath(t *testing.T) {
+	ms := func(v int64) *int64 { return &v }
+	tests := []struct {
+		event foregroundEvent
+		want  string
+	}{
+		{foregroundEvent{Path: "direct", Remote: "[2001:db8::1]:4433", RTTMs: ms(12)}, "direct to [2001:db8::1]:4433, 12 ms"},
+		{foregroundEvent{Path: "relay", Remote: "https://relay.example./", RTTMs: ms(150)}, "relayed via https://relay.example./, 150 ms"},
+		{foregroundEvent{Path: "unknown"}, "path unknown"},
+	}
+	for _, tt := range tests {
+		if got := describePath(tt.event); got != tt.want {
+			t.Errorf("describePath = %q, want %q", got, tt.want)
+		}
+	}
+}
+
+func TestLocalCommandShowsDevicePaths(t *testing.T) {
+	stdout := `{"event":"share_ready","ticket":"DCSHARE2T"}
+{"event":"share_paired","peer":"66ed43143f88520ba7cae1b7f7eb10b9","name":"pixel"}
+{"event":"share_path","peer":"66ed43143f88520ba7cae1b7f7eb10b9","path":"relay","remote":"https://relay.example./","rtt_ms":150}
+{"event":"share_path","peer":"66ed43143f88520ba7cae1b7f7eb10b9","path":"direct","remote":"[2001:db8::1]:4433","rtt_ms":12}`
+	exe, _ := fakeDaemon(t, stdout, "", 0)
+	out, err := runCommand(t, exe, "local", "--port", "9999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"  pixel: relayed via https://relay.example./, 150 ms", "  pixel: direct to [2001:db8::1]:4433, 12 ms"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestShareName(t *testing.T) {
 	if got, err := shareName("", "localhost:9999", false); err != nil || got != deviceNameHint()+":9999" {
 		t.Fatalf("default = %q, %v", got, err)

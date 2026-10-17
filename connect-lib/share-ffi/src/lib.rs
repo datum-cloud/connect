@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use connect_share::{DialOptions, ShareTicket, dial};
+use connect_share::{DialEvent, DialOptions, ShareTicket, dial};
 use tokio_util::sync::CancellationToken;
 
 uniffi::setup_scaffolding!();
@@ -75,12 +75,50 @@ pub fn device_endpoint_id(device_key: Vec<u8>) -> Result<String, ShareError> {
     Ok(secret_key(&device_key)?.public().to_string())
 }
 
+/// How traffic reaches the sharer right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PathKind {
+    /// Straight between the devices.
+    Direct,
+    /// Through an iroh relay.
+    Relay,
+    Unknown,
+}
+
+/// A path report. Sent when the path changes between direct and relayed or
+/// to another address, and when latency moves by more than a quarter.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PathReport {
+    pub kind: PathKind,
+    /// The sharer's address on this path: an IP and port, or the relay URL.
+    pub remote: Option<String>,
+    pub rtt_ms: Option<u32>,
+}
+
+impl From<connect_share::PathInfo> for PathReport {
+    fn from(path: connect_share::PathInfo) -> Self {
+        Self {
+            kind: match path.kind {
+                connect_share::PathKind::Direct => PathKind::Direct,
+                connect_share::PathKind::Relay => PathKind::Relay,
+                connect_share::PathKind::Unknown => PathKind::Unknown,
+            },
+            remote: path.remote,
+            rtt_ms: path
+                .rtt
+                .map(|rtt| rtt.as_millis().min(u32::MAX as u128) as u32),
+        }
+    }
+}
+
 /// Receives dial progress. Called from a library thread.
 #[uniffi::export(with_foreign)]
 pub trait DialListener: Send + Sync {
     /// Pairing succeeded and `local_addr` accepts connections.
     /// `sharer_name` is the sharer's name for the service, if it sent one.
     fn on_ready(&self, local_addr: String, sharer_name: Option<String>);
+    /// The path to the sharer changed. Only reported while traffic flows.
+    fn on_path(&self, path: PathReport);
     /// The dial ended. `error` is `None` after [`DialSession::stop`].
     fn on_stopped(&self, error: Option<String>);
 }
@@ -121,11 +159,19 @@ impl DialSession {
         RUNTIME.spawn(async move {
             let ready_listener = listener.clone();
             let ready_session = task_session.clone();
-            let result = dial(options, task_session.cancel.clone(), move |ready| {
-                let addr = ready.local_addr.to_string();
-                *ready_session.local_addr.lock().expect("local_addr lock") = Some(addr.clone());
-                ready_listener.on_ready(addr, ready.sharer_name.clone());
-            })
+            let result = dial(
+                options,
+                task_session.cancel.clone(),
+                move |event| match event {
+                    DialEvent::Ready(ready) => {
+                        let addr = ready.local_addr.to_string();
+                        *ready_session.local_addr.lock().expect("local_addr lock") =
+                            Some(addr.clone());
+                        ready_listener.on_ready(addr, ready.sharer_name);
+                    }
+                    DialEvent::Path(path) => ready_listener.on_path(path.into()),
+                },
+            )
             .await;
             if let Err(error) = &result {
                 tracing::warn!(%error, "share_ffi_dial_failed");

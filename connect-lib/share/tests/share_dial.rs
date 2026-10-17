@@ -1,7 +1,9 @@
 //! End to end over loopback with relays disabled: share, pair, dial, forward.
 use std::time::Duration;
 
-use connect_share::{DialOptions, ShareEvent, ShareOptions, ShareTicket, dial, share};
+use connect_share::{
+    DialEvent, DialOptions, PathInfo, PathKind, ShareEvent, ShareOptions, ShareTicket, dial, share,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -79,15 +81,31 @@ async fn start_share(
     (loopback_only(ticket), rx, cancel)
 }
 
+type Ready = tokio::sync::oneshot::Receiver<(std::net::SocketAddr, Option<String>)>;
+
 async fn start_dial(
     ticket: ShareTicket,
 ) -> (
-    tokio::sync::oneshot::Receiver<(std::net::SocketAddr, Option<String>)>,
+    Ready,
     tokio::task::JoinHandle<Result<(), connect_share::Error>>,
     CancellationToken,
 ) {
+    let (ready, task, cancel, _paths) = start_dial_with_paths(ticket).await;
+    (ready, task, cancel)
+}
+
+async fn start_dial_with_paths(
+    ticket: ShareTicket,
+) -> (
+    Ready,
+    tokio::task::JoinHandle<Result<(), connect_share::Error>>,
+    CancellationToken,
+    mpsc::UnboundedReceiver<PathInfo>,
+) {
     let cancel = CancellationToken::new();
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let (path_tx, path_rx) = mpsc::unbounded_channel();
+    let mut tx = Some(tx);
     let task = tokio::spawn({
         let cancel = cancel.clone();
         async move {
@@ -100,14 +118,21 @@ async fn start_dial(
                     relay_urls: Some(Vec::new()),
                 },
                 cancel,
-                |ready| {
-                    let _ = tx.send((ready.local_addr, ready.sharer_name.clone()));
+                move |event| match event {
+                    DialEvent::Ready(ready) => {
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.send((ready.local_addr, ready.sharer_name));
+                        }
+                    }
+                    DialEvent::Path(path) => {
+                        let _ = path_tx.send(path);
+                    }
                 },
             )
             .await
         }
     });
-    (rx, task, cancel)
+    (rx, task, cancel, path_rx)
 }
 
 #[tokio::test]
@@ -133,6 +158,47 @@ async fn paired_peer_reaches_shared_service() {
         stream.read_exact(&mut reply).await.unwrap();
         assert_eq!(&reply, b"pong");
     }
+    dial_cancel.cancel();
+    share_cancel.cancel();
+}
+
+/// Both ends report the path once traffic flows. With relays disabled the
+/// only possible path is direct.
+#[tokio::test]
+async fn both_ends_report_a_direct_path() {
+    let (ticket, mut events, share_cancel) = start_share(4).await;
+    let (ready, _task, dial_cancel, mut dial_paths) = start_dial_with_paths(ticket).await;
+    let (local, _) = tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("dial ready")
+        .unwrap();
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.unwrap();
+
+    let dial_path = tokio::time::timeout(Duration::from_secs(10), dial_paths.recv())
+        .await
+        .expect("dial path report")
+        .unwrap();
+    assert_eq!(dial_path.kind, PathKind::Direct, "{dial_path:?}");
+    assert!(
+        dial_path.remote.is_some() && dial_path.rtt.is_some(),
+        "{dial_path:?}"
+    );
+
+    let share_path = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await {
+                Some(ShareEvent::Path { path, .. }) => break path,
+                Some(_) => continue,
+                None => panic!("share ended"),
+            }
+        }
+    })
+    .await
+    .expect("share path report");
+    assert_eq!(share_path.kind, PathKind::Direct, "{share_path:?}");
     dial_cancel.cancel();
     share_cancel.cancel();
 }

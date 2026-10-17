@@ -118,6 +118,7 @@ func runLocal(cmd *cobra.Command, opts *options, target, name string, maxPeers i
 	out := cmd.OutOrStdout()
 	jsonOut := outputFormat(cmd) == "json"
 	daemonArgs := []string{"local", target, "--max-peers", strconv.Itoa(maxPeers), "--name", name}
+	names := map[string]string{}
 	return runForeground(cmd, opts, daemonArgs, func(line []byte, event foregroundEvent) {
 		if jsonOut {
 			fmt.Fprintln(out, string(line))
@@ -144,7 +145,14 @@ func runLocal(cmd *cobra.Command, opts *options, target, name string, maxPeers i
 			if name == "" {
 				name = "device"
 			}
+			names[event.Peer] = name
 			fmt.Fprintf(out, "✓ Paired %s (%s)\n", name, shortID(event.Peer))
+		case "share_path":
+			name := names[event.Peer]
+			if name == "" {
+				name = shortID(event.Peer)
+			}
+			fmt.Fprintf(out, "  %s: %s\n", name, describePath(event))
 		}
 	})
 }
@@ -165,6 +173,10 @@ func runTicketDial(cmd *cobra.Command, opts *options, ticket string, bind uint16
 			fmt.Fprintln(out, string(line))
 			return
 		}
+		if event.Event == "dial_path" {
+			fmt.Fprintf(out, "  Path: %s\n", describePath(event))
+			return
+		}
 		if event.Event == "dial_ready" {
 			if event.SharerName != "" {
 				fmt.Fprintf(out, "✓ Paired with %q. The shared service is at %s until you press Ctrl+C.\n", event.SharerName, event.LocalAddr)
@@ -183,6 +195,9 @@ type foregroundEvent struct {
 	Name       string `json:"name,omitempty"`
 	LocalAddr  string `json:"local_addr,omitempty"`
 	SharerName string `json:"sharer_name,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Remote     string `json:"remote,omitempty"`
+	RTTMs      *int64 `json:"rtt_ms,omitempty"`
 }
 
 // runForeground runs datum-connectd in a project-less foreground mode until it
@@ -337,6 +352,30 @@ func (l *logTail) lastError() string {
 		plain = append([]string{strings.TrimPrefix(text, "error: ")}, plain...)
 	}
 	return strings.Join(plain, "\n")
+}
+
+// describePath renders a path report, for example "direct to
+// [2001:db8::1]:4433, 12 ms" or "relayed via https://relay.example./, 150 ms".
+func describePath(event foregroundEvent) string {
+	var b strings.Builder
+	switch event.Path {
+	case "direct":
+		b.WriteString("direct")
+		if event.Remote != "" {
+			b.WriteString(" to " + event.Remote)
+		}
+	case "relay":
+		b.WriteString("relayed")
+		if event.Remote != "" {
+			b.WriteString(" via " + event.Remote)
+		}
+	default:
+		b.WriteString("path unknown")
+	}
+	if event.RTTMs != nil {
+		fmt.Fprintf(&b, ", %d ms", *event.RTTMs)
+	}
+	return b.String()
 }
 
 func outputFormat(cmd *cobra.Command) string {

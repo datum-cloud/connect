@@ -10,6 +10,8 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import net.datum.connect.share.DialListener
 import net.datum.connect.share.DialSession
+import net.datum.connect.share.PathKind
+import net.datum.connect.share.PathReport
 import net.datum.connect.share.ShareException
 import net.datum.connect.share.deviceEndpointId
 import net.datum.connect.share.generateDeviceKey
@@ -71,12 +73,17 @@ class BindingsTest {
             val stopped = CountDownLatch(1)
             val readyAddr = AtomicReference<String>()
             val readySharer = AtomicReference<String?>()
+            val paths = java.util.concurrent.CopyOnWriteArrayList<PathReport>()
             val stopError = AtomicReference<String?>("not stopped")
             val session = DialSession.start(ticket, 0u, generateDeviceKey(), "jvm-test", object : DialListener {
                 override fun onReady(localAddr: String, sharerName: String?) {
                     readySharer.set(sharerName)
                     readyAddr.set(localAddr)
                     ready.countDown()
+                }
+
+                override fun onPath(path: PathReport) {
+                    paths.add(path)
                 }
 
                 override fun onStopped(error: String?) {
@@ -97,6 +104,12 @@ class BindingsTest {
                 val body = socket.getInputStream().readBytes().decodeToString()
                 assertTrue(body, body.endsWith("hello from origin"))
             }
+
+            // Traffic flowed, so the dialer reports how it reached the sharer.
+            val deadline = System.currentTimeMillis() + 10_000
+            while (paths.isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(50)
+            assertTrue("path reported", paths.isNotEmpty())
+            assertTrue(paths.last().summary(), paths.last().kind != PathKind.UNKNOWN)
 
             session.stop()
             assertTrue("dial stopped", stopped.await(10, TimeUnit.SECONDS))

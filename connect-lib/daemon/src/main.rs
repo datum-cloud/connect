@@ -140,6 +140,17 @@ fn main() {
     runtime.block_on(run_console(args));
 }
 
+/// A path report: `path` is direct, relay, or unknown; `remote` the peer's
+/// address on it; `rtt_ms` the round-trip time.
+fn path_json(event: &str, path: &connect_share::PathInfo) -> serde_json::Value {
+    serde_json::json!({
+        "event": event,
+        "path": path.kind.as_str(),
+        "remote": path.remote,
+        "rtt_ms": path.rtt.map(|rtt| rtt.as_millis() as u64),
+    })
+}
+
 /// One machine-readable event per stdout line; the plugin parses these.
 fn emit(event: serde_json::Value) {
     println!("{event}");
@@ -199,6 +210,11 @@ async fn run_projectless(command: Projectless) {
                     "peer": peer.to_string(),
                     "name": name,
                 })),
+                connect_share::ShareEvent::Path { peer, path } => {
+                    let mut event = path_json("share_path", &path);
+                    event["peer"] = peer.to_string().into();
+                    emit(event)
+                }
             })
             .await
         }
@@ -215,12 +231,13 @@ async fn run_projectless(command: Projectless) {
                 name,
                 relay_urls: relays(relay_urls),
             };
-            connect_share::dial(options, cancel, |ready| {
-                emit(serde_json::json!({
+            connect_share::dial(options, cancel, |event| match event {
+                connect_share::DialEvent::Ready(ready) => emit(serde_json::json!({
                     "event": "dial_ready",
                     "local_addr": ready.local_addr,
                     "sharer_name": ready.sharer_name,
-                }))
+                })),
+                connect_share::DialEvent::Path(path) => emit(path_json("dial_path", &path)),
             })
             .await
         }

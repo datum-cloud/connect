@@ -244,6 +244,15 @@ private fun ConnectionCard(connection: Connection, onRename: () -> Unit) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = if (status is Status.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
             )
+            if (status is Status.Ready) {
+                val path = connection.path
+                Text(
+                    path?.let { p -> p.summary() + (p.remote?.let { "\n$it" } ?: "") }
+                        ?: "Path appears once traffic flows",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (status is Status.Ready) {
                     Button(onClick = {

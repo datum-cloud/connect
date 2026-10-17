@@ -14,6 +14,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import net.datum.connect.share.DialListener
 import net.datum.connect.share.DialSession
+import net.datum.connect.share.PathReport
 
 /**
  * Runs one dial per active connection while the user switches to a browser.
@@ -131,6 +132,10 @@ class DialService : Service() {
             }
         }
 
+        override fun onPath(path: PathReport) = onMain {
+            Connections.setPath(id, path)
+        }
+
         override fun onReady(localAddr: String, sharerName: String?) = onMain {
             sharerName?.let { Connections.offerSharerName(id, it) }
             Connections.setStatus(id, Status.Ready(localAddr))
@@ -156,7 +161,7 @@ class DialService : Service() {
         val title = if (active.size == 1) "1 connection open" else "${active.size} connections open"
         val lines = active.map { c ->
             when (val status = c.status) {
-                is Status.Ready -> "${c.name}: http://${status.localAddr}"
+                is Status.Ready -> "${c.name}: http://${status.localAddr}" + (c.path?.let { " · ${it.summary()}" } ?: "")
                 else -> "${c.name}: pairing…"
             }
         }

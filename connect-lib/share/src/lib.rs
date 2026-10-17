@@ -12,11 +12,13 @@
 
 mod dial;
 mod pair;
+mod path;
 mod share;
 mod ticket;
 
-pub use dial::{DialOptions, DialReady, dial};
+pub use dial::{DialEvent, DialOptions, DialReady, dial};
 pub use pair::PAIR_ALPN;
+pub use path::{PathInfo, PathKind};
 pub use share::{ShareEvent, ShareOptions, share};
 pub use ticket::{ShareTicket, TicketError};
 

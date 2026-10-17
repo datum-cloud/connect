@@ -27,7 +27,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::presets};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
     net::{TcpStream, UdpSocket},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, broadcast, mpsc},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -271,6 +271,9 @@ struct Inner {
     accept_task: Mutex<Option<JoinHandle<()>>>,
     metrics: Metrics,
     peer_diagnostics: RwLock<HashMap<EndpointId, PeerDiagnostics>>,
+    /// Last path report published per peer, and when, for throttling.
+    published_paths: std::sync::Mutex<HashMap<EndpointId, (PeerDiagnostics, Instant)>>,
+    path_updates: broadcast::Sender<(EndpointId, PeerDiagnostics)>,
     ip_registry: Arc<ip::Registry>,
     protocols: Protocols,
 }
@@ -336,6 +339,8 @@ impl Transport {
                 accept_task: Mutex::new(None),
                 metrics: Metrics::default(),
                 peer_diagnostics: RwLock::new(HashMap::new()),
+                published_paths: std::sync::Mutex::new(HashMap::new()),
+                path_updates: broadcast::channel(64).0,
                 ip_registry,
                 protocols,
             }),
@@ -411,6 +416,16 @@ impl Transport {
     /// Returns the most recently selected iroh path for a peer.
     pub fn peer_diagnostics(&self, peer: EndpointId) -> Option<PeerDiagnostics> {
         self.inner.peer_diagnostics.read().ok()?.get(&peer).cloned()
+    }
+
+    /// Reports the selected path to each peer as it changes: immediately when
+    /// it switches between direct and relayed or to another address, and for
+    /// latency only on a change of more than a quarter, at most every
+    /// [`PATH_RTT_REPORT_INTERVAL`]. Driven by iroh's path notifications plus
+    /// a [`PATH_RTT_SAMPLE_INTERVAL`] latency sample per open connection, so
+    /// an idle connection costs nothing extra on the network.
+    pub fn path_updates(&self) -> broadcast::Receiver<(EndpointId, PeerDiagnostics)> {
+        self.inner.path_updates.subscribe()
     }
 
     /// Verifies QUIC reachability and returns handshake latency.
@@ -863,30 +878,103 @@ impl Transport {
         Some(id)
     }
 
+    /// Records the connection's selected path now, then follows it until the
+    /// connection closes or the transport shuts down.
     fn observe_connection(&self, conn: &iroh::endpoint::Connection) {
-        let paths = conn.paths();
-        let selected = paths.iter().find(|path| path.is_selected());
-        let diagnostics = match selected {
-            Some(path) => PeerDiagnostics {
-                path: if path.is_ip() {
-                    ConnectionPath::Direct
-                } else if path.is_relay() {
-                    ConnectionPath::Relay
-                } else {
-                    ConnectionPath::Unknown
-                },
-                detail: Some(path.remote_addr().to_string()),
-                latency: Some(path.rtt()),
-            },
-            None => PeerDiagnostics {
-                path: ConnectionPath::Unknown,
-                detail: None,
-                latency: None,
-            },
-        };
+        let peer = conn.remote_id();
+        self.record_path(peer, path_diagnostics(conn.paths().iter()));
+        let transport = self.clone();
+        let conn = conn.clone();
+        let shutdown = self.inner.shutdown.clone();
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let mut changes = conn.paths_stream();
+            let mut sample = tokio::time::interval(PATH_RTT_SAMPLE_INTERVAL);
+            sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            sample.tick().await;
+            loop {
+                let diagnostics = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    paths = changes.next() => match paths {
+                        Some(paths) => path_diagnostics(paths.iter()),
+                        None => break,
+                    },
+                    _ = sample.tick() => path_diagnostics(conn.paths().iter()),
+                };
+                transport.record_path(peer, diagnostics);
+            }
+        });
+    }
+
+    fn record_path(&self, peer: EndpointId, diagnostics: PeerDiagnostics) {
         if let Ok(mut peers) = self.inner.peer_diagnostics.write() {
-            peers.insert(conn.remote_id(), diagnostics);
+            peers.insert(peer, diagnostics.clone());
         }
+        let Ok(mut published) = self.inner.published_paths.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        if let Some((last, at)) = published.get(&peer)
+            && !path_report_due(last, *at, &diagnostics, now)
+        {
+            return;
+        }
+        published.insert(peer, (diagnostics.clone(), now));
+        // No subscribers is normal; reports are best effort.
+        let _ = self.inner.path_updates.send((peer, diagnostics));
+    }
+}
+
+/// How often an open connection samples its latency between path changes.
+pub const PATH_RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+/// Minimum time between latency-only path reports for one peer.
+pub const PATH_RTT_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Summarizes the selected path of a connection's open paths.
+fn path_diagnostics<'a>(
+    mut paths: impl Iterator<Item = iroh::endpoint::Path<'a>>,
+) -> PeerDiagnostics {
+    match paths.find(|path| path.is_selected()) {
+        Some(path) => PeerDiagnostics {
+            path: if path.is_ip() {
+                ConnectionPath::Direct
+            } else if path.is_relay() {
+                ConnectionPath::Relay
+            } else {
+                ConnectionPath::Unknown
+            },
+            detail: Some(path.remote_addr().to_string()),
+            latency: Some(path.rtt()),
+        },
+        None => PeerDiagnostics {
+            path: ConnectionPath::Unknown,
+            detail: None,
+            latency: None,
+        },
+    }
+}
+
+/// A path change is always reported; a latency change only when it moved by
+/// more than a quarter and the last report is older than
+/// [`PATH_RTT_REPORT_INTERVAL`].
+fn path_report_due(
+    last: &PeerDiagnostics,
+    at: Instant,
+    next: &PeerDiagnostics,
+    now: Instant,
+) -> bool {
+    if last.path != next.path || last.detail != next.detail {
+        return true;
+    }
+    if now.duration_since(at) < PATH_RTT_REPORT_INTERVAL {
+        return false;
+    }
+    match (last.latency, next.latency) {
+        (Some(a), Some(b)) => {
+            let (a, b) = (a.as_secs_f64(), b.as_secs_f64());
+            (a - b).abs() > a.max(b) * 0.25
+        }
+        (a, b) => a.is_some() != b.is_some(),
     }
 }
 
@@ -2157,5 +2245,56 @@ mod tests {
         })
         .await
         .expect("bounded receive queue drops excess datagrams");
+    }
+}
+
+#[cfg(test)]
+mod path_report_tests {
+    use super::*;
+
+    fn report(path: ConnectionPath, detail: &str, rtt_ms: u64) -> PeerDiagnostics {
+        PeerDiagnostics {
+            path,
+            detail: Some(detail.into()),
+            latency: Some(Duration::from_millis(rtt_ms)),
+        }
+    }
+
+    #[test]
+    fn path_changes_are_reported_at_once() {
+        let now = Instant::now();
+        let relay = report(ConnectionPath::Relay, "relay", 150);
+        assert!(path_report_due(
+            &relay,
+            now,
+            &report(ConnectionPath::Direct, "[2001:db8::1]:1", 12),
+            now
+        ));
+        assert!(path_report_due(
+            &relay,
+            now,
+            &report(ConnectionPath::Relay, "other-relay", 150),
+            now
+        ));
+    }
+
+    #[test]
+    fn latency_changes_are_throttled_and_need_a_real_change() {
+        let at = Instant::now();
+        let last = report(ConnectionPath::Direct, "a", 100);
+        let soon = at + Duration::from_secs(2);
+        let later = at + PATH_RTT_REPORT_INTERVAL + Duration::from_secs(1);
+        assert!(
+            !path_report_due(&last, at, &report(ConnectionPath::Direct, "a", 200), soon),
+            "throttled"
+        );
+        assert!(
+            !path_report_due(&last, at, &report(ConnectionPath::Direct, "a", 110), later),
+            "small change"
+        );
+        assert!(
+            path_report_due(&last, at, &report(ConnectionPath::Direct, "a", 140), later),
+            "large change"
+        );
     }
 }

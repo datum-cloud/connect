@@ -12,7 +12,7 @@ use iroh::{EndpointId, RelayUrl, SecretKey};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Error, ShareTicket, configure_relays,
+    Error, PathInfo, ShareTicket, configure_relays,
     pair::{PAIR_ALPN, PairingHandler, PairingProtocol},
     wait_online,
 };
@@ -45,6 +45,9 @@ pub enum ShareEvent {
         peer: EndpointId,
         name: Option<String>,
     },
+    /// The path to a paired `peer` changed. Reported only while that peer
+    /// has a connection open.
+    Path { peer: EndpointId, path: PathInfo },
 }
 
 /// Shares `options.target` until `cancel` fires, then closes the endpoint.
@@ -94,6 +97,8 @@ async fn run(
     paired: &mut tokio::sync::mpsc::UnboundedReceiver<crate::pair::Paired>,
     on_event: &mut impl FnMut(ShareEvent),
 ) -> Result<(), Error> {
+    // Subscribe first so no report between pairing and the loop is lost.
+    let mut paths = transport.path_updates();
     if relays {
         wait_online(transport).await?;
     }
@@ -116,6 +121,18 @@ async fn run(
         let event = tokio::select! {
             _ = cancel.cancelled() => break,
             event = paired.recv() => event,
+            update = paths.recv() => {
+                match update {
+                    // Only paired devices; other peers are refused anyway.
+                    Ok((peer, diagnostics)) if peers.contains(&peer) => on_event(ShareEvent::Path {
+                        peer,
+                        path: diagnostics.into(),
+                    }),
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+                continue;
+            }
         };
         let Some(event) = event else { break };
         peers.insert(event.peer);
@@ -128,6 +145,15 @@ async fn run(
             peer: event.peer,
             name: event.name,
         });
+        // The pairing connection already reported this peer's path, before
+        // the peer was paired, so later identical reports are not repeated.
+        // Report the current path now.
+        if let Some(diagnostics) = transport.peer_diagnostics(event.peer) {
+            on_event(ShareEvent::Path {
+                peer: event.peer,
+                path: diagnostics.into(),
+            });
+        }
     }
     tracing::info!("share_stopped");
     Ok(())

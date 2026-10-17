@@ -6,7 +6,7 @@ use iroh::{RelayUrl, SecretKey};
 use tokio::{io::copy_bidirectional, net::TcpListener};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Error, ShareTicket, configure_relays, pair::request_pairing, wait_online};
+use crate::{Error, PathInfo, ShareTicket, configure_relays, pair::request_pairing, wait_online};
 
 /// Inputs for one dial session.
 #[derive(Clone, Debug)]
@@ -24,6 +24,16 @@ pub struct DialOptions {
     pub relay_urls: Option<Vec<RelayUrl>>,
 }
 
+/// Progress reported to the caller.
+#[derive(Clone, Debug)]
+pub enum DialEvent {
+    /// Paired; the local listener accepts connections. Sent once.
+    Ready(DialReady),
+    /// The path to the sharer changed. Reported only while a connection is
+    /// open, so it describes the most recent traffic.
+    Path(PathInfo),
+}
+
 /// Reported once the local listener accepts connections.
 #[derive(Clone, Debug)]
 pub struct DialReady {
@@ -37,7 +47,7 @@ pub struct DialReady {
 pub async fn dial(
     options: DialOptions,
     cancel: CancellationToken,
-    on_ready: impl FnOnce(&DialReady),
+    on_event: impl FnMut(DialEvent),
 ) -> Result<(), Error> {
     let key = options.secret_key.unwrap_or_else(SecretKey::generate);
     let (config, relays) = configure_relays(TransportConfig::new(key), options.relay_urls);
@@ -53,7 +63,7 @@ pub async fn dial(
         options.bind,
         options.name,
         &cancel,
-        on_ready,
+        on_event,
     )
     .await;
     transport.shutdown().await;
@@ -67,8 +77,9 @@ async fn run(
     bind: SocketAddr,
     name: Option<String>,
     cancel: &CancellationToken,
-    on_ready: impl FnOnce(&DialReady),
+    mut on_event: impl FnMut(DialEvent),
 ) -> Result<(), Error> {
+    let mut paths = transport.path_updates();
     if relays && ticket.endpoint.relay_urls().next().is_some() {
         wait_online(transport).await?;
     }
@@ -85,10 +96,10 @@ async fn run(
     let local_addr = listener
         .local_addr()
         .map_err(|source| Error::Bind { addr: bind, source })?;
-    on_ready(&DialReady {
+    on_event(DialEvent::Ready(DialReady {
         local_addr,
         sharer_name,
-    });
+    }));
     tracing::info!(%local_addr, sharer = %ticket.endpoint.id, "dial_ready");
 
     let destination = DestinationId::tcp(ticket.port);
@@ -96,6 +107,16 @@ async fn run(
         let accepted = tokio::select! {
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => accepted,
+            update = paths.recv() => {
+                match update {
+                    Ok((peer, diagnostics)) if peer == ticket.endpoint.id => {
+                        on_event(DialEvent::Path(diagnostics.into()));
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+                continue;
+            }
         };
         let (mut local, _) = match accepted {
             Ok(accepted) => accepted,

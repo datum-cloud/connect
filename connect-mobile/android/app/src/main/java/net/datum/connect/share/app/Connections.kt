@@ -1,6 +1,8 @@
 package net.datum.connect.share.app
 
 import java.io.File
+import net.datum.connect.share.PathKind
+import net.datum.connect.share.PathReport
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -30,6 +32,8 @@ data class Connection(
     val ticket: String,
     val requestedPort: Int,
     val status: Status,
+    /** The live path to the sharer while ready; never saved. */
+    val path: PathReport? = null,
 )
 
 /**
@@ -127,7 +131,11 @@ object Connections {
 
     fun get(id: Long): Connection? = mutable.value.firstOrNull { it.id == id }
 
-    fun setStatus(id: Long, status: Status) = modify(id) { it.copy(status = status) }
+    /** A new status clears the path unless the connection stays ready. */
+    fun setStatus(id: Long, status: Status) =
+        modify(id) { it.copy(status = status, path = if (status is Status.Ready) it.path else null) }
+
+    fun setPath(id: Long, path: PathReport) = modify(id) { it.copy(path = path) }
 
     /** Adopts the sharer's name unless the user already chose one. */
     fun offerSharerName(id: Long, sharerName: String) {
@@ -193,3 +201,13 @@ fun usedPorts(connections: List<Connection>): Set<Int> =
             (c.status as? Status.Ready)?.localAddr?.substringAfterLast(':')?.toIntOrNull(),
         )
     }.toSet()
+
+/** For display: "Direct · 12 ms", "Relayed · 150 ms", or "Path unknown". */
+fun PathReport.summary(): String {
+    val kind = when (kind) {
+        PathKind.DIRECT -> "Direct"
+        PathKind.RELAY -> "Relayed"
+        PathKind.UNKNOWN -> "Path unknown"
+    }
+    return rttMs?.let { "$kind · $it ms" } ?: kind
+}

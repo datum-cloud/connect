@@ -74,6 +74,15 @@ func TestLocalShareAndTicketDial(t *testing.T) {
 		t.Fatalf("body = %q", body)
 	}
 
+	// Both ends report the path once traffic flows; with relays disabled it
+	// can only be direct.
+	if path := dial.next(t, "dial_path"); path["path"] != "direct" {
+		t.Fatalf("dial_path = %v", path)
+	}
+	if path := share.next(t, "share_path"); path["path"] != "direct" {
+		t.Fatalf("share_path = %v", path)
+	}
+
 	// A second device is refused once the peer limit is reached.
 	second := exec.Command(testPlugin, "dial", ticket, "-o", "json")
 	second.Env = env
