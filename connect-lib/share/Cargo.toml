@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 connect-transport = { path = "../transport" }
+data-encoding = "2.10"
 iroh = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }

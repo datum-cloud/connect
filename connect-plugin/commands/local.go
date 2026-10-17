@@ -17,19 +17,19 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/mdp/qrterminal/v3"
 	"github.com/spf13/cobra"
 
 	"go.datum.net/datumctl-plugins/connect/internal/daemonservice"
 )
 
 // shareTicketPrefix marks a project-less share ticket (connect-lib/share).
-const shareTicketPrefix = "dcshare1"
+// Tickets are case-insensitive.
+const shareTicketPrefix = "DCSHARE2"
 
 var foregroundExecutable = daemonservice.ForegroundExecutable
 
 func isShareTicket(value string) bool {
-	return strings.HasPrefix(strings.TrimSpace(value), shareTicketPrefix)
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(value)), shareTicketPrefix)
 }
 
 func newLocal(opts *options) *cobra.Command {
@@ -98,16 +98,9 @@ func runLocal(cmd *cobra.Command, opts *options, target string, maxPeers int) er
 			fmt.Fprintln(out, "The ticket also contains this computer's IP addresses.")
 			if terminalWriter(out) {
 				fmt.Fprintln(out)
-				qrterminal.GenerateWithConfig(event.Ticket, qrterminal.Config{
-					Level:          qrterminal.L,
-					Writer:         out,
-					HalfBlocks:     true,
-					BlackChar:      qrterminal.BLACK_BLACK,
-					WhiteBlackChar: qrterminal.WHITE_BLACK,
-					WhiteChar:      qrterminal.WHITE_WHITE,
-					BlackWhiteChar: qrterminal.BLACK_WHITE,
-					QuietZone:      2,
-				})
+				if err := writeQR(out, event.Ticket); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "could not draw QR code: %v\n", err)
+				}
 				fmt.Fprintln(out, "Scan with the Datum Connect Android app, or on another computer run:")
 			} else {
 				fmt.Fprintln(out, "On another computer, run:")

@@ -33,7 +33,7 @@ func TestConnectServiceGateRequired(t *testing.T) {
 
 func TestTicketDialSkipsServiceGate(t *testing.T) {
 	dial := &cobra.Command{Use: "dial"}
-	if connectServiceGateRequired(dial, []string{"dcshare1abc"}) {
+	if connectServiceGateRequired(dial, []string{"DCSHARE2abc"}) {
 		t.Fatal("a share-ticket dial must not require Connect service access")
 	}
 	if !connectServiceGateRequired(dial, []string{"server:22"}) {

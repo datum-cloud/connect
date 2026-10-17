@@ -705,6 +705,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "connect-transport",
+ "data-encoding",
  "iroh",
  "rand 0.9.2",
  "serde",
