@@ -331,8 +331,15 @@ async fn probe(state: Shared) {
                 tcp("[2606:4700:4700::1111]:443").await,
             ),
             (
-                "IPv4 TCP to Cloudflare 1.1.1.1:443".into(),
+                "IPv4 TCP to Cloudflare 1.1.1.1:443 (literal address; needs a native IPv4 route)"
+                    .into(),
                 tcp("1.1.1.1:443").await,
+            ),
+            (
+                // NAT64's well-known prefix carries IPv4 over IPv6, which is
+                // how an IPv6-only instance reaches IPv4 hosts.
+                "IPv4 via NAT64 to Cloudflare [64:ff9b::1.1.1.1]:443".into(),
+                tcp("[64:ff9b::101:101]:443").await,
             ),
             ("DNS datum.net".into(), resolve("datum.net:443").await),
             (
@@ -431,6 +438,53 @@ fn ipv6_addresses() -> Vec<String> {
                 "{} {}/{prefix}",
                 f.get(5)?,
                 std::net::Ipv6Addr::from(octets)
+            ))
+        })
+        .collect()
+}
+
+fn none_if_empty(items: Vec<String>) -> String {
+    if items.is_empty() {
+        "none".into()
+    } else {
+        items.join("; ")
+    }
+}
+
+/// Local IPv4 addresses, other than loopback, from the kernel's FIB.
+fn ipv4_addresses() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut last = None;
+    for line in read("/proc/net/fib_trie").unwrap_or_default().lines() {
+        let line = line.trim();
+        if let Some(addr) = line.strip_prefix("|-- ") {
+            last = Some(addr.to_string());
+        } else if line.contains("/32 host LOCAL")
+            && let Some(addr) = &last
+            && !addr.starts_with("127.")
+            && !out.contains(addr)
+        {
+            out.push(addr.clone());
+        }
+    }
+    out
+}
+
+fn ipv4_default_routes() -> Vec<String> {
+    read("/proc/net/route")
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 3 || f[1] != "00000000" {
+                return None;
+            }
+            let gateway = u32::from_str_radix(f[2], 16).ok()?;
+            Some(format!(
+                "default via {} dev {}",
+                std::net::Ipv4Addr::from(gateway.swap_bytes()),
+                f[0]
             ))
         })
         .collect()
@@ -644,6 +698,8 @@ fn page(state: &Shared, name: &str, started: Instant) -> String {
     let network = vec![
         row("IPv6 addresses", ipv6_addresses().join("; ")),
         row("IPv6 default routes", ipv6_default_routes().join("; ")),
+        row("IPv4 addresses", none_if_empty(ipv4_addresses())),
+        row("IPv4 default routes", none_if_empty(ipv4_default_routes())),
         row("MTU", mtus()),
         row(
             "resolv.conf",
