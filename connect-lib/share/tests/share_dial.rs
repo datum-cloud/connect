@@ -203,6 +203,33 @@ async fn both_ends_report_a_direct_path() {
     share_cancel.cancel();
 }
 
+/// A ticket whose share has stopped fails fast with a plain message.
+#[tokio::test]
+async fn stopped_share_is_unreachable_within_the_timeout() {
+    let (ticket, _events, share_cancel) = start_share(4).await;
+    share_cancel.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    let (_ready, task, _cancel) = start_dial(ticket).await;
+    let result = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("dial finished")
+        .unwrap();
+    assert!(
+        matches!(result, Err(connect_share::Error::Unreachable)),
+        "{result:?}"
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "ticket no longer reachable"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < connect_share::PAIR_TIMEOUT + Duration::from_secs(2),
+        "{elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn wrong_secret_is_refused() {
     let (mut ticket, _events, share_cancel) = start_share(4).await;

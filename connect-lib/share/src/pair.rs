@@ -22,6 +22,11 @@ use crate::Error;
 /// ALPN for the pairing exchange. Shares the transport's endpoint identity.
 pub const PAIR_ALPN: &[u8] = b"datum-connect/share-pair/1";
 
+/// How long a peer waits for the sharer to connect and answer. A running
+/// sharer answers in about a second even through a relay; a stopped one never
+/// does, so waiting longer only delays the error.
+pub const PAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const MAX_MESSAGE: usize = 1024;
 const MAX_NAME: usize = 64;
 
@@ -155,17 +160,30 @@ impl ProtocolHandler for PairingProtocol {
 }
 
 /// Peer side: presents `secret` to `sharer` from `endpoint`'s identity and
-/// returns the sharer's display name, if it sent one.
+/// returns the sharer's display name, if it sent one. Gives up after
+/// [`PAIR_TIMEOUT`] with [`Error::Unreachable`].
 pub(crate) async fn request_pairing(
     endpoint: &Endpoint,
     sharer: EndpointAddr,
     secret: &[u8; 32],
     name: Option<&str>,
 ) -> Result<Option<String>, Error> {
+    tokio::time::timeout(PAIR_TIMEOUT, exchange(endpoint, sharer, secret, name))
+        .await
+        .map_err(|_| Error::Unreachable)?
+}
+
+async fn exchange(
+    endpoint: &Endpoint,
+    sharer: EndpointAddr,
+    secret: &[u8; 32],
+    name: Option<&str>,
+) -> Result<Option<String>, Error> {
+    // A connect error also means the sharer cannot be reached.
     let conn = endpoint
         .connect(sharer, PAIR_ALPN)
         .await
-        .map_err(|e| Error::Pairing(e.to_string()))?;
+        .map_err(|_| Error::Unreachable)?;
     let result = async {
         let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
         let request = Request {

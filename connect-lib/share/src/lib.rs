@@ -17,7 +17,7 @@ mod share;
 mod ticket;
 
 pub use dial::{DialEvent, DialOptions, DialReady, dial};
-pub use pair::PAIR_ALPN;
+pub use pair::{PAIR_ALPN, PAIR_TIMEOUT};
 pub use path::{PathInfo, PathKind};
 pub use share::{ShareEvent, ShareOptions, share};
 pub use ticket::{ShareTicket, TicketError};
@@ -43,6 +43,10 @@ pub enum Error {
     RelayUnavailable,
     #[error("pairing failed: {0}")]
     Pairing(String),
+    /// The sharer did not answer within [`PAIR_TIMEOUT`]: usually its share
+    /// stopped, which ends the ticket.
+    #[error("ticket no longer reachable")]
+    Unreachable,
 }
 
 /// `None` keeps the transport preset's relays. An empty list disables relays,

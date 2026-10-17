@@ -66,7 +66,14 @@ pub async fn dial(
         on_event,
     )
     .await;
-    transport.shutdown().await;
+    if result.is_err() {
+        // A graceful endpoint close waits for in-flight connections to drain,
+        // which would hold back the error by seconds. Report it now and
+        // finish closing in the background.
+        tokio::spawn(async move { transport.shutdown().await });
+    } else {
+        transport.shutdown().await;
+    }
     result
 }
 
