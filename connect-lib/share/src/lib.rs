@@ -16,10 +16,11 @@ mod path;
 mod share;
 mod ticket;
 
+pub use connect_transport::LocalStream;
 pub use dial::{DialEvent, DialOptions, DialReady, dial};
 pub use pair::{PAIR_ALPN, PAIR_TIMEOUT};
 pub use path::{PathInfo, PathKind};
-pub use share::{ShareEvent, ShareOptions, share};
+pub use share::{ShareEvent, ShareOptions, ShareTarget, share};
 pub use ticket::{ShareTicket, TicketError};
 
 /// Errors from either side of a share.

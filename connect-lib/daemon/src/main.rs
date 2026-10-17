@@ -192,7 +192,7 @@ async fn run_projectless(command: Projectless) {
             relay_urls,
         } => {
             let options = connect_share::ShareOptions {
-                target,
+                target: target.into(),
                 relay_urls: relays(relay_urls),
                 max_peers,
                 name: name.clone(),

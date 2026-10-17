@@ -2,7 +2,8 @@
 use std::time::Duration;
 
 use connect_share::{
-    DialEvent, DialOptions, PathInfo, PathKind, ShareEvent, ShareOptions, ShareTicket, dial, share,
+    DialEvent, DialOptions, PathInfo, PathKind, ShareEvent, ShareOptions, ShareTarget, ShareTicket,
+    dial, share,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -61,7 +62,7 @@ async fn start_share(
         async move {
             share(
                 ShareOptions {
-                    target: target.to_string(),
+                    target: target.to_string().into(),
                     relay_urls: Some(Vec::new()),
                     max_peers,
                     name: Some("test\u{1b}[31m service".into()),
@@ -228,6 +229,65 @@ async fn stopped_share_is_unreachable_within_the_timeout() {
         elapsed < connect_share::PAIR_TIMEOUT + Duration::from_secs(2),
         "{elapsed:?}"
     );
+}
+
+/// An in-process target receives the dialer's bytes with no socket in
+/// between.
+#[tokio::test]
+async fn in_process_target_serves_without_a_socket() {
+    let (streams, mut incoming) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            share(
+                ShareOptions {
+                    target: ShareTarget::InProcess { port: 80, streams },
+                    relay_urls: Some(Vec::new()),
+                    max_peers: 4,
+                    name: Some("in-process".into()),
+                },
+                cancel,
+                |event| {
+                    let _ = tx.send(event);
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let Some(ShareEvent::Ready { ticket, target }) = rx.recv().await else {
+        panic!("share did not become ready");
+    };
+    assert_eq!(target, "in-process");
+    assert_eq!(ticket.port, 80);
+    // Echo each delivered session.
+    tokio::spawn(async move {
+        while let Some(mut stream) = incoming.recv().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4];
+                while stream.read_exact(&mut buf).await.is_ok() {
+                    if stream.write_all(b"pong").await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let (ready, _task, dial_cancel) = start_dial(loopback_only(ticket)).await;
+    let (local, _) = tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("dial ready")
+        .unwrap();
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"pong");
+    dial_cancel.cancel();
+    cancel.cancel();
 }
 
 #[tokio::test]

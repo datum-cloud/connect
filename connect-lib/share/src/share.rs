@@ -1,14 +1,15 @@
 //! Sharer side: publish one local TCP service and admit paired peers.
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
     sync::Arc,
 };
 
 use connect_transport::{
-    Access, DestinationId, DestinationPolicy, Policy, Target, Transport, TransportConfig,
+    Access, DestinationId, DestinationPolicy, LocalStream, Policy, Target, Transport,
+    TransportConfig,
 };
 use iroh::{EndpointId, RelayUrl, SecretKey};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -20,8 +21,8 @@ use crate::{
 /// Inputs for one foreground share.
 #[derive(Clone, Debug)]
 pub struct ShareOptions {
-    /// Local `HOST:PORT` to share.
-    pub target: String,
+    /// What to share.
+    pub target: ShareTarget,
     /// Relays to use instead of the transport preset's defaults. An empty
     /// list disables relays.
     pub relay_urls: Option<Vec<RelayUrl>>,
@@ -35,11 +36,9 @@ pub struct ShareOptions {
 /// Progress reported to the caller.
 #[derive(Clone, Debug)]
 pub enum ShareEvent {
-    /// The service is reachable through `ticket`.
-    Ready {
-        ticket: ShareTicket,
-        target: SocketAddr,
-    },
+    /// The service is reachable through `ticket`. `target` describes what is
+    /// shared: the resolved socket address, or "in-process".
+    Ready { ticket: ShareTicket, target: String },
     /// `peer` paired and may now open the service.
     Paired {
         peer: EndpointId,
@@ -50,19 +49,52 @@ pub enum ShareEvent {
     Path { peer: EndpointId, path: PathInfo },
 }
 
+/// The service a share forwards to.
+#[derive(Clone, Debug)]
+pub enum ShareTarget {
+    /// A TCP `HOST:PORT`, resolved once when the share starts.
+    Address(String),
+    /// Sessions are delivered to `streams` in this process; nothing is
+    /// dialed. For services without a reachable address of their own, such
+    /// as on a unikernel with no loopback interface. `port` only names the
+    /// destination in the ticket; nothing listens on it.
+    InProcess {
+        port: u16,
+        streams: mpsc::Sender<LocalStream>,
+    },
+}
+
+impl From<String> for ShareTarget {
+    fn from(address: String) -> Self {
+        Self::Address(address)
+    }
+}
+
+impl From<&str> for ShareTarget {
+    fn from(address: &str) -> Self {
+        Self::Address(address.to_string())
+    }
+}
+
 /// Shares `options.target` until `cancel` fires, then closes the endpoint.
 pub async fn share(
     options: ShareOptions,
     cancel: CancellationToken,
     mut on_event: impl FnMut(ShareEvent),
 ) -> Result<(), Error> {
-    let target = connect_transport::resolve_tcp_target(&options.target)
-        .await
-        .map_err(|source| Error::Resolve {
-            target: options.target.clone(),
-            source,
-        })?
-        .ok_or_else(|| Error::Unresolved(options.target.clone()))?;
+    // Resolve before binding so a bad address fails without an endpoint.
+    let address = match &options.target {
+        ShareTarget::Address(address) => Some(
+            connect_transport::resolve_tcp_target(address)
+                .await
+                .map_err(|source| Error::Resolve {
+                    target: address.clone(),
+                    source,
+                })?
+                .ok_or_else(|| Error::Unresolved(address.clone()))?,
+        ),
+        ShareTarget::InProcess { .. } => None,
+    };
 
     let secret: [u8; 32] = rand::random();
     let (handler, mut paired) = PairingHandler::new(secret, options.name, options.max_peers);
@@ -74,24 +106,64 @@ pub async fn share(
     let transport = Transport::bind(config)
         .await
         .map_err(|error| Error::Transport(error.to_string()))?;
+    let (served, forwarder) = match (options.target, address) {
+        (_, Some(address)) => (
+            Served {
+                port: address.port(),
+                target: Target::Tcp(address),
+                description: address.to_string(),
+            },
+            None,
+        ),
+        (ShareTarget::InProcess { port, streams }, None) => {
+            let mut listener = transport.local_listener();
+            let served = Served {
+                port,
+                target: listener.target(),
+                description: "in-process".into(),
+            };
+            // Hand each authorized session to the caller until either side
+            // goes away.
+            let forwarder = tokio::spawn(async move {
+                while let Some(stream) = listener.accept().await {
+                    if streams.send(stream).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            (served, Some(forwarder))
+        }
+        (ShareTarget::Address(_), None) => unreachable!("addresses resolve above"),
+    };
     let result = run(
         &transport,
         relays,
-        target,
+        &served,
         secret,
         &cancel,
         &mut paired,
         &mut on_event,
     )
     .await;
+    if let Some(forwarder) = forwarder {
+        forwarder.abort();
+    }
     transport.shutdown().await;
     result
+}
+
+/// What the share's single destination forwards to.
+struct Served {
+    /// Names the destination (`tcp-<port>`) and goes in the ticket.
+    port: u16,
+    target: Target,
+    description: String,
 }
 
 async fn run(
     transport: &Transport,
     relays: bool,
-    target: SocketAddr,
+    served: &Served,
     secret: [u8; 32],
     cancel: &CancellationToken,
     paired: &mut tokio::sync::mpsc::UnboundedReceiver<crate::pair::Paired>,
@@ -105,18 +177,18 @@ async fn run(
     // No peer may open the destination until it pairs.
     let mut peers = HashSet::new();
     transport
-        .replace_policy(share_policy(target, &peers))
+        .replace_policy(share_policy(served, &peers))
         .await
         .map_err(|error| Error::Transport(error.to_string()))?;
     on_event(ShareEvent::Ready {
         ticket: ShareTicket {
             endpoint: transport.endpoint().addr(),
-            port: target.port(),
+            port: served.port,
             secret,
         },
-        target,
+        target: served.description.clone(),
     });
-    tracing::info!(endpoint_id = %transport.endpoint_id(), %target, "share_ready");
+    tracing::info!(endpoint_id = %transport.endpoint_id(), target = %served.description, "share_ready");
     loop {
         let event = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -137,7 +209,7 @@ async fn run(
         let Some(event) = event else { break };
         peers.insert(event.peer);
         transport
-            .replace_policy(share_policy(target, &peers))
+            .replace_policy(share_policy(served, &peers))
             .await
             .map_err(|error| Error::Transport(error.to_string()))?;
         tracing::info!(peer = %event.peer, name = ?event.name, "share_paired");
@@ -159,13 +231,13 @@ async fn run(
     Ok(())
 }
 
-/// One TCP destination, keyed by the target port, open only to `peers`.
-pub(crate) fn share_policy(target: SocketAddr, peers: &HashSet<EndpointId>) -> Policy {
+/// One TCP destination, keyed by the served port, open only to `peers`.
+fn share_policy(served: &Served, peers: &HashSet<EndpointId>) -> Policy {
     Policy {
         destinations: HashMap::from([(
-            DestinationId::tcp(target.port()),
+            DestinationId::tcp(served.port),
             DestinationPolicy {
-                target: Target::Tcp(target),
+                target: served.target,
                 access: Access::Peers(peers.clone()),
             },
         )]),

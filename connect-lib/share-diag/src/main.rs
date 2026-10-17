@@ -1,13 +1,14 @@
 //! Test share for Datum Compute, in one process with no child processes, so
 //! it runs on unikernel instances.
 //!
-//! Serves a live diagnostics page on `127.0.0.1:$PORT` (default 8080), or on
-//! the first address it can reach itself on when loopback is missing, and
-//! shares it with `connect_share::share`. The ticket and the pairing and path
+//! Shares a live diagnostics page with `connect_share::share` as an
+//! in-process target: tunneled sessions are handed straight to the page's
+//! HTTP server, with no listening socket. Unikernels may have no loopback
+//! interface, so a process cannot reach its own TCP port there. The ticket and the pairing and path
 //! events are printed to stdout, so `datumctl compute logs` shows them.
 //! Nothing listens on a public address.
 //!
-//! Optional environment: SHARE_NAME, PORT, and DATUM_ACCOUNT, DATUM_ORG,
+//! Optional environment: SHARE_NAME, and DATUM_ACCOUNT, DATUM_ORG,
 //! DATUM_PROJECT, WORKLOAD, LOCATION, RUNTIME, which only label the page.
 use std::{
     collections::BTreeMap,
@@ -18,7 +19,10 @@ use std::{
 };
 
 use axum::{Router, response::Html, routing::get};
-use connect_share::{PathInfo, PathKind, ShareEvent, ShareOptions, ShareTicket, share};
+use connect_share::{
+    PathInfo, PathKind, ShareEvent, ShareOptions, ShareTarget, ShareTicket, share,
+};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const VERSION: &str = match option_env!("DATUM_CONNECT_RELEASE_VERSION") {
@@ -34,6 +38,7 @@ struct State {
     paths: BTreeMap<String, (Instant, PathInfo)>,
     events: Vec<(SystemTime, String)>,
     probes: Vec<(String, String)>,
+    self_checks: Vec<(String, String)>,
     probed_at: Option<Instant>,
 }
 
@@ -59,10 +64,6 @@ fn env(name: &str) -> String {
 
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8080);
     let name = std::env::var("SHARE_NAME").unwrap_or_else(|_| "Datum Compute test".into());
     let started = Instant::now();
     let state: Shared = Arc::new(Mutex::new(State {
@@ -70,11 +71,9 @@ async fn main() {
         ..State::default()
     }));
     log(&format!("Datum Connect diagnostics {VERSION}: {name}"));
+    let checks = self_checks().await;
+    set(&state, |s| s.self_checks = checks);
 
-    // Some unikernel network stacks have no loopback interface. Serve on the
-    // first address this process can actually reach itself on, and log what
-    // was tried. BIND forces one address.
-    let (listener, target) = bind_reachable(port).await;
     let app = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route(
@@ -85,17 +84,31 @@ async fn main() {
                 move || {
                     let state = state.clone();
                     let name = name.clone();
-                    async move { Html(page(&state, &name, target, started)) }
+                    async move { Html(page(&state, &name, started)) }
                 }
             }),
         );
-    tokio::spawn(async move { axum::serve(listener, app).await });
+    // Each tunneled session arrives here as a stream; serve HTTP/1.1 on it.
+    let (streams, mut incoming) = mpsc::channel::<connect_share::LocalStream>(64);
+    tokio::spawn(async move {
+        while let Some(stream) = incoming.recv().await {
+            let service = hyper_util::service::TowerToHyperService::new(app.clone());
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
     tokio::spawn(probe(state.clone()));
 
     loop {
         set(&state, |s| s.phase = "sharing".into());
         let options = ShareOptions {
-            target: target.to_string(),
+            target: ShareTarget::InProcess {
+                port: 80,
+                streams: streams.clone(),
+            },
             relay_urls: None,
             max_peers: 8,
             name: Some(name.clone()),
@@ -116,40 +129,37 @@ async fn main() {
     }
 }
 
-/// Binds the page server on the first candidate address that a TCP connect
-/// from this process reaches: BIND if set, else loopback IPv4, loopback
-/// IPv6, then the instance's own global IPv6 addresses.
-async fn bind_reachable(port: u16) -> (tokio::net::TcpListener, SocketAddr) {
-    let mut candidates: Vec<std::net::IpAddr> = Vec::new();
-    if let Some(ip) = std::env::var("BIND").ok().and_then(|b| b.parse().ok()) {
-        candidates.push(ip);
-    }
-    candidates.push(std::net::Ipv4Addr::LOCALHOST.into());
-    candidates.push(std::net::Ipv6Addr::LOCALHOST.into());
+/// Whether this process can reach itself over TCP: loopback IPv4 and IPv6,
+/// then the instance's own global IPv6 addresses. Shown on the page, because
+/// a missing loopback breaks any program that talks to localhost.
+async fn self_checks() -> Vec<(String, String)> {
+    let mut candidates: Vec<std::net::IpAddr> = vec![
+        std::net::Ipv4Addr::LOCALHOST.into(),
+        std::net::Ipv6Addr::LOCALHOST.into(),
+    ];
     candidates.extend(global_ipv6());
+    let mut results = Vec::new();
     for ip in candidates {
-        let addr = SocketAddr::new(ip, port);
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                log(&format!("self-check {addr}: bind failed: {error}"));
-                continue;
+        let result = match tokio::net::TcpListener::bind(SocketAddr::new(ip, 0)).await {
+            Err(error) => format!("bind failed: {error}"),
+            Ok(listener) => {
+                let addr = listener.local_addr().expect("bound address");
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::net::TcpStream::connect(addr),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => "reachable".to_string(),
+                    Ok(Err(error)) => format!("connect failed: {error}"),
+                    Err(_) => "connect timed out".to_string(),
+                }
             }
         };
-        match tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr))
-            .await
-        {
-            Ok(Ok(_)) => {
-                log(&format!(
-                    "self-check {addr}: reachable; serving the page here"
-                ));
-                return (listener, addr);
-            }
-            Ok(Err(error)) => log(&format!("self-check {addr}: connect failed: {error}")),
-            Err(_) => log(&format!("self-check {addr}: connect timed out")),
-        }
+        log(&format!("self-check {ip}: {result}"));
+        results.push((format!("TCP to itself at {ip}"), result));
     }
-    panic!("no address reachable from this process for the diagnostics page");
+    results
 }
 
 fn global_ipv6() -> Vec<std::net::IpAddr> {
@@ -455,7 +465,7 @@ fn ago(at: Instant) -> String {
     format!("{} s ago", at.elapsed().as_secs())
 }
 
-fn page(state: &Shared, name: &str, target: SocketAddr, started: Instant) -> String {
+fn page(state: &Shared, name: &str, started: Instant) -> String {
     let s = state.lock().expect("state lock");
     let row = |k: &str, v: String| (k.to_string(), v);
     let datum = vec![
@@ -505,7 +515,10 @@ fn page(state: &Shared, name: &str, target: SocketAddr, started: Instant) -> Str
                 })
                 .unwrap_or_default(),
         ),
-        row("Shared target", format!("{target} (this page)")),
+        row(
+            "Shared target",
+            "this page, in-process (no listening socket)".to_string(),
+        ),
         row(
             "Paired devices",
             if s.paired.is_empty() {
@@ -610,19 +623,21 @@ th,td{{text-align:left;vertical-align:top;padding:.3rem .5rem .3rem 0;border-top
 th{{font-weight:600;width:36%}} small{{opacity:.75}}
 </style></head><body>
 <h1>It works: {title}</h1>
-<p>Served on <code>{target}</code> inside a Datum Compute instance by one static process,
-<code>datum-connect-diag</code>, and reached only through a project-less Datum Connect share over iroh.
+<p>Served inside a Datum Compute instance by one static process, <code>datum-connect-diag</code>,
+with no listening socket: each tunneled session from a project-less Datum Connect share over
+iroh is handed straight to this page's HTTP server.
 <small>Network probes from {probed}.</small></p>
 <h2>Datum</h2>{datum}
 <h2>Share</h2>{share}
 <h2>Network</h2>{network}
 <h2>Network probes</h2>{probes}
+<h2>Local TCP self-checks</h2><small>Whether this process can reach a TCP port of its own.</small>{self_checks}
 <h2>Machine</h2>{machine}
 <h2>Recent share events</h2>{events}
 <h2>Environment</h2><small>Names containing TOKEN, SECRET, PASSWORD, or KEY are hidden.</small>{env}
 </body></html>"#,
         title = escape(name),
-        target = escape(&target.to_string()),
+        self_checks = table(&s.self_checks),
         datum = table(&datum),
         share = table(&share_rows),
         network = table(&network),
