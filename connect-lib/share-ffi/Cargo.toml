@@ -1,0 +1,32 @@
+[package]
+name = "connect-share-ffi"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "UniFFI bindings for connect-share, used by the Datum Connect mobile apps"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "connect_share_ffi"
+
+[[bin]]
+# Generates Kotlin bindings from the built library:
+# cargo run -p connect-share-ffi --features bindgen --bin uniffi-bindgen -- generate --library <lib> --language kotlin --out-dir <dir>
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+connect-share = { path = "../share" }
+iroh = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uniffi = "0.31.2"

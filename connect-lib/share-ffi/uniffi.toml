@@ -1,0 +1,3 @@
+[bindings.kotlin]
+package_name = "net.datum.connect.share"
+cdylib_name = "connect_share_ffi"
