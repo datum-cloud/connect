@@ -48,6 +48,9 @@ version_name=$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<<"$badging" | head 
 size_mb=$(( $(stat -c %s "$apk") / 1048576 ))
 base="https://${bucket}.s3.${region}.amazonaws.com/${prefix}"
 
+# Inline the logo; drop its provenance comment from the page.
+logo=$(grep -v '^<!--' scripts/datum-logo.svg)
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -68,12 +71,17 @@ cat > "$work/index.html" <<HTML
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Datum Connect for Android</title>
 <style>
-body{font-family:system-ui,sans-serif;margin:1.25rem;line-height:1.5;max-width:40rem}
+:root{color-scheme:light dark}
+body{font-family:ui-sans-serif,system-ui,sans-serif,'Apple Color Emoji','Segoe UI Emoji','Segoe UI Symbol','Noto Color Emoji';margin:1.25rem;line-height:1.5;max-width:40rem}
+header{margin:.5rem 0 1.5rem}
+header svg{display:block;height:28px;width:auto}
+h1{font-weight:600;letter-spacing:-.01em}
 a.btn{display:inline-block;font-size:1.1rem;padding:.7rem 1rem;border-radius:8px;background:#4f46e5;color:#fff;text-decoration:none}
 code{word-break:break-all}
-small{color:#555}
+small{opacity:.75}
 </style></head>
 <body>
+<header><a href="https://www.datum.net/" style="color:inherit">$logo</a></header>
 <h1>Datum Connect for Android</h1>
 <p>Open services shared from your computer with <code>datumctl connect local</code>. No account needed.</p>
 <p><a class="btn" href="$name">Download APK (${size_mb} MB)</a></p>
