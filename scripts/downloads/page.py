@@ -8,7 +8,7 @@ lists every published file under them, and writes
 connect/index.html. connect/android/index.html becomes a redirect to it, so
 older links keep working. The publish scripts run this after uploading;
 running it alone just refreshes the page. Uses the AWS CLI and its usual
-credentials (for example AWS_PROFILE=datum-admin).
+credentials (for example AWS_PROFILE=datum-sandbox-admin).
 """
 import argparse
 import html

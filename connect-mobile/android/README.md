@@ -118,7 +118,7 @@ nix develop .#android
 cd connect-mobile/android
 export DATUM_CONNECT_SIGNING=~/.config/datum-connect/android-release/signing.properties
 gradle assembleRelease
-AWS_PROFILE=datum-admin scripts/publish-apk.sh
+AWS_PROFILE=datum-sandbox-admin scripts/publish-apk.sh
 ```
 
 `publish-apk.sh` refuses debug-signed APKs. It uploads
