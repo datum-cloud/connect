@@ -110,7 +110,8 @@ previous one. Override it with `-PversionCode=N`.
 ## Publish for new users
 
 People without the app download it from the public `datum-download` bucket:
-<https://datum-download.s3.us-east-2.amazonaws.com/connect/android/index.html>.
+<https://datum-download.s3.us-east-2.amazonaws.com/connect/index.html>. The
+same page offers the Linux command line and explains how to pair devices.
 
 ```sh
 nix develop .#android
@@ -122,10 +123,15 @@ AWS_PROFILE=datum-admin scripts/publish-apk.sh
 
 `publish-apk.sh` refuses debug-signed APKs. It uploads
 `datum-connect-YYYYMMDD-<sha256[:12]>.apk` (build date in UTC) with its
-version and full SHA-256 as object metadata, then replaces `index.html` and
-`latest.json`, which point at the newest build. The page lists every earlier
-APK in the bucket under "Past builds", newest first, using that metadata. APK
-objects are immutable; the page and JSON are served with `no-cache`.
+version, build date, and full SHA-256 as object metadata, replaces
+`android/latest.json`, then re-renders the page with
+`scripts/downloads/page.py`. The page lists every earlier APK and Linux
+archive under "Past builds", newest first, using that metadata. Published
+files are immutable; the page and JSON are served with `no-cache`. The old
+`connect/android/index.html` URL redirects to the page.
+
+Linux archives are built with `scripts/build-linux-share.sh` and published
+with `scripts/downloads/publish-linux.sh`, both at the repository root.
 
 The bucket is in AWS account 007091975061, us-east-2. Block Public Access is
 on except for a bucket policy that allows public `s3:GetObject`. ACLs are

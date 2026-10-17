@@ -248,7 +248,15 @@ S3 bucket (account 007091975061, us-east-2), published with
 `scripts/publish-apk.sh` as `datum-connect-YYYYMMDD-<sha256[:12]>.apk` with a
 download page at
 <https://datum-download.s3.us-east-2.amazonaws.com/connect/android/index.html>.
-GitHub releases and the Play Store can follow. Keep signing keys in
+GitHub releases and the Play Store can follow.
+
+The same page, <https://datum-download.s3.us-east-2.amazonaws.com/connect/index.html>,
+offers Linux x86_64 and arm64 archives of `datumctl-connect` and
+`datum-connectd` for people without `datumctl`, with instructions for pairing
+two devices. `scripts/build-linux-share.sh` builds them in an Ubuntu 22.04
+container (glibc 2.34+, OpenSSL 3), and `scripts/downloads/publish-linux.sh`
+publishes them. macOS archives need a macOS build host and are not published
+yet. Keep signing keys in
 CI secrets. The existing app branch commits keystore passwords in
 `ui/Dioxus.toml`; do not repeat that.
 
