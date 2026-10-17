@@ -76,8 +76,7 @@ def android_section(apk):
 <h2>Android</h2>
 <p>Open a shared service on your phone. Scan the QR code from a computer, then tap <b>Open</b>.</p>
 <p><a class="btn" href="android/{e(apk['name'])}">Download APK ({mb(apk.get('size', 0))})</a></p>
-<p><small>Built {day(apk['built'])}, version <code>{e(apk['versionName'])}</code>. Android 10 or later.
-Allow installs from your browser when Android asks.<br>
+<p><small>Built {day(apk['built'])}, version <code>{e(apk['versionName'])}</code>. Android 10 or later. Allow installs from your browser when Android asks.<br>
 SHA-256 <code>{e(apk['sha256'])}</code><br>
 Signing certificate SHA-256 <code>{e(apk['signingCertSha256'])}</code></small></p>
 """
@@ -92,9 +91,7 @@ CLI = {
     "macos": {
         "title": "macOS",
         "needs": "Needs macOS 12 or later.",
-        "note": """<p><small>These binaries are not notarized. Download them with <code>curl</code> as shown;
-a browser download is quarantined and macOS refuses to run it. If that happens, run
-<code>xattr -d com.apple.quarantine datumctl-connect datum-connectd</code> in the extracted folder.</small></p>
+        "note": """<p><small>These binaries are not notarized. Download them with <code>curl</code> as shown; a browser download is quarantined and macOS refuses to run it. If that happens, run <code>xattr -d com.apple.quarantine datumctl-connect datum-connectd</code> in the extracted folder.</small></p>
 """,
     },
 }
@@ -112,42 +109,32 @@ def cli_section(platform, build, base, others_missing):
     coming = " ".join(f"{CLI[p]['title']} builds are coming." for p in others_missing)
     return f"""
 <h2>{info['title']}</h2>
-<p>The <code>datumctl-connect</code> command line, with the <code>datum-connectd</code> agent it runs.
-Use it on its own, as below, or as a <code>datumctl</code> plugin.</p>
+<p>The <code>datumctl-connect</code> command line, with the <code>datum-connectd</code> agent it runs. Use it on its own, as below, or as a <code>datumctl</code> plugin.</p>
 <ul class="files">
 {''.join(rows)}
 </ul>
-<p><small>Built {day(build['built'])}, version <code>{e(build['version'])}</code>.
-{info['needs']} {coming}</small></p>
+<p><small>Built {day(build['built'])}, version <code>{e(build['version'])}</code>. {info['needs']} {coming}</small></p>
 <pre><code>curl -fsSLO {e(base)}/{platform}/{e(example['name'])}
 tar xzf {e(example['name'])}
 cd {e(example['dir'])}
 ./datumctl-connect --help</code></pre>
-{info['note']}<p><small>Already use <code>datumctl</code>? Copy both binaries into <code>~/.datumctl/plugins/</code>
-and run <code>datumctl connect local</code> instead of <code>./datumctl-connect local</code>.</small></p>
+{info['note']}<p><small>Already use <code>datumctl</code>? Copy both binaries into <code>~/.datumctl/plugins/</code> and run <code>datumctl connect local</code> instead of <code>./datumctl-connect local</code>.</small></p>
 """
 
 
 PAIRING = """
 <h2>Make a tunnel between two devices</h2>
-<p>One device shares a local service. The other pairs with it and gets that service on its own
-<code>localhost</code>. Traffic is end-to-end encrypted over <a href="https://www.iroh.computer/">iroh</a>,
-directly between the devices when the network allows and through a public relay when it doesn't.
-No Datum account or login is needed.</p>
+<p>One device shares a local service. The other pairs with it and gets that service on its own <code>localhost</code>. Traffic is end-to-end encrypted over <a href="https://www.iroh.computer/">iroh</a>, directly between the devices when the network allows and through a public relay when it doesn't. No Datum account or login is needed.</p>
 <ol>
 <li><p><b>On the computer with the service</b>, for example a web app on port 8080:</p>
 <pre><code>./datumctl-connect local --port 8080 --name "my app"</code></pre>
 <p>It prints a QR code, a ticket, and a ready-to-run dial command, and waits.</p></li>
-<li><p><b>On an Android phone:</b> in Datum Connect, tap <b>Scan QR code</b>, then <b>Connect</b>
-and <b>Open</b>.</p>
-<p><b>Or on another computer:</b> run the printed command, then open
-<code>http://localhost:8080</code>:</p>
+<li><p><b>On an Android phone:</b> in Datum Connect, tap <b>Scan QR code</b>, then <b>Connect</b> and <b>Open</b>.</p>
+<p><b>Or on another computer:</b> run the printed command, then open <code>http://localhost:8080</code>:</p>
 <pre><code>./datumctl-connect dial DCSHARE2… --bind 8080</code></pre></li>
 <li><p>Press Ctrl+C on the sharing computer to end the share. Every run prints a new ticket.</p></li>
 </ol>
-<p><small>Anyone with the ticket can connect, up to <code>--max-peers</code> devices (default 4),
-until the share stops. The ticket also contains the sharing computer's IP addresses, so send it
-only to people you trust.</small></p>
+<p><small>Anyone with the ticket can connect, up to <code>--max-peers</code> devices (default 4), until the share stops. The ticket also contains the sharing computer's IP addresses, so send it only to people you trust.</small></p>
 """
 
 
@@ -178,7 +165,7 @@ def page(apk, cli, past, base):
 <title>Datum Connect downloads</title>
 <style>
 :root{{color-scheme:light dark}}
-body{{font-family:ui-sans-serif,system-ui,sans-serif,'Apple Color Emoji','Segoe UI Emoji','Segoe UI Symbol','Noto Color Emoji';margin:1.25rem;line-height:1.5;max-width:40rem}}
+body{{font-family:ui-sans-serif,system-ui,sans-serif,'Apple Color Emoji','Segoe UI Emoji','Segoe UI Symbol','Noto Color Emoji';margin:1.25rem;line-height:1.5}}
 header{{margin:.5rem 0 1.5rem}}
 header svg{{display:block;height:28px;width:auto}}
 h1,h2{{font-weight:600;letter-spacing:-.01em}}
