@@ -247,17 +247,20 @@ For users without the app: a release-signed APK in the public `datum-download`
 S3 bucket (account 007091975061, us-east-2), published with
 `scripts/publish-apk.sh` as `datum-connect-YYYYMMDD-<sha256[:12]>.apk` with a
 download page at
-<https://datum-download.s3.us-east-2.amazonaws.com/connect/android/index.html>.
+<https://datum-download.s3.us-east-2.amazonaws.com/connect/index.html>.
 GitHub releases and the Play Store can follow.
 
 The same page, <https://datum-download.s3.us-east-2.amazonaws.com/connect/index.html>,
-offers Linux x86_64 and arm64 archives of `datumctl-connect` and
-`datum-connectd` for people without `datumctl`, with instructions for pairing
-two devices. `scripts/build-linux-share.sh` builds them in an Ubuntu 22.04
-container (glibc 2.34+, OpenSSL 3), and `scripts/downloads/publish-linux.sh`
-publishes them. macOS archives need a macOS build host and are not published
-yet. Keep signing keys in
-CI secrets. The existing app branch commits keystore passwords in
+offers Linux and macOS archives of `datumctl-connect` and `datum-connectd`
+for people without `datumctl`, with instructions for pairing two devices.
+`scripts/build-linux-share.sh` builds the Linux x86_64 and arm64 archives in an
+Ubuntu 22.04 container (glibc 2.34+, OpenSSL 3).
+`scripts/build-macos-share.sh` builds the arm64 and x86_64 macOS archives and
+must run on a Mac; the binaries are not notarized, so the page installs them
+with `curl`. `scripts/downloads/publish-cli.sh linux|macos` publishes either
+set.
+
+Keep signing keys in CI secrets. The existing app branch commits keystore passwords in
 `ui/Dioxus.toml`; do not repeat that.
 
 **Where it lives**

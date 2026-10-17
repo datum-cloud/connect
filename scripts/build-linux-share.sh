@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds Linux archives of datumctl-connect and datum-connectd for x86_64 and
 # arm64, for people who want `datumctl connect local` without the official
-# release. Output: dist/share/datum-connect-linux-<arch>.tar.gz
+# release. Output: dist/share/datum-connect-linux-<arch>.tar.gz; publish with
+# scripts/downloads/publish-cli.sh linux.
 #
 #   scripts/build-linux-share.sh
 #
@@ -42,6 +43,7 @@ for arch in x86_64 arm64; do
   (cd "$root/connect-plugin" && CGO_ENABLED=0 GOOS=linux GOARCH=$goarch \
     go build -buildvcs=false -trimpath -ldflags "-X main.version=$version" -o "$stage/datumctl-connect" .)
   cp "$root/LICENSE" "$stage/"
+  echo "$version" > "$stage/VERSION"
   tar -C "$out" -czf "$out/datum-connect-linux-$arch.tar.gz" "datum-connect-linux-$arch"
   rm -rf "$stage"
 done

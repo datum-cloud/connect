@@ -3,8 +3,8 @@
 
     scripts/downloads/page.py [--bucket datum-download] [--region us-east-2]
 
-Reads connect/android/latest.json and connect/linux/latest.json, lists every
-published file under connect/android/ and connect/linux/, and writes
+Reads latest.json for connect/android/, connect/linux/, and connect/macos/,
+lists every published file under them, and writes
 connect/index.html. connect/android/index.html becomes a redirect to it, so
 older links keep working. The publish scripts run this after uploading;
 running it alone just refreshes the page. Uses the AWS CLI and its usual
@@ -22,13 +22,17 @@ PREFIX = "connect"
 LOGO = pathlib.Path(__file__).with_name("datum-logo.svg")
 
 
-def aws(region, *args):
-    return subprocess.check_output(["aws", "--region", region, *args], text=True)
+def aws(region, *args, quiet=False):
+    return subprocess.check_output(
+        ["aws", "--region", region, *args], text=True,
+        stderr=subprocess.DEVNULL if quiet else None,
+    )
 
 
 def latest(bucket, region, platform):
     try:
-        return json.loads(aws(region, "s3", "cp", f"s3://{bucket}/{PREFIX}/{platform}/latest.json", "-"))
+        # A platform with nothing published yet has no latest.json.
+        return json.loads(aws(region, "s3", "cp", f"s3://{bucket}/{PREFIX}/{platform}/latest.json", "-", quiet=True))
     except subprocess.CalledProcessError:
         return None
 
@@ -79,29 +83,47 @@ Signing certificate SHA-256 <code>{e(apk['signingCertSha256'])}</code></small></
 """
 
 
-def linux_section(linux, base):
-    if not linux:
+CLI = {
+    "linux": {
+        "title": "Linux",
+        "needs": "Needs glibc 2.34 or later and OpenSSL 3: Ubuntu 22.04, Debian 12, Fedora 36, or newer.",
+        "note": "",
+    },
+    "macos": {
+        "title": "macOS",
+        "needs": "Needs macOS 12 or later.",
+        "note": """<p><small>These binaries are not notarized. Download them with <code>curl</code> as shown;
+a browser download is quarantined and macOS refuses to run it. If that happens, run
+<code>xattr -d com.apple.quarantine datumctl-connect datum-connectd</code> in the extracted folder.</small></p>
+""",
+    },
+}
+
+
+def cli_section(platform, build, base, others_missing):
+    if not build:
         return ""
+    info = CLI[platform]
     rows = []
-    for f in linux["files"]:
-        rows.append(f"""<li><a href="linux/{e(f['name'])}">{e(f['name'])}</a> ({mb(f['size'])})
+    for f in build["files"]:
+        rows.append(f"""<li><a href="{platform}/{e(f['name'])}">{e(f['name'])}</a> ({mb(f['size'])})
 <br><small>{e(f['label'])}<br>SHA-256 <code>{e(f['sha256'])}</code></small></li>""")
-    example = linux["files"][0]
+    example = build["files"][0]
+    coming = " ".join(f"{CLI[p]['title']} builds are coming." for p in others_missing)
     return f"""
-<h2>Linux</h2>
+<h2>{info['title']}</h2>
 <p>The <code>datumctl-connect</code> command line, with the <code>datum-connectd</code> agent it runs.
 Use it on its own, as below, or as a <code>datumctl</code> plugin.</p>
 <ul class="files">
 {''.join(rows)}
 </ul>
-<p><small>Built {day(linux['built'])}, version <code>{e(linux['version'])}</code>.
-Needs glibc 2.34 or later and OpenSSL 3: Ubuntu 22.04, Debian 12, Fedora 36, or newer.
-macOS builds are coming.</small></p>
-<pre><code>curl -fsSLO {e(base)}/linux/{e(example['name'])}
+<p><small>Built {day(build['built'])}, version <code>{e(build['version'])}</code>.
+{info['needs']} {coming}</small></p>
+<pre><code>curl -fsSLO {e(base)}/{platform}/{e(example['name'])}
 tar xzf {e(example['name'])}
 cd {e(example['dir'])}
 ./datumctl-connect --help</code></pre>
-<p><small>Already use <code>datumctl</code>? Copy both binaries into <code>~/.datumctl/plugins/</code>
+{info['note']}<p><small>Already use <code>datumctl</code>? Copy both binaries into <code>~/.datumctl/plugins/</code>
 and run <code>datumctl connect local</code> instead of <code>./datumctl-connect local</code>.</small></p>
 """
 
@@ -149,7 +171,7 @@ def past_section(files):
 """
 
 
-def page(apk, linux, past, base):
+def page(apk, cli, past, base):
     logo = "\n".join(line for line in LOGO.read_text().splitlines() if not line.startswith("<!--"))
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -174,9 +196,21 @@ ul.files li{{padding:.6rem 0;border-top:1px solid color-mix(in srgb,currentColor
 <header><a href="https://www.datum.net/" style="color:inherit">{logo}</a></header>
 <h1>Datum Connect</h1>
 <p>Share a service running on one device with your other devices, without an account.</p>
-{android_section(apk)}{linux_section(linux, base)}{PAIRING}{past_section(past)}
+{android_section(apk)}{cli_sections(cli, base)}{PAIRING}{past_section(past)}
 </body></html>
 """
+
+
+def cli_sections(cli, base):
+    missing = [p for p in CLI if not cli.get(p)]
+    # Mention missing platforms once, under the first published one.
+    out, mentioned = [], False
+    for platform in CLI:
+        section = cli_section(platform, cli.get(platform), base, [] if mentioned else missing)
+        if section:
+            out.append(section)
+            mentioned = True
+    return "".join(out)
 
 
 REDIRECT = """<!doctype html>
@@ -195,17 +229,18 @@ def main():
     base = f"https://{args.bucket}.s3.{args.region}.amazonaws.com/{PREFIX}"
 
     apk = latest(args.bucket, args.region, "android")
-    linux = latest(args.bucket, args.region, "linux")
+    cli = {platform: latest(args.bucket, args.region, platform) for platform in CLI}
     current = set()
     if apk:
         current.add(f"{PREFIX}/android/{apk['name']}")
         sizes = {f["name"]: f["size"] for f in published(args.bucket, args.region, "android", ".apk")}
         apk["size"] = sizes.get(apk["name"], 0)
-    if linux:
-        current.update(f"{PREFIX}/linux/{f['name']}" for f in linux["files"])
+    for platform, build in cli.items():
+        if build:
+            current.update(f"{PREFIX}/{platform}/{f['name']}" for f in build["files"])
 
     past = []
-    for platform, suffix in (("android", ".apk"), ("linux", ".tar.gz")):
+    for platform, suffix in (("android", ".apk"), *((p, ".tar.gz") for p in CLI)):
         for f in published(args.bucket, args.region, platform, suffix):
             if f["key"] not in current:
                 f["href"] = f"{platform}/{f['name']}"
@@ -217,7 +252,7 @@ def main():
 
     with tempfile.TemporaryDirectory() as work:
         index = pathlib.Path(work, "index.html")
-        index.write_text(page(apk, linux, past, base))
+        index.write_text(page(apk, cli, past, base))
         redirect = pathlib.Path(work, "redirect.html")
         redirect.write_text(REDIRECT)
         for path, key in ((index, f"{PREFIX}/index.html"), (redirect, f"{PREFIX}/android/index.html")):

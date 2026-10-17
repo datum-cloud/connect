@@ -130,8 +130,10 @@ archive under "Past builds", newest first, using that metadata. Published
 files are immutable; the page and JSON are served with `no-cache`. The old
 `connect/android/index.html` URL redirects to the page.
 
-Linux archives are built with `scripts/build-linux-share.sh` and published
-with `scripts/downloads/publish-linux.sh`, both at the repository root.
+Command line archives are built with `scripts/build-linux-share.sh` (Linux)
+or `scripts/build-macos-share.sh` (on a Mac) and published with
+`scripts/downloads/publish-cli.sh linux` or `publish-cli.sh macos`, all at the
+repository root.
 
 The bucket is in AWS account 007091975061, us-east-2. Block Public Access is
 on except for a bucket policy that allows public `s3:GetObject`. ACLs are
