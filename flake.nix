@@ -103,6 +103,55 @@
           shellHook = "";
         };
 
+        # ── Android shell ─────────────────────────────────────────────────
+        # `nix develop .#android` for connect-mobile/android: the Rust
+        # toolchain with Android targets, cargo-ndk, the Android SDK and NDK,
+        # JDK 17, and Gradle. The SDK is unfree; this shell accepts its license.
+        devShells.android =
+          let
+            androidPkgs = import nixpkgs {
+              inherit system overlays;
+              config = {
+                allowUnfree = true;
+                android_sdk.accept_license = true;
+              };
+            };
+            androidRust = rustToolchain.override {
+              targets = [
+                "aarch64-linux-android"
+                "armv7-linux-androideabi"
+                "x86_64-linux-android"
+              ];
+            };
+            android = androidPkgs.androidenv.composeAndroidPackages {
+              platformVersions = [ "35" ];
+              buildToolsVersions = [ "35.0.0" ];
+              includeNDK = true;
+              ndkVersions = [ "27.2.12479018" ];
+              includeEmulator = true;
+              includeSystemImages = true;
+              systemImageTypes = [ "google_apis" ];
+              abiVersions = [ "x86_64" ];
+            };
+            sdkRoot = "${android.androidsdk}/libexec/android-sdk";
+          in
+          androidPkgs.mkShell {
+            packages = [
+              androidRust
+              android.androidsdk
+              androidPkgs.cargo-ndk
+              androidPkgs.jdk17
+              androidPkgs.gradle
+            ];
+            ANDROID_HOME = sdkRoot;
+            ANDROID_SDK_ROOT = sdkRoot;
+            ANDROID_NDK_ROOT = "${sdkRoot}/ndk/27.2.12479018";
+            JAVA_HOME = androidPkgs.jdk17.home;
+            # Gradle's downloaded aapt2 does not run from the Nix store layout;
+            # use the SDK's.
+            GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${sdkRoot}/build-tools/35.0.0/aapt2";
+          };
+
         # nix fmt
         formatter = pkgs.nixpkgs-fmt;
       });
