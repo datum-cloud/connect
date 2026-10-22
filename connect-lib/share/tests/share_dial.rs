@@ -2,8 +2,8 @@
 use std::time::Duration;
 
 use connect_share::{
-    DialEvent, DialOptions, PathInfo, PathKind, ShareEvent, ShareOptions, ShareTarget, ShareTicket,
-    dial, share,
+    DialEvent, DialOptions, PathInfo, PathKind, ShareEvent, ShareKey, ShareOptions, ShareTarget,
+    ShareTicket, dial, share,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -68,6 +68,7 @@ async fn start_share(
                     name: Some("test\u{1b}[31m service".into()),
                     udp_port: None,
                     public_addrs: Vec::new(),
+                    key: None,
                 },
                 cancel,
                 |event| {
@@ -251,6 +252,7 @@ async fn in_process_target_serves_without_a_socket() {
                     name: Some("in-process".into()),
                     udp_port: None,
                     public_addrs: Vec::new(),
+                    key: None,
                 },
                 cancel,
                 |event| {
@@ -318,6 +320,7 @@ async fn fixed_port_and_public_address_are_advertised() {
                     name: None,
                     udp_port: Some(port),
                     public_addrs: vec![public],
+                    key: None,
                 },
                 cancel,
                 |event| {
@@ -389,4 +392,186 @@ async fn pairing_limit_is_enforced() {
         "{result:?}"
     );
     share_cancel.cancel();
+}
+
+/// Starts a share of `target` on a fixed UDP port, so a restart comes back
+/// at the same loopback address. The task ends once the endpoint closes.
+async fn start_keyed_share(
+    target: std::net::SocketAddr,
+    udp_port: u16,
+    key: ShareKey,
+) -> (ShareTicket, CancellationToken, tokio::task::JoinHandle<()>) {
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            share(
+                ShareOptions {
+                    target: target.to_string().into(),
+                    relay_urls: Some(Vec::new()),
+                    max_peers: 4,
+                    name: None,
+                    udp_port: Some(udp_port),
+                    public_addrs: Vec::new(),
+                    key: Some(key),
+                },
+                cancel,
+                |event| {
+                    let _ = tx.send(event);
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let Some(ShareEvent::Ready { ticket, .. }) = rx.recv().await else {
+        panic!("share did not become ready");
+    };
+    (loopback_only(ticket), cancel, task)
+}
+
+/// Dials `ticket` and checks one ping reaches the origin.
+async fn ping_through(ticket: ShareTicket) -> Result<(), connect_share::Error> {
+    let (ready, task, cancel) = start_dial(ticket).await;
+    // A failed dial drops the ready sender, so read its error from the task.
+    let Ok(ready) = ready.await else {
+        return task.await.unwrap();
+    };
+    let mut stream = TcpStream::connect(ready.0).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"pong");
+    cancel.cancel();
+    Ok(())
+}
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A share restarted with the same key accepts the ticket from its first
+/// run, even after the service moved to another local port. A new key
+/// refuses that ticket.
+#[tokio::test]
+async fn kept_key_reuses_the_ticket_across_restarts() {
+    let udp_port = free_udp_port();
+    // The key's port names the destination, not the service's port.
+    let key = ShareKey::generate(4242);
+    let (first, cancel, task) = start_keyed_share(origin().await, udp_port, key.clone()).await;
+    assert_eq!(first.port, 4242);
+    assert_eq!(first.endpoint.id, key.endpoint_id());
+    tokio::time::timeout(Duration::from_secs(20), ping_through(first.clone()))
+        .await
+        .expect("first run")
+        .unwrap();
+    cancel.cancel();
+    task.await.unwrap();
+
+    let (second, cancel, task) = start_keyed_share(origin().await, udp_port, key).await;
+    assert_eq!(second.endpoint.id, first.endpoint.id);
+    assert_eq!(second.secret, first.secret);
+    tokio::time::timeout(Duration::from_secs(20), ping_through(first.clone()))
+        .await
+        .expect("restarted run")
+        .unwrap();
+    cancel.cancel();
+    task.await.unwrap();
+
+    let (_third, cancel, _task) =
+        start_keyed_share(origin().await, udp_port, ShareKey::generate(4242)).await;
+    let result = tokio::time::timeout(Duration::from_secs(20), ping_through(first))
+        .await
+        .expect("new key run");
+    assert!(result.is_err(), "the old ticket still worked");
+    cancel.cancel();
+}
+
+/// Over the real relays and address lookup: a restarted share found by its
+/// identity alone, without the addresses from the first run. Needs network
+/// access to the n0 relays and DNS, so it is ignored by default.
+#[tokio::test]
+#[ignore = "uses the public n0 relays and DNS"]
+async fn kept_key_is_found_after_its_addresses_change() {
+    let target = origin().await;
+    let key = ShareKey::generate(target.port());
+    let run = |key: ShareKey| async move {
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                share(
+                    ShareOptions {
+                        target: target.to_string().into(),
+                        relay_urls: None,
+                        max_peers: 4,
+                        name: None,
+                        udp_port: None,
+                        public_addrs: Vec::new(),
+                        key: Some(key),
+                    },
+                    cancel,
+                    |event| {
+                        let _ = tx.send(event);
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let Some(ShareEvent::Ready { ticket, .. }) = rx.recv().await else {
+            panic!("share did not become ready");
+        };
+        (ticket, cancel, task)
+    };
+    let (first, cancel, task) = run(key.clone()).await;
+    cancel.cancel();
+    task.await.unwrap();
+    let (_second, cancel, _task) = run(key).await;
+    // Only the identity and secret survive; addresses come from lookup.
+    let mut stale = first;
+    stale.endpoint = iroh::EndpointAddr::new(stale.endpoint.id);
+    let dial_cancel = CancellationToken::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    tokio::spawn({
+        let dial_cancel = dial_cancel.clone();
+        async move {
+            dial(
+                DialOptions {
+                    ticket: stale,
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    secret_key: None,
+                    name: None,
+                    relay_urls: None,
+                },
+                dial_cancel,
+                move |event| {
+                    if let DialEvent::Ready(ready) = event
+                        && let Some(tx) = tx.take()
+                    {
+                        let _ = tx.send(ready.local_addr);
+                    }
+                },
+            )
+            .await
+        }
+    });
+    let local = tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("dial ready")
+        .unwrap();
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"pong");
+    dial_cancel.cancel();
+    cancel.cancel();
 }

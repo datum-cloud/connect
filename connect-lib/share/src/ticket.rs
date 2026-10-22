@@ -135,10 +135,10 @@ impl ShareTicket {
     }
 }
 
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+    pub(crate) fn take(&mut self, len: usize) -> Option<&'a [u8]> {
         if self.0.len() < len {
             return None;
         }
@@ -147,11 +147,11 @@ impl<'a> Reader<'a> {
         Some(head)
     }
 
-    fn u8(&mut self) -> Option<u8> {
+    pub(crate) fn u8(&mut self) -> Option<u8> {
         self.take(1).map(|bytes| bytes[0])
     }
 
-    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
         self.take(N)?.try_into().ok()
     }
 }

@@ -127,6 +127,7 @@ async fn main() {
             name: Some(name.clone()),
             udp_port: udp_port(),
             public_addrs: public_addrs(),
+            key: None,
         };
         let events = state.clone();
         let result = share(options, CancellationToken::new(), move |event| {

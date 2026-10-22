@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Error, PathInfo, ShareTicket, configure_relays,
+    Error, PathInfo, ShareKey, ShareTicket, configure_relays,
     pair::{PAIR_ALPN, PairingHandler, PairingProtocol},
     ticket::MAX_ADDRS,
     wait_online,
@@ -41,6 +41,10 @@ pub struct ShareOptions {
     /// it sends from, so these go in the ticket alongside the discovered ones,
     /// and are never dropped to fit its address limit.
     pub public_addrs: Vec<SocketAddr>,
+    /// Identity, pairing secret, and destination port to share under, so
+    /// tickets from earlier runs keep working. `None` makes new ones, and
+    /// so a new ticket, each run.
+    pub key: Option<ShareKey>,
 }
 
 /// Progress reported to the caller.
@@ -106,10 +110,13 @@ pub async fn share(
         ShareTarget::InProcess { .. } => None,
     };
 
-    let secret: [u8; 32] = rand::random();
+    let (secret_key, secret, key_port) = match options.key {
+        Some(key) => (key.secret_key, key.secret, Some(key.port)),
+        None => (SecretKey::generate(), rand::random(), None),
+    };
     let (handler, mut paired) = PairingHandler::new(secret, options.name, options.max_peers);
-    let mut config = TransportConfig::new(SecretKey::generate())
-        .protocol(PAIR_ALPN, Arc::new(PairingProtocol(handler)));
+    let mut config =
+        TransportConfig::new(secret_key).protocol(PAIR_ALPN, Arc::new(PairingProtocol(handler)));
     if let Some(port) = options.udp_port {
         config = config.bind_port(port);
     }
@@ -121,7 +128,9 @@ pub async fn share(
     let (served, forwarder) = match (options.target, address) {
         (_, Some(address)) => (
             Served {
-                port: address.port(),
+                // A key's port names the destination even if the service
+                // moved, so its earlier tickets still work.
+                port: key_port.unwrap_or(address.port()),
                 target: Target::Tcp(address),
                 description: address.to_string(),
                 public_addrs: public_addrs.clone(),
@@ -131,7 +140,7 @@ pub async fn share(
         (ShareTarget::InProcess { port, streams }, None) => {
             let mut listener = transport.local_listener();
             let served = Served {
-                port,
+                port: key_port.unwrap_or(port),
                 target: listener.target(),
                 description: "in-process".into(),
                 public_addrs: public_addrs.clone(),

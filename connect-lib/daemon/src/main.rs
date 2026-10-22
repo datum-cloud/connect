@@ -95,6 +95,11 @@ enum Projectless {
         /// only. Defaults to the transport preset.
         #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
         relay_urls: Option<String>,
+        /// Keep the share's identity and pairing secret in this file, created
+        /// on first use, so its ticket works across restarts. Delete the
+        /// file for a new ticket.
+        #[arg(long)]
+        key_file: Option<std::path::PathBuf>,
     },
     /// Pair with a share ticket and serve the shared service on a local port.
     LocalDial {
@@ -164,6 +169,20 @@ fn emit(event: serde_json::Value) {
     println!("{event}");
 }
 
+/// Loads the share key at `path`, or creates one naming the port of
+/// `target` (`HOST:PORT`). Returns the key and whether it was created.
+fn load_share_key(
+    path: &std::path::Path,
+    target: &str,
+) -> Result<(connect_share::ShareKey, bool), String> {
+    let port = target
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| format!("{target} has no port to name in the ticket"))?;
+    connect_share::ShareKey::load_or_create(path, port).map_err(|error| error.to_string())
+}
+
 async fn run_projectless(command: Projectless) {
     let (_log_guard, _otel_guard) = match init_tracing(None).await {
         Ok(guard) => guard,
@@ -200,7 +219,18 @@ async fn run_projectless(command: Projectless) {
             udp_port,
             public_addrs,
             relay_urls,
+            key_file,
         } => {
+            let (key, key_created) = match &key_file {
+                Some(path) => match load_share_key(path, &target) {
+                    Ok((key, created)) => (Some(key), Some(created)),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(2);
+                    }
+                },
+                None => (None, None),
+            };
             let options = connect_share::ShareOptions {
                 target: target.into(),
                 relay_urls: relays(relay_urls),
@@ -208,6 +238,7 @@ async fn run_projectless(command: Projectless) {
                 name: name.clone(),
                 udp_port,
                 public_addrs,
+                key,
             };
             connect_share::share(options, cancel, |event| match event {
                 connect_share::ShareEvent::Ready { ticket, target } => emit(serde_json::json!({
@@ -216,6 +247,8 @@ async fn run_projectless(command: Projectless) {
                     "endpoint_id": ticket.endpoint.id.to_string(),
                     "target": target,
                     "ticket": ticket.to_string(),
+                    "key_file": key_file,
+                    "key_created": key_created,
                 })),
                 connect_share::ShareEvent::Paired { peer, name } => emit(serde_json::json!({
                     "event": "share_paired",
