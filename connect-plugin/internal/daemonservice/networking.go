@@ -46,6 +46,40 @@ type helperReceipt struct {
 	SHA256     string `json:"sha256"`
 }
 
+func decodeHelperReceipt(data []byte) (helperReceipt, error) {
+	var receipt helperReceipt
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&receipt); err != nil {
+		return helperReceipt{}, err
+	}
+	if decoder.Decode(new(any)) != io.EOF || !filepath.IsAbs(receipt.Executable) || len(receipt.SHA256) != 64 {
+		return helperReceipt{}, fmt.Errorf("invalid helper installation receipt")
+	}
+	if _, err := hex.DecodeString(receipt.SHA256); err != nil {
+		return helperReceipt{}, fmt.Errorf("invalid helper installation receipt checksum")
+	}
+	return receipt, nil
+}
+
+func validateHelperReceiptFile(path string) error {
+	if err := validatePrivilegedExecutable(path); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() == 0 || info.Size() > 4096 {
+		return fmt.Errorf("refuse unsafe helper installation receipt")
+	}
+	dir, err := os.Stat(filepath.Dir(path))
+	if err != nil || !dir.IsDir() || dir.Mode().Perm() != 0711 {
+		return fmt.Errorf("refuse helper installation receipt in an unsafe state directory")
+	}
+	return nil
+}
+
 // EnsureNetworking runs only after interactive consent. The daemon never elevates
 // itself. Configuration crosses stdin; tokens and OIDC environment do not.
 func EnsureNetworking(cmd *cobra.Command, version, executable string, config HelperApprovals, upgrade, replaceApproval bool) error {
@@ -307,10 +341,11 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	var old helperReceipt
 	receiptPath := filepath.Join(dir, "installed.json")
 	if content, err := os.ReadFile(receiptPath); err == nil {
-		if err := validatePrivilegedExecutable(receiptPath); err != nil {
+		if err := validateHelperReceiptFile(receiptPath); err != nil {
 			return err
 		}
-		if err := json.Unmarshal(content, &old); err != nil {
+		old, err = decodeHelperReceipt(content)
+		if err != nil {
 			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -322,6 +357,15 @@ func authorizeNetworking(ctx context.Context, requested HelperApprovals, source,
 	}
 	if installed && old.Executable == "" {
 		return fmt.Errorf("existing helper is manually managed; automatic setup will not replace it")
+	}
+	if installed {
+		if err := validatePrivilegedExecutable(old.Executable); err != nil {
+			return err
+		}
+		oldHash, err := executableHash(old.Executable)
+		if err != nil || oldHash != old.SHA256 {
+			return fmt.Errorf("installed helper does not match its root-owned receipt; left unchanged")
+		}
 	}
 	if installed && old.Executable != target && !upgrade {
 		return fmt.Errorf("helper upgrade requires explicit approval: retry join with --upgrade-helper; existing IP attachments will disconnect")

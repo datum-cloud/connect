@@ -51,6 +51,48 @@ func TestHelperExecutableIsOutsideLinuxStateDirectory(t *testing.T) {
 	}
 }
 
+func TestLegacyHelperDetectionMatchesOnlyStateDirectoryExecutables(t *testing.T) {
+	uid := uint32(1000)
+	legacy := filepath.Join(helperStateDir(uid), "helper-abc123")
+	if !isLegacyHelperExec("{ path="+legacy+" ; argv[]="+legacy+" --config /var/lib/state }", uid) {
+		t.Fatal("did not detect helper executable under legacy state directory")
+	}
+	if isLegacyHelperExec("{ path=/usr/libexec/datum-connect/1000/helper-abc123 ; argv[]=helper }", uid) {
+		t.Fatal("classified current executable as legacy")
+	}
+}
+
+func TestManagedHelperReceiptDistinguishesManualInstall(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "datum-connect-network-1000")
+	if err := os.Mkdir(stateDir, 0711); err != nil {
+		t.Fatal(err)
+	}
+	if safeManagedReceiptMetadata(stateDir) {
+		t.Fatal("manual helper without a Connect receipt was recognized as managed")
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "installed.json"), []byte(`{"executable":"/var/lib/helper"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !safeManagedReceiptMetadata(stateDir) {
+		t.Fatal("Connect-managed helper receipt was not recognized")
+	}
+	if err := os.Chmod(filepath.Join(stateDir, "installed.json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if safeManagedReceiptMetadata(stateDir) {
+		t.Fatal("world-readable receipt was recognized as safe")
+	}
+	if err := os.Chmod(filepath.Join(stateDir, "installed.json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stateDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if safeManagedReceiptMetadata(stateDir) {
+		t.Fatal("insecure state directory was recognized as managed")
+	}
+}
+
 func TestUserIPConfigRequiresHelperAndPeerOnlyApprovals(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("Unix helper")

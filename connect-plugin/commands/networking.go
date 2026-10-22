@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 )
 
 var ensureNetworking = daemonservice.EnsureNetworking
+var needsLinuxHelperMigration = daemonservice.NeedsLinuxHelperMigration
 
 type networkPlan struct {
 	Network        string                        `json:"network"`
@@ -160,6 +162,89 @@ func waitForPeer(ctx context.Context, client *connectapi.Client, project, networ
 	}
 }
 
+// activeManagedNetworks snapshots managed VPC sessions before a privileged
+// helper replacement. Those sessions are supervised by the daemon and should
+// reconnect after the helper service comes back.
+func activeManagedNetworks(data []byte) ([]string, error) {
+	var status struct {
+		Networks []networkDisplay `json:"networks"`
+	}
+	if err := json.Unmarshal(data, &status); err != nil {
+		return nil, err
+	}
+	var networks []string
+	for _, network := range status.Networks {
+		if network.Mode == "gateway" && network.Persistent && network.DesiredAttached && network.Running {
+			networks = append(networks, network.Network)
+		}
+	}
+	slices.Sort(networks)
+	return slices.Compact(networks), nil
+}
+
+func networkAlreadyConfigured(data []byte, name string) (bool, error) {
+	var status struct {
+		Networks []networkDisplay `json:"networks"`
+	}
+	if err := json.Unmarshal(data, &status); err != nil {
+		return false, err
+	}
+	for _, network := range status.Networks {
+		if network.Network == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// waitForManagedNetworks gives the daemon's attachment supervisors time to
+// recreate their sessions after a helper restart. A timeout is reported as a
+// warning so the newly requested join can still succeed independently.
+func waitForManagedNetworks(ctx context.Context, client *connectapi.Client, project string, expected []string, timeout time.Duration) ([]string, error) {
+	if len(expected) == 0 {
+		return nil, nil
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	pending := append([]string(nil), expected...)
+	for {
+		data, err := client.Request(ctx, http.MethodGet, "/v1/status", project, nil)
+		if err == nil {
+			var status struct {
+				Networks []networkDisplay `json:"networks"`
+			}
+			if err = json.Unmarshal(data, &status); err == nil {
+				active := make(map[string]bool, len(status.Networks))
+				for _, network := range status.Networks {
+					active[network.Network] = network.Running && (network.Connected == nil || *network.Connected)
+				}
+				pending = pending[:0]
+				for _, network := range expected {
+					if !active[network] {
+						pending = append(pending, network)
+					}
+				}
+				if len(pending) == 0 {
+					return nil, nil
+				}
+			} else {
+				return expected, err
+			}
+		} else {
+			return expected, err
+		}
+		select {
+		case <-ctx.Done():
+			return expected, ctx.Err()
+		case <-deadline.C:
+			return pending, nil
+		case <-ticker.C:
+		}
+	}
+}
+
 func validateNetworkPlan(plan networkPlan, network string) error {
 	if plan.Network != network || len(plan.HelperConfig.Approvals) != 1 {
 		return fmt.Errorf("daemon returned an ambiguous networking approval plan")
@@ -271,6 +356,16 @@ func newJoin(opts *options) *cobra.Command {
 		join := func() (json.RawMessage, error) {
 			return client.Request(cmd.Context(), http.MethodPost, "/v1/networks", project, map[string]string{"network": args[0]})
 		}
+		// Detect the known pre-SELinux Linux helper before a no-op repeat join.
+		// Migrate only when this network already has local state; a first-time
+		// network still follows the normal server-directed approval flow below.
+		if !upgrade && runtime.GOOS == "linux" && guidedSetupEnabled(cmd, opts) && needsLinuxHelperMigration() {
+			if statusData, statusErr := client.Request(cmd.Context(), http.MethodGet, "/v1/status", project, nil); statusErr == nil {
+				if configured, parseErr := networkAlreadyConfigured(statusData, args[0]); parseErr == nil && configured {
+					upgrade = true
+				}
+			}
+		}
 		var result json.RawMessage
 		if !upgrade {
 			result, err = join()
@@ -292,18 +387,61 @@ func newJoin(opts *options) *cobra.Command {
 			if err := validateNetworkPlan(plan, args[0]); err != nil {
 				return err
 			}
+			var activeBeforeUpgrade []string
+			if runtime.GOOS == "linux" {
+				statusData, statusErr := client.Request(cmd.Context(), http.MethodGet, "/v1/status", project, nil)
+				if statusErr != nil {
+					return friendlyError(cmd, opts, project, statusErr)
+				}
+				activeBeforeUpgrade, err = activeManagedNetworks(statusData)
+				if err != nil {
+					return fmt.Errorf("read current VPC attachment status before helper update: %w", err)
+				}
+			}
 			writeNetworkApproval(cmd.ErrOrStderr(), plan, peer)
 			question := "Install the privileged helper and approve this access?"
-			if upgrade {
-				question = "Upgrade the helper? Active IP attachments will disconnect; services and local ports stay running."
+			if runtime.GOOS == "linux" {
+				question = "Install or update the networking helper and approve this access? If an update is needed, active IP attachments will briefly disconnect. Connect will rejoin saved VPC attachments; direct peer attachments need another join."
+			} else if upgrade {
+				question = "Upgrade the helper? Active IP attachments will briefly disconnect; services and local ports stay running."
 			} else if replaceApproval {
-				question = "Replace this interface's administrator approval if it changed? Replacement disconnects active IP attachments; services and local ports stay running."
+				question = "Replace this interface's administrator approval if it changed? Replacement briefly disconnects active IP attachments; services and local ports stay running."
 			}
 			if err := confirmSetup(cmd, question); err != nil {
 				return err
 			}
-			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, upgrade, replaceApproval); err != nil {
+			allowUpgrade := upgrade || runtime.GOOS == "linux"
+			if err := ensureNetworking(cmd, cmd.Root().Version, executable, plan.HelperConfig, allowUpgrade, replaceApproval); err != nil {
 				return err
+			}
+			if len(activeBeforeUpgrade) > 0 && allowUpgrade {
+				fmt.Fprintln(cmd.ErrOrStderr(), "Reconnecting saved VPC attachments…")
+				var retrying []string
+				for _, network := range activeBeforeUpgrade {
+					for attempt := 0; attempt < 30; attempt++ {
+						_, reconnectErr := client.Request(cmd.Context(), http.MethodPost, "/v1/networks", project, map[string]string{"network": network})
+						if reconnectErr == nil {
+							retrying = append(retrying, network)
+							break
+						}
+						var networkError *connectapi.HTTPError
+						if !errors.As(reconnectErr, &networkError) || networkError.Code != "network_setup_required" || attempt == 29 {
+							fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not restart saved VPC attachment %q: %s\n", network, reconnectErr)
+							break
+						}
+						select {
+						case <-cmd.Context().Done():
+							return cmd.Context().Err()
+						case <-time.After(100 * time.Millisecond):
+						}
+					}
+				}
+				reconnectCtx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
+				pending, waitErr := waitForManagedNetworks(reconnectCtx, client, project, retrying, 30*time.Second)
+				cancel()
+				if waitErr != nil || len(pending) > 0 {
+					fmt.Fprintf(cmd.ErrOrStderr(), "Warning: these VPC attachments have not confirmed reconnection: %s. Check `datumctl connect status`.\n", strings.Join(pending, ", "))
+				}
 			}
 			// launchd/systemd acknowledging Start is not yet helper readiness.
 			for attempt := 0; attempt < 30; attempt++ {
@@ -349,7 +487,7 @@ func newJoin(opts *options) *cobra.Command {
 	cmd.Flags().StringSliceVar(&udp, "allow-udp", nil, "Approved destination UDP ports (subnet mode: client to subnet; host mode: both directions)")
 	cmd.Flags().BoolVar(&ping, "allow-ping", false, "Permit ping (subnet mode: client to subnet; host mode: both directions)")
 	cmd.Flags().StringVar(&executable, "helper-executable", "", "Explicit local helper build instead of downloading this plugin's release")
-	cmd.Flags().BoolVar(&upgrade, "upgrade-helper", false, "Approve matching-helper upgrade; active IP attachments disconnect")
+	cmd.Flags().BoolVar(&upgrade, "upgrade-helper", false, "Force a helper update; active IP attachments briefly disconnect")
 	cmd.Flags().BoolVar(&replaceApproval, "replace-helper-approval", false, "Replace a changed administrator approval for this network; active IP attachments disconnect")
 	cmd.Flags().BoolVar(&wait, "wait", false, "Wait for the peer to connect after joining")
 	cmd.Flags().BoolVar(&noWait, "no-wait", false, "Return immediately even if a routed peer is not connected yet")

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +70,44 @@ func TestJoinRequestTimeoutCoversFreshBindingReconciliation(t *testing.T) {
 				t.Fatalf("joinRequestTimeout() = %s, want %s", got, test.want)
 			}
 		})
+	}
+}
+
+func TestActiveManagedNetworksIncludesOnlySavedRunningVPCs(t *testing.T) {
+	data := []byte(`{"networks":[{"network":"z-vpc","mode":"gateway","persistent":true,"desired_attached":true,"running":true,"connected":true},{"network":"peer","mode":"peer","persistent":true,"desired_attached":true,"running":true,"connected":true},{"network":"inactive","mode":"gateway","persistent":true,"desired_attached":true,"running":false},{"network":"ephemeral","mode":"gateway","running":true}]}`)
+	got, err := activeManagedNetworks(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "z-vpc" {
+		t.Fatalf("activeManagedNetworks() = %v", got)
+	}
+}
+
+func TestNetworkAlreadyConfigured(t *testing.T) {
+	configured, err := networkAlreadyConfigured([]byte(`{"networks":[{"network":"vpc","mode":"gateway"}]}`), "vpc")
+	if err != nil || !configured {
+		t.Fatalf("configured=%v err=%v", configured, err)
+	}
+	configured, err = networkAlreadyConfigured([]byte(`{"networks":[]}`), "vpc")
+	if err != nil || configured {
+		t.Fatalf("configured=%v err=%v", configured, err)
+	}
+}
+
+func TestWaitForManagedNetworksReportsNotRecoveredAttachments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"networks":[{"network":"vpc","mode":"gateway","running":true,"connected":false}]}`)
+	}))
+	defer server.Close()
+	client, err := connectapi.New(server.URL, "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := waitForManagedNetworks(context.Background(), client, "demo", []string{"vpc"}, 10*time.Millisecond)
+	if err != nil || len(pending) != 1 || pending[0] != "vpc" {
+		t.Fatalf("pending=%v err=%v", pending, err)
 	}
 }
 
@@ -152,10 +191,14 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv("DATUM_CONNECT_TOKEN", "local-test-token")
-			previousGuided, previousEnsure := guidedSetupEnabled, ensureNetworking
-			t.Cleanup(func() { guidedSetupEnabled, ensureNetworking = previousGuided, previousEnsure })
+			previousGuided, previousEnsure, previousMigrationCheck := guidedSetupEnabled, ensureNetworking, needsLinuxHelperMigration
+			t.Cleanup(func() {
+				guidedSetupEnabled, ensureNetworking, needsLinuxHelperMigration = previousGuided, previousEnsure, previousMigrationCheck
+			})
 			guidedSetupEnabled = func(*cobra.Command, *options) bool { return test.guided }
 			approvals, prepared, joins := 0, 0, 0
+			migrationChecks := 0
+			needsLinuxHelperMigration = func() bool { migrationChecks++; return true }
 			ensureNetworking = func(_ *cobra.Command, _, _ string, config daemonservice.HelperApprovals, _, replace bool) error {
 				approvals++
 				if len(config.Approvals) != 1 {
@@ -212,7 +255,60 @@ func TestJoinGuidedApprovalAndAutomationBoundary(t *testing.T) {
 			if (err == nil) != test.success || approvals != test.prompts || prepared != 1 || joins < 1 {
 				t.Fatalf("err=%v approvals=%d prepared=%d joins=%d", err, approvals, prepared, joins)
 			}
+			if !test.guided && migrationChecks != 0 {
+				t.Fatalf("headless join checked for or initiated automatic helper migration %d times", migrationChecks)
+			}
 		})
+	}
+}
+
+func TestJoinAutomaticallyMigratesLegacyLinuxHelperInteractively(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux helper migration")
+	}
+	t.Setenv("DATUM_CONNECT_TOKEN", "local-test-token")
+	previousGuided, previousEnsure, previousMigrationCheck := guidedSetupEnabled, ensureNetworking, needsLinuxHelperMigration
+	t.Cleanup(func() {
+		guidedSetupEnabled, ensureNetworking, needsLinuxHelperMigration = previousGuided, previousEnsure, previousMigrationCheck
+	})
+	guidedSetupEnabled = func(*cobra.Command, *options) bool { return true }
+	needsLinuxHelperMigration = func() bool { return true }
+	var upgraded bool
+	rejoinRequests := 0
+	ensureNetworking = func(_ *cobra.Command, _, _ string, _ daemonservice.HelperApprovals, upgrade, _ bool) error {
+		upgraded = upgrade
+		return nil
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/health":
+			io.WriteString(w, `{"status":"ok"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			io.WriteString(w, `{"networks":[{"network":"vpc","mode":"gateway","persistent":true,"desired_attached":true,"running":true,"connected":true}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/networks/vpc/setup":
+			io.WriteString(w, `{"network":"vpc","binding":{"interface_name":"dcvpc","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","mtu":1280},"helper_config":{"allowed_uid":501,"approvals":[{"interface_name":"dcvpc","assigned_address":"fd00::1/128","peer_address":"fd00::2/128","mtu":1280}]}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/networks":
+			rejoinRequests++
+			io.WriteString(w, `{"network":"vpc","mode":"gateway","running":true,"connected":true}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	cmd := newJoin(&options{baseURL: server.URL, timeout: time.Second})
+	cmd.Flags().String("project", "demo", "")
+	cmd.Flags().String("output", "json", "")
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetIn(strings.NewReader("y\n"))
+	cmd.SetArgs([]string{"vpc"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !upgraded || rejoinRequests != 2 {
+		t.Fatalf("migration=%v join requests=%d; want migration and explicit saved-attachment rejoin plus requested join", upgraded, rejoinRequests)
 	}
 }
 

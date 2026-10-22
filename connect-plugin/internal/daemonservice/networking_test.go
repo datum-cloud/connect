@@ -43,6 +43,23 @@ func TestApprovalsAreAdditiveAndCannotRetarget(t *testing.T) {
 	}
 }
 
+func TestHelperReceiptRequiresExactSafeShape(t *testing.T) {
+	valid := `{"executable":"/usr/libexec/datum-connect/1000/helper-a","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	if _, err := decodeHelperReceipt([]byte(valid)); err != nil {
+		t.Fatalf("valid receipt rejected: %v", err)
+	}
+	for _, data := range []string{
+		`{"executable":"relative/helper","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		`{"executable":"/helper","sha256":"short"}`,
+		`{"executable":"/helper","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extra":true}`,
+		valid + ` {}`,
+	} {
+		if _, err := decodeHelperReceipt([]byte(data)); err == nil {
+			t.Errorf("accepted invalid receipt %s", data)
+		}
+	}
+}
+
 func TestExistingApprovalCannotGainSubnetAccess(t *testing.T) {
 	host := InterfaceApproval{InterfaceName: "dcfirst", AssignedAddress: "fd00::1/128", PeerAddress: "fd00::2/128", MTU: 1280}
 	subnet := host

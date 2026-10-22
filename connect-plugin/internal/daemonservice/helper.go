@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kardianos/service"
@@ -163,6 +164,60 @@ func helperExecutableDir(uid uint32) string {
 		return filepath.Join("/usr/libexec/datum-connect", strconv.FormatUint(uint64(uid), 10))
 	}
 	return helperStateDir(uid)
+}
+
+// NeedsLinuxHelperMigration identifies the pre-SELinux systemd installation
+// whose executable lives in mutable /var/lib state. It is read-only and never
+// prompts; callers still need interactive confirmation before replacing it.
+func NeedsLinuxHelperMigration() bool {
+	uid := uint32(os.Getuid())
+	if runtime.GOOS != "linux" || uid == 0 || uid == ^uint32(0) {
+		return false
+	}
+	// Only offer automatic replacement for an install created by Connect.
+	// Manual service installs do not have this root-owned receipt and remain
+	// under explicit operator control.
+	if !hasManagedHelperReceipt(helperStateDir(uid)) {
+		return false
+	}
+	systemctl, err := exec.LookPath("systemctl")
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, systemctl, "show", "--property=ExecStart", "--value", "datum-connect-network-helper-"+strconv.FormatUint(uint64(uid), 10)).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return isLegacyHelperExec(string(output), uid)
+}
+
+func hasManagedHelperReceipt(stateDir string) bool {
+	path := filepath.Join(stateDir, "installed.json")
+	if err := validateHelperReceiptFile(path); err != nil || !safeManagedReceiptMetadata(stateDir) {
+		return false
+	}
+	// The receipt is root-only. Root-side authorization parses its JSON shape
+	// and checks the recorded executable before replacing any service.
+	return true
+}
+
+func safeManagedReceiptMetadata(stateDir string) bool {
+	path := filepath.Join(stateDir, "installed.json")
+	receipt, err := os.Lstat(path)
+	if err != nil || !receipt.Mode().IsRegular() || receipt.Mode().Perm() != 0600 || receipt.Size() == 0 || receipt.Size() > 4096 {
+		return false
+	}
+	dir, err := os.Stat(stateDir)
+	if err != nil || !dir.IsDir() || dir.Mode().Perm() != 0711 {
+		return false
+	}
+	return true
+}
+
+func isLegacyHelperExec(output string, uid uint32) bool {
+	return strings.Contains(output, filepath.Join(helperStateDir(uid), "helper-"))
 }
 
 func helperServiceConfig(uid uint32, executable string) *service.Config {

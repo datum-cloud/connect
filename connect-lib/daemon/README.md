@@ -399,13 +399,20 @@ rejoin. Retrying setup cannot silently change an existing pinned peer or its
 rules; use a new attachment name for a different grant.
 
 Adding another approved host pair reloads the root-owned approval file for new
-requests without restarting active interfaces. A binary upgrade requires
-`join friend --upgrade-helper` and explicit confirmation. It restarts only the
-networking helper, disconnecting active IP attachments, not your daemon's normal
-TCP/UDP services or OIDC session. Failed activation attempts restore the previous
-helper service where possible and report failures; existing root approval files
-and old binaries remain for recovery. Manually managed helper installations are
-never silently replaced.
+requests without restarting active interfaces. On Linux, interactive `join`
+offers to migrate an older helper from `/var/lib` to `/usr/libexec` automatically;
+you do not need to pass `--upgrade-helper`. Connect stages and validates the
+replacement, including its SELinux context, before it stops the old service. If
+an update is needed, active IP attachments briefly disconnect. The daemon
+reconnects saved VPC attachments; `join` waits up to 30 seconds and reports any
+that do not recover. TCP/UDP services and the OIDC session stay running. Failed
+activation attempts restore the previous helper service where possible and
+report failures; existing root approval files and old binaries remain for
+recovery. Scripts, JSON/YAML output, custom daemon URLs, and scoped tokens never
+trigger elevation or migration. Use `--upgrade-helper` to explicitly force an
+update during an interactive join. Headless operators must arrange helper
+installation and approval separately. Manually managed helper installations
+are never silently replaced.
 
 Scripts, JSON/YAML output, custom daemon URLs, and scoped tokens never trigger
 elevation. An administrator must complete setup locally first. API clients with
