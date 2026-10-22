@@ -300,11 +300,7 @@ async fn in_process_target_serves_without_a_socket() {
 /// share still pairs and serves over it.
 #[tokio::test]
 async fn fixed_port_and_public_address_are_advertised() {
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_udp_port();
     let public: std::net::SocketAddr = "[2001:db8::1]:4433".parse().unwrap();
     let target = origin().await;
     let cancel = CancellationToken::new();
@@ -447,12 +443,24 @@ async fn ping_through(ticket: ShareTicket) -> Result<(), connect_share::Error> {
     Ok(())
 }
 
+/// A UDP port free on both the IPv4 and IPv6 wildcard addresses, which is
+/// what a share binds, and not handed to another test in this process: the
+/// probe sockets close at once, so the kernel may offer the same port again.
 fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static TAKEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    let mut taken = TAKEN.lock().unwrap();
+    loop {
+        let port = std::net::UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // A dual-stack bind fails if either family has the port.
+        if !taken.contains(&port) && std::net::UdpSocket::bind(("::", port)).is_ok() {
+            taken.push(port);
+            return port;
+        }
+    }
 }
 
 /// A share restarted with the same key accepts the ticket from its first
@@ -489,6 +497,114 @@ async fn kept_key_reuses_the_ticket_across_restarts() {
         .await
         .expect("new key run");
     assert!(result.is_err(), "the old ticket still worked");
+    cancel.cancel();
+}
+
+/// One ping over `stream`, or the reason it failed.
+async fn ping(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(b"ping").await?;
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await?;
+    assert_eq!(&reply, b"pong");
+    Ok(())
+}
+
+/// A ready dial ends with `Unreachable` once its share stops, and a local
+/// connection made in the meantime fails instead of hanging.
+#[tokio::test]
+async fn dial_ends_when_its_share_stops() {
+    let (ticket, _events, share_cancel) = start_share(4).await;
+    let (ready, task, _dial_cancel) = start_dial(ticket).await;
+    let (local, _) = tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("dial ready")
+        .unwrap();
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    ping(&mut stream).await.unwrap();
+    drop(stream);
+
+    share_cancel.cancel();
+    let stopped = std::time::Instant::now();
+    let bound = connect_share::SHARER_LOST_TIMEOUT + Duration::from_secs(2);
+    // Accepted before the dial notices, so its tunnel cannot be set up.
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    let forwarded = tokio::time::timeout(bound, ping(&mut stream))
+        .await
+        .expect("local connection hung");
+    assert!(forwarded.is_err(), "ping reached a stopped share");
+
+    let result = tokio::time::timeout(bound, task)
+        .await
+        .expect("dial still running")
+        .unwrap();
+    assert!(
+        matches!(result, Err(connect_share::Error::Unreachable)),
+        "{result:?}"
+    );
+    let elapsed = stopped.elapsed();
+    assert!(elapsed < bound, "{elapsed:?}");
+    // The listener is gone with the dial.
+    assert!(TcpStream::connect(local).await.is_err());
+}
+
+/// A dial with no traffic stays up through many liveness checks, past the
+/// grace period, and still forwards afterwards.
+#[tokio::test]
+async fn idle_dial_stays_up() {
+    let (ticket, _events, share_cancel) = start_share(4).await;
+    let (ready, task, dial_cancel) = start_dial(ticket).await;
+    let (local, _) = tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("dial ready")
+        .unwrap();
+    tokio::time::sleep(connect_share::LIVENESS_GRACE + 2 * connect_share::LIVENESS_INTERVAL).await;
+    assert!(!task.is_finished(), "{:?}", task.await);
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), ping(&mut stream))
+        .await
+        .expect("ping")
+        .unwrap();
+    dial_cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("dial stopped")
+        .unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    share_cancel.cancel();
+}
+
+/// A share that restarts with the same key within the grace period keeps
+/// the dial up; the liveness check pairs again, so forwarding resumes.
+#[tokio::test]
+async fn dial_survives_a_quick_restart_with_the_same_key() {
+    let udp_port = free_udp_port();
+    let key = ShareKey::generate(4242);
+    let target = origin().await;
+    let (ticket, cancel, share_task) = start_keyed_share(target, udp_port, key.clone()).await;
+    let (ready, task, dial_cancel) = start_dial(ticket).await;
+    let (local, _) = tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("dial ready")
+        .unwrap();
+    cancel.cancel();
+    share_task.await.unwrap();
+    // With the dial's checks arriving, iroh can still hold the UDP socket
+    // for a few milliseconds after the share returns.
+    let waited = std::time::Instant::now();
+    while std::net::UdpSocket::bind(("::", udp_port)).is_err() {
+        assert!(waited.elapsed() < Duration::from_secs(5), "port still held");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (_ticket, cancel, _share_task) = start_keyed_share(target, udp_port, key).await;
+    // Long enough that the dial would have ended without the restart.
+    tokio::time::sleep(connect_share::SHARER_LOST_TIMEOUT).await;
+    assert!(!task.is_finished(), "{:?}", task.await);
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), ping(&mut stream))
+        .await
+        .expect("ping")
+        .unwrap();
+    dial_cancel.cancel();
     cancel.cancel();
 }
 

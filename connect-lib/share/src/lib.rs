@@ -18,7 +18,9 @@ mod share;
 mod ticket;
 
 pub use connect_transport::LocalStream;
-pub use dial::{DialEvent, DialOptions, DialReady, dial};
+pub use dial::{
+    DialEvent, DialOptions, DialReady, LIVENESS_GRACE, LIVENESS_INTERVAL, SHARER_LOST_TIMEOUT, dial,
+};
 pub use key::{KeyError, ShareKey};
 pub use pair::{PAIR_ALPN, PAIR_TIMEOUT};
 pub use path::{PathInfo, PathKind};
@@ -46,8 +48,9 @@ pub enum Error {
     RelayUnavailable,
     #[error("pairing failed: {0}")]
     Pairing(String),
-    /// The sharer did not answer within [`PAIR_TIMEOUT`]: usually its share
-    /// stopped, which ends the ticket.
+    /// The sharer did not answer within [`PAIR_TIMEOUT`], or a ready dial's
+    /// sharer stopped answering for [`LIVENESS_GRACE`]: usually its share
+    /// stopped, or restarted with a new key, which ends the ticket.
     #[error("ticket no longer reachable")]
     Unreachable,
 }

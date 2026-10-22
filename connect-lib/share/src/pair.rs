@@ -168,9 +168,41 @@ pub(crate) async fn request_pairing(
     secret: &[u8; 32],
     name: Option<&str>,
 ) -> Result<Option<String>, Error> {
-    tokio::time::timeout(PAIR_TIMEOUT, exchange(endpoint, sharer, secret, name))
-        .await
-        .map_err(|_| Error::Unreachable)?
+    match tokio::time::timeout(PAIR_TIMEOUT, exchange(endpoint, sharer, secret, name)).await {
+        Err(_) | Ok(Err(Failure::Unreachable)) => Err(Error::Unreachable),
+        Ok(Err(Failure::Stream(error) | Failure::Rejected(error))) => Err(Error::Pairing(error)),
+        Ok(Ok(name)) => Ok(name),
+    }
+}
+
+/// Peer side, once paired: repeats the exchange to check the sharer still
+/// runs under the same identity and still admits this peer. A sharer that
+/// restarted with the same key forgets its peers, so this also pairs again.
+/// Only an answer from the sharer refusing the peer is [`Error::Pairing`];
+/// no answer within `timeout`, or a broken exchange, is
+/// [`Error::Unreachable`].
+pub(crate) async fn probe_pairing(
+    endpoint: &Endpoint,
+    sharer: EndpointAddr,
+    secret: &[u8; 32],
+    name: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<(), Error> {
+    match tokio::time::timeout(timeout, exchange(endpoint, sharer, secret, name)).await {
+        Err(_) | Ok(Err(Failure::Unreachable | Failure::Stream(_))) => Err(Error::Unreachable),
+        Ok(Err(Failure::Rejected(error))) => Err(Error::Pairing(error)),
+        Ok(Ok(_)) => Ok(()),
+    }
+}
+
+/// Why an exchange failed.
+enum Failure {
+    /// No connection to the sharer.
+    Unreachable,
+    /// Connected, but the exchange broke off.
+    Stream(String),
+    /// The sharer answered and refused.
+    Rejected(String),
 }
 
 async fn exchange(
@@ -178,26 +210,27 @@ async fn exchange(
     sharer: EndpointAddr,
     secret: &[u8; 32],
     name: Option<&str>,
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>, Failure> {
     // A connect error also means the sharer cannot be reached.
     let conn = endpoint
         .connect(sharer, PAIR_ALPN)
         .await
-        .map_err(|_| Error::Unreachable)?;
+        .map_err(|_| Failure::Unreachable)?;
     let result = async {
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+        let stream = |e: &dyn std::fmt::Display| Failure::Stream(e.to_string());
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| stream(&e))?;
         let request = Request {
             secret: URL_SAFE_NO_PAD.encode(secret),
             name: name.map(str::to_owned),
         };
-        let body = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-        send.write_all(&body).await.map_err(|e| e.to_string())?;
-        send.finish().map_err(|e| e.to_string())?;
+        let body = serde_json::to_vec(&request).map_err(|e| stream(&e))?;
+        send.write_all(&body).await.map_err(|e| stream(&e))?;
+        send.finish().map_err(|e| stream(&e))?;
         let reply = recv
             .read_to_end(MAX_MESSAGE)
             .await
-            .map_err(|e| e.to_string())?;
-        let response: Response = serde_json::from_slice(&reply).map_err(|e| e.to_string())?;
+            .map_err(|e| stream(&e))?;
+        let response: Response = serde_json::from_slice(&reply).map_err(|e| stream(&e))?;
         if response.ok {
             Ok(response
                 .name
@@ -205,12 +238,14 @@ async fn exchange(
                 .map(clean_name)
                 .filter(|name| !name.is_empty()))
         } else {
-            Err(response.error.unwrap_or_else(|| "rejected".into()))
+            Err(Failure::Rejected(
+                response.error.unwrap_or_else(|| "rejected".into()),
+            ))
         }
     }
     .await;
     conn.close(0u32.into(), b"done");
-    result.map_err(Error::Pairing)
+    result
 }
 
 /// Bounds a display name and drops control characters, which could rewrite
