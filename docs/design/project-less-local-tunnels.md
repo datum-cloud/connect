@@ -33,8 +33,9 @@ Later, not in this proposal's first phase:
 
 Non-goals:
 
-- Persistent identities or hostnames without an account. Signed-in users keep
-  `serve`, `dial`, and `serve --public`.
+- Hostnames, or identities beyond one share's key, without an account.
+  Signed-in users keep `serve`, `dial`, and `serve --public`. A share may keep
+  its own key so its ticket survives restarts; see [Lifetime](#lifetime).
 - Raw UDP and VPC (`join`) without an account.
 
 ## What exists today
@@ -135,9 +136,23 @@ and CONNECT-IP ALPNs cannot be replaced.
 
 ### Lifetime
 
-Everything lives in memory. The sharer generates a new key on each run, so
-every run prints a new ticket, and stopping the command revokes all pairings.
-Nothing is written to disk on the sharer.
+By default everything lives in memory. The sharer generates a new key on each
+run, so every run prints a new ticket, and stopping the command revokes all
+pairings. Nothing is written to disk on the sharer.
+
+A share can instead keep a `ShareKey`: its iroh secret key, pairing secret, and
+destination port, in a file such as `--key-file`, written with mode 0600 and
+refused when other users can read it. A run with the same key prints a ticket
+with the same identity and secret, so tickets from earlier runs still pair, and
+devices with a saved ticket reconnect without scanning again. The direct
+addresses in an old ticket may be stale. Peers still find the sharer by its
+EndpointId through the transport preset's address lookup, which publishes the
+sharer's current addresses to n0's DNS.
+
+The key's port names the destination, so the service may move to another local
+port without breaking old tickets. Paired peers are still kept only in memory;
+returning devices pair again with the secret, and `--max-peers` counts per run.
+To revoke a kept ticket, delete the key file, or in the apps choose New ticket.
 
 ### Relays
 
@@ -184,11 +199,12 @@ which suits a phone on the same Wi-Fi and offline tests.
 | `share(ShareOptions, cancel, on_event)` | Sharer. Emits `Ready { ticket }` and `Paired { peer, name }`. |
 | `dial(DialOptions, cancel, on_ready)` | Peer. Pairs, binds a local TCP listener, forwards each connection. Accepts a caller-supplied key so a device can keep one identity. |
 | `ShareTicket` | `Display` and `FromStr` for the text form. |
+| `ShareKey` | A share's identity, secret, and port, kept so its ticket survives restarts. Text form `DCKEY1…`; `load_or_create` keeps it in a 0600 file. |
 
 ### `datum-connectd` foreground modes (implemented)
 
 ```text
-datum-connectd local HOST:PORT [--max-peers N] [--relay-urls URLS]
+datum-connectd local HOST:PORT [--max-peers N] [--relay-urls URLS] [--key-file PATH]
 datum-connectd local-dial TICKET [--bind ADDR] [--name NAME] [--relay-urls URLS]
 ```
 
@@ -199,7 +215,7 @@ daemon repository, credentials, or the loopback API.
 ### Plugin commands (implemented)
 
 ```text
-datumctl connect local --port PORT [--host HOST] [--name NAME]
+datumctl connect local --port PORT [--host HOST] [--name NAME] [--key-file PATH]
 datumctl connect local HOST:PORT [--name NAME]
 datumctl connect dial TICKET [--bind PORT]
 ```
@@ -329,7 +345,8 @@ identities to the allowlist, alongside paired peers.
 
 | Risk | Control |
 |---|---|
-| Ticket leaks | Pairing limit; ticket dies when the sharer stops; the UI warns that the ticket is a secret |
+| Ticket leaks | Pairing limit; ticket dies when the sharer stops, or with a kept key when the key is deleted or rotated; the UI warns that the ticket is a secret |
+| Kept key file leaks | Written 0600 and refused if others can read it; the key alone lets anyone impersonate the share |
 | Peer impersonation | Peer identity comes from the iroh TLS handshake, not from the request |
 | Secret guessing | 256-bit secret, constant-time comparison |
 | Exposure of the sharer's other ports | Only `tcp-<port>` is advertised; the transport refuses other destinations |

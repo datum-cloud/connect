@@ -3,6 +3,7 @@ package commands
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -94,6 +95,34 @@ func TestLocalPassesUDPPortAndPublicAddrs(t *testing.T) {
 		"--public-addr", "[2001:db8::1]:4433", "--public-addr", "203.0.113.9:4433"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("daemon args = %q", got)
+	}
+}
+
+func TestLocalKeyFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "api.key")
+	for _, tt := range []struct {
+		created bool
+		want    string
+	}{
+		{true, "Saved the share's key to " + path},
+		{false, "Ticket reused from " + path + "; delete the file for a new one."},
+	} {
+		stdout := fmt.Sprintf(`{"event":"share_ready","ticket":"DCSHARE2T","key_file":%q,"key_created":%t}`, path, tt.created)
+		exe, argsFile := fakeDaemon(t, stdout, "", 0)
+		out, err := runCommand(t, exe, "local", "--port", "9999", "--name", "n", "--key-file", "api.key")
+		if err != nil {
+			t.Fatal(err)
+		}
+		args, _ := os.ReadFile(argsFile)
+		want := []string{"local", "localhost:9999", "--max-peers", "4", "--name", "n", "--key-file", path}
+		if got := strings.Split(strings.TrimSpace(string(args)), "\n"); !slices.Equal(got, want) {
+			t.Fatalf("daemon args = %q", got)
+		}
+		if !strings.Contains(out, tt.want) {
+			t.Fatalf("output missing %q:\n%s", tt.want, out)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -41,23 +42,28 @@ func newLocal(opts *options) *cobra.Command {
 	var name string
 	var udpPort uint16
 	var publicAddrs []string
+	var keyFile string
 	cmd := &cobra.Command{
 		Use:   "local [HOST:PORT]",
 		Short: "Share a local service with your own devices, without signing in",
 		Long: "Share one local TCP service with devices that hold a pairing ticket. No Datum\n" +
-			"account, login, or project is needed, and nothing is saved.\n\n" +
+			"account, login, or project is needed, and nothing is saved unless you pass\n" +
+			"--key-file.\n\n" +
 			"The command prints a ticket and a QR code. Scan the QR code with the Datum\n" +
 			"Connect Android app, or run the printed dial command on another computer.\n" +
 			"Traffic goes directly between the devices when possible and otherwise through\n" +
 			"a public iroh relay.\n\n" +
 			"Anyone with the ticket can pair, up to --max-peers devices, until you stop\n" +
 			"this command. The ticket also contains this computer's IP addresses. Each run\n" +
-			"prints a new ticket.\n\n" +
+			"prints a new ticket, unless --key-file names a file that keeps the share's\n" +
+			"identity: the first run creates it, later runs print a ticket that devices\n" +
+			"paired before still accept. Delete the file for a new ticket.\n\n" +
 			"Devices show the share as --name, which defaults to HOSTNAME:PORT. Each device\n" +
 			"can rename it.",
 		Example: "  datumctl connect local --port 9999\n" +
 			"  datumctl connect local --port 3000 --name \"API dev server\"\n" +
-			"  datumctl connect local 127.0.0.1:3000 --max-peers 1",
+			"  datumctl connect local 127.0.0.1:3000 --max-peers 1\n" +
+			"  datumctl connect local --port 3000 --key-file ~/.config/datum/api-share.key",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target, err := localTarget(args, host, port, cmd.Flags().Changed("port"))
@@ -81,6 +87,14 @@ func newLocal(opts *options) *cobra.Command {
 			for _, addr := range publicAddrs {
 				extra = append(extra, "--public-addr", addr)
 			}
+			if keyFile != "" {
+				// The daemon may run from another directory.
+				abs, err := filepath.Abs(keyFile)
+				if err != nil {
+					return fmt.Errorf("--key-file: %w", err)
+				}
+				extra = append(extra, "--key-file", abs)
+			}
 			return runLocal(cmd, opts, target, name, maxPeers, extra)
 		},
 	}
@@ -89,6 +103,7 @@ func newLocal(opts *options) *cobra.Command {
 	cmd.Flags().IntVar(&maxPeers, "max-peers", 4, "Devices that may pair before pairing closes")
 	cmd.Flags().StringVar(&name, "name", "", "Name devices show for this share (default HOSTNAME:PORT)")
 	cmd.Flags().Uint16Var(&udpPort, "udp-port", 0, "Bind iroh's UDP socket to this port, so a load balancer or firewall can forward to it (default random)")
+	cmd.Flags().StringVar(&keyFile, "key-file", "", "Keep the share's identity in this file, created on first use, so its ticket works across runs")
 	cmd.Flags().StringArrayVar(&publicAddrs, "public-addr", nil, "IP:PORT where peers can reach this share directly, such as a load balancer forwarding to --udp-port; repeatable")
 	return cmd
 }
@@ -158,6 +173,13 @@ func runLocal(cmd *cobra.Command, opts *options, target, name string, maxPeers i
 			_, port, _ := net.SplitHostPort(target)
 			fmt.Fprintf(out, "Sharing %s as %q. Anyone with this ticket can connect until you press Ctrl+C.\n", target, name)
 			fmt.Fprintln(out, "The ticket also contains this computer's IP addresses.")
+			switch {
+			case event.KeyFile == "":
+			case event.KeyCreated != nil && *event.KeyCreated:
+				fmt.Fprintf(out, "Saved the share's key to %s. Later runs with --key-file print a ticket paired devices still accept.\n", event.KeyFile)
+			default:
+				fmt.Fprintf(out, "Ticket reused from %s; delete the file for a new one.\n", event.KeyFile)
+			}
 			if terminalWriter(out) {
 				fmt.Fprintln(out)
 				if err := writeQR(out, event.Ticket); err != nil {
@@ -227,6 +249,8 @@ type foregroundEvent struct {
 	Path       string `json:"path,omitempty"`
 	Remote     string `json:"remote,omitempty"`
 	RTTMs      *int64 `json:"rtt_ms,omitempty"`
+	KeyFile    string `json:"key_file,omitempty"`
+	KeyCreated *bool  `json:"key_created,omitempty"`
 }
 
 // runForeground runs datum-connectd in a project-less foreground mode until it
