@@ -49,6 +49,11 @@
 
           cargoLock = {
             lockFile = ./connect-lib/Cargo.lock;
+            # Git dependencies need a fixed hash; update it when the rev in
+            # Cargo.lock changes (nix build prints the new one).
+            outputHashes = {
+              "h3-0.0.8" = "sha256-vgyUL3kht0or68fhT5Uv6qp9Eg7TZU4UG2QfLrIXonQ=";
+            };
           };
 
           inherit nativeBuildInputs buildInputs;
@@ -56,6 +61,14 @@
           cargoBuildFlags = [ "-p" "datum-connect-daemon" ];
           doCheck = true;
           cargoTestFlags = [ "--workspace" "--locked" ];
+          # The sandbox has no system CA store, and building a reqwest client
+          # fails without one.
+          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+          # This test hands the daemon /bin/sh as a helper that must be owned
+          # by the build user or root. In the sandbox's user namespace the
+          # root-owned store path shows up as owned by nobody, so it can't
+          # pass here; cargo test covers it.
+          checkFlags = [ "--skip=oidc_session_enrollment_pins_session_and_requires_setup_to_replace" ];
 
           meta = with pkgs.lib; {
             description = "Persistent Datum Connect daemon";
