@@ -951,10 +951,18 @@ impl Transport {
                     Ok(tcp) => tcp,
                     Err(error) if cancel.is_cancelled() => return Err(error),
                     Err(error) => {
+                        // Flush the 502 before closing, as the 403 path does;
+                        // returning at once closed the connection first, so
+                        // the client saw a connection error instead.
                         stream
                             .send_response(response(StatusCode::BAD_GATEWAY))
                             .await
                             .map_err(error_display)?;
+                        stream.finish().await.map_err(error_display)?;
+                        drop(stream);
+                        h3.shutdown(0).await.map_err(error_display)?;
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(1), conn_guard.closed()).await;
                         return Err(error);
                     }
                 };
@@ -1029,6 +1037,10 @@ impl Transport {
                         .send_response(response(StatusCode::BAD_GATEWAY))
                         .await
                         .map_err(error_display)?;
+                    stream.finish().await.map_err(error_display)?;
+                    drop(stream);
+                    h3.shutdown(0).await.map_err(error_display)?;
+                    let _ = tokio::time::timeout(Duration::from_secs(1), conn_guard.closed()).await;
                     return Err(Error::Protocol("local target unavailable or busy".into()));
                 }
                 stream
@@ -2291,16 +2303,19 @@ mod tests {
                 .is_err()
         );
 
-        // A dropped listener refuses new sessions rather than hanging them.
+        // A dropped listener refuses new sessions with a 502 rather than
+        // hanging them or closing the connection before the answer arrives.
         drop(listener);
+        let refused = timeout(
+            Duration::from_secs(5),
+            client.connect_tcp(address(&server), destination, CancellationToken::new()),
+        )
+        .await
+        .expect("refused promptly")
+        .err();
         assert!(
-            timeout(
-                Duration::from_secs(5),
-                client.connect_tcp(address(&server), destination, CancellationToken::new())
-            )
-            .await
-            .expect("refused promptly")
-            .is_err()
+            matches!(refused, Some(Error::Rejected(StatusCode::BAD_GATEWAY))),
+            "{refused:?}"
         );
         server.shutdown().await;
         client.shutdown().await;

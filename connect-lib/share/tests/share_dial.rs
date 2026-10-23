@@ -784,14 +784,11 @@ async fn dial_reports_an_unreachable_shared_service() {
         .await
         .expect("dial reports the failure")
         .expect("failure channel stays open");
-    // The sharer's own attempt to open the dead service fails, though how that
-    // surfaces varies: an application close (H3_NO_ERROR) means the sharer
-    // ended the CONNECT stream itself and so could not reach the service,
-    // while refusing it outright names the status. Either way the report is
-    // the point: this used to be a log line the caller never saw.
-    assert!(
-        error.contains("502") || error.contains("H3_NO_ERROR"),
-        "expected the sharer to report its own failure, got: {error}"
+    // The sharer answers 502 when it can't open the service, and the dial
+    // turns that into words; before, the caller saw a raw connection error.
+    assert_eq!(
+        error, "the sharer couldn't reach the service it shares; is it running?",
+        "expected the sharer's 502 as a readable reason"
     );
 
     // The dial keeps serving: a second attempt is reported too, not silence.
@@ -914,6 +911,17 @@ async fn dial_reports_a_service_that_comes_back() {
     let mut reply = [0u8; 4];
     stream.read_exact(&mut reply).await.unwrap();
     assert_eq!(&reply, b"pong");
+
+    // Healthy forwards after the recovery are not reported.
+    let mut again = TcpStream::connect(local).await.unwrap();
+    again.write_all(b"ping").await.unwrap();
+    again.read_exact(&mut reply).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .is_err(),
+        "a healthy forward must not be reported as a recovery"
+    );
 
     dial_cancel.cancel();
     cancel.cancel();

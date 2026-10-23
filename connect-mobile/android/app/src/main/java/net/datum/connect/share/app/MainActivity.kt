@@ -249,7 +249,7 @@ private fun ConnectionCard(connection: Connection, onRename: () -> Unit) {
             )
             if (status is Status.Ready && connection.unreachable != null) {
                 Text(
-                    "Shared service unreachable: ${connection.unreachable}",
+                    connection.unreachable.replaceFirstChar(Char::uppercaseChar),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )

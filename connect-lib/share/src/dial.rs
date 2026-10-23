@@ -63,7 +63,7 @@ pub enum DialEvent {
     /// could not reach the service it shares, for example because that
     /// service is down. The connection is dropped but the dial keeps serving,
     /// so a caller can say the service is unreachable instead of leaving
-    /// requests to time out. Sent again only after a [`DialEvent::Forwarded`].
+    /// requests to time out. Sent for every failed connection.
     ConnectFailed(String),
     /// A local connection is being forwarded, after one or more
     /// [`DialEvent::ConnectFailed`]: the sharer reached the service.
@@ -158,6 +158,8 @@ async fn run(
     // Forwarded connections report their failures back to the loop, which
     // holds the caller's callback.
     let (events, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
+    // Forwarded is reported only on recovery, not for every connection.
+    let mut failing = false;
     loop {
         let accepted = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -167,8 +169,13 @@ async fn run(
             }
             event = forwarded.recv() => {
                 // The loop holds a sender, so this only ends with the dial.
-                if let Some(event) = event {
-                    on_event(event);
+                match event {
+                    Some(DialEvent::Forwarded) if !failing => {}
+                    Some(event) => {
+                        failing = matches!(event, DialEvent::ConnectFailed(_));
+                        on_event(event);
+                    }
+                    None => {}
                 }
                 continue;
             }
@@ -209,12 +216,29 @@ async fn run(
                 }
                 Err(error) => {
                     tracing::warn!(%error, "dial_connect_failed");
-                    let _ = events.send(DialEvent::ConnectFailed(error.to_string()));
+                    let _ = events.send(DialEvent::ConnectFailed(connect_failure(&error)));
                 }
             }
         });
     }
     Ok(())
+}
+
+/// Says why a forward failed in words a person can act on. The sharer answers
+/// 502 when it can't reach the service it shares and 403 when it no longer
+/// admits this device; anything else is a problem reaching the sharer.
+fn connect_failure(error: &connect_transport::Error) -> String {
+    use connect_transport::Error;
+    use http::StatusCode;
+    match error {
+        Error::Rejected(StatusCode::BAD_GATEWAY) => {
+            "the sharer couldn't reach the service it shares; is it running?".into()
+        }
+        Error::Rejected(StatusCode::FORBIDDEN) => "the sharer refused this device".into(),
+        Error::Rejected(status) => format!("the sharer refused the connection ({status})"),
+        Error::Timeout => "the sharer didn't answer in time".into(),
+        error => format!("couldn't reach the sharer: {error}"),
+    }
 }
 
 /// Repeats the pairing exchange every [`LIVENESS_INTERVAL`] and returns the

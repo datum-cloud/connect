@@ -226,6 +226,7 @@ func runTicketDial(cmd *cobra.Command, opts *options, ticket string, bind uint16
 		"--bind", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(bind))),
 		"--name", deviceNameHint(),
 	}
+	lastFailure := "" // a browser retrying a down service repeats the same reason
 	return runForeground(cmd, opts, daemonArgs, func(line []byte, event foregroundEvent) {
 		if jsonOut {
 			fmt.Fprintln(out, string(line))
@@ -236,9 +237,13 @@ func runTicketDial(cmd *cobra.Command, opts *options, ticket string, bind uint16
 			fmt.Fprintf(out, "  Path: %s\n", describePath(event))
 			return
 		case "dial_connect_failed":
-			fmt.Fprintf(out, "✗ The shared service is unreachable: %s\n", event.Reason)
+			if event.Reason != lastFailure || lastFailure == "" {
+				fmt.Fprintf(out, "✗ %s\n", sentence(event.Reason, "The shared service is unreachable"))
+			}
+			lastFailure = event.Reason
 			return
 		case "dial_forwarded":
+			lastFailure = ""
 			fmt.Fprintln(out, "✓ The shared service is reachable again.")
 			return
 		}
@@ -420,6 +425,16 @@ func (l *logTail) lastError() string {
 		plain = append([]string{strings.TrimPrefix(text, "error: ")}, plain...)
 	}
 	return strings.Join(plain, "\n")
+}
+
+// sentence capitalizes a reason from datum-connectd for display on its own
+// line, or returns fallback when the reason is empty.
+func sentence(reason, fallback string) string {
+	if reason == "" {
+		return fallback
+	}
+	r, size := utf8.DecodeRuneInString(reason)
+	return string(unicode.ToUpper(r)) + reason[size:]
 }
 
 // describePath renders a path report, for example "direct to

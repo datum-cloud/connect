@@ -12,6 +12,7 @@ workspace = true
 base64 = { workspace = true }
 connect-transport = { path = "../transport" }
 data-encoding = "2.10"
+http = { workspace = true }
 iroh = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }

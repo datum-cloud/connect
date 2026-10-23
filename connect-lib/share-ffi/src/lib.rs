@@ -121,7 +121,7 @@ pub trait DialListener: Send + Sync {
     fn on_path(&self, path: PathReport);
     /// A local connection could not be forwarded, for example because the
     /// shared service is down. The dial keeps serving; `reason` says why.
-    /// Reported again only after [`Self::on_forwarded`].
+    /// Reported for every failed connection.
     fn on_connect_failed(&self, reason: String);
     /// A connection was forwarded after one or more failures: the shared
     /// service is reachable again.
