@@ -34,6 +34,8 @@ data class Connection(
     val status: Status,
     /** The live path to the sharer while ready; never saved. */
     val path: PathReport? = null,
+    /** Why the shared service could not be reached, while ready; never saved. */
+    val unreachable: String? = null,
 )
 
 /**
@@ -131,11 +133,17 @@ object Connections {
 
     fun get(id: Long): Connection? = mutable.value.firstOrNull { it.id == id }
 
-    /** A new status clears the path unless the connection stays ready. */
+    /** A new status clears the path and any unreachable reason unless the connection stays ready. */
     fun setStatus(id: Long, status: Status) =
-        modify(id) { it.copy(status = status, path = if (status is Status.Ready) it.path else null) }
+        modify(id) {
+            if (status is Status.Ready) it.copy(status = status)
+            else it.copy(status = status, path = null, unreachable = null)
+        }
 
     fun setPath(id: Long, path: PathReport) = modify(id) { it.copy(path = path) }
+
+    /** The shared service is unreachable for [reason], or reachable again when null. */
+    fun setUnreachable(id: Long, reason: String?) = modify(id) { it.copy(unreachable = reason) }
 
     /** Adopts the sharer's name unless the user already chose one. */
     fun offerSharerName(id: Long, sharerName: String) {

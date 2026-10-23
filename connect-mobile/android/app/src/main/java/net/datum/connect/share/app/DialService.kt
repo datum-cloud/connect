@@ -136,6 +136,14 @@ class DialService : Service() {
             Connections.setPath(id, path)
         }
 
+        override fun onConnectFailed(reason: String) = onMain {
+            Connections.setUnreachable(id, reason)
+        }
+
+        override fun onForwarded() = onMain {
+            Connections.setUnreachable(id, null)
+        }
+
         override fun onReady(localAddr: String, sharerName: String?) = onMain {
             sharerName?.let { Connections.offerSharerName(id, it) }
             Connections.setStatus(id, Status.Ready(localAddr))
@@ -161,7 +169,10 @@ class DialService : Service() {
         val title = if (active.size == 1) "1 connection open" else "${active.size} connections open"
         val lines = active.map { c ->
             when (val status = c.status) {
-                is Status.Ready -> "${c.name}: http://${status.localAddr}" + (c.path?.let { " · ${it.summary()}" } ?: "")
+                is Status.Ready -> "${c.name}: " + (
+                    c.unreachable?.let { "service unreachable" }
+                        ?: ("http://${status.localAddr}" + (c.path?.let { " · ${it.summary()}" } ?: ""))
+                    )
                 else -> "${c.name}: pairing…"
             }
         }

@@ -55,6 +55,21 @@ class ConnectionsTest {
     }
 
     @Test
+    fun unreachableClearsOnForwardOrStop() {
+        val id = Connections.add("DATUMTUN1U", 0, "svc", 9999)
+        Connections.setStatus(id, Status.Ready("127.0.0.1:1"))
+        Connections.setUnreachable(id, "connection refused")
+        Connections.setStatus(id, Status.Ready("127.0.0.1:1"))
+        assertEquals("connection refused", Connections.get(id)!!.unreachable)
+        Connections.setUnreachable(id, null)
+        assertEquals(null, Connections.get(id)!!.unreachable)
+        Connections.setUnreachable(id, "connection refused")
+        Connections.setStatus(id, Status.Stopped)
+        assertEquals(null, Connections.get(id)!!.unreachable)
+        Connections.remove(id)
+    }
+
+    @Test
     fun sharerNameDoesNotReplaceUserName() {
         val chosen = Connections.add("DATUMTUN1A", 0, "mine", 9999)
         val derived = Connections.add("DATUMTUN1B", 0, null, 9999)

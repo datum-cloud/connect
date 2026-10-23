@@ -231,8 +231,15 @@ func runTicketDial(cmd *cobra.Command, opts *options, ticket string, bind uint16
 			fmt.Fprintln(out, string(line))
 			return
 		}
-		if event.Event == "dial_path" {
+		switch event.Event {
+		case "dial_path":
 			fmt.Fprintf(out, "  Path: %s\n", describePath(event))
+			return
+		case "dial_connect_failed":
+			fmt.Fprintf(out, "✗ The shared service is unreachable: %s\n", event.Reason)
+			return
+		case "dial_forwarded":
+			fmt.Fprintln(out, "✓ The shared service is reachable again.")
 			return
 		}
 		if event.Event == "dial_ready" {
@@ -253,6 +260,7 @@ type foregroundEvent struct {
 	Name       string `json:"name,omitempty"`
 	LocalAddr  string `json:"local_addr,omitempty"`
 	SharerName string `json:"sharer_name,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 	Path       string `json:"path,omitempty"`
 	Remote     string `json:"remote,omitempty"`
 	RTTMs      *int64 `json:"rtt_ms,omitempty"`

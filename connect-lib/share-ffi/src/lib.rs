@@ -119,6 +119,13 @@ pub trait DialListener: Send + Sync {
     fn on_ready(&self, local_addr: String, sharer_name: Option<String>);
     /// The path to the sharer changed. Only reported while traffic flows.
     fn on_path(&self, path: PathReport);
+    /// A local connection could not be forwarded, for example because the
+    /// shared service is down. The dial keeps serving; `reason` says why.
+    /// Reported again only after [`Self::on_forwarded`].
+    fn on_connect_failed(&self, reason: String);
+    /// A connection was forwarded after one or more failures: the shared
+    /// service is reachable again.
+    fn on_forwarded(&self);
     /// The dial ended. `error` is `None` after [`DialSession::stop`].
     fn on_stopped(&self, error: Option<String>);
 }
@@ -170,6 +177,8 @@ impl DialSession {
                         ready_listener.on_ready(addr, ready.sharer_name);
                     }
                     DialEvent::Path(path) => ready_listener.on_path(path.into()),
+                    DialEvent::ConnectFailed(reason) => ready_listener.on_connect_failed(reason),
+                    DialEvent::Forwarded => ready_listener.on_forwarded(),
                 },
             )
             .await;

@@ -247,6 +247,13 @@ private fun ConnectionCard(connection: Connection, onRename: () -> Unit) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = if (status is Status.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
             )
+            if (status is Status.Ready && connection.unreachable != null) {
+                Text(
+                    "Shared service unreachable: ${connection.unreachable}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
             if (status is Status.Ready) {
                 val path = connection.path
                 Text(

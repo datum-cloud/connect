@@ -256,6 +256,22 @@ func TestLocalCommandJSONPassesEventsThrough(t *testing.T) {
 	}
 }
 
+func TestTicketDialReportsUnreachableService(t *testing.T) {
+	stdout := `{"event":"dial_ready","local_addr":"127.0.0.1:8888","sharer_name":"api"}
+{"event":"dial_connect_failed","reason":"connection refused"}
+{"event":"dial_forwarded"}`
+	exe, _ := fakeDaemon(t, stdout, "", 0)
+	out, err := runCommand(t, exe, "dial", "DATUMTUN1XYZ", "--bind", "8888")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"✗ The shared service is unreachable: connection refused", "✓ The shared service is reachable again."} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestTicketDialReportsChildError(t *testing.T) {
 	stderr := `{"fields":{"message":"projectless_failed","error":"pairing failed: invalid secret"}}`
 	exe, argsFile := fakeDaemon(t, "", stderr, 1)

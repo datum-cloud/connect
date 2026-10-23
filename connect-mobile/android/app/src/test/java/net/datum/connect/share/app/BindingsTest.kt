@@ -88,6 +88,10 @@ class BindingsTest {
                     paths.add(path)
                 }
 
+                override fun onConnectFailed(reason: String) {}
+
+                override fun onForwarded() {}
+
                 override fun onStopped(error: String?) {
                     stopError.set(error)
                     stopped.countDown()

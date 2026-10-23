@@ -283,6 +283,13 @@ async fn run_projectless(command: Projectless) {
                     "sharer_name": ready.sharer_name,
                 })),
                 connect_share::DialEvent::Path(path) => emit(path_json("dial_path", &path)),
+                connect_share::DialEvent::ConnectFailed(reason) => emit(serde_json::json!({
+                    "event": "dial_connect_failed",
+                    "reason": reason,
+                })),
+                connect_share::DialEvent::Forwarded => {
+                    emit(serde_json::json!({ "event": "dial_forwarded" }))
+                }
             })
             .await
         }
