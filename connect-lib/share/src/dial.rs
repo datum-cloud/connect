@@ -63,8 +63,11 @@ pub enum DialEvent {
     /// could not reach the service it shares, for example because that
     /// service is down. The connection is dropped but the dial keeps serving,
     /// so a caller can say the service is unreachable instead of leaving
-    /// requests to time out.
+    /// requests to time out. Sent again only after a [`DialEvent::Forwarded`].
     ConnectFailed(String),
+    /// A local connection is being forwarded, after one or more
+    /// [`DialEvent::ConnectFailed`]: the sharer reached the service.
+    Forwarded,
 }
 
 /// Reported once the local listener accepts connections.
@@ -154,7 +157,7 @@ async fn run(
     tokio::pin!(lost);
     // Forwarded connections report their failures back to the loop, which
     // holds the caller's callback.
-    let (failures, mut failure_events) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
     loop {
         let accepted = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -162,10 +165,10 @@ async fn run(
                 tracing::warn!(%error, sharer = %ticket.endpoint.id, "dial_sharer_lost");
                 return Err(error);
             }
-            error = failure_events.recv() => {
+            event = forwarded.recv() => {
                 // The loop holds a sender, so this only ends with the dial.
-                if let Some(error) = error {
-                    on_event(DialEvent::ConnectFailed(error));
+                if let Some(event) = event {
+                    on_event(event);
                 }
                 continue;
             }
@@ -192,20 +195,21 @@ async fn run(
         let sharer = ticket.endpoint.clone();
         let destination = destination.clone();
         let stream_cancel = cancel.child_token();
-        let failures = failures.clone();
+        let events = events.clone();
         tokio::spawn(async move {
             match transport
                 .connect_tcp(sharer, destination, stream_cancel)
                 .await
             {
                 Ok(mut remote) => {
+                    let _ = events.send(DialEvent::Forwarded);
                     if let Err(error) = copy_bidirectional(&mut local, &mut remote).await {
                         tracing::debug!(%error, "dial_forward_ended");
                     }
                 }
                 Err(error) => {
                     tracing::warn!(%error, "dial_connect_failed");
-                    let _ = failures.send(error.to_string());
+                    let _ = events.send(DialEvent::ConnectFailed(error.to_string()));
                 }
             }
         });
