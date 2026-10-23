@@ -6,7 +6,8 @@
 //! restarted sharer by its identity even when its addresses changed, through
 //! the transport preset's address lookup.
 //!
-//! Text form: `DCKEY1` followed by unpadded RFC 4648 base32 of
+//! Text form: `DATUMKEY1` (or the earlier `DCKEY1`) followed by unpadded
+//! RFC 4648 base32 of
 //!
 //! | Field | Size |
 //! |---|---|
@@ -25,7 +26,8 @@ use iroh::{EndpointId, SecretKey};
 
 use crate::ticket::Reader;
 
-const PREFIX: &str = "DCKEY1";
+const PREFIX: &str = "DATUMKEY1";
+const LEGACY_PREFIX: &str = "DCKEY1";
 const VERSION: u8 = 1;
 
 /// The identity, pairing secret, and destination port behind a share's
@@ -189,7 +191,10 @@ impl FromStr for ShareKey {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let value = value.trim().to_ascii_uppercase();
-        let body = value.strip_prefix(PREFIX).ok_or(KeyError::Prefix)?;
+        let body = value
+            .strip_prefix(PREFIX)
+            .or_else(|| value.strip_prefix(LEGACY_PREFIX))
+            .ok_or(KeyError::Prefix)?;
         let bytes = BASE32_NOPAD
             .decode(body.as_bytes())
             .map_err(|_| KeyError::Malformed)?;
@@ -210,6 +215,16 @@ mod tests {
         assert_eq!(parsed.port, 9999);
         let lower: ShareKey = key.to_string().to_lowercase().parse().unwrap();
         assert_eq!(lower.secret, key.secret);
+        assert!(key.to_string().starts_with("DATUMKEY1"));
+    }
+
+    #[test]
+    fn accepts_legacy_prefix() {
+        let key = ShareKey::generate(9999);
+        let legacy = format!("{LEGACY_PREFIX}{}", BASE32_NOPAD.encode(&key.to_bytes()));
+        let parsed: ShareKey = legacy.parse().unwrap();
+        assert_eq!(parsed.endpoint_id(), key.endpoint_id());
+        assert_eq!(parsed.secret, key.secret);
     }
 
     #[test]
@@ -223,11 +238,11 @@ mod tests {
     #[test]
     fn rejects_other_input() {
         assert!(matches!(
-            "DCSHARE2AA".parse::<ShareKey>(),
+            "DATUMTUN1AA".parse::<ShareKey>(),
             Err(KeyError::Prefix)
         ));
         assert!(matches!(
-            "DCKEY1!!".parse::<ShareKey>(),
+            "DATUMKEY1!!".parse::<ShareKey>(),
             Err(KeyError::Malformed)
         ));
         let mut bytes = ShareKey::generate(1).to_bytes();

@@ -79,8 +79,11 @@ fails.
 
 ### Ticket
 
-`connect-lib/share/src/ticket.rs`. Text form: `DCSHARE2` followed by
-unpadded RFC 4648 base32 of a compact binary encoding. Parsing ignores case.
+`connect-lib/share/src/ticket.rs`. Text form: `DATUMTUN1` followed by
+unpadded RFC 4648 base32 of a compact binary encoding. Parsing ignores case
+and also accepts `DCSHARE2`, the prefix before the rename. The prefix ends in
+`1`, which base32 never uses, so a search for the prefix in pasted text can't
+match a word such as `datumctl`.
 
 | Field | Encoding |
 |---|---|
@@ -199,7 +202,7 @@ which suits a phone on the same Wi-Fi and offline tests.
 | `share(ShareOptions, cancel, on_event)` | Sharer. Emits `Ready { ticket }` and `Paired { peer, name }`. |
 | `dial(DialOptions, cancel, on_ready)` | Peer. Pairs, binds a local TCP listener, forwards each connection. Accepts a caller-supplied key so a device can keep one identity. |
 | `ShareTicket` | `Display` and `FromStr` for the text form. |
-| `ShareKey` | A share's identity, secret, and port, kept so its ticket survives restarts. Text form `DCKEY1…`; `load_or_create` keeps it in a 0600 file. |
+| `ShareKey` | A share's identity, secret, and port, kept so its ticket survives restarts. Text form `DATUMKEY1…` (earlier `DCKEY1…` still parses); `load_or_create` keeps it in a 0600 file. |
 
 ### `datum-connectd` foreground modes (implemented)
 
@@ -223,7 +226,7 @@ datumctl connect dial TICKET [--bind PORT]
 - `local` skips `project()` and the service-catalog gate. Add it to the
   ungated list in `activation.go`.
 - `dial` keeps its project behavior when the argument is `CONNECTOR:PORT`. When
-  the argument starts with `DCSHARE2`, it skips the project and runs
+  the argument starts with `DATUMTUN1` (or `DCSHARE2`), it skips the project and runs
   `local-dial`.
 - Both run in the foreground and exec `datum-connectd`, which the plugin
   already downloads and verifies. They do not install the background daemon.

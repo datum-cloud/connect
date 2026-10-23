@@ -33,13 +33,15 @@ class BindingsTest {
 
     @Test(expected = ShareException.InvalidTicket::class)
     fun rejectsInvalidTicket() {
-        parseTicket("DCSHARE2!!")
+        parseTicket("DATUMTUN1!!")
     }
 
     @Test
     fun extractsTicketFromDialCommand() {
-        assertEquals("DCSHARE2ABC27", extractTicket("datumctl connect dial DCSHARE2ABC27 --bind 9999"))
+        assertEquals("DATUMTUN1ABC27", extractTicket("datumctl connect dial DATUMTUN1ABC27 --bind 9999"))
+        assertEquals("DATUMTUN1ABC", extractTicket("datumtun1abc"))
         assertEquals("DCSHARE2ABC", extractTicket("dcshare2abc"))
+        assertNull(extractTicket("datumctl connect dial"))
         assertNull(extractTicket("no ticket here"))
     }
 
@@ -66,7 +68,7 @@ class BindingsTest {
             .start()
         try {
             val event = sharer.inputStream.bufferedReader().readLine()
-            val ticket = Regex("\"ticket\":\"(DCSHARE2[^\"]+)\"").find(event)!!.groupValues[1]
+            val ticket = Regex("\"ticket\":\"(DATUMTUN1[^\"]+)\"").find(event)!!.groupValues[1]
             assertEquals(origin.localPort, parseTicket(ticket).port.toInt())
 
             val ready = CountDownLatch(1)

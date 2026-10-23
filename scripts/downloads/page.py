@@ -131,7 +131,7 @@ PAIRING = """
 <p>It prints a QR code, a ticket, and a ready-to-run dial command, and waits.</p></li>
 <li><p><b>On an Android phone:</b> in Datum Connect, tap <b>Scan QR code</b>, then <b>Connect</b> and <b>Open</b>.</p>
 <p><b>Or on another computer:</b> run the printed command, then open <code>http://localhost:8080</code>:</p>
-<pre><code>./datumctl-connect dial DCSHARE2… --bind 8080</code></pre></li>
+<pre><code>./datumctl-connect dial DATUMTUN1… --bind 8080</code></pre></li>
 <li><p>Press Ctrl+C on the sharing computer to end the share. Every run prints a new ticket.</p></li>
 </ol>
 <p><small>Anyone with the ticket can connect, up to <code>--max-peers</code> devices (default 4), until the share stops. The ticket also contains the sharing computer's IP addresses, so send it only to people you trust.</small></p>

@@ -156,9 +156,12 @@ class MainActivity : FragmentActivity() {
             ?.let(::extractTicket)
 }
 
-/** Finds a ticket in pasted, scanned, or shared text, such as a full dial command. */
+/**
+ * Finds a ticket in pasted, scanned, or shared text, such as a full dial command.
+ * Accepts DCSHARE2, the prefix before the rename, so older tickets still work.
+ */
 internal fun extractTicket(text: String): String? =
-    Regex("DCSHARE2[A-Z2-7]+", RegexOption.IGNORE_CASE).find(text)?.value?.uppercase()
+    Regex("(?:DATUMTUN1|DCSHARE2)[A-Z2-7]+", RegexOption.IGNORE_CASE).find(text)?.value?.uppercase()
 
 private sealed interface Parsed {
     data object Empty : Parsed

@@ -51,7 +51,7 @@ notification while the port is open. Tap **Stop** there or in the app to close
 it.
 
 In the emulator, paste the ticket instead of scanning: run
-`adb shell input text 'DCSHARE2…'` with the field focused, or use **Paste**
+`adb shell input text 'DATUMTUN1…'` with the field focused, or use **Paste**
 after copying the ticket into the emulator's clipboard.
 
 ## Update the app without a public URL

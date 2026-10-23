@@ -67,7 +67,7 @@ func TestDescribePath(t *testing.T) {
 }
 
 func TestLocalCommandShowsDevicePaths(t *testing.T) {
-	stdout := `{"event":"share_ready","ticket":"DCSHARE2T"}
+	stdout := `{"event":"share_ready","ticket":"DATUMTUN1T"}
 {"event":"share_paired","peer":"66ed43143f88520ba7cae1b7f7eb10b9","name":"pixel"}
 {"event":"share_path","peer":"66ed43143f88520ba7cae1b7f7eb10b9","path":"relay","remote":"https://relay.example./","rtt_ms":150}
 {"event":"share_path","peer":"66ed43143f88520ba7cae1b7f7eb10b9","path":"direct","remote":"[2001:db8::1]:4433","rtt_ms":12}`
@@ -84,7 +84,7 @@ func TestLocalCommandShowsDevicePaths(t *testing.T) {
 }
 
 func TestLocalPassesUDPPortAndPublicAddrs(t *testing.T) {
-	exe, argsFile := fakeDaemon(t, `{"event":"share_ready","ticket":"DCSHARE2T"}`, "", 0)
+	exe, argsFile := fakeDaemon(t, `{"event":"share_ready","ticket":"DATUMTUN1T"}`, "", 0)
 	if _, err := runCommand(t, exe, "local", "--port", "9999", "--name", "n", "--udp-port", "4433",
 		"--public-addr", "[2001:db8::1]:4433", "--public-addr", "203.0.113.9:4433"); err != nil {
 		t.Fatal(err)
@@ -109,7 +109,7 @@ func TestLocalKeyFile(t *testing.T) {
 		{true, "Saved the share's key to " + path},
 		{false, "Ticket reused from " + path + "; delete the file for a new one."},
 	} {
-		stdout := fmt.Sprintf(`{"event":"share_ready","ticket":"DCSHARE2T","key_file":%q,"key_created":%t}`, path, tt.created)
+		stdout := fmt.Sprintf(`{"event":"share_ready","ticket":"DATUMTUN1T","key_file":%q,"key_created":%t}`, path, tt.created)
 		exe, argsFile := fakeDaemon(t, stdout, "", 0)
 		out, err := runCommand(t, exe, "local", "--port", "9999", "--name", "n", "--key-file", "api.key")
 		if err != nil {
@@ -179,8 +179,8 @@ func TestLogTailLastError(t *testing.T) {
 		t.Fatalf("lastError = %q", got)
 	}
 	clap := &logTail{}
-	io.WriteString(clap, "error: invalid value 'DCSHARE2x' for '<TICKET>': malformed share ticket\n\nFor more information, try '--help'.\n")
-	if got := clap.lastError(); got != "invalid value 'DCSHARE2x' for '<TICKET>': malformed share ticket" {
+	io.WriteString(clap, "error: invalid value 'DATUMTUN1x' for '<TICKET>': malformed share ticket\n\nFor more information, try '--help'.\n")
+	if got := clap.lastError(); got != "invalid value 'DATUMTUN1x' for '<TICKET>': malformed share ticket" {
 		t.Fatalf("lastError = %q", got)
 	}
 }
@@ -221,7 +221,7 @@ func runCommand(t *testing.T, exe string, args ...string) (string, error) {
 }
 
 func TestLocalCommandRunsProjectless(t *testing.T) {
-	stdout := `{"event":"share_ready","endpoint_id":"ab","target":"127.0.0.1:9999","ticket":"DCSHARE2TICKET"}
+	stdout := `{"event":"share_ready","endpoint_id":"ab","target":"127.0.0.1:9999","ticket":"DATUMTUN1TICKET"}
 {"event":"share_paired","peer":"66ed43143f88520ba7cae1b7f7eb10b9","name":"pixel"}`
 	exe, argsFile := fakeDaemon(t, stdout, "", 0)
 	out, err := runCommand(t, exe, "local", "--port", "9999", "--name", "API dev server")
@@ -237,7 +237,7 @@ func TestLocalCommandRunsProjectless(t *testing.T) {
 	if strings.Contains(string(env), "DATUM_SESSION") {
 		t.Fatal("DATUM_SESSION leaked to the child")
 	}
-	for _, want := range []string{"Sharing localhost:9999 as \"API dev server\"", "datumctl connect dial DCSHARE2TICKET --bind 9999", "✓ Paired pixel (66ed43143f88…)"} {
+	for _, want := range []string{"Sharing localhost:9999 as \"API dev server\"", "datumctl connect dial DATUMTUN1TICKET --bind 9999", "✓ Paired pixel (66ed43143f88…)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
@@ -245,7 +245,7 @@ func TestLocalCommandRunsProjectless(t *testing.T) {
 }
 
 func TestLocalCommandJSONPassesEventsThrough(t *testing.T) {
-	stdout := `{"event":"share_ready","ticket":"DCSHARE2T"}`
+	stdout := `{"event":"share_ready","ticket":"DATUMTUN1T"}`
 	exe, _ := fakeDaemon(t, stdout, "", 0)
 	out, err := runCommand(t, exe, "local", "localhost:80", "-o", "json")
 	if err != nil {
@@ -259,20 +259,20 @@ func TestLocalCommandJSONPassesEventsThrough(t *testing.T) {
 func TestTicketDialReportsChildError(t *testing.T) {
 	stderr := `{"fields":{"message":"projectless_failed","error":"pairing failed: invalid secret"}}`
 	exe, argsFile := fakeDaemon(t, "", stderr, 1)
-	_, err := runCommand(t, exe, "dial", "DCSHARE2XYZ", "--bind", "8888")
+	_, err := runCommand(t, exe, "dial", "DATUMTUN1XYZ", "--bind", "8888")
 	if err == nil || err.Error() != "pairing failed: invalid secret" {
 		t.Fatalf("err = %v", err)
 	}
 	args, _ := os.ReadFile(argsFile)
 	got := strings.Fields(string(args))
-	if len(got) < 4 || !slices.Equal(got[:4], []string{"local-dial", "DCSHARE2XYZ", "--bind", "127.0.0.1:8888"}) {
+	if len(got) < 4 || !slices.Equal(got[:4], []string{"local-dial", "DATUMTUN1XYZ", "--bind", "127.0.0.1:8888"}) {
 		t.Fatalf("daemon args = %v", got)
 	}
 }
 
 func TestTicketDialRejectsUDP(t *testing.T) {
 	exe, _ := fakeDaemon(t, "", "", 0)
-	_, err := runCommand(t, exe, "dial", "DCSHARE2XYZ", "--protocol", "udp")
+	_, err := runCommand(t, exe, "dial", "DATUMTUN1XYZ", "--protocol", "udp")
 	if err == nil || !strings.Contains(err.Error(), "TCP only") {
 		t.Fatalf("err = %v", err)
 	}

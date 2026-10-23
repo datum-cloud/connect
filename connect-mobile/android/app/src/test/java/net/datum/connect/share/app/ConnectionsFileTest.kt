@@ -9,7 +9,7 @@ import org.junit.Test
 
 class ConnectionsFileTest {
     private fun connection(id: Long, name: String, port: Int, status: Status = Status.Ready("127.0.0.1:$port")) =
-        Connection(id, name, nameFromUser = id % 2 == 0L, ticket = "DCSHARE2T$id", requestedPort = port, status = status)
+        Connection(id, name, nameFromUser = id % 2 == 0L, ticket = "DATUMTUN1T$id", requestedPort = port, status = status)
 
     @Test
     fun encodeAndDecodeRoundTrip() {
@@ -18,8 +18,8 @@ class ConnectionsFileTest {
         assertFalse("statuses are not saved", text.contains("127.0.0.1"))
         assertEquals(
             listOf(
-                ConnectionsFile.Saved("api", false, "DCSHARE2T1", 3000),
-                ConnectionsFile.Saved("docs", true, "DCSHARE2T2", 0),
+                ConnectionsFile.Saved("api", false, "DATUMTUN1T1", 3000),
+                ConnectionsFile.Saved("docs", true, "DATUMTUN1T2", 0),
             ),
             ConnectionsFile.decode(text),
         )
@@ -62,10 +62,10 @@ class ConnectionsFileTest {
 
         val (added, skipped) = Connections.importSaved(
             listOf(
-                ConnectionsFile.Saved("api", true, "DCSHARE2OK", 4000),
+                ConnectionsFile.Saved("api", true, "DATUMTUN1OK", 4000),
                 ConnectionsFile.Saved("bad", true, "nope", 0),
             ),
-        ) { it.startsWith("DCSHARE2") }
+        ) { it.startsWith("DATUMTUN1") }
         assertEquals(1 to 1, added to skipped)
         assertEquals(listOf("api", "api (2)"), Connections.list.value.map { it.name })
 

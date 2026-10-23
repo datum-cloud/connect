@@ -1,9 +1,12 @@
 //! Share tickets: everything a peer needs to reach and pair with a sharer.
 //!
-//! Text form: `DCSHARE2` followed by unpadded RFC 4648 base32 of a compact
+//! Text form: `DATUMTUN1` followed by unpadded RFC 4648 base32 of a compact
 //! binary encoding. Every character is in the QR alphanumeric set, so QR
 //! encoders use alphanumeric mode, which keeps the code small enough to scan
-//! from a terminal. Parsing ignores case so a typed ticket also works.
+//! from a terminal. The prefix ends in `1`, which base32 never uses, so a
+//! search for the prefix in pasted text can't match a word such as
+//! `datumctl`. Parsing ignores case so a typed ticket also works, and accepts
+//! the earlier `DCSHARE2` prefix so saved tickets keep working.
 //!
 //! Binary layout (version 1):
 //!
@@ -24,7 +27,8 @@ use std::{
 use data_encoding::BASE32_NOPAD;
 use iroh::{EndpointAddr, EndpointId, RelayUrl};
 
-const PREFIX: &str = "DCSHARE2";
+const PREFIX: &str = "DATUMTUN1";
+const LEGACY_PREFIX: &str = "DCSHARE2";
 const VERSION: u8 = 1;
 const MAX_RELAYS: usize = 4;
 /// Direct addresses beyond this are dropped to keep the QR code scannable;
@@ -167,7 +171,10 @@ impl FromStr for ShareTicket {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let value = value.trim().to_ascii_uppercase();
-        let body = value.strip_prefix(PREFIX).ok_or(TicketError::Prefix)?;
+        let body = value
+            .strip_prefix(PREFIX)
+            .or_else(|| value.strip_prefix(LEGACY_PREFIX))
+            .ok_or(TicketError::Prefix)?;
         let bytes = BASE32_NOPAD
             .decode(body.as_bytes())
             .map_err(|_| TicketError::Malformed)?;
@@ -232,13 +239,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legacy_prefix() {
+        let ticket = sample();
+        let legacy = format!("{LEGACY_PREFIX}{}", BASE32_NOPAD.encode(&ticket.to_bytes()));
+        assert_eq!(legacy.parse::<ShareTicket>().unwrap(), ticket);
+        assert!(ticket.to_string().starts_with("DATUMTUN1"));
+    }
+
+    #[test]
     fn rejects_other_input() {
         assert!(matches!(
             "datumabc".parse::<ShareTicket>(),
             Err(TicketError::Prefix)
         ));
         assert!(matches!(
-            "DCSHARE2!!".parse::<ShareTicket>(),
+            "DATUMTUN1!!".parse::<ShareTicket>(),
             Err(TicketError::Malformed)
         ));
         let mut bytes = sample().to_bytes();

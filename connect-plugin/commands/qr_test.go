@@ -9,7 +9,7 @@ import (
 )
 
 func TestWriteQRUsesExplicitColorsAndQuietZone(t *testing.T) {
-	ticket := "DCSHARE2" + strings.Repeat("A7", 112)
+	ticket := "DATUMTUN1" + strings.Repeat("A7", 112)
 	var out bytes.Buffer
 	if err := writeQR(&out, ticket); err != nil {
 		t.Fatal(err)

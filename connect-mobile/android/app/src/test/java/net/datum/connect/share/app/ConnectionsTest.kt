@@ -9,7 +9,7 @@ import net.datum.connect.share.PathReport
 
 class ConnectionsTest {
     private fun connection(id: Long, port: Int, status: Status) =
-        Connection(id, "c$id", false, "DCSHARE2X", port, status)
+        Connection(id, "c$id", false, "DATUMTUN1X", port, status)
 
     @Test
     fun uniqueNameAddsSuffix() {
@@ -44,7 +44,7 @@ class ConnectionsTest {
     fun pathSummaryAndClearing() {
         assertEquals("Direct · 12 ms", PathReport(PathKind.DIRECT, "[2001:db8::1]:1", 12u).summary())
         assertEquals("Relayed", PathReport(PathKind.RELAY, null, null).summary())
-        val id = Connections.add("DCSHARE2P", 0, "path", 9999)
+        val id = Connections.add("DATUMTUN1P", 0, "path", 9999)
         Connections.setStatus(id, Status.Ready("127.0.0.1:1"))
         Connections.setPath(id, PathReport(PathKind.RELAY, "https://relay.example./", 150u))
         Connections.setStatus(id, Status.Ready("127.0.0.1:1"))
@@ -56,8 +56,8 @@ class ConnectionsTest {
 
     @Test
     fun sharerNameDoesNotReplaceUserName() {
-        val chosen = Connections.add("DCSHARE2A", 0, "mine", 9999)
-        val derived = Connections.add("DCSHARE2B", 0, null, 9999)
+        val chosen = Connections.add("DATUMTUN1A", 0, "mine", 9999)
+        val derived = Connections.add("DATUMTUN1B", 0, null, 9999)
         Connections.offerSharerName(chosen, "laptop:9999")
         Connections.offerSharerName(derived, "laptop:9999")
         assertEquals("mine", Connections.get(chosen)!!.name)

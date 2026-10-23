@@ -25,14 +25,21 @@ import (
 	"go.datum.net/datumctl-plugins/connect/internal/daemonservice"
 )
 
-// shareTicketPrefix marks a project-less share ticket (connect-lib/share).
-// Tickets are case-insensitive.
-const shareTicketPrefix = "DCSHARE2"
+// shareTicketPrefixes mark a project-less share ticket (connect-lib/share),
+// newest first; DCSHARE2 tickets saved before the rename still dial. Tickets
+// are case-insensitive.
+var shareTicketPrefixes = []string{"DATUMTUN1", "DCSHARE2"}
 
 var foregroundExecutable = daemonservice.ForegroundExecutable
 
 func isShareTicket(value string) bool {
-	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(value)), shareTicketPrefix)
+	value = strings.ToUpper(strings.TrimSpace(value))
+	for _, prefix := range shareTicketPrefixes {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func newLocal(opts *options) *cobra.Command {

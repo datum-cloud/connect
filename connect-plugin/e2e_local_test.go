@@ -49,7 +49,7 @@ func TestLocalShareAndTicketDial(t *testing.T) {
 	share := startForeground(t, env, "local", origin, "--max-peers", "1", "--name", "E2E service", "-o", "json")
 	ready := share.next(t, "share_ready")
 	ticket, _ := ready["ticket"].(string)
-	if !strings.HasPrefix(ticket, "DCSHARE2") {
+	if !strings.HasPrefix(ticket, "DATUMTUN1") {
 		t.Fatalf("share_ready ticket = %q", ticket)
 	}
 
