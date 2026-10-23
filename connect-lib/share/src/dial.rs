@@ -59,6 +59,12 @@ pub enum DialEvent {
     /// The path to the sharer changed. Reported only while a connection is
     /// open, either forwarded traffic or a liveness check.
     Path(PathInfo),
+    /// A local connection could not be forwarded: the sharer refused it, or
+    /// could not reach the service it shares, for example because that
+    /// service is down. The connection is dropped but the dial keeps serving,
+    /// so a caller can say the service is unreachable instead of leaving
+    /// requests to time out.
+    ConnectFailed(String),
 }
 
 /// Reported once the local listener accepts connections.
@@ -146,12 +152,22 @@ async fn run(
         name,
     );
     tokio::pin!(lost);
+    // Forwarded connections report their failures back to the loop, which
+    // holds the caller's callback.
+    let (failures, mut failure_events) = tokio::sync::mpsc::unbounded_channel();
     loop {
         let accepted = tokio::select! {
             _ = cancel.cancelled() => break,
             error = &mut lost => {
                 tracing::warn!(%error, sharer = %ticket.endpoint.id, "dial_sharer_lost");
                 return Err(error);
+            }
+            error = failure_events.recv() => {
+                // The loop holds a sender, so this only ends with the dial.
+                if let Some(error) = error {
+                    on_event(DialEvent::ConnectFailed(error));
+                }
+                continue;
             }
             accepted = listener.accept() => accepted,
             update = paths.recv() => {
@@ -176,6 +192,7 @@ async fn run(
         let sharer = ticket.endpoint.clone();
         let destination = destination.clone();
         let stream_cancel = cancel.child_token();
+        let failures = failures.clone();
         tokio::spawn(async move {
             match transport
                 .connect_tcp(sharer, destination, stream_cancel)
@@ -186,7 +203,10 @@ async fn run(
                         tracing::debug!(%error, "dial_forward_ended");
                     }
                 }
-                Err(error) => tracing::warn!(%error, "dial_connect_failed"),
+                Err(error) => {
+                    tracing::warn!(%error, "dial_connect_failed");
+                    let _ = failures.send(error.to_string());
+                }
             }
         });
     }

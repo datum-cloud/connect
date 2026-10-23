@@ -108,6 +108,8 @@ async fn start_dial_with_paths(
 ) {
     let cancel = CancellationToken::new();
     let (tx, rx) = tokio::sync::oneshot::channel();
+    // Path reports are not read by the tests using this helper; the channel
+    // still exists so the callback has somewhere to send them.
     let (path_tx, path_rx) = mpsc::unbounded_channel();
     let mut tx = Some(tx);
     let task = tokio::spawn({
@@ -131,6 +133,10 @@ async fn start_dial_with_paths(
                     DialEvent::Path(path) => {
                         let _ = path_tx.send(path);
                     }
+                    // Forwarding failures are what the dial reports instead of
+                    // logging only; tests that care read them from their own
+                    // dial. This helper keeps the ready/path shape.
+                    DialEvent::ConnectFailed(_) => {}
                 },
             )
             .await
@@ -688,6 +694,110 @@ async fn kept_key_is_found_after_its_addresses_change() {
     let mut reply = [0u8; 4];
     stream.read_exact(&mut reply).await.unwrap();
     assert_eq!(&reply, b"pong");
+    dial_cancel.cancel();
+    cancel.cancel();
+}
+
+/// A share whose service is down answers the forwarded CONNECT with 502. The
+/// dial reports that once instead of leaving a caller to time out, and keeps
+/// serving so the share can come back.
+#[tokio::test]
+async fn dial_reports_an_unreachable_shared_service() {
+    // Bind a port and drop the listener, so the share resolves the address but
+    // nothing accepts on it: what a service going down looks like.
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+
+    let cancel = CancellationToken::new();
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            share(
+                ShareOptions {
+                    target: dead_addr.to_string().into(),
+                    relay_urls: Some(Vec::new()),
+                    max_peers: 4,
+                    name: Some("dead service".into()),
+                    udp_port: None,
+                    public_addrs: Vec::new(),
+                    key: None,
+                },
+                cancel,
+                move |event| {
+                    let _ = events_tx.send(event);
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let Some(ShareEvent::Ready { ticket, .. }) = events_rx.recv().await else {
+        panic!("share did not become ready");
+    };
+
+    let dial_cancel = CancellationToken::new();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (fail_tx, mut fail_rx) = mpsc::unbounded_channel();
+    let mut ready_tx = Some(ready_tx);
+    tokio::spawn({
+        let cancel = dial_cancel.clone();
+        async move {
+            dial(
+                DialOptions {
+                    ticket: loopback_only(ticket),
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    secret_key: None,
+                    name: Some("test-phone".into()),
+                    relay_urls: Some(Vec::new()),
+                },
+                cancel,
+                move |event| match event {
+                    DialEvent::Ready(ready) => {
+                        if let Some(tx) = ready_tx.take() {
+                            let _ = tx.send(ready.local_addr);
+                        }
+                    }
+                    DialEvent::ConnectFailed(error) => {
+                        let _ = fail_tx.send(error);
+                    }
+                    DialEvent::Path(_) => {}
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let local = tokio::time::timeout(Duration::from_secs(30), ready_rx)
+        .await
+        .expect("dial ready")
+        .unwrap();
+
+    // The connection is dropped, and the dial says why.
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    let _ = stream.write_all(b"ping").await;
+    let error = tokio::time::timeout(Duration::from_secs(20), fail_rx.recv())
+        .await
+        .expect("dial reports the failure")
+        .expect("failure channel stays open");
+    // The sharer's own attempt to open the dead service fails, though how that
+    // surfaces varies: an application close (H3_NO_ERROR) means the sharer
+    // ended the CONNECT stream itself and so could not reach the service,
+    // while refusing it outright names the status. Either way the report is
+    // the point: this used to be a log line the caller never saw.
+    assert!(
+        error.contains("502") || error.contains("H3_NO_ERROR"),
+        "expected the sharer to report its own failure, got: {error}"
+    );
+
+    // The dial keeps serving: a second attempt is reported too, not silence.
+    let _ = TcpStream::connect(local).await;
+    tokio::time::timeout(Duration::from_secs(20), fail_rx.recv())
+        .await
+        .expect("dial reports the next failure")
+        .expect("failure channel stays open");
+
     dial_cancel.cancel();
     cancel.cancel();
 }
