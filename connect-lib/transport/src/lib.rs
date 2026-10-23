@@ -202,10 +202,14 @@ const LOCAL_BACKLOG: usize = 64;
 const LOCAL_BUFFER: usize = 64 * 1024;
 
 /// Peer authorization for one destination.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Access {
     Public,
     Peers(HashSet<EndpointId>),
+    /// Peers admitted by a set shared with the caller, so adding one takes
+    /// effect immediately: a peer may connect the moment it pairs, before
+    /// any policy replacement reaches the transport.
+    SharedPeers(Arc<SharedPeers>),
 }
 
 impl Access {
@@ -213,7 +217,46 @@ impl Access {
         match self {
             Self::Public => true,
             Self::Peers(peers) => peers.contains(&peer),
+            Self::SharedPeers(peers) => peers.contains(peer),
         }
+    }
+}
+
+impl PartialEq for Access {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Public, Self::Public) => true,
+            (Self::Peers(a), Self::Peers(b)) => a == b,
+            (Self::SharedPeers(a), Self::SharedPeers(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Access {}
+
+/// A peer set that one side adds to and the transport reads. Clones share
+/// the same set, and holding one never keeps a transport alive.
+#[derive(Debug, Default)]
+pub struct SharedPeers(std::sync::RwLock<HashSet<EndpointId>>);
+
+impl SharedPeers {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn insert(&self, peer: EndpointId) -> bool {
+        self.0
+            .write()
+            .expect("shared peers lock poisoned")
+            .insert(peer)
+    }
+
+    pub fn contains(&self, peer: EndpointId) -> bool {
+        self.0
+            .read()
+            .expect("shared peers lock poisoned")
+            .contains(&peer)
     }
 }
 
@@ -1797,6 +1840,51 @@ mod tests {
         net::{TcpListener, UdpSocket},
         time::{sleep, timeout},
     };
+
+    #[test]
+    fn shared_peers_admit_a_peer_added_after_the_policy_was_installed() {
+        // The share installs its policy once, at bind time, and then only adds
+        // to the shared set. A peer admitted later must be allowed without
+        // another policy replacement, which is what closes the gap between a
+        // peer pairing and it opening the service.
+        let peers = SharedPeers::new();
+        let policy = Policy {
+            destinations: HashMap::from([(
+                DestinationId::tcp(8080),
+                DestinationPolicy {
+                    target: Target::Tcp("127.0.0.1:8080".parse().unwrap()),
+                    access: Access::SharedPeers(peers.clone()),
+                },
+            )]),
+        };
+        let peer = SecretKey::generate().public();
+        let destination = DestinationId::tcp(8080);
+        let target = Target::Tcp("127.0.0.1:8080".parse().unwrap());
+
+        assert!(!policy_allows(
+            &policy,
+            &destination,
+            peer,
+            target,
+            SessionKind::Tcp
+        ));
+        assert!(peers.insert(peer));
+        assert!(policy_allows(
+            &policy,
+            &destination,
+            peer,
+            target,
+            SessionKind::Tcp
+        ));
+        // Another peer stays out.
+        assert!(!policy_allows(
+            &policy,
+            &destination,
+            SecretKey::generate().public(),
+            target,
+            SessionKind::Tcp
+        ));
+    }
 
     #[tokio::test]
     async fn resolve_tcp_target_prefers_the_listening_address() {

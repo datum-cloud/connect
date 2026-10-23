@@ -1,12 +1,8 @@
 //! Sharer side: publish one local TCP service and admit paired peers.
-use std::{
-    collections::{HashMap, HashSet},
-    net::SocketAddr,
-    sync::Arc,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use connect_transport::{
-    Access, DestinationId, DestinationPolicy, LocalStream, Policy, Target, Transport,
+    Access, DestinationId, DestinationPolicy, LocalStream, Policy, SharedPeers, Target, Transport,
     TransportConfig,
 };
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
@@ -220,8 +216,10 @@ async fn run(
     if relays {
         wait_online(transport).await?;
     }
-    // No peer may open the destination until it pairs.
-    let mut peers = HashSet::new();
+    // No peer may open the destination until it pairs. The set is shared with
+    // the transport, so a peer admitted by the pairing handler can connect at
+    // once instead of waiting for the loop to swap in a new policy.
+    let peers = SharedPeers::new();
     transport
         .replace_policy(share_policy(served, &peers))
         .await
@@ -242,7 +240,7 @@ async fn run(
             update = paths.recv() => {
                 match update {
                     // Only paired devices; other peers are refused anyway.
-                    Ok((peer, diagnostics)) if peers.contains(&peer) => on_event(ShareEvent::Path {
+                    Ok((peer, diagnostics)) if peers.contains(peer) => on_event(ShareEvent::Path {
                         peer,
                         path: diagnostics.into(),
                     }),
@@ -254,6 +252,9 @@ async fn run(
         };
         let Some(event) = event else { break };
         peers.insert(event.peer);
+        // The policy already sees the new peer through the shared set; this
+        // replacement only re-advertises it, and keeps a same-policy swap from
+        // disturbing sessions opened in between.
         transport
             .replace_policy(share_policy(served, &peers))
             .await
@@ -278,13 +279,13 @@ async fn run(
 }
 
 /// One TCP destination, keyed by the served port, open only to `peers`.
-fn share_policy(served: &Served, peers: &HashSet<EndpointId>) -> Policy {
+fn share_policy(served: &Served, peers: &Arc<SharedPeers>) -> Policy {
     Policy {
         destinations: HashMap::from([(
             DestinationId::tcp(served.port),
             DestinationPolicy {
                 target: served.target,
-                access: Access::Peers(peers.clone()),
+                access: Access::SharedPeers(peers.clone()),
             },
         )]),
     }
