@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Builds macOS archives of datumctl-connect and datum-connectd for Apple
 # silicon (arm64) and Intel (x86_64). Run on a Mac with Xcode command line
-# tools, rustup, and Go. Output: dist/share/datum-connect-macos-<arch>.tar.gz;
-# publish with scripts/downloads/publish-cli.sh macos.
+# tools, either inside `nix develop` (Rust with both Apple targets, and Go) or
+# with rustup and Go installed. Output:
+# dist/share/datum-connect-macos-<arch>.tar.gz; publish with
+# scripts/downloads/publish-cli.sh macos.
 #
-#   scripts/build-macos-share.sh
+#   nix develop -c scripts/build-macos-share.sh
 #
 # The binaries are not Developer ID signed or notarized. The linker gives them
 # the ad-hoc signature Apple silicon requires; a browser download is still
@@ -17,7 +19,14 @@ out="$root/dist/share"
 version=$(git -C "$root" describe --tags --always --dirty)
 toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' "$root/connect-lib/rust-toolchain.toml")
 
-rustup target add --toolchain "$toolchain" aarch64-apple-darwin x86_64-apple-darwin
+command -v go >/dev/null || { echo "go not found; run inside nix develop or install Go" >&2; exit 1; }
+# The nix dev shell's Rust already has both targets; rustup installs them.
+sysroot=$(cd "$root/connect-lib" && rustc --print sysroot)
+for target in aarch64-apple-darwin x86_64-apple-darwin; do
+  [[ -d "$sysroot/lib/rustlib/$target" ]] && continue
+  command -v rustup >/dev/null || { echo "Rust has no $target standard library and rustup is not installed" >&2; exit 1; }
+  rustup target add --toolchain "$toolchain" "$target"
+done
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
   (cd "$root/connect-lib" && DATUM_CONNECT_RELEASE_VERSION="${version#v}" \
     cargo build --locked --release -p datum-connect-daemon --target "$target")

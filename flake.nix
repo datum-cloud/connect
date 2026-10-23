@@ -19,6 +19,15 @@
         # builds for the native host target. The tag-triggered release workflow
         # installs each explicit cross target for its build matrix.
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./connect-lib/rust-toolchain.toml;
+        # On a Mac the dev shell also carries both Apple targets, so
+        # scripts/build-macos-share.sh builds arm64 and x86_64 inside it.
+        devRustToolchain =
+          if pkgs.stdenv.isDarwin then
+            rustToolchain.override {
+              targets = [ "aarch64-apple-darwin" "x86_64-apple-darwin" ];
+            }
+          else
+            rustToolchain;
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rustToolchain;
           rustc = rustToolchain;
@@ -86,7 +95,7 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             # Rust toolchain (stable, with clippy + rustfmt + rust-analyzer)
-            rustToolchain
+            devRustToolchain
 
             # Go toolchain for the datumctl-connect plugin shell.
             # Pinned to match the directive in go.mod (currently 1.25.x);
@@ -111,7 +120,7 @@
           PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
 
           # rust-analyzer wants this to navigate to std/core sources.
-          RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+          RUST_SRC_PATH = "${devRustToolchain}/lib/rustlib/src/rust/library";
 
           shellHook = "";
         };
