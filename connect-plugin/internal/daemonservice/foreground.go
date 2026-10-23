@@ -2,6 +2,7 @@ package daemonservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -16,8 +17,13 @@ import (
 // PATH, then the same pinned, checksum-verified release download that guided
 // setup uses. Local development builds never download an unrelated release.
 func ForegroundExecutable(ctx context.Context, version string, progress io.Writer) (string, error) {
-	if path, err := DiscoverExecutable(); err == nil {
+	path, err := DiscoverExecutable()
+	if err == nil {
 		return path, nil
+	}
+	var broken *BrokenExecutableError
+	if errors.As(err, &broken) {
+		return "", err
 	}
 	if !daemoninstall.PublishedRelease(version) {
 		return "", fmt.Errorf("datum-connectd was not found next to the plugin or in PATH, and plugin version %q has no release to download it from", version)

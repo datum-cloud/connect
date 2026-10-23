@@ -2,6 +2,7 @@ package daemonservice
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -171,5 +172,39 @@ func TestCopyCredentialRejectsUnknownType(t *testing.T) {
 	}
 	if err := copyCredential(source, filepath.Join(dir, "out.json")); err == nil {
 		t.Fatal("expected validation error")
+	}
+}
+
+func TestAdjacentExecutable(t *testing.T) {
+	name := "datum-connectd"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	dir := t.TempDir()
+	if path, err := adjacentExecutable(dir); path != "" || err != nil {
+		t.Fatalf("empty dir = %q, %v; want none", path, err)
+	}
+	daemon := filepath.Join(dir, name)
+	if err := os.WriteFile(daemon, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if path, err := adjacentExecutable(dir); path != daemon || err != nil {
+		t.Fatalf("present = %q, %v; want %q", path, err, daemon)
+	}
+}
+
+func TestAdjacentExecutableReportsDanglingSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "target", "debug", "datum-connectd")
+	if err := os.Symlink(missing, filepath.Join(dir, "datum-connectd")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := adjacentExecutable(dir)
+	var broken *BrokenExecutableError
+	if !errors.As(err, &broken) || broken.Target != missing || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("err = %v; want BrokenExecutableError naming %s", err, missing)
 	}
 }

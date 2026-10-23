@@ -417,14 +417,11 @@ func validatePlatformScope(system bool) error {
 func daemonExecutable(explicit string) (string, error) {
 	if explicit == "" {
 		if self, err := os.Executable(); err == nil {
-			name := "datum-connectd"
-			if runtime.GOOS == "windows" {
-				name += ".exe"
+			adjacent, err := adjacentExecutable(filepath.Dir(self))
+			if err != nil {
+				return "", err
 			}
-			adjacent := filepath.Join(filepath.Dir(self), name)
-			if info, statErr := os.Stat(adjacent); statErr == nil && !info.IsDir() {
-				explicit = adjacent
-			}
+			explicit = adjacent
 		}
 		if explicit == "" {
 			var err error
@@ -449,6 +446,49 @@ func daemonExecutable(explicit string) (string, error) {
 		return "", fmt.Errorf("daemon executable %s must be a regular executable file", abs)
 	}
 	return abs, nil
+}
+
+// BrokenExecutableError reports a datum-connectd beside the plugin that
+// exists but cannot run, such as a symlink to a deleted build. Lookup stops
+// there rather than falling back to PATH or a download.
+type BrokenExecutableError struct {
+	Path   string
+	Target string // symlink target, if Path is a symlink
+	Err    error
+}
+
+func (e *BrokenExecutableError) Error() string {
+	if e.Target != "" && errors.Is(e.Err, os.ErrNotExist) {
+		return fmt.Sprintf("%s is a symlink to %s, which does not exist", e.Path, e.Target)
+	}
+	if e.Target != "" {
+		return fmt.Sprintf("%s is a symlink to %s, which can't be used: %v", e.Path, e.Target, e.Err)
+	}
+	return fmt.Sprintf("%s can't be used: %v", e.Path, e.Err)
+}
+
+func (e *BrokenExecutableError) Unwrap() error { return e.Err }
+
+// adjacentExecutable returns datum-connectd in dir, "" when dir has none, or a
+// BrokenExecutableError when the entry is there but unusable.
+func adjacentExecutable(dir string) (string, error) {
+	name := "datum-connectd"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	path := filepath.Join(dir, name)
+	if _, err := os.Lstat(path); err != nil {
+		return "", nil
+	}
+	info, err := os.Stat(path)
+	if err == nil && info.IsDir() {
+		err = errors.New("it is a directory")
+	}
+	if err == nil {
+		return path, nil
+	}
+	target, _ := os.Readlink(path)
+	return "", &BrokenExecutableError{Path: path, Target: target, Err: err}
 }
 
 func serviceStateDir(system bool) string {
