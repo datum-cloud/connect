@@ -262,6 +262,13 @@ private fun ConnectionCard(connection: Connection, onRename: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                connection.traffic?.let { traffic ->
+                    Text(
+                        traffic.summary() + "\n" + traffic.detail(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (status is Status.Ready) {

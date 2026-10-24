@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use connect_share::{DialEvent, DialOptions, ShareTicket, dial};
+use connect_share::{DialEvent, DialOptions, ShareTicket, Traffic, dial};
 use tokio_util::sync::CancellationToken;
 
 uniffi::setup_scaffolding!();
@@ -111,6 +111,31 @@ impl From<connect_share::PathInfo> for PathReport {
     }
 }
 
+/// Totals since a dial started. Read them on a timer and divide the change by
+/// the interval for bandwidth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TrafficStats {
+    /// Bytes from local apps, sent to the sharer.
+    pub bytes_sent: u64,
+    /// Bytes from the sharer, delivered to local apps.
+    pub bytes_received: u64,
+    /// Local connections forwarded so far, including open ones.
+    pub connections: u64,
+    /// Local connections being forwarded now.
+    pub open_connections: u64,
+}
+
+impl From<connect_share::TrafficSnapshot> for TrafficStats {
+    fn from(snapshot: connect_share::TrafficSnapshot) -> Self {
+        Self {
+            bytes_sent: snapshot.bytes_sent,
+            bytes_received: snapshot.bytes_received,
+            connections: snapshot.connections,
+            open_connections: snapshot.open_connections,
+        }
+    }
+}
+
 /// Receives dial progress. Called from a library thread.
 #[uniffi::export(with_foreign)]
 pub trait DialListener: Send + Sync {
@@ -135,6 +160,7 @@ pub trait DialListener: Send + Sync {
 pub struct DialSession {
     cancel: CancellationToken,
     local_addr: Mutex<Option<String>>,
+    traffic: Traffic,
 }
 
 #[uniffi::export]
@@ -154,6 +180,7 @@ impl DialSession {
         let session = Arc::new(Self {
             cancel: CancellationToken::new(),
             local_addr: Mutex::new(None),
+            traffic: Traffic::default(),
         });
         let options = DialOptions {
             ticket,
@@ -161,6 +188,7 @@ impl DialSession {
             secret_key: Some(key),
             name: device_name,
             relay_urls: None,
+            traffic: session.traffic.clone(),
         };
         let task_session = session.clone();
         RUNTIME.spawn(async move {
@@ -193,6 +221,12 @@ impl DialSession {
     /// Stops forwarding and closes the endpoint. Safe to call more than once.
     pub fn stop(&self) {
         self.cancel.cancel();
+    }
+
+    /// Bytes and connections forwarded so far. Cheap enough to call every
+    /// second; keeps the last totals after the dial stops.
+    pub fn traffic(&self) -> TrafficStats {
+        self.traffic.snapshot().into()
     }
 
     /// The local address once ready, for example `127.0.0.1:8888`.

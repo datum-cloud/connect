@@ -275,6 +275,7 @@ async fn run_projectless(command: Projectless) {
                 secret_key: None,
                 name,
                 relay_urls: relays(relay_urls),
+                traffic: Default::default(),
             };
             connect_share::dial(options, cancel, |event| match event {
                 connect_share::DialEvent::Ready(ready) => emit(serde_json::json!({

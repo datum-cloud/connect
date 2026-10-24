@@ -7,7 +7,7 @@ use tokio::{io::copy_bidirectional, net::TcpListener, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Error, PathInfo, ShareTicket, configure_relays,
+    Error, PathInfo, ShareTicket, Traffic, configure_relays,
     pair::{probe_pairing, request_pairing},
     wait_online,
 };
@@ -49,6 +49,9 @@ pub struct DialOptions {
     /// Relays to use instead of the transport preset's defaults. An empty
     /// list disables relays.
     pub relay_urls: Option<Vec<RelayUrl>>,
+    /// Counters the dial adds forwarded bytes to. Keep a clone to read them
+    /// while it runs; `Traffic::default()` when nobody reads them.
+    pub traffic: Traffic,
 }
 
 /// Progress reported to the caller.
@@ -83,27 +86,21 @@ pub struct DialReady {
 /// answering for [`LIVENESS_GRACE`], within [`SHARER_LOST_TIMEOUT`] of it
 /// going away, or with [`Error::Pairing`] when it refuses this peer.
 pub async fn dial(
-    options: DialOptions,
+    mut options: DialOptions,
     cancel: CancellationToken,
     on_event: impl FnMut(DialEvent),
 ) -> Result<(), Error> {
-    let key = options.secret_key.unwrap_or_else(SecretKey::generate);
-    let (config, relays) = configure_relays(TransportConfig::new(key), options.relay_urls);
+    let key = options
+        .secret_key
+        .take()
+        .unwrap_or_else(SecretKey::generate);
+    let (config, relays) = configure_relays(TransportConfig::new(key), options.relay_urls.take());
     // Bind (not client) so the endpoint has the MASQUE ALPN; the default
     // empty policy admits no inbound sessions.
     let transport = Transport::bind(config)
         .await
         .map_err(|error| Error::Transport(error.to_string()))?;
-    let result = run(
-        &transport,
-        relays,
-        options.ticket,
-        options.bind,
-        options.name,
-        &cancel,
-        on_event,
-    )
-    .await;
+    let result = run(&transport, relays, options, &cancel, on_event).await;
     if result.is_err() {
         // A graceful endpoint close waits for in-flight connections to drain,
         // which would hold back the error by seconds. Report it now and
@@ -118,12 +115,17 @@ pub async fn dial(
 async fn run(
     transport: &Transport,
     relays: bool,
-    ticket: ShareTicket,
-    bind: SocketAddr,
-    name: Option<String>,
+    options: DialOptions,
     cancel: &CancellationToken,
     mut on_event: impl FnMut(DialEvent),
 ) -> Result<(), Error> {
+    let DialOptions {
+        ticket,
+        bind,
+        name,
+        traffic,
+        ..
+    } = options;
     let mut paths = transport.path_updates();
     if relays && ticket.endpoint.relay_urls().next().is_some() {
         wait_online(transport).await?;
@@ -191,7 +193,7 @@ async fn run(
                 continue;
             }
         };
-        let (mut local, _) = match accepted {
+        let (local, _) = match accepted {
             Ok(accepted) => accepted,
             Err(error) => {
                 tracing::warn!(%error, "dial_accept_failed");
@@ -203,6 +205,7 @@ async fn run(
         let destination = destination.clone();
         let stream_cancel = cancel.child_token();
         let events = events.clone();
+        let traffic = traffic.clone();
         tokio::spawn(async move {
             match transport
                 .connect_tcp(sharer, destination, stream_cancel)
@@ -210,6 +213,7 @@ async fn run(
             {
                 Ok(mut remote) => {
                     let _ = events.send(DialEvent::Forwarded);
+                    let mut local = traffic.count(local);
                     if let Err(error) = copy_bidirectional(&mut local, &mut remote).await {
                         tracing::debug!(%error, "dial_forward_ended");
                     }

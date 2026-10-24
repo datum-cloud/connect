@@ -16,6 +16,7 @@ mod pair;
 mod path;
 mod share;
 mod ticket;
+mod traffic;
 
 pub use connect_transport::LocalStream;
 pub use dial::{
@@ -26,6 +27,7 @@ pub use pair::{PAIR_ALPN, PAIR_TIMEOUT};
 pub use path::{PathInfo, PathKind};
 pub use share::{ShareEvent, ShareOptions, ShareTarget, share};
 pub use ticket::{ShareTicket, TicketError};
+pub use traffic::{Traffic, TrafficSnapshot};
 
 /// Errors from either side of a share.
 #[derive(Debug, thiserror::Error)]

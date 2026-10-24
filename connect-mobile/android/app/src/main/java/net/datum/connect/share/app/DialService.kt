@@ -9,12 +9,16 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import net.datum.connect.share.DialListener
 import net.datum.connect.share.DialSession
 import net.datum.connect.share.PathReport
+import net.datum.connect.share.TrafficStats
 
 /**
  * Runs one dial per active connection while the user switches to a browser.
@@ -34,6 +38,17 @@ class DialService : Service() {
     private val tokens = mutableMapOf<Long, Long>()
     private var nextToken = 1L
     private var foreground = false
+
+    /** Last counter reading per connection, for bandwidth. Main thread only. */
+    private val samples = mutableMapOf<Long, Pair<TrafficStats, Long>>()
+    private val handler = Handler(Looper.getMainLooper())
+    private val sampler = object : Runnable {
+        override fun run() {
+            sampleTraffic()
+            handler.postDelayed(this, SAMPLE_INTERVAL_MS)
+        }
+    }
+    private var sampling = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -83,15 +98,44 @@ class DialService : Service() {
     /** Invalidates callbacks first, then cancels and frees the session. */
     private fun endSession(id: Long) {
         tokens.remove(id)
+        samples.remove(id)
         sessions.remove(id)?.let {
             it.stop()
             it.close()
         }
     }
 
+    /**
+     * Reads each ready dial's counters and updates its [Traffic]. The list and
+     * notification change only when the numbers do, so an idle connection
+     * costs one cheap native call a second.
+     */
+    private fun sampleTraffic() {
+        val now = SystemClock.elapsedRealtime()
+        var changed = false
+        for ((id, session) in sessions) {
+            val connection = Connections.get(id) ?: continue
+            if (connection.status !is Status.Ready) continue
+            val stats = session.traffic()
+            val previous = samples.put(id, stats to now)
+            val traffic = meter(previous?.first, stats, previous?.let { now - it.second } ?: 0)
+            if (traffic != connection.traffic) {
+                Connections.setTraffic(id, traffic)
+                changed = true
+            }
+        }
+        if (changed) updateForeground()
+    }
+
     private fun updateForeground() {
         val active = Connections.list.value.filter { it.id in sessions }
+        if (sessions.isNotEmpty() && !sampling) {
+            sampling = true
+            handler.postDelayed(sampler, SAMPLE_INTERVAL_MS)
+        }
         if (active.isEmpty()) {
+            sampling = false
+            handler.removeCallbacks(sampler)
             if (foreground) ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             foreground = false
             stopSelf()
@@ -117,6 +161,7 @@ class DialService : Service() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(sampler)
         sessions.keys.toList().forEach(::stop)
         super.onDestroy()
     }
@@ -171,7 +216,11 @@ class DialService : Service() {
             when (val status = c.status) {
                 is Status.Ready -> "${c.name}: " + (
                     c.unreachable?.let { "service unreachable" }
-                        ?: ("http://${status.localAddr}" + (c.path?.let { " · ${it.summary()}" } ?: ""))
+                        ?: (
+                            "http://${status.localAddr}" +
+                                (c.path?.let { " · ${it.summary()}" } ?: "") +
+                                (c.traffic?.takeIf { it.rate > 0 }?.let { " · ${formatBytes(it.rate)}/s" } ?: "")
+                            )
                     )
                 else -> "${c.name}: pairing…"
             }
@@ -193,6 +242,8 @@ class DialService : Service() {
             .setStyle(Notification.BigTextStyle().bigText(lines.joinToString("\n")))
             .setContentIntent(open)
             .setOngoing(true)
+            // Updated each second while traffic flows; never sound or buzz again.
+            .setOnlyAlertOnce(true)
             .addAction(Notification.Action.Builder(null, "Stop all", stopAll).build())
             .build()
     }
@@ -204,6 +255,7 @@ class DialService : Service() {
         private const val ACTION_STOP = "net.datum.connect.share.STOP"
         private const val ACTION_STOP_ALL = "net.datum.connect.share.STOP_ALL"
         private const val EXTRA_ID = "id"
+        private const val SAMPLE_INTERVAL_MS = 1000L
 
         /** Starts (or restarts) the dial for connection [id]. */
         fun start(context: Context, id: Long) {

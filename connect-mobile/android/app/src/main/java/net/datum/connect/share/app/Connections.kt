@@ -3,6 +3,7 @@ package net.datum.connect.share.app
 import java.io.File
 import net.datum.connect.share.PathKind
 import net.datum.connect.share.PathReport
+import net.datum.connect.share.TrafficStats
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36,7 +37,39 @@ data class Connection(
     val path: PathReport? = null,
     /** Why the shared service could not be reached, while ready; never saved. */
     val unreachable: String? = null,
+    /** Bytes forwarded and current bandwidth, while ready; never saved. */
+    val traffic: Traffic? = null,
 )
+
+/**
+ * Totals since the dial started, and bytes per second over the last sample.
+ * Sent is from apps on this phone to the sharer, received the other way.
+ */
+data class Traffic(
+    val sent: Long,
+    val received: Long,
+    val sendRate: Long,
+    val receiveRate: Long,
+    val openConnections: Long,
+)
+
+/**
+ * Turns two readings of a dial's counters, [elapsedMs] apart, into [Traffic].
+ * The first reading, with no [previous], has no rate yet.
+ */
+fun meter(previous: TrafficStats?, current: TrafficStats, elapsedMs: Long): Traffic {
+    fun rate(before: ULong?, now: ULong): Long {
+        if (before == null || elapsedMs <= 0 || now < before) return 0
+        return ((now - before).toLong() * 1000) / elapsedMs
+    }
+    return Traffic(
+        sent = current.bytesSent.toLong(),
+        received = current.bytesReceived.toLong(),
+        sendRate = rate(previous?.bytesSent, current.bytesSent),
+        receiveRate = rate(previous?.bytesReceived, current.bytesReceived),
+        openConnections = current.openConnections.toLong(),
+    )
+}
 
 /**
  * The connections list. Updated by the UI and [DialService] on the main thread.
@@ -133,12 +166,14 @@ object Connections {
 
     fun get(id: Long): Connection? = mutable.value.firstOrNull { it.id == id }
 
-    /** A new status clears the path and any unreachable reason unless the connection stays ready. */
+    /** A new status clears the path, traffic, and any unreachable reason unless the connection stays ready. */
     fun setStatus(id: Long, status: Status) =
         modify(id) {
             if (status is Status.Ready) it.copy(status = status)
-            else it.copy(status = status, path = null, unreachable = null)
+            else it.copy(status = status, path = null, unreachable = null, traffic = null)
         }
+
+    fun setTraffic(id: Long, traffic: Traffic) = modify(id) { it.copy(traffic = traffic) }
 
     fun setPath(id: Long, path: PathReport) = modify(id) { it.copy(path = path) }
 
@@ -209,6 +244,37 @@ fun usedPorts(connections: List<Connection>): Set<Int> =
             (c.status as? Status.Ready)?.localAddr?.substringAfterLast(':')?.toIntOrNull(),
         )
     }.toSet()
+
+/** For display, in decimal units like Android's own: "512 B", "1.5 KB", "12.3 MB", "120 MB". */
+fun formatBytes(bytes: Long): String {
+    if (bytes < 1000) return "$bytes B"
+    var value = bytes.toDouble()
+    var unit = 0
+    val units = listOf("B", "KB", "MB", "GB", "TB")
+    while (value >= 999.95 && unit < units.lastIndex) {
+        value /= 1000
+        unit++
+    }
+    return if (value < 99.95) "%.1f %s".format(java.util.Locale.ROOT, value, units[unit])
+    else "%.0f %s".format(java.util.Locale.ROOT, value, units[unit])
+}
+
+/** Both directions together. */
+val Traffic.total: Long get() = sent + received
+val Traffic.rate: Long get() = sendRate + receiveRate
+
+/** For display: "3.4 MB transferred · 1.2 MB/s". */
+fun Traffic.summary(): String = "${formatBytes(total)} transferred · ${formatBytes(rate)}/s"
+
+/** For display: "↓ 3.4 MB · ↑ 1.2 KB · 2 connections open". */
+fun Traffic.detail(): String {
+    val open = when (openConnections) {
+        0L -> ""
+        1L -> " · 1 connection open"
+        else -> " · $openConnections connections open"
+    }
+    return "↓ ${formatBytes(received)} · ↑ ${formatBytes(sent)}$open"
+}
 
 /** For display: "Direct · 12 ms", "Relayed · 150 ms", or "Path unknown". */
 fun PathReport.summary(): String {

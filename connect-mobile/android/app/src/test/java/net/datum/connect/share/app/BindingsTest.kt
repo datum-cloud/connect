@@ -120,6 +120,11 @@ class BindingsTest {
             session.stop()
             assertTrue("dial stopped", stopped.await(10, TimeUnit.SECONDS))
             assertNull(stopError.get())
+            // The request and the whole response, counted from this side.
+            val traffic = session.traffic()
+            assertEquals(18uL, traffic.bytesSent)
+            assertEquals(36uL, traffic.bytesReceived)
+            assertEquals(1uL, traffic.connections)
             session.close()
         } finally {
             sharer.destroy()

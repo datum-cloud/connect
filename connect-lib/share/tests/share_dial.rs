@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use connect_share::{
     DialEvent, DialOptions, PathInfo, PathKind, ShareEvent, ShareKey, ShareOptions, ShareTarget,
-    ShareTicket, dial, share,
+    ShareTicket, Traffic, TrafficSnapshot, dial, share,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -122,6 +122,7 @@ async fn start_dial_with_paths(
                     secret_key: None,
                     name: Some("test-phone".into()),
                     relay_urls: Some(Vec::new()),
+                    traffic: Default::default(),
                 },
                 cancel,
                 move |event| match event {
@@ -169,6 +170,71 @@ async fn paired_peer_reaches_shared_service() {
         assert_eq!(&reply, b"pong");
     }
     dial_cancel.cancel();
+    share_cancel.cancel();
+}
+
+/// The dial counts bytes in both directions while connections stay open, and
+/// the open count falls once they close.
+#[tokio::test]
+async fn dial_counts_forwarded_bytes() {
+    let (ticket, _events, share_cancel) = start_share(4).await;
+    let traffic = Traffic::default();
+    let cancel = CancellationToken::new();
+    let (tx, ready) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    tokio::spawn({
+        let cancel = cancel.clone();
+        let traffic = traffic.clone();
+        async move {
+            dial(
+                DialOptions {
+                    ticket,
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    secret_key: None,
+                    name: None,
+                    relay_urls: Some(Vec::new()),
+                    traffic,
+                },
+                cancel,
+                move |event| {
+                    if let DialEvent::Ready(ready) = event
+                        && let Some(tx) = tx.take()
+                    {
+                        let _ = tx.send(ready.local_addr);
+                    }
+                },
+            )
+            .await
+        }
+    });
+    let local = tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("dial ready")
+        .unwrap();
+    assert_eq!(traffic.snapshot(), TrafficSnapshot::default());
+
+    let mut stream = TcpStream::connect(local).await.unwrap();
+    for _ in 0..3 {
+        stream.write_all(b"ping").await.unwrap();
+        let mut reply = [0u8; 4];
+        stream.read_exact(&mut reply).await.unwrap();
+    }
+    // Counted as the bytes move, before the connection closes.
+    let open = traffic.snapshot();
+    assert_eq!(open.bytes_sent, 12, "{open:?}");
+    assert_eq!(open.bytes_received, 12, "{open:?}");
+    assert_eq!((open.connections, open.open_connections), (1, 1));
+
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while traffic.snapshot().open_connections != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("connection closes");
+    assert_eq!(traffic.snapshot().connections, 1);
+    cancel.cancel();
     share_cancel.cancel();
 }
 
@@ -672,6 +738,7 @@ async fn kept_key_is_found_after_its_addresses_change() {
                     secret_key: None,
                     name: None,
                     relay_urls: None,
+                    traffic: Default::default(),
                 },
                 dial_cancel,
                 move |event| {
@@ -751,6 +818,7 @@ async fn dial_reports_an_unreachable_shared_service() {
                     secret_key: None,
                     name: Some("test-phone".into()),
                     relay_urls: Some(Vec::new()),
+                    traffic: Default::default(),
                 },
                 cancel,
                 move |event| match event {
@@ -853,6 +921,7 @@ async fn dial_reports_a_service_that_comes_back() {
                     secret_key: None,
                     name: Some("test-phone".into()),
                     relay_urls: Some(Vec::new()),
+                    traffic: Default::default(),
                 },
                 cancel,
                 move |event| match event {
