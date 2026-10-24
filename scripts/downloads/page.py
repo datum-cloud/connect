@@ -132,9 +132,58 @@ PAIRING = """
 <li><p><b>On an Android phone:</b> in Datum Connect, tap <b>Scan QR code</b>, then <b>Connect</b> and <b>Open</b>.</p>
 <p><b>Or on another computer:</b> run the printed command, then open <code>http://localhost:8080</code>:</p>
 <pre><code>./datumctl-connect dial DATUMTUN1… --bind 8080</code></pre></li>
-<li><p>Press Ctrl+C on the sharing computer to end the share. Every run prints a new ticket.</p></li>
+<li><p>Press Ctrl+C on the sharing computer to end the share. Every run prints a new ticket, unless you pass <code>--key-file FILE</code>: then later runs print a ticket that paired devices still accept. Delete the file for a new one.</p></li>
 </ol>
 <p><small>Anyone with the ticket can connect, up to <code>--max-peers</code> devices (default 4), until the share stops. The ticket also contains the sharing computer's IP addresses, so send it only to people you trust.</small></p>
+"""
+
+
+# Plain text with BASE replaced, so shell and Python braces need no escaping.
+AGENTS = """
+<h2 id="agents">For AI agents</h2>
+<p>If you are an agent working on someone's computer, these binaries let you pair that computer with the Datum Connect apps they use. You can share a service running where you work, such as a dev server or a preview, so they open it in the Android app or the Datum desktop app. Or you can open a service they share from one of those apps on <code>localhost</code>. Neither needs a Datum account, a login, or <code>datumctl</code>.</p>
+
+<h3>Install</h3>
+<p>Pick the archive for this machine from <code>latest.json</code>, check its SHA-256, and unpack it. This needs <code>curl</code>, <code>tar</code>, <code>python3</code>, and <code>shasum</code> (on Linux without it, use <code>sha256sum -c -</code>):</p>
+<pre><code>base=BASE
+os=$(uname -s | sed 's/Linux/linux/; s/Darwin/macos/')
+arch=$(uname -m | sed 's/aarch64/arm64/; s/amd64/x86_64/')
+curl -fsSL "$base/$os/latest.json" -o latest.json
+read -r name dir sha &lt;&lt;&lt; "$(python3 -c 'import json, sys
+f = next(f for f in json.load(open("latest.json"))["files"] if f["arch"] == sys.argv[1])
+print(f["name"], f["dir"], f["sha256"])' "$arch")"
+curl -fsSLO "$base/$os/$name"
+echo "$sha  $name" | shasum -a 256 -c -
+tar xzf "$name"
+"$dir/datumctl-connect" version</code></pre>
+<p>Keep <code>datumctl-connect</code> and <code>datum-connectd</code> in the same directory. The command line runs the agent from beside itself, then from <code>PATH</code>.</p>
+
+<h3>Share a service with the person's devices</h3>
+<pre><code>"$dir/datumctl-connect" local --port 8080 --name "Preview" --key-file share.key -o json</code></pre>
+<p>With <code>-o json</code>, each line on stdout is one JSON event:</p>
+<ul>
+<li><code>share_ready</code>: the share is reachable. Give its <code>ticket</code> to the person. In the Android app they tap <b>Scan QR code</b> or paste it. In the desktop app they choose <b>Add New</b>, then <b>Open a ticket</b>.</li>
+<li><code>share_paired</code>: a device paired. <code>name</code> is the device's name.</li>
+<li><code>share_path</code>: how traffic to a device travels. <code>path</code> is <code>direct</code> or <code>relay</code>, with <code>rtt_ms</code>.</li>
+</ul>
+<p><code>--key-file</code> keeps the ticket the same across runs, so saved connections in the apps reconnect when you restart the share. The file is created on first use, readable only by its owner, and refused if others can read it. Delete it to cut off every device that has the ticket. Without it, each run makes a new ticket.</p>
+
+<h3>Open a service the person shares</h3>
+<p>The person shares from the desktop app (<b>Add New</b>, then <b>Share with devices</b>, then <b>Copy ticket</b>), or from another computer with <code>datumctl connect local</code>, and gives you the ticket:</p>
+<pre><code>"$dir/datumctl-connect" dial DATUMTUN1… --bind 8080 -o json</code></pre>
+<ul>
+<li><code>dial_ready</code>: the service is on <code>local_addr</code>, for example <code>http://127.0.0.1:8080</code>. <code>sharer_name</code> is the share's name.</li>
+<li><code>dial_connect_failed</code>: the sharing device answered, but nothing accepted the connection behind the share. <code>reason</code> says why.</li>
+<li><code>dial_path</code>: how traffic travels, as for <code>share_path</code>.</li>
+</ul>
+<p>The command exits with an error on stderr when the ticket is refused, or when the sharing device stops answering for about 13 seconds.</p>
+
+<h3>Running them</h3>
+<ul>
+<li>Both commands run until stopped. Start them in the background, read stdout line by line, and wait for <code>share_ready</code> or <code>dial_ready</code> before relying on them. Stop them with SIGINT or SIGTERM.</li>
+<li>Tickets are bearer secrets: anyone holding one can connect, up to <code>--max-peers</code> devices (default 4), and it contains the sharing computer's IP addresses. Give it only to the person you work for, and keep it and the key file out of logs, commits, issues, and chat channels.</li>
+<li>Share only what the person asked to share, and stop the share when the work is done.</li>
+</ul>
 """
 
 
@@ -183,7 +232,7 @@ ul.files li{{padding:.6rem 0;border-top:1px solid color-mix(in srgb,currentColor
 <header><a href="https://www.datum.net/" style="color:inherit">{logo}</a></header>
 <h1>Datum Connect</h1>
 <p>Share a service running on one device with your other devices, without an account.</p>
-{android_section(apk)}{cli_sections(cli, base)}{PAIRING}{past_section(past)}
+{android_section(apk)}{cli_sections(cli, base)}{PAIRING}{AGENTS.replace("BASE", e(base))}{past_section(past)}
 </body></html>
 """
 
