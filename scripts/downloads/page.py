@@ -219,6 +219,8 @@ header{{margin:.5rem 0 1.5rem}}
 header svg{{display:block;height:28px;width:auto}}
 h1,h2{{font-weight:600;letter-spacing:-.01em}}
 h2{{font-size:1.25rem;margin-top:2.5rem}}
+h1{{margin-bottom:0}}
+.tagline{{margin-top:.25rem;font-size:1.15rem;font-weight:500;font-style:italic;opacity:.75}}
 a.btn{{display:inline-block;font-size:1.1rem;padding:.7rem 1rem;border-radius:8px;background:#4f46e5;color:#fff;text-decoration:none}}
 code{{overflow-wrap:anywhere}}
 pre{{padding:.75rem;border-radius:6px;overflow-x:auto;background:color-mix(in srgb,currentColor 8%,transparent)}}
@@ -231,6 +233,7 @@ ul.files li{{padding:.6rem 0;border-top:1px solid color-mix(in srgb,currentColor
 <body>
 <header><a href="https://www.datum.net/" style="color:inherit">{logo}</a></header>
 <h1>Datum Connect</h1>
+<p class="tagline">Private By Default</p>
 <p>Share a service running on one device with your other devices, without an account.</p>
 {android_section(apk)}{cli_sections(cli, base)}{PAIRING}{AGENTS.replace("BASE", e(base))}{past_section(past)}
 </body></html>
