@@ -1174,3 +1174,204 @@ fn transient_path_mtu_probe_pauses_but_persistent_low_mtu_fails() {
         Err(super::Error::InsufficientDatagramMtu { .. })
     ));
 }
+
+fn admit_for(
+    approved: EndpointId,
+    enabled: Arc<std::sync::atomic::AtomicBool>,
+    seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+) -> Admit {
+    Arc::new(move |request: AdmissionRequest| {
+        seen.lock()
+            .unwrap()
+            .push(request.proxy_authorization().map(str::to_owned));
+        let config = config();
+        // Answer for the approved key only, but name the approved key even when a stranger
+        // asks, so the server's own peer check is what refuses the stranger.
+        let grant = (enabled.load(Ordering::SeqCst) && request.network == "test").then(|| Grant {
+            peer: approved,
+            network: request.network.clone(),
+            address: config.address,
+            routes: config.routes,
+            mtu: config.mtu,
+        });
+        Box::pin(async move { grant })
+    })
+}
+
+fn refused(result: Result<IpSession>) -> bool {
+    matches!(
+        result,
+        Err(Error::RejectedWithReason {
+            status: StatusCode::FORBIDDEN,
+            reason: RejectionReason::PeerNetworkNotApproved,
+            ..
+        })
+    )
+}
+
+#[tokio::test]
+async fn admission_callback_grants_only_its_own_peer_and_network_for_one_connection() {
+    let _permit = NETWORK_TESTS.acquire().await.unwrap();
+    let server = endpoint().await;
+    let client = endpoint().await;
+    let stranger = endpoint().await;
+    let cancel = CancellationToken::new();
+    let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (incoming, mut accepted) = mpsc::channel(4);
+    let serving = tokio::spawn(serve_with_admission(
+        server.clone(),
+        Vec::new(),
+        incoming,
+        cancel.clone(),
+        Some(admit_for(client.id(), enabled.clone(), seen.clone())),
+    ));
+
+    // A grant naming another peer is refused, whatever the callback returns.
+    assert!(refused(
+        connect(
+            stranger.clone(),
+            server.addr(),
+            "test",
+            CancellationToken::new()
+        )
+        .await
+    ));
+    // A declined request is refused as an unmatched one is.
+    assert!(refused(
+        connect(
+            client.clone(),
+            server.addr(),
+            "other",
+            CancellationToken::new()
+        )
+        .await
+    ));
+    assert!(accepted.try_recv().is_err());
+
+    // The callback's grant admits its own peer and network.
+    let connecting = tokio::spawn(connect(
+        client.clone(),
+        server.addr(),
+        "test",
+        CancellationToken::new(),
+    ));
+    let admitted = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.peer, client.id());
+    admitted.ready.send(true).unwrap();
+    let session = connecting.await.unwrap().unwrap();
+    assert_eq!(session.config, config());
+
+    // When that connection ends, its grant goes with it: the same key is refused without the
+    // callback's approval.
+    session.cancel();
+    drop(session);
+    drop(admitted.session);
+    enabled.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(refused(
+        connect(
+            client.clone(),
+            server.addr(),
+            "test",
+            CancellationToken::new()
+        )
+        .await
+    ));
+    assert!(accepted.try_recv().is_err());
+    assert!(seen.lock().unwrap().iter().all(Option::is_none));
+
+    cancel.cancel();
+    serving.await.unwrap().unwrap();
+    stranger.close().await;
+    client.close().await;
+    server.close().await;
+}
+
+#[tokio::test]
+async fn unanswered_admission_callback_refuses() {
+    let _permit = NETWORK_TESTS.acquire().await.unwrap();
+    let server = endpoint().await;
+    let client = endpoint().await;
+    let cancel = CancellationToken::new();
+    let (incoming, mut accepted) = mpsc::channel(4);
+    let admit: Admit = Arc::new(|_| Box::pin(std::future::pending()));
+    let serving = tokio::spawn(serve_with_admission(
+        server.clone(),
+        Vec::new(),
+        incoming,
+        cancel.clone(),
+        Some(admit),
+    ));
+    assert!(refused(
+        connect(
+            client.clone(),
+            server.addr(),
+            "test",
+            CancellationToken::new()
+        )
+        .await
+    ));
+    assert!(accepted.try_recv().is_err());
+    cancel.cancel();
+    serving.await.unwrap().unwrap();
+    client.close().await;
+    server.close().await;
+}
+
+#[test]
+fn admission_request_debug_redacts_the_credential() {
+    let request = AdmissionRequest {
+        peer: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+        network: "test".into(),
+        session_id: "s".into(),
+        proxy_authorization: Some("Bearer secret-value".into()),
+    };
+    let rendered = format!("{request:?}");
+    assert!(!rendered.contains("secret-value"), "{rendered}");
+    assert_eq!(request.proxy_authorization(), Some("Bearer secret-value"));
+}
+
+#[test]
+fn admission_callback_is_offered_one_proxy_authorization_value_only() {
+    use http::header::{AUTHORIZATION, HeaderName, HeaderValue, PROXY_AUTHORIZATION};
+    fn headers(values: &[(HeaderName, HeaderValue)]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in values {
+            headers.append(name.clone(), value.clone());
+        }
+        headers
+    }
+    let one = HeaderValue::from_static("Bearer one");
+    let other = HeaderValue::from_static("Bearer other");
+    assert_eq!(
+        proxy_authorization(&headers(&[(PROXY_AUTHORIZATION, one.clone())])).as_deref(),
+        Some("Bearer one")
+    );
+    // Authorization is never offered, and does not hide a Proxy-Authorization value.
+    assert_eq!(
+        proxy_authorization(&headers(&[
+            (AUTHORIZATION, other.clone()),
+            (PROXY_AUTHORIZATION, one.clone()),
+        ]))
+        .as_deref(),
+        Some("Bearer one")
+    );
+    for refused in [
+        headers(&[]),
+        headers(&[(AUTHORIZATION, other)]),
+        headers(&[
+            (PROXY_AUTHORIZATION, one),
+            (PROXY_AUTHORIZATION, HeaderValue::from_static("Bearer two")),
+        ]),
+        headers(&[(
+            PROXY_AUTHORIZATION,
+            HeaderValue::from_bytes(b"Bearer \xff").unwrap(),
+        )]),
+    ] {
+        assert_eq!(proxy_authorization(&refused), None, "{refused:?}");
+    }
+}
