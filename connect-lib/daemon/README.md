@@ -81,6 +81,14 @@ A configuration approves exact project/network pairs:
 }
 ```
 
+A binding may also name `token_file`, the path of a file that holds one bearer
+token. The daemon reads it on every connection attempt, including reconnects, and
+sends it as `Proxy-Authorization: Bearer TOKEN` with the CONNECT-IP request, so a
+gateway that admits devices by token can admit this one. Replace the file's
+contents to rotate the token. An unreadable file, or one that does not hold
+exactly one token, fails the attachment without retrying. Without `token_file`,
+the request carries no credential, as before.
+
 Replace the example key and address with the gateway's actual identity and QUIC
 address. Set the required `underlay_address` to this daemon's existing, explicit
 IPv4 or IPv6 address on the physical or container network. Every gateway socket

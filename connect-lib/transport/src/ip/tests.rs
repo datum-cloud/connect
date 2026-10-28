@@ -1375,3 +1375,66 @@ fn admission_callback_is_offered_one_proxy_authorization_value_only() {
         assert_eq!(proxy_authorization(&refused), None, "{refused:?}");
     }
 }
+
+#[tokio::test]
+async fn connect_options_send_the_proxy_authorization_header() {
+    let _permit = NETWORK_TESTS.acquire().await.unwrap();
+    let server = endpoint().await;
+    let client = endpoint().await;
+    let cancel = CancellationToken::new();
+    let enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (incoming, _accepted) = mpsc::channel(4);
+    let serving = tokio::spawn(serve_with_admission(
+        server.clone(),
+        Vec::new(),
+        incoming,
+        cancel.clone(),
+        Some(admit_for(client.id(), enabled, seen.clone())),
+    ));
+    let options = ConnectOptions {
+        proxy_authorization: Some("Bearer test-token".into()),
+    };
+    let rendered = format!("{options:?}");
+    assert!(!rendered.contains("test-token"), "{rendered}");
+    assert!(refused(
+        connect_with_options(
+            client.clone(),
+            server.addr(),
+            "test",
+            CancellationToken::new(),
+            options
+        )
+        .await
+    ));
+    assert!(refused(
+        connect(
+            client.clone(),
+            server.addr(),
+            "test",
+            CancellationToken::new()
+        )
+        .await
+    ));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Some("Bearer test-token".to_owned()), None]
+    );
+    assert!(matches!(
+        connect_with_options(
+            client.clone(),
+            server.addr(),
+            "test",
+            CancellationToken::new(),
+            ConnectOptions {
+                proxy_authorization: Some("Bearer bad\nvalue".into()),
+            }
+        )
+        .await,
+        Err(Error::Configuration(_))
+    ));
+    cancel.cancel();
+    serving.await.unwrap().unwrap();
+    client.close().await;
+    server.close().await;
+}
