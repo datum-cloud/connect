@@ -16,7 +16,9 @@ use http::{Method, Request, Response, StatusCode};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use std::{
     collections::HashMap,
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    pin::Pin,
     str::FromStr,
     sync::{
         Arc,
@@ -36,6 +38,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub const ALPN: &[u8] = b"datum-connect/connect-ip-v1";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 const DATAGRAM_SETUP_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CAPSULE: usize = 16 * 1024;
@@ -522,6 +525,20 @@ impl Registry {
             incoming,
         })
     }
+    /// Removes the entry for `key` only if it is still the registration made at `generation`.
+    fn remove_generation(&self, key: &(EndpointId, String), generation: u64) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if entries
+            .get(key)
+            .is_some_and(|entry| entry.generation == generation)
+            && let Some(entry) = entries.remove(key)
+        {
+            entry.cancel.cancel();
+        }
+    }
     fn lookup(&self, peer: EndpointId, network: &str) -> Option<Admission> {
         self.entries
             .lock()
@@ -529,6 +546,61 @@ impl Registry {
             .get(&(peer, network.into()))
             .filter(|entry| !entry.cancel.is_cancelled())
             .cloned()
+    }
+}
+
+/// A CONNECT-IP request that matched no grant, offered to an admission callback.
+pub struct AdmissionRequest {
+    pub peer: EndpointId,
+    pub network: String,
+    pub session_id: String,
+    proxy_authorization: Option<String>,
+}
+impl AdmissionRequest {
+    /// The request's `Proxy-Authorization` value, if it sent exactly one. It may be a credential:
+    /// callers must not log it.
+    pub fn proxy_authorization(&self) -> Option<&str> {
+        self.proxy_authorization.as_deref()
+    }
+}
+impl std::fmt::Debug for AdmissionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionRequest")
+            .field("peer", &self.peer)
+            .field("network", &self.network)
+            .field("session_id", &self.session_id)
+            .field(
+                "proxy_authorization",
+                &self.proxy_authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+pub type AdmissionFuture = Pin<Box<dyn Future<Output = Option<Grant>> + Send>>;
+
+/// Decides a request that matched no grant. Returning a grant for the request's own peer and
+/// network admits the session; the grant is registered for that peer and network while the
+/// connection lasts, and removed when it ends. Returning `None`, a grant for another peer or
+/// network, or not answering within the admission timeout refuses the request exactly as an
+/// unmatched request is refused.
+pub type Admit = Arc<dyn Fn(AdmissionRequest) -> AdmissionFuture + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct AdmissionHook {
+    admit: Admit,
+    incoming: mpsc::Sender<Incoming>,
+}
+
+/// Removes a callback-admitted grant when its connection ends.
+struct ConnectionGrant {
+    registry: Arc<Registry>,
+    key: (EndpointId, String),
+    generation: u64,
+}
+impl Drop for ConnectionGrant {
+    fn drop(&mut self) {
+        self.registry.remove_generation(&self.key, self.generation);
     }
 }
 
@@ -677,6 +749,21 @@ pub async fn serve(
     incoming: mpsc::Sender<Incoming>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    serve_with_admission(endpoint, grants, incoming, cancel, None).await
+}
+
+/// As [`serve`], and offers each request that matches no grant to `admit`, when given.
+pub async fn serve_with_admission(
+    endpoint: Endpoint,
+    grants: Vec<Grant>,
+    incoming: mpsc::Sender<Incoming>,
+    cancel: CancellationToken,
+    admit: Option<Admit>,
+) -> Result<()> {
+    let hook = admit.map(|admit| AdmissionHook {
+        admit,
+        incoming: incoming.clone(),
+    });
     let local = cancel.child_token();
     let _guard = local.clone().drop_guard();
     let policies = Arc::new(Registry::new(local.clone()));
@@ -692,7 +779,7 @@ pub async fn serve(
             request = endpoint.accept() => {
                 let Some(request) = request else { break; };
                 if tasks.len() >= MAX_SESSIONS { request.refuse(); continue; }
-                let policies = policies.clone(); let child = local.child_token();
+                let policies = policies.clone(); let child = local.child_token(); let hook = hook.clone();
                 tasks.spawn(async move {
                     let _guard = child.clone().drop_guard();
                     let result = async {
@@ -706,7 +793,7 @@ pub async fn serve(
                             tracing::warn!(stage="quic_handshake", timeout_seconds=SETUP_TIMEOUT.as_secs(), "CONNECT-IP QUIC handshake timed out");
                             Error::Timeout
                         })??;
-                        serve_connection(conn, policies, child).await
+                        serve_connection_with_admission(conn, policies, child, hook).await
                     }.await;
                     if let Err(error) = result { tracing::warn!(stage="connect_ip", %error, "CONNECT-IP incoming session ended"); }
                 });
@@ -724,7 +811,18 @@ pub(crate) async fn serve_connection(
     policies: Arc<Registry>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    serve_connection_with_admission(conn, policies, cancel, None).await
+}
+
+/// As [`serve_connection`], and offers a request that matches no grant to `hook`, when given.
+async fn serve_connection_with_admission(
+    conn: iroh::endpoint::Connection,
+    policies: Arc<Registry>,
+    cancel: CancellationToken,
+    hook: Option<AdmissionHook>,
+) -> Result<()> {
     let mut _session_lifetime = None;
+    let mut _connection_grant: Option<ConnectionGrant> = None;
     let peer = conn.remote_id();
     let mut session_id = String::from("unidentified");
     let mut network_name = String::from("unknown");
@@ -777,11 +875,48 @@ pub(crate) async fn serve_connection(
             && request.uri().path() == PATH
             && request.uri().query().is_none()
             && one_header(request.headers(), "capsule-protocol") == Some("?1");
-        let admission = if valid {
+        let mut admission = if valid {
             network.and_then(|name| policies.lookup(peer, name))
         } else {
             None
         };
+        if admission.is_none()
+            && valid
+            && let (Some(name), Some(hook)) = (network, hook.as_ref())
+        {
+            let offered = AdmissionRequest {
+                peer,
+                network: name.to_owned(),
+                session_id: session_id.clone(),
+                proxy_authorization: proxy_authorization(request.headers()),
+            };
+            match tokio::time::timeout(ADMISSION_TIMEOUT, (hook.admit)(offered)).await {
+                Ok(Some(grant)) if grant.peer == peer && grant.network == name => {
+                    match policies.insert(grant, hook.incoming.clone()) {
+                        Ok((generation, _)) => {
+                            _connection_grant = Some(ConnectionGrant {
+                                registry: policies.clone(),
+                                key: (peer, name.to_owned()),
+                                generation,
+                            });
+                            admission = policies.lookup(peer, name);
+                        }
+                        Err(error) => {
+                            tracing::warn!(peer=%peer, network=%name, %session_id, %error, stage="connect_admission_callback", "CONNECT-IP admission callback grant was not registered");
+                        }
+                    }
+                }
+                Ok(Some(_)) => {
+                    tracing::warn!(peer=%peer, network=%name, %session_id, stage="connect_admission_callback", "CONNECT-IP admission callback returned a grant for another peer or network");
+                }
+                Ok(None) => {
+                    tracing::info!(peer=%peer, network=%name, %session_id, stage="connect_admission_callback", "CONNECT-IP admission callback declined");
+                }
+                Err(_) => {
+                    tracing::warn!(peer=%peer, network=%name, %session_id, timeout_seconds=ADMISSION_TIMEOUT.as_secs(), stage="connect_admission_callback", "CONNECT-IP admission callback timed out");
+                }
+            }
+        }
         let Some(admission) = admission else {
             let reason = if !valid {
                 "invalid_request"
@@ -1285,6 +1420,12 @@ fn one_header<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
     let mut values = headers.get_all(name).iter();
     let first = values.next()?.to_str().ok()?;
     values.next().is_none().then_some(first)
+}
+/// The value an admission callback is offered: one `Proxy-Authorization` header of visible
+/// ASCII. A repeated header counts as missing, and no other header, `Authorization` included,
+/// is offered.
+fn proxy_authorization(headers: &http::HeaderMap) -> Option<String> {
+    one_header(headers, http::header::PROXY_AUTHORIZATION.as_str()).map(str::to_owned)
 }
 fn validate_packet(packet: &[u8], config: &SessionConfig, toward_gateway: bool) -> Result<()> {
     if packet.len() > config.mtu as usize {
