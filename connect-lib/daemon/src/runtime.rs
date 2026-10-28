@@ -685,6 +685,7 @@ impl Control for RealControl {
                 routes: routes.clone(),
                 interface_name: interface_name.clone(),
                 mtu: 1280,
+                token_file: None,
             };
             let local = binding.address()?;
             if local.prefix_len() != 128 || local.addr().is_ipv4() {
@@ -1045,6 +1046,7 @@ impl Control for RealControl {
                 routes: routes.clone(),
                 interface_name,
                 mtu: 1280,
+                token_file: None,
             };
             let assigned = binding.address()?;
             let peer: connect_ip_adapter::IpNet = peer_address.parse().map_err(|_| {

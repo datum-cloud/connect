@@ -123,6 +123,7 @@ impl Binding {
             routes: self.tun_routes(),
             interface_name: self.interface_name.clone(),
             mtu: self.mtu,
+            token_file: None,
         }
     }
     pub(crate) fn local_address(&self) -> Result<IpNet, ApiError> {

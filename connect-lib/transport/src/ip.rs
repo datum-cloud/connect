@@ -628,13 +628,52 @@ fn session_parts(
     (session, outgoing, incoming)
 }
 
+/// Options for an outbound CONNECT-IP request.
+#[derive(Clone, Default)]
+pub struct ConnectOptions {
+    /// Sent once as the request's `Proxy-Authorization` header, for example `Bearer <token>`.
+    /// The header is marked sensitive, and `Debug` never shows the value.
+    pub proxy_authorization: Option<String>,
+}
+impl std::fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field(
+                "proxy_authorization",
+                &self.proxy_authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 pub async fn connect(
     endpoint: Endpoint,
     peer: EndpointAddr,
     network: &str,
     cancel: CancellationToken,
 ) -> Result<IpSession> {
+    connect_with_options(endpoint, peer, network, cancel, ConnectOptions::default()).await
+}
+
+/// As [`connect`], with the request shaped by `options`.
+pub async fn connect_with_options(
+    endpoint: Endpoint,
+    peer: EndpointAddr,
+    network: &str,
+    cancel: CancellationToken,
+    options: ConnectOptions,
+) -> Result<IpSession> {
     valid_network(network)?;
+    let proxy_authorization = options
+        .proxy_authorization
+        .as_deref()
+        .map(|value| {
+            let mut value = http::HeaderValue::from_str(value)
+                .map_err(|_| Error::Configuration("invalid proxy authorization value"))?;
+            value.set_sensitive(true);
+            Ok::<_, Error>(value)
+        })
+        .transpose()?;
     let local = cancel.child_token();
     let guard = local.clone().drop_guard();
     let session_id = session_id();
@@ -665,6 +704,9 @@ pub async fn connect(
                 ) {
                     request.headers_mut().insert(name, value);
                 }
+            }
+            if let Some(value) = proxy_authorization.clone() {
+                request.headers_mut().insert(http::header::PROXY_AUTHORIZATION, value);
             }
             request.extensions_mut().insert(Protocol::CONNECT_IP);
             let mut stream = sender.send_request(request).await.map_err(|error| {

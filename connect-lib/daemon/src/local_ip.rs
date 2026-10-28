@@ -53,6 +53,10 @@ pub struct Binding {
     pub routes: Vec<String>,
     pub interface_name: String,
     pub mtu: u16,
+    /// A file holding a bearer token sent with each CONNECT-IP request for this binding. It is
+    /// read again on every connection attempt, so a replaced token is used on the next one.
+    #[serde(default)]
+    pub token_file: Option<std::path::PathBuf>,
 }
 
 impl LocalIpConfig {
@@ -454,6 +458,25 @@ impl Attachment {
     }
 }
 
+/// The request options for a binding: its token, when it names a token file.
+async fn connect_options(token_file: Option<&Path>) -> Result<ip::ConnectOptions, ApiError> {
+    let Some(path) = token_file else {
+        return Ok(ip::ConnectOptions::default());
+    };
+    let token = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|_| ApiError::bad_request("Could not read the binding's token file"))?;
+    let token = token.trim();
+    if token.is_empty() || token.chars().any(char::is_whitespace) {
+        return Err(ApiError::bad_request(
+            "The binding's token file must hold one token",
+        ));
+    }
+    Ok(ip::ConnectOptions {
+        proxy_authorization: Some(format!("Bearer {token}")),
+    })
+}
+
 pub async fn join(
     binding: Binding,
     peer_address: Option<connect_ip_adapter::IpNet>,
@@ -480,13 +503,15 @@ pub async fn join(
             peer = peer.with_relay_url(relay);
         }
     }
+    let options = connect_options(binding.token_file.as_deref()).await?;
     let session = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        ip::connect(
+        ip::connect_with_options(
             endpoint.clone(),
             peer.clone(),
             &binding.network,
             cancel.clone(),
+            options,
         ),
     )
     .await
@@ -576,6 +601,7 @@ pub async fn join(
     let task_peer = peer.clone();
     let task_endpoint = endpoint.clone();
     let task_network = network.clone();
+    let task_token_file = binding.token_file.clone();
     let task = tokio::spawn(async move {
         let mut session = session;
         let mut buffer = vec![0u8; 65536];
@@ -682,9 +708,20 @@ pub async fn join(
                     _ = task_cancel.cancelled() => break 'attachment,
                     _ = tokio::time::sleep(reconnect_delay) => {}
                 }
+                let options = match connect_options(task_token_file.as_deref()).await {
+                    Ok(options) => options,
+                    Err(_) => {
+                        let error = "could not read the binding's token file".to_owned();
+                        *task_failure.lock().await = Some(error.clone());
+                        *task_state.write().await = "failed";
+                        tracing::error!(%project, %network, %gateway, attempt=reconnect_attempt, %error,
+                            stage="connect_ip_reconnect_rejected", "CONNECT-IP reconnect has no usable token");
+                        break 'attachment;
+                    }
+                };
                 let attempt = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
-                    ip::connect(task_endpoint.clone(), task_peer.clone(), &task_network, task_cancel.clone()),
+                    ip::connect_with_options(task_endpoint.clone(), task_peer.clone(), &task_network, task_cancel.clone(), options),
                 ).await;
                 let replacement = match attempt {
                     Ok(Ok(replacement)) => {
@@ -846,6 +883,46 @@ fn handshake_error(network: &str, connector: &str, error: ip::Error) -> ApiError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn binding_token_file_becomes_a_bearer_credential() {
+        assert_eq!(
+            connect_options(None).await.unwrap().proxy_authorization,
+            None
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        std::fs::write(&path, "header.payload.signature\n").unwrap();
+        let rendered = format!("{:?}", connect_options(Some(&path)).await.unwrap());
+        assert!(
+            rendered.contains("<redacted>") && !rendered.contains("payload"),
+            "{rendered}"
+        );
+        assert_eq!(
+            connect_options(Some(&path))
+                .await
+                .unwrap()
+                .proxy_authorization
+                .as_deref(),
+            Some("Bearer header.payload.signature")
+        );
+        for invalid in ["", "  \n", "two tokens"] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(connect_options(Some(&path)).await.is_err(), "{invalid:?}");
+        }
+        assert!(
+            connect_options(Some(&directory.path().join("missing")))
+                .await
+                .is_err()
+        );
+        let binding: Binding = serde_json::from_value(serde_json::json!({
+            "project": "demo", "network": "vpc", "gateway": iroh::SecretKey::from_bytes(&[7; 32]).public().to_string(),
+            "addresses": ["192.0.2.3:4433"], "assigned_address": "fd00::2/128", "routes": ["fd00:1::/64"],
+            "interface_name": "dcip0", "mtu": 1280, "token_file": "/run/token"
+        }))
+        .unwrap();
+        assert_eq!(binding.token_file.as_deref(), Some(Path::new("/run/token")));
+    }
 
     #[test]
     fn reconnect_retries_transient_failures_but_stops_on_configuration_rejections() {
