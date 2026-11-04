@@ -1,0 +1,62 @@
+apiVersion: connect.datumapis.com/v1alpha1
+kind: ConnectGateway
+metadata:
+  name: production
+  labels:
+    policy.connect.datum.net/environment: staging
+    policy.connect.datum.net/access-domain: application
+    policy.connect.datum.net/developer-access: "true"
+spec:
+  contractVersion: managed-network-v1
+  networkRef: default
+  placement:
+    locationSelector:
+      matchExpressions:
+      - key: topology.datum.net/region
+        operator: In
+        values: [us-central-1]
+    availability:
+      minReady: 1
+---
+apiVersion: connect.datumapis.com/v1alpha1
+kind: ConnectConnectionPolicy
+metadata:
+  name: staging-developers
+spec:
+  gatewaySelector:
+    matchLabels:
+      policy.connect.datum.net/environment: staging
+    matchExpressions:
+    - key: policy.connect.datum.net/access-domain
+      operator: In
+      values: [application, observability]
+    - key: policy.connect.datum.net/developer-access
+      operator: Exists
+  connectorSelector:
+    matchLabels:
+      policy.connect.datum.net/environment: staging
+  access:
+    permission: Network
+---
+# This second policy composes additively. The binding does not name either one.
+apiVersion: connect.datumapis.com/v1alpha1
+kind: ConnectConnectionPolicy
+metadata:
+  name: production-operators
+spec:
+  gatewayRef:
+    name: production
+  connectorSelector:
+    matchLabels:
+      policy.connect.datum.net/access-domain: application
+  access:
+    permission: Network
+---
+apiVersion: connect.datumapis.com/v1alpha1
+kind: ConnectNetworkBinding
+metadata:
+  name: laptop-production
+spec:
+  gatewayRef: production
+  connectorRef: laptop
+

@@ -17,6 +17,13 @@ rules:
   - update
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - compute.datumapis.com
   resources:
   - workloads
@@ -29,20 +36,28 @@ rules:
 - apiGroups:
   - connect.datumapis.com
   resources:
+  - connectconnectionpolicies
   - connectgatewayclasses
+  - connectgatewayplacements
   - connectgateways
   - connectnetworkbindings
   - connectoradvertisements
   - connectorclasses
   - connectors
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - connect.datumapis.com
   resources:
+  - connectconnectionpolicies/status
   - connectgatewayclasses/status
+  - connectgatewayplacements/status
   - connectgateways/status
   - connectnetworkbindings/status
   - connectoradvertisements/status
@@ -62,4 +77,20 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - locations.miloapis.com
+  resources:
+  - locations
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - networking.datumapis.com
+  resources:
+  - networks
+  verbs:
+  - get
+  - list
   - watch

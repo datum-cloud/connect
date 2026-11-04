@@ -51,6 +51,16 @@ spec:
             type: object
           spec:
             properties:
+              contractVersion:
+                default: legacy-v1
+                description: |-
+                  ContractVersion selects the reconciliation contract without exposing the
+                  gateway provider. Existing preview objects default to legacy-v1; new
+                  managed-network objects must set managed-network-v1 explicitly.
+                enum:
+                - legacy-v1
+                - managed-network-v1
+                type: string
               gatewayClassRef:
                 description: GatewayClassRef names a cluster-scoped ConnectGatewayClass
                   in this project.
@@ -67,6 +77,71 @@ spec:
                   to the assigned addresses of the other attached Connectors. It is disabled
                   by default; VPC routes remain available regardless of this setting.
                 type: boolean
+              placement:
+                description: |-
+                  Placement selects every platform Location where this logical gateway is
+                  offered. It is used only by the managed-network-v1 contract.
+                properties:
+                  availability:
+                    properties:
+                      minReady:
+                        default: 1
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
+                  locationSelector:
+                    description: |-
+                      A label selector is a label query over a set of resources. The result of matchLabels and
+                      matchExpressions are ANDed. An empty label selector matches all objects. A null
+                      label selector matches no objects.
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - locationSelector
+                type: object
               relayURLs:
                 description: RelayURLs pins the gateway to operator-managed iroh relays
                   when set.
@@ -80,11 +155,17 @@ spec:
                 minItems: 1
                 type: array
             required:
-            - gatewayClassRef
-            - locationRef
             - networkRef
-            - routes
             type: object
+            x-kubernetes-validations:
+            - message: managed-network-v1 requires placement and forbids legacy gateway
+                implementation fields
+              rule: self.contractVersion != 'managed-network-v1' || (has(self.placement)
+                && !has(self.gatewayClassRef) && !has(self.locationRef) && !has(self.routes)
+                && !has(self.relayURLs) && !has(self.peerRouting))
+            - message: legacy-v1 requires gatewayClassRef, locationRef, and routes
+              rule: self.contractVersion != 'legacy-v1' || (has(self.gatewayClassRef)
+                && has(self.locationRef) && has(self.routes))
           status:
             properties:
               classRef:
@@ -150,6 +231,12 @@ spec:
               idleSince:
                 format: date-time
                 type: string
+              matched:
+                description: |-
+                  Placement counts are the only per-location information published on a
+                  managed logical gateway. Details remain on ConnectGatewayPlacement.
+                format: int32
+                type: integer
               observedGeneration:
                 format: int64
                 type: integer
@@ -163,6 +250,12 @@ spec:
                 - Available
                 - Scaling
                 type: string
+              ready:
+                format: int32
+                type: integer
+              unavailable:
+                format: int32
+                type: integer
               workloadRef:
                 type: string
             type: object

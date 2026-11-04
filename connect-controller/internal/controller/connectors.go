@@ -45,11 +45,14 @@ type ConnectReconciler struct {
 	classClient client.Client
 }
 
-// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectgatewayclasses;connectors;connectoradvertisements;connectgateways;connectnetworkbindings,verbs=get;list;watch
-// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectgatewayclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectnetworkbindings/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses;connectgatewayclasses;connectors;connectoradvertisements;connectgateways;connectgatewayplacements;connectconnectionpolicies;connectnetworkbindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=connect.datumapis.com,resources=connectorclasses/status;connectgatewayclasses/status;connectors/status;connectoradvertisements/status;connectgateways/status;connectgatewayplacements/status;connectconnectionpolicies/status;connectnetworkbindings/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloads,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps;secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=locations.miloapis.com,resources=locations,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.datumapis.com,resources=networks,verbs=get;list;watch
 
 func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	local := mgr.GetLocalManager()
@@ -64,12 +67,16 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		{"connector", &connectv1alpha1.Connector{}},
 		{"connectoradvertisement", &connectv1alpha1.ConnectorAdvertisement{}},
 		{"connectgateway", &connectv1alpha1.ConnectGateway{}},
+		{"connectconnectionpolicy", &connectv1alpha1.ConnectConnectionPolicy{}},
 		{"connectnetworkbinding", &connectv1alpha1.ConnectNetworkBinding{}},
 	} {
 		builder := mcbuilder.ControllerManagedBy(mgr).Named(item.name).For(item.obj,
 			mcbuilder.WithEngageWithLocalCluster(false))
 		if item.name == "connector" {
 			builder = builder.Owns(&coordinationv1.Lease{})
+		}
+		if item.name == "connectgateway" {
+			builder = builder.Owns(&connectv1alpha1.ConnectGatewayPlacement{})
 		}
 		if err := builder.Complete(&ConnectReconciler{mgr: mgr, kind: item.name, classClient: local.GetClient()}); err != nil {
 			return fmt.Errorf("register %s controller: %w", item.name, err)
@@ -165,11 +172,34 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 			}
 			return ctrl.Result{}, err
 		}
+		if effectiveGatewayContract(obj.Spec) == managedGatewayContract {
+			locations, listErr := listPlacementLocations(ctx, c)
+			if listErr != nil {
+				return ctrl.Result{}, listErr
+			}
+			if err := reconcileManagedGatewayPlacements(ctx, c, &obj, locations); err != nil {
+				logger.Error(err, "reconcile managed ConnectGateway placements")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		}
 		if err := reconcileGateway(ctx, c, r.classClient, string(req.ClusterName), &obj, time.Now()); err != nil {
 			logger.Error(err, "reconcile ConnectGateway")
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
+	case "connectconnectionpolicy":
+		var obj connectv1alpha1.ConnectConnectionPolicy
+		if err := c.Get(ctx, key, &obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		if err := reconcileConnectionPolicy(ctx, c, &obj); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	case "connectnetworkbinding":
 		var obj connectv1alpha1.ConnectNetworkBinding
 		if err := c.Get(ctx, key, &obj); err != nil {
@@ -177,6 +207,17 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 				return ctrl.Result{}, nil
 			}
 			return ctrl.Result{}, err
+		}
+		var gateway connectv1alpha1.ConnectGateway
+		gatewayErr := c.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Spec.GatewayRef}, &gateway)
+		if gatewayErr == nil && effectiveGatewayContract(gateway.Spec) == managedGatewayContract {
+			if err := reconcileManagedNetworkBinding(ctx, c, &obj, &gateway); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
+		}
+		if gatewayErr != nil && !apierrors.IsNotFound(gatewayErr) {
+			return ctrl.Result{}, gatewayErr
 		}
 		if err := reconcileNetworkBinding(ctx, c, string(req.ClusterName), &obj); err != nil {
 			logger.Error(err, "reconcile ConnectNetworkBinding")

@@ -109,8 +109,22 @@ spec:
                   - type
                   type: object
                 type: array
+              effectivePolicyRevision:
+                type: string
               endpointID:
                 type: string
+              networkPlan:
+                properties:
+                  destinationPrefixes:
+                    items:
+                      type: string
+                    type: array
+                  expectedPrefix:
+                    type: string
+                  mtu:
+                    format: int32
+                    type: integer
+                type: object
               observedGeneration:
                 format: int64
                 type: integer
@@ -124,6 +138,8 @@ spec:
                 items:
                   type: string
                 type: array
+              selectedPlacementRef:
+                type: string
             type: object
         type: object
     served: true

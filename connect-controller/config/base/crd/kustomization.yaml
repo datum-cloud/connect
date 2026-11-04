@@ -6,4 +6,6 @@ resources:
 - bases/connect.datumapis.com_connectgatewayclasses.yaml
 - bases/connect.datumapis.com_connectoradvertisements.yaml
 - bases/connect.datumapis.com_connectgateways.yaml
+- bases/connect.datumapis.com_connectgatewayplacements.yaml
+- bases/connect.datumapis.com_connectconnectionpolicies.yaml
 - bases/connect.datumapis.com_connectnetworkbindings.yaml

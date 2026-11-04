@@ -26,6 +26,7 @@ connect-ip-adapter = { path = "../ip-adapter" }
 connect-masque-edge = { path = "../masque-interop-lab" }
 fs2 = { workspace = true }
 iroh = { workspace = true }
+ipnet = { version = "2", features = ["serde"] }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
@@ -40,6 +41,7 @@ tracing = { workspace = true }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }

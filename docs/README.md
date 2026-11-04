@@ -50,6 +50,7 @@ Use these guides to install, operate, and develop Datum Connect.
 - [Service publication and dialing](architecture/service-publication.md)
 - [Managed VPC attachment](architecture/managed-vpc-attachment.md)
 - [CONNECT-IP data plane](architecture/connect-ip-data-plane.md)
+- [Managed-network Galactic prototype](managed-network-galactic-prototype.md)
 
 ### Cross-Cutting Concerns
 

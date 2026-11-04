@@ -28,6 +28,14 @@ spec:
     - connect.datumapis.com/connectgateways.get
     - connect.datumapis.com/connectgateways/status.get
     - connect.datumapis.com/connectgateways.watch
+    - connect.datumapis.com/connectgatewayplacements.list
+    - connect.datumapis.com/connectgatewayplacements.get
+    - connect.datumapis.com/connectgatewayplacements/status.get
+    - connect.datumapis.com/connectgatewayplacements.watch
+    - connect.datumapis.com/connectconnectionpolicies.list
+    - connect.datumapis.com/connectconnectionpolicies.get
+    - connect.datumapis.com/connectconnectionpolicies/status.get
+    - connect.datumapis.com/connectconnectionpolicies.watch
     - connect.datumapis.com/connectnetworkbindings.list
     - connect.datumapis.com/connectnetworkbindings.get
     - connect.datumapis.com/connectnetworkbindings/status.get

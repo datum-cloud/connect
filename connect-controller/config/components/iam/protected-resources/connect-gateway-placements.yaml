@@ -1,0 +1,17 @@
+apiVersion: iam.miloapis.com/v1alpha1
+kind: ProtectedResource
+metadata:
+  name: connect.datumapis.com-connectgatewayplacement
+spec:
+  serviceRef:
+    name: connect.datumapis.com
+  kind: ConnectGatewayPlacement
+  plural: connectgatewayplacements
+  singular: connectgatewayplacement
+  permissions: [list, get, watch, updateStatus]
+  subresources:
+  - name: status
+    permissions: [get, update, patch]
+  parentResources:
+  - apiGroup: resourcemanager.miloapis.com
+    kind: Project

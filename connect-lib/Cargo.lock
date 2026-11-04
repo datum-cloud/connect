@@ -967,6 +967,7 @@ dependencies = [
  "connect-masque-edge",
  "connect-transport",
  "fs2",
+ "ipnet",
  "iroh",
  "libc",
  "opentelemetry",
@@ -985,6 +986,7 @@ dependencies = [
  "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "windows",
 ]
 

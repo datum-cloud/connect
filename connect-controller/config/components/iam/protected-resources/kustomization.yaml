@@ -4,6 +4,8 @@ kind: Kustomization
 resources:
 - connect-gateway-classes.yaml
 - connect-gateways.yaml
+- connect-gateway-placements.yaml
+- connect-connection-policies.yaml
 - connect-network-bindings.yaml
 - connector-advertisements.yaml
 - connector-classes.yaml

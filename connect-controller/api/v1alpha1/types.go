@@ -196,16 +196,21 @@ type ConnectGateway struct {
 	Status            ConnectGatewayStatus `json:"status,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:message="managed-network-v1 requires placement and forbids legacy gateway implementation fields",rule="self.contractVersion != 'managed-network-v1' || (has(self.placement) && !has(self.gatewayClassRef) && !has(self.locationRef) && !has(self.routes) && !has(self.relayURLs) && !has(self.peerRouting))"
+// +kubebuilder:validation:XValidation:message="legacy-v1 requires gatewayClassRef, locationRef, and routes",rule="self.contractVersion != 'legacy-v1' || (has(self.gatewayClassRef) && has(self.locationRef) && has(self.routes))"
 type ConnectGatewaySpec struct {
+	// ContractVersion selects the reconciliation contract without exposing the
+	// gateway provider. Existing preview objects default to legacy-v1; new
+	// managed-network objects must set managed-network-v1 explicitly.
+	// +kubebuilder:validation:Enum=legacy-v1;managed-network-v1
+	// +kubebuilder:default=legacy-v1
+	ContractVersion string `json:"contractVersion,omitempty"`
 	// GatewayClassRef names a cluster-scoped ConnectGatewayClass in this project.
-	// +kubebuilder:validation:Required
-	GatewayClassRef string `json:"gatewayClassRef"`
+	GatewayClassRef string `json:"gatewayClassRef,omitempty"`
 	// +kubebuilder:validation:Required
 	NetworkRef string `json:"networkRef"`
 	// LocationRef is the fully qualified Compute Location name (for example, us-central-1).
-	// +kubebuilder:validation:Required
 	LocationRef string `json:"locationRef,omitempty"`
-	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=32
 	Routes []string `json:"routes,omitempty"`
@@ -215,6 +220,21 @@ type ConnectGatewaySpec struct {
 	// to the assigned addresses of the other attached Connectors. It is disabled
 	// by default; VPC routes remain available regardless of this setting.
 	PeerRouting bool `json:"peerRouting,omitempty"`
+	// Placement selects every platform Location where this logical gateway is
+	// offered. It is used only by the managed-network-v1 contract.
+	Placement *ConnectGatewayPlacementPolicy `json:"placement,omitempty"`
+}
+
+type ConnectGatewayPlacementPolicy struct {
+	// +kubebuilder:validation:Required
+	LocationSelector metav1.LabelSelector       `json:"locationSelector"`
+	Availability     ConnectGatewayAvailability `json:"availability,omitempty"`
+}
+
+type ConnectGatewayAvailability struct {
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	MinReady int32 `json:"minReady,omitempty"`
 }
 
 type ConnectGatewayStatus struct {
@@ -228,6 +248,11 @@ type ConnectGatewayStatus struct {
 	WorkloadRef string             `json:"workloadRef,omitempty"`
 	EndpointID  string             `json:"endpointID,omitempty"`
 	Conditions  []metav1.Condition `json:"conditions,omitempty"`
+	// Placement counts are the only per-location information published on a
+	// managed logical gateway. Details remain on ConnectGatewayPlacement.
+	Matched     int32 `json:"matched,omitempty"`
+	Ready       int32 `json:"ready,omitempty"`
+	Unavailable int32 `json:"unavailable,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -257,13 +282,22 @@ type ConnectNetworkBindingSpec struct {
 }
 
 type ConnectNetworkBindingStatus struct {
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
-	EndpointID         string             `json:"endpointID,omitempty"`
-	AssignedAddress    string             `json:"assignedAddress,omitempty"`
-	PeerAddress        string             `json:"peerAddress,omitempty"`
-	Routes             []string           `json:"routes,omitempty"`
-	RelayURLs          []string           `json:"relayURLs,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	ObservedGeneration      int64                      `json:"observedGeneration,omitempty"`
+	EndpointID              string                     `json:"endpointID,omitempty"`
+	AssignedAddress         string                     `json:"assignedAddress,omitempty"`
+	PeerAddress             string                     `json:"peerAddress,omitempty"`
+	Routes                  []string                   `json:"routes,omitempty"`
+	RelayURLs               []string                   `json:"relayURLs,omitempty"`
+	Conditions              []metav1.Condition         `json:"conditions,omitempty"`
+	SelectedPlacementRef    string                     `json:"selectedPlacementRef,omitempty"`
+	EffectivePolicyRevision string                     `json:"effectivePolicyRevision,omitempty"`
+	NetworkPlan             *ConnectNetworkPlanSummary `json:"networkPlan,omitempty"`
+}
+
+type ConnectNetworkPlanSummary struct {
+	ExpectedPrefix      string   `json:"expectedPrefix,omitempty"`
+	DestinationPrefixes []string `json:"destinationPrefixes,omitempty"`
+	MTU                 int32    `json:"mtu,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -273,6 +307,86 @@ type ConnectNetworkBindingList struct {
 	Items           []ConnectNetworkBinding `json:"items"`
 }
 
+// ConnectGatewayPlacement is controller-owned per-location state for one
+// logical ConnectGateway. Users select the parent gateway, never a placement.
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:metadata:annotations="discovery.miloapis.com/parent-contexts=Project"
+// +kubebuilder:printcolumn:name="Gateway",type=string,JSONPath=`.spec.gatewayRef`
+// +kubebuilder:printcolumn:name="Location",type=string,JSONPath=`.spec.locationRef`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+type ConnectGatewayPlacement struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              ConnectGatewayPlacementSpec   `json:"spec,omitempty"`
+	Status            ConnectGatewayPlacementStatus `json:"status,omitempty"`
+}
+
+type ConnectGatewayPlacementSpec struct {
+	GatewayRef  string `json:"gatewayRef"`
+	LocationRef string `json:"locationRef"`
+}
+
+type ConnectGatewayPlacementStatus struct {
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	AssignmentRef      string             `json:"assignmentRef,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type ConnectGatewayPlacementList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ConnectGatewayPlacement `json:"items"`
+}
+
+// ConnectConnectionPolicy grants protected Connector classifications access
+// to logical gateways. Applicable policies compose additively over deny-all.
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:metadata:annotations="discovery.miloapis.com/parent-contexts=Project"
+type ConnectConnectionPolicy struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              ConnectConnectionPolicySpec   `json:"spec,omitempty"`
+	Status            ConnectConnectionPolicyStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:validation:XValidation:message="exactly one of gatewayRef or gatewaySelector is required",rule="(has(self.gatewayRef) ? 1 : 0) + (has(self.gatewaySelector) ? 1 : 0) == 1"
+// +kubebuilder:validation:XValidation:message="gatewaySelector must use nonempty protected In/Exists requirements",rule="!has(self.gatewaySelector) || ((has(self.gatewaySelector.matchLabels) ? size(self.gatewaySelector.matchLabels) : 0) + (has(self.gatewaySelector.matchExpressions) ? size(self.gatewaySelector.matchExpressions) : 0) > 0 && (!has(self.gatewaySelector.matchLabels) || self.gatewaySelector.matchLabels.all(k, v, k.startsWith('policy.connect.datum.net/'))) && (!has(self.gatewaySelector.matchExpressions) || self.gatewaySelector.matchExpressions.all(r, r.key.startsWith('policy.connect.datum.net/') && (r.operator == 'In' || r.operator == 'Exists'))))"
+// +kubebuilder:validation:XValidation:message="connectorSelector must use nonempty protected In/Exists requirements",rule="((has(self.connectorSelector.matchLabels) ? size(self.connectorSelector.matchLabels) : 0) + (has(self.connectorSelector.matchExpressions) ? size(self.connectorSelector.matchExpressions) : 0) > 0) && (!has(self.connectorSelector.matchLabels) || self.connectorSelector.matchLabels.all(k, v, k.startsWith('policy.connect.datum.net/'))) && (!has(self.connectorSelector.matchExpressions) || self.connectorSelector.matchExpressions.all(r, r.key.startsWith('policy.connect.datum.net/') && (r.operator == 'In' || r.operator == 'Exists')))"
+type ConnectConnectionPolicySpec struct {
+	GatewayRef      *LocalObjectReference `json:"gatewayRef,omitempty"`
+	GatewaySelector *metav1.LabelSelector `json:"gatewaySelector,omitempty"`
+	// ConnectorSelector is the prototype trusted subject mechanism. Only
+	// controller/IAM-owned policy.connect.datum.net labels are accepted.
+	ConnectorSelector metav1.LabelSelector `json:"connectorSelector"`
+	Access            ConnectPolicyAccess  `json:"access"`
+}
+
+type LocalObjectReference struct {
+	Name string `json:"name"`
+}
+
+type ConnectPolicyAccess struct {
+	// +kubebuilder:validation:Enum=Network
+	Permission string `json:"permission"`
+}
+
+type ConnectConnectionPolicyStatus struct {
+	ObservedGeneration   int64              `json:"observedGeneration,omitempty"`
+	ResolvedGatewayCount int32              `json:"resolvedGatewayCount,omitempty"`
+	Revision             string             `json:"revision,omitempty"`
+	Conditions           []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+type ConnectConnectionPolicyList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ConnectConnectionPolicy `json:"items"`
+}
+
 func init() {
-	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &ConnectGatewayClass{}, &ConnectGatewayClassList{}, &Connector{}, &ConnectorList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{}, &ConnectNetworkBinding{}, &ConnectNetworkBindingList{})
+	SchemeBuilder.Register(&ConnectorClass{}, &ConnectorClassList{}, &ConnectGatewayClass{}, &ConnectGatewayClassList{}, &Connector{}, &ConnectorList{}, &ConnectorAdvertisement{}, &ConnectorAdvertisementList{}, &ConnectGateway{}, &ConnectGatewayList{}, &ConnectNetworkBinding{}, &ConnectNetworkBindingList{}, &ConnectGatewayPlacement{}, &ConnectGatewayPlacementList{}, &ConnectConnectionPolicy{}, &ConnectConnectionPolicyList{})
 }
