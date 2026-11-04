@@ -523,37 +523,68 @@ impl CloudConnector {
                     "Network {network:?} was not found in this project."
                 ))
             })?;
-        let location = self.edge_location().await?;
-        let matches = gateways["items"]
+        let items = gateways["items"]
             .as_array()
             .into_iter()
             .flatten()
+            .collect::<Vec<_>>();
+        let managed = items
+            .iter()
+            .copied()
             .filter(|gateway| {
                 gateway["spec"]["networkRef"] == network
-                    && gateway["spec"]["locationRef"] == location
+                    && gateway["spec"]["contractVersion"] == "managed-network-v1"
             })
             .cloned()
             .collect::<Vec<_>>();
-        if matches.len() > 1 {
-            let names = matches
+        if managed.len() > 1 {
+            let names = managed
                 .iter()
                 .filter_map(|item| item["metadata"]["name"].as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(Error::Unsupported(format!(
-                "multiple ConnectGateways exist for network {network:?} in location {location}: {names}; remove the duplicate or ask your administrator to resolve it"
+                "multiple managed ConnectGateways exist for network {network:?}: {names}; select one explicitly or ask your administrator to resolve the duplicate"
             )));
         }
-        let gateway = if let Some(gateway) = matches.into_iter().next() {
-            gateway
+        let (gateway, selected_location) = if let Some(gateway) = managed.into_iter().next() {
+            (gateway, None)
         } else {
-            self.create_network_gateway(network, &location, &network_object)
-                .await?
+            let location = self.edge_location().await?;
+            let matches = items
+                .iter()
+                .copied()
+                .filter(|gateway| {
+                    gateway["spec"]["networkRef"] == network
+                        && gateway["spec"]["contractVersion"] != "managed-network-v1"
+                        && gateway["spec"]["locationRef"] == location
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.len() > 1 {
+                let names = matches
+                    .iter()
+                    .filter_map(|item| item["metadata"]["name"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::Unsupported(format!(
+                    "multiple ConnectGateways exist for network {network:?} in location {location}: {names}; remove the duplicate or ask your administrator to resolve it"
+                )));
+            }
+            let gateway = if let Some(gateway) = matches.into_iter().next() {
+                gateway
+            } else {
+                self.create_network_gateway(network, &location, &network_object)
+                    .await?
+            };
+            (gateway, Some(location))
         };
         let gateway_name = string(&gateway, "/metadata/name")?;
         tracing::info!(
             network,
-            location,
+            location = selected_location
+                .as_deref()
+                .unwrap_or("controller-selected"),
             gateway = gateway_name,
             stage = "gateway_selected",
             "selected project ConnectGateway"
@@ -590,6 +621,10 @@ impl CloudConnector {
                 .await?
             }
         };
+        let contract_version = gateway["spec"]["contractVersion"]
+            .as_str()
+            .unwrap_or("legacy-v1")
+            .to_owned();
         // A fresh OnDemand gateway needs time for its Compute Workload to
         // provision and apply the Connector grant. Match the plugin's default
         // four-minute request budget instead of timing out during startup.
@@ -598,11 +633,20 @@ impl CloudConnector {
         let mut connector_not_ready_logged = false;
         let mut gateway_workload_wait_logged = false;
         loop {
-            if current_condition(&binding, "Accepted") {
+            let ready = if contract_version == "managed-network-v1" {
+                current_condition(&binding, "Ready")
+            } else {
+                current_condition(&binding, "Accepted")
+            };
+            if ready {
                 let mut result = binding["status"].clone();
                 result["network"] = json!(network);
                 result["gateway"] = json!(gateway_name);
-                result["gateway_location"] = json!(gateway["spec"]["locationRef"]);
+                result["gateway_location"] = if contract_version == "managed-network-v1" {
+                    result["selectedPlacementRef"].clone()
+                } else {
+                    gateway["spec"]["locationRef"].clone()
+                };
                 if result["endpointID"].is_string() {
                     result["gatewayEndpointID"] = result["endpointID"].clone();
                 } else if let Some(endpoint) = gateway.pointer("/status/endpointID") {
@@ -610,6 +654,7 @@ impl CloudConnector {
                 }
                 result["bindingName"] = json!(binding_name);
                 result["connectorName"] = json!(self.name);
+                result["contractVersion"] = json!(contract_version);
                 return Ok(Some(result));
             }
             if let Some(condition) = binding
@@ -679,6 +724,46 @@ impl CloudConnector {
                 .await?
                 .ok_or(Error::Api(404))?;
         }
+    }
+
+    /// Mint one short-lived managed-network descriptor. The sensitive response
+    /// is returned as bounded bytes so it is never rendered as a JSON value in
+    /// logs, errors, or tracing fields.
+    pub async fn mint_network_credentials(&self, binding: &str) -> Result<Vec<u8>> {
+        validate_name(binding)?;
+        let url = format!(
+            "{}/connection-credentials",
+            self.connect_resource("connectnetworkbindings", binding)
+        );
+        for attempt in 0..2 {
+            let token = self.tokens.token().await?;
+            let response = self
+                .client
+                .post(&url)
+                .bearer_auth(token)
+                .header(reqwest::header::CACHE_CONTROL, "no-store")
+                .send()
+                .await?;
+            if response.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
+                self.tokens.invalidate().await;
+                continue;
+            }
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                tracing::warn!(
+                    status,
+                    stage = "managed_credential_mint",
+                    "managed credential mint rejected"
+                );
+                return Err(if status == 401 {
+                    Error::Authentication(status)
+                } else {
+                    Error::Api(status)
+                });
+            }
+            return bounded_body(response).await;
+        }
+        Err(Error::Authentication(401))
     }
 
     async fn edge_location(&self) -> Result<String> {

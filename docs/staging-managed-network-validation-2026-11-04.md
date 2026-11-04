@@ -36,7 +36,6 @@ Cleanup state: **nothing created; nothing to clean up**.
 
 ## Production gaps
 
-- production daemon H3/H2 wire dialers and runtime reconciliation;
 - authenticated broker deployment and automated Galactic grant lifecycle;
 - trusted IAM group/subject resolution instead of protected Connector labels;
 - policy enter/leave Events with durable set-diff state;

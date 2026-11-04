@@ -25,23 +25,31 @@ connect-transport = { path = "../transport", features = ["otel"] }
 connect-ip-adapter = { path = "../ip-adapter" }
 connect-masque-edge = { path = "../masque-interop-lab" }
 fs2 = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
+h2 = "0.4"
+http = { workspace = true }
 iroh = { workspace = true }
 ipnet = { version = "2", features = ["serde"] }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 rand = { workspace = true }
+quinn = { version = "0.11.7", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = "0.26"
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = { workspace = true }
 url = { workspace = true }
+webpki-roots = "1"
 
 [dev-dependencies]
 reqwest = { workspace = true }

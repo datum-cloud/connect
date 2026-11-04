@@ -9,4 +9,6 @@ resources:
 - protected-resources/connector-classes.yaml
 - protected-resources/connect-gateway-classes.yaml
 - protected-resources/connect-gateways.yaml
+- protected-resources/connect-gateway-placements.yaml
+- protected-resources/connect-connection-policies.yaml
 - protected-resources/connect-network-bindings.yaml

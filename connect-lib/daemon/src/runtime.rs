@@ -647,6 +647,92 @@ impl Control for RealControl {
             else {
                 return Ok(None);
             };
+            if status["contractVersion"] == "managed-network-v1" {
+                let binding_name = json_string(&status, "bindingName")?;
+                let descriptor = mint_managed_descriptor(&runtime.cloud, &binding_name).await?;
+                let plan = descriptor
+                    .verify_provider_plan(
+                        descriptor.network_plan.expected_prefix,
+                        &descriptor.network_plan.destination_prefixes,
+                    )
+                    .map_err(|error| {
+                        ApiError::bad_request(format!(
+                            "Invalid managed network descriptor: {error}"
+                        ))
+                    })?;
+                let mut digest = Sha256::new();
+                digest.update(project.as_bytes());
+                digest.update([0]);
+                digest.update(network.as_bytes());
+                let hash = digest.finalize();
+                let interface_name = format!(
+                    "dc{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    hash[0], hash[1], hash[2], hash[3], hash[4]
+                );
+                let assigned_address: connect_ip_adapter::IpNet =
+                    format!("{}/128", plan.host_address)
+                        .parse()
+                        .map_err(|_| ApiError::internal("Invalid managed host assignment"))?;
+                let peer_address: connect_ip_adapter::IpNet = format!(
+                    "{}/128",
+                    crate::galactic_masque::helper_peer_address(&plan).map_err(|_| {
+                        ApiError::bad_request("Managed plan has no safe helper peer sentinel")
+                    })?
+                )
+                .parse()
+                .map_err(|_| ApiError::internal("Invalid managed helper peer sentinel"))?;
+                let routes = plan
+                    .routes
+                    .iter()
+                    .map(|route| route.to_string().parse::<connect_ip_adapter::IpNet>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| ApiError::internal("Invalid managed route"))?;
+                let approval = connect_ip_adapter::helper::Approval {
+                    interface_name: interface_name.clone(),
+                    assigned_address,
+                    peer_address,
+                    mtu: plan.mtu,
+                    routes: routes.clone(),
+                    advertise_routes: vec![],
+                };
+                let config = connect_ip_adapter::helper::Config {
+                    allowed_uid: unsafe { libc::geteuid() },
+                    approvals: vec![],
+                    managed_policy: Some(
+                        connect_ip_adapter::helper::ManagedPolicy::managed_vpc_default(),
+                    ),
+                };
+                config
+                    .managed_policy
+                    .as_ref()
+                    .expect("managed policy")
+                    .approve(&approval)
+                    .map_err(|error| {
+                        ApiError::bad_request(format!(
+                            "VPC attachment is outside the safe managed networking policy: {error}"
+                        ))
+                    })?;
+                config
+                    .validate()
+                    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                return Ok(Some(serde_json::json!({
+                    "network": network,
+                    "managed_gateway": true,
+                    "gateway_resource": status["gateway"],
+                    "gateway_location": status["gateway_location"],
+                    "binding": {
+                        "assigned_address": assigned_address,
+                        "peer_address": peer_address,
+                        "interface_name": interface_name,
+                        "mtu": plan.mtu,
+                        "routes": routes,
+                        "advertise_routes": []
+                    },
+                    "helper_socket": crate::networking::helper_socket()?,
+                    "helper_config": config,
+                    "managed_approval": approval
+                })));
+            }
             let endpoint_id = json_string(&status, "gatewayEndpointID")?;
             let assigned_address = json_string(&status, "assignedAddress")?;
             let peer_address = json_string(&status, "peerAddress")?;
@@ -1003,6 +1089,80 @@ impl Control for RealControl {
             .await
             .map_err(cloud_error)?
         {
+            if status["contractVersion"] == "managed-network-v1" {
+                let binding_name = json_string(&status, "bindingName")?;
+                let mut digest = Sha256::new();
+                digest.update(project.as_bytes());
+                digest.update([0]);
+                digest.update(network.as_bytes());
+                let hash = digest.finalize();
+                let interface_name = format!(
+                    "dc{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    hash[0], hash[1], hash[2], hash[3], hash[4]
+                );
+                let mut networks = runtime.networks.lock().await;
+                require_network_authorization(&runtime.authorized, &runtime.cancel)?;
+                if let Some(existing) = networks
+                    .get(network)
+                    .filter(|attachment| !attachment.is_finished())
+                {
+                    let mut result = existing.status().await;
+                    result["gateway_resource"] = status["gateway"].clone();
+                    result["gateway_location"] = status["gateway_location"].clone();
+                    result["desired_attached"] = serde_json::json!(true);
+                    return Ok(result);
+                }
+                if let Some(previous) = networks.remove(network) {
+                    previous.stop().await;
+                }
+                let mut descriptor = mint_managed_descriptor(&runtime.cloud, &binding_name).await?;
+                let mut session = crate::galactic_masque::connect_preferred(
+                    &descriptor,
+                    runtime.cancel.child_token(),
+                )
+                .await;
+                if matches!(
+                    session,
+                    Err(crate::galactic_masque::AttemptFailure::HttpStatus(401))
+                ) {
+                    descriptor = mint_managed_descriptor(&runtime.cloud, &binding_name).await?;
+                    session = crate::galactic_masque::connect_preferred(
+                        &descriptor,
+                        runtime.cancel.child_token(),
+                    )
+                    .await;
+                }
+                let session = session.map_err(managed_connect_error)?;
+                #[cfg(unix)]
+                let helper_socket = Some(crate::networking::helper_socket()?);
+                #[cfg(not(unix))]
+                let helper_socket: Option<PathBuf> = None;
+                let attachment = crate::local_ip::NetworkAttachment::Galactic(
+                    crate::galactic_masque::activate(
+                        project,
+                        network,
+                        &binding_name,
+                        &interface_name,
+                        &descriptor,
+                        session,
+                        runtime.cancel.child_token(),
+                        helper_socket.as_deref(),
+                    )
+                    .await?,
+                );
+                if let Err(error) =
+                    require_network_authorization(&runtime.authorized, &runtime.cancel)
+                {
+                    attachment.stop().await;
+                    return Err(error);
+                }
+                let mut result = attachment.status().await;
+                result["gateway_resource"] = status["gateway"].clone();
+                result["gateway_location"] = status["gateway_location"].clone();
+                result["desired_attached"] = serde_json::json!(true);
+                networks.insert(network.to_owned(), attachment);
+                return Ok(result);
+            }
             let endpoint_id = json_string(&status, "gatewayEndpointID")?;
             let assigned_address = json_string(&status, "assignedAddress")?;
             let peer_address = json_string(&status, "peerAddress")?;
@@ -1292,6 +1452,66 @@ fn require_network_authorization(
         ));
     }
     Ok(())
+}
+
+async fn mint_managed_descriptor(
+    cloud: &CloudConnector,
+    binding: &str,
+) -> Result<crate::galactic_masque::ConnectionDescriptor, ApiError> {
+    let bytes = cloud
+        .mint_network_credentials(binding)
+        .await
+        .map_err(cloud_error)?;
+    crate::galactic_masque::ConnectionDescriptor::parse(&bytes, chrono::Utc::now()).map_err(
+        |error| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("Managed credential broker returned an invalid descriptor: {error}"),
+            )
+            .with_code("managed_descriptor_invalid")
+        },
+    )
+}
+
+fn managed_connect_error(failure: crate::galactic_masque::AttemptFailure) -> ApiError {
+    use crate::galactic_masque::AttemptFailure;
+    match failure {
+        AttemptFailure::HttpStatus(401) => ApiError::new(
+            axum::http::StatusCode::UNAUTHORIZED,
+            "Galactic rejected the refreshed managed-network credential",
+        )
+        .with_code("managed_credential_rejected"),
+        AttemptFailure::HttpStatus(403) => ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "Galactic authorization was revoked or the VPC selector no longer matches",
+        )
+        .with_code("managed_authorization_revoked"),
+        AttemptFailure::HttpStatus(503) => ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Galactic managed-network capacity is temporarily unavailable",
+        )
+        .with_code("managed_provider_unavailable"),
+        AttemptFailure::TlsIdentity => ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "Galactic TLS identity verification failed; no interface was created",
+        )
+        .with_code("managed_tls_identity_failed"),
+        AttemptFailure::PlanMismatch => ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "Galactic returned an invalid CONNECT-IP plan; no interface was created",
+        )
+        .with_code("managed_provider_plan_invalid"),
+        AttemptFailure::HttpStatus(status) => ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("Galactic rejected CONNECT-IP with HTTP {status}"),
+        )
+        .with_code("managed_provider_rejected"),
+        AttemptFailure::Connectivity => ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "Could not establish HTTP/3 CONNECT-IP to the managed provider",
+        )
+        .with_code("managed_provider_unreachable"),
+    }
 }
 
 #[cfg(unix)]

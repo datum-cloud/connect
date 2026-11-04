@@ -184,6 +184,64 @@ async fn joining_managed_network_waits_for_transient_connector_not_ready() {
 }
 
 #[tokio::test]
+async fn managed_network_contract_returns_binding_and_mints_sensitive_descriptor() {
+    let connector = connect_connector();
+    let connector_name = connector["metadata"]["name"].as_str().unwrap().to_owned();
+    let binding_name = network_binding_name("staging-vpc", &connector_name);
+    let gateway = json!({
+        "metadata":{"name":"production","generation":2},
+        "spec":{
+            "contractVersion":"managed-network-v1",
+            "networkRef":"staging-vpc",
+            "placement":{"locationSelector":{"matchLabels":{"topology.datum.net/region":"us-central-1"}}}
+        },
+        "status":{"ready":1,"conditions":[{"type":"Ready","status":"True","observedGeneration":2}]}
+    });
+    let binding = json!({
+        "metadata":{"name":binding_name.clone(),"uid":"binding-uid","resourceVersion":"1","generation":1},
+        "spec":{"gatewayRef":"production","connectorRef":connector_name.clone()},
+        "status":{
+            "selectedPlacementRef":"production-us-central-1",
+            "effectivePolicyRevision":"policy-rev",
+            "networkPlan":{"destinationPrefixes":["fd20:0:27::/48"],"mtu":1280},
+            "conditions":[{"type":"Ready","status":"True","reason":"Resolved","observedGeneration":1}]
+        }
+    });
+    let descriptor = json!({
+        "binding":binding_name.clone(),
+        "policyRevision":"policy-rev",
+        "networkPlan":{"expectedPrefix":"fd20:0:27:10:1:1::/96","destinationPrefixes":["fd20:0:27::/48"],"mtu":1280},
+        "transport":{"type":"masque.connect.datum.net/v1","authority":"masque.example.test","vpcSelector":"default/vpc","credential":"secret-never-logged","expiresAt":"2099-01-01T00:00:00Z","transports":["h3","h2"]}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, json!({"items":[gateway]})),
+        Reply::Json(200, json!({"metadata":{"name":"staging-vpc"}})),
+        Reply::Json(200, connector),
+        Reply::Json(404, json!({})),
+        Reply::Json(201, binding),
+        Reply::Json(200, descriptor.clone()),
+    ])
+    .await;
+    let mut cloud = client(&base);
+    set_edge_url(&mut cloud, &base);
+    let status = cloud
+        .join_gateway_network("staging-vpc", &ConnectionDetails::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status["contractVersion"], "managed-network-v1");
+    assert_eq!(status["bindingName"], binding_name);
+    let bytes = cloud.mint_network_credentials(&binding_name).await.unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), descriptor);
+    let requests = task.await.unwrap();
+    assert!(requests.last().unwrap().0.starts_with("POST "));
+    assert!(requests.last().unwrap().0.contains(&format!(
+        "/connectnetworkbindings/{binding_name}/connection-credentials "
+    )));
+}
+
+#[tokio::test]
 async fn joining_network_creates_a_gateway_in_the_edge_selected_location() {
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
     let connector = json!({

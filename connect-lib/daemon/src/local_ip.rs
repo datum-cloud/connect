@@ -309,24 +309,28 @@ pub enum Approval {
 
 pub enum NetworkAttachment {
     Gateway(Attachment),
+    Galactic(crate::galactic_masque::ManagedAttachment),
     Peer(crate::peer_ip::Attachment),
 }
 impl NetworkAttachment {
     pub fn is_finished(&self) -> bool {
         match self {
             Self::Gateway(a) => a.task.is_finished(),
+            Self::Galactic(a) => a.task.is_finished(),
             Self::Peer(a) => a.task.is_finished(),
         }
     }
     pub async fn status(&self) -> Value {
         match self {
             Self::Gateway(a) => a.status().await,
+            Self::Galactic(a) => a.status().await,
             Self::Peer(a) => a.status().await,
         }
     }
     pub async fn stop(self) {
         match self {
             Self::Gateway(a) => a.stop().await,
+            Self::Galactic(a) => a.stop().await,
             Self::Peer(a) => a.stop().await,
         }
     }

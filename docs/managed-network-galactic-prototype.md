@@ -45,9 +45,16 @@ mismatch fails closed without interface activation. A policy revision change
 requires a new descriptor. A different placement is a new attachment and may
 receive a different `/96`; this prototype makes no roaming guarantee.
 
-The current branch implements descriptor validation and activation ordering
-behind transport and networking traits. Wiring the production H3/H2 wire
-dialers into the long-running daemon runtime is still required before rollout.
+The daemon runtime now mints a descriptor after a managed binding becomes
+Ready, establishes WebPKI-authenticated CONNECT-IP over HTTP/3, and falls back
+to HTTP/2 Extended CONNECT only when the HTTP/3 path has a connectivity
+failure. It parses Galactic's delegated `/96` and route capsules, verifies
+exact equality with the descriptor, selects the first host `/128`, and creates
+the native interface only after verification. Packets are then bridged between
+the native adapter and HTTP Datagrams or HTTP/2 DATAGRAM capsules. A 401 causes
+one remint; application responses and TLS or plan failures never trigger a
+transport fallback. The legacy iroh attachment remains selected only by the
+legacy contract.
 
 ## Local validation
 
