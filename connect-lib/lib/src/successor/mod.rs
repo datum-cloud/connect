@@ -38,6 +38,10 @@ pub enum Error {
         reason: String,
         fields: String,
     },
+    /// Admission quota denied a create. Quota admission runs before the
+    /// storage AlreadyExists check, so this can also mask a 409.
+    #[error("project quota exceeded for {0}; delete unused resources or request a higher limit")]
+    QuotaExceeded(String),
     #[error("resource is not owned by this Connector: {0}")]
     Ownership(String),
     #[error("{0}")]
@@ -180,6 +184,8 @@ impl CloudConnector {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
+            // Identify the client to the API server.
+            .user_agent(crate::http_user_agent::datum_http_user_agent())
             .build()?;
         Ok(Self {
             tokens: TokenProvider::new(credentials, client.clone()),
@@ -256,6 +262,15 @@ impl CloudConnector {
         {
             Ok(Some(value)) => Ok(value),
             Err(Error::Api(409)) => self.connect_get(plural, name).await?.ok_or(Error::Api(404)),
+            // Quota admission rejects before storage reports AlreadyExists, so a
+            // deterministic-name create for an existing object returns 403. Treat
+            // an existing object as success instead of failing every reconcile.
+            Err(error @ (Error::QuotaExceeded(_) | Error::Api(403))) => {
+                match self.connect_get(plural, name).await? {
+                    Some(existing) => Ok(existing),
+                    None => Err(error),
+                }
+            }
             Ok(None) => Err(Error::Api(500)),
             Err(error) => Err(error),
         }
@@ -546,6 +561,24 @@ impl CloudConnector {
         }
         let gateway = if let Some(gateway) = matches.into_iter().next() {
             gateway
+        } else if let Some(existing) = self
+            .connect_get("connectgateways", &network_gateway_name(network, &location))
+            .await?
+            .filter(|gateway| gateway["spec"]["networkRef"] == network)
+        {
+            // Get before create: the deterministic name already exists but its
+            // spec.locationRef no longer equals the edge-reported location (for
+            // example the location was renamed after the gateway was created).
+            // Reuse it rather than POSTing a duplicate on every reconcile.
+            tracing::warn!(
+                network,
+                location,
+                gateway = existing["metadata"]["name"].as_str().unwrap_or("unknown"),
+                gateway_location = existing["spec"]["locationRef"].as_str().unwrap_or(""),
+                stage = "gateway_selected",
+                "reusing existing ConnectGateway whose locationRef differs from the edge location"
+            );
+            existing
         } else {
             self.create_network_gateway(network, &location, &network_object)
                 .await?
@@ -934,6 +967,18 @@ impl CloudConnector {
                     .strip_prefix(&self.base)
                     .unwrap_or("control-plane resource");
                 tracing::warn!(%method, resource, status, "control_plane_request_rejected");
+                if status == 403 && method == Method::POST {
+                    let body = bounded_body(response).await?;
+                    let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let quota = value["message"]
+                        .as_str()
+                        .is_some_and(|message| message.to_ascii_lowercase().contains("quota"));
+                    return Err(if quota {
+                        Error::QuotaExceeded(resource.to_owned())
+                    } else {
+                        Error::Api(status)
+                    });
+                }
                 if status == 422 {
                     // Only return bounded field paths and reason identifiers. Kubernetes
                     // messages can echo rejected values, so never expose raw response bodies.
