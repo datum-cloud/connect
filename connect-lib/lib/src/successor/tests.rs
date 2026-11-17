@@ -273,6 +273,8 @@ async fn joining_network_creates_a_gateway_in_the_edge_selected_location() {
             json!({"status":{"ipam":{"ipv6Prefix":"fd20:0:27::/48"}}}),
         ),
         edge_location(),
+        // Get-before-create of the deterministic gateway name.
+        Reply::Json(404, json!({})),
         Reply::Json(200, json!({"items":[class]})),
         Reply::EchoCreated,
         Reply::Json(200, connector),
@@ -321,6 +323,43 @@ async fn joining_network_creates_a_gateway_in_the_edge_selected_location() {
             .position(|(line, _)| line.starts_with("POST ") && line.contains("connectgateways"))
             .unwrap()
             < create_binding
+    );
+}
+
+#[tokio::test]
+async fn joining_reuses_existing_gateway_name_when_location_ref_was_corrected() {
+    // Regression: an existing gateway's spec.locationRef no longer matches the
+    // edge-reported location, so the list filter misses it. A create would be
+    // rejected with 403 by quota admission instead of 409.
+    let gateway_name = network_gateway_name("staging-vpc", "us-central-1");
+    let existing = json!({
+        "metadata":{"name":gateway_name,"generation":1},
+        "spec":{"networkRef":"staging-vpc","locationRef":"us-east-1"}
+    });
+    let (base, task) = server(vec![
+        token(),
+        Reply::Json(200, json!({"items":[existing.clone()]})),
+        Reply::Json(
+            200,
+            json!({"status":{"ipam":{"ipv6Prefix":"fd20:0:27::/48"}}}),
+        ),
+        edge_location(),
+        Reply::Json(200, existing),
+        // Stop right after selection; the Connector lookup fails the join.
+        Reply::Json(500, json!({})),
+    ])
+    .await;
+    let mut cloud = client(&base);
+    set_edge_url(&mut cloud, &base);
+    let _ = cloud
+        .join_gateway_network("staging-vpc", &ConnectionDetails::default())
+        .await;
+    let requests = task.await.unwrap();
+    assert!(
+        !requests
+            .iter()
+            .any(|(line, _)| line.starts_with("POST ") && line.contains("connectgateways")),
+        "must not POST a ConnectGateway that already exists: {requests:?}"
     );
 }
 
