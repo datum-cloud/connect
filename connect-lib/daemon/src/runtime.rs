@@ -292,6 +292,10 @@ impl RealControl {
         let task = tokio::spawn(async move {
             let runtime = task_runtime;
             let mut interval = tokio::time::interval(Duration::from_secs(30));
+            // Per-network retry backoff for managed VPC re-joins, so a
+            // persistent failure is not retried on every refresh tick.
+            let mut network_backoff: HashMap<String, (tokio::time::Instant, Duration)> =
+                HashMap::new();
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
             loop {
@@ -384,8 +388,28 @@ impl RealControl {
                             let desired_networks: Vec<_> = control.store.snapshot().await.projects
                                 .get(&project).into_iter().flat_map(|state| state.managed_networks.values())
                                 .filter(|network| network.desired_attached).map(|network| network.network.clone()).collect();
+                            network_backoff.retain(|name, _| desired_networks.contains(name));
                             for network in desired_networks {
+                                if network_backoff.get(&network).is_some_and(|(next, _)| tokio::time::Instant::now() < *next) {
+                                    continue;
+                                }
                                 let observed = control.join_network(&project, &network).await;
+                                match &observed {
+                                    Ok(_) => { network_backoff.remove(&network); }
+                                    Err(error) => {
+                                        let (floor, cap) = if error.code.as_deref() == Some("quota_exceeded") {
+                                            (Duration::from_secs(5 * 60), Duration::from_secs(60 * 60))
+                                        } else {
+                                            (Duration::from_secs(30), Duration::from_secs(10 * 60))
+                                        };
+                                        let delay = network_backoff.get(&network)
+                                            .map(|(_, previous)| std::cmp::min(previous.saturating_mul(2), cap))
+                                            .unwrap_or(floor)
+                                            .max(floor);
+                                        tracing::warn!(project = %project, network = %network, retry_in_s = delay.as_secs(), error = %error.message, stage = "network_reconcile_backoff", "managed network re-join failed; backing off");
+                                        network_backoff.insert(network.clone(), (tokio::time::Instant::now() + delay, delay));
+                                    }
+                                }
                                 let _ = control.store.transact(|root| {
                                     if let Some(current) = root.projects.get_mut(&project).and_then(|state| state.managed_networks.get_mut(&network)) {
                                         match &observed {
@@ -1670,10 +1694,14 @@ fn cloud_error(error: connect_lib::successor::Error) -> ApiError {
         Error::Unsupported(_) => axum::http::StatusCode::NOT_IMPLEMENTED,
         Error::NotFound(_) => axum::http::StatusCode::NOT_FOUND,
         Error::Ownership(_) => axum::http::StatusCode::CONFLICT,
+        Error::QuotaExceeded(_) => axum::http::StatusCode::FORBIDDEN,
         _ => axum::http::StatusCode::BAD_GATEWAY,
     };
     let message = error.to_string();
     let api_error = ApiError::new(status, message);
+    if matches!(error, Error::QuotaExceeded(_)) {
+        return api_error.with_code("quota_exceeded");
+    }
     if matches!(error, Error::NotFound(_)) {
         api_error.with_code("network_not_found")
     } else {
