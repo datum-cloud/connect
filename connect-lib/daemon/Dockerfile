@@ -56,7 +56,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       export "CC_${env_cc_target}=${gnu}-gcc" "CXX_${env_cc_target}=${gnu}-g++" "AR_${env_cc_target}=${gnu}-ar"; \
       export PKG_CONFIG_ALLOW_CROSS=1 "PKG_CONFIG_LIBDIR=/usr/lib/${gnu}/pkgconfig:/usr/share/pkgconfig"; \
     fi; \
-    DATUM_CONNECT_RELEASE_VERSION="${VERSION}" \
+    # Release tags arrive as v0.0.0-1.2.3[-pre]; report them as v1.2.3[-pre].
+    version=$(echo "${VERSION}" | sed -E 's/^v0\.0\.0-([0-9]+\.[0-9]+\.[0-9]+)/v\1/'); \
+    DATUM_CONNECT_RELEASE_VERSION="$version" \
       cargo build --locked --release -p datum-connect-daemon --target "$rust_target"; \
     install -D -m 0755 "target/$rust_target/release/datum-connectd" /out/datum-connectd
 
