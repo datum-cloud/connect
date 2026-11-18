@@ -48,6 +48,12 @@ struct Args {
     #[arg(long)]
     local_ip_config: Option<PathBuf>,
 
+    /// Read-only Connector key (raw 32 bytes or PEM PKCS#8 Ed25519) used for
+    /// every project instead of generated keys. Intended for single-project
+    /// containers whose state directory is not persistent.
+    #[arg(long, env = "DATUM_CONNECT_CONNECTOR_KEY_FILE")]
+    connector_key_file: Option<PathBuf>,
+
     /// Comma-separated HTTPS relay origins. Staging sessions default to Datum staging relays.
     #[arg(long, env = "DATUM_CONNECT_RELAY_URLS")]
     relay_urls: Option<String>,
@@ -105,6 +111,11 @@ async fn run(
     auth::initialize_setup_token(&store, &args.repo).await?;
     let shutdown = external_shutdown.unwrap_or_default();
 
+    if let Some(path) = args.connector_key_file.as_deref() {
+        // Fail at startup rather than at enrollment, and log only the public half.
+        let key = datum_connect_daemon::connector_key::read_connector_key_file(path).await?;
+        tracing::info!(stage = "startup", public_key = %key.public(), "connector_key_file_loaded");
+    }
     let mutation_lock = Arc::new(tokio::sync::Mutex::new(()));
     let local_ip = match args.local_ip_config {
         Some(path) => Some(datum_connect_daemon::local_ip::LocalIpConfig::load(&path).await?),
@@ -113,6 +124,7 @@ async fn run(
     let control: Arc<dyn Control> = Arc::new(
         RealControl::new(args.repo.clone(), store.clone(), mutation_lock.clone())
             .with_local_ip_config(local_ip)
+            .with_connector_key_file(args.connector_key_file.clone())
             .with_relay_urls(
                 args.relay_urls
                     .as_deref()

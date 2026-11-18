@@ -465,6 +465,12 @@ def main():
     print('PASS structured correlation logs contain no test credentials', flush=True)
 
 
+# Test-only key from `openssl genpkey -algorithm ed25519`, shared with the
+# daemon's connector_key unit tests, and its documented public-key derivation.
+INJECTED_KEY_PEM = '-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIDGCCjjXq5e7uh1oO5HDUvCKwRBUvsUHabWTv29WE1Af\n-----END PRIVATE KEY-----\n'
+INJECTED_PUBLIC_KEY = '03fba577c5a289b42cb771f779faed8273ddc037883fbbb0502584bfc0d504da'
+
+
 def container_e2e(args):
     """Drive two connectd-container entrypoints through environment variables only."""
     root = Path(tempfile.mkdtemp(prefix='datum-connect-container-e2e-'))
@@ -474,12 +480,23 @@ def container_e2e(args):
     creds = root / 'credential.json'
     creds.write_text(json.dumps({'type': 'connector', 'project_id': 'demo', 'api_endpoint': f'http://127.0.0.1:{platform.server_port}', 'token_uri': f'http://127.0.0.1:{platform.server_port}/token', 'client_id': 'local-test', 'refresh_token': 'test-refresh-secret'}))
     creds.chmod(0o400)
-    forward = free_port()
+    forward, pinned_forward = free_port(), free_port()
+    key_file = root / 'secret' / 'connector.pem'
+    key_file.parent.mkdir()
+    key_file.write_text(INJECTED_KEY_PEM)
+    key_file.chmod(0o400)
+    other_key = root / 'secret' / 'other.key'
+    other_key.write_bytes(os.urandom(32))
+    other_key.chmod(0o400)
     environments = {
         # A stable server with persistent state and the default project-wide
         # allow, and an ephemeral dialer that gets a fresh key when recreated.
         'server': {'DATUM_CONNECT_NAME': 'server-pod', 'DATUM_CONNECT_SERVICES': f'127.0.0.1:{origin.server_port}'},
         'client': {'DATUM_CONNECT_EPHEMERAL': 'true', 'DATUM_CONNECT_NAME_HINT': 'Client_VM.example', 'DATUM_CONNECT_DIALS': f'server-pod:{origin.server_port}@0.0.0.0:{forward}'},
+        # A diskless forwarder with an injected key and a fixed name, and a
+        # server whose allowlist pins that key before the forwarder exists.
+        'pinned': {'DATUM_CONNECT_NAME': 'pinned-server', 'DATUM_CONNECT_SERVICES': f'127.0.0.1:{origin.server_port}', 'DATUM_CONNECT_SERVICE_ALLOW': INJECTED_PUBLIC_KEY},
+        'forwarder': {'DATUM_CONNECT_NAME': 'forwarder-vm', 'DATUM_CONNECT_CONNECTOR_KEY_FILE': str(root / 'secret' / 'connector.pem'), 'DATUM_CONNECT_DIALS': f'pinned-server:{origin.server_port}@127.0.0.1:{pinned_forward}'},
     }
     for name, env in environments.items():
         env.update({
@@ -518,8 +535,8 @@ def container_e2e(args):
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.load(response)
 
-    def roundtrip():
-        with urllib.request.urlopen(f'http://127.0.0.1:{forward}/', timeout=15) as response:
+    def roundtrip(port=None):
+        with urllib.request.urlopen(f'http://127.0.0.1:{port or forward}/', timeout=15) as response:
             assert response.read() == b'datum-connect-real-iroh-h3-roundtrip\n'
 
     def log_lines(name):
@@ -539,7 +556,7 @@ def container_e2e(args):
         start('client')
         time.sleep(8)
         start('server')
-        for name in environments:
+        for name in ('client', 'server'):
             wait_ready(name)
         print('PASS entrypoints enroll, serve, and dial from environment variables', flush=True)
         client = status('client')
@@ -579,7 +596,16 @@ def container_e2e(args):
         assert recreated['public_key'] != old_client['public_key']
         assert recreated['name'].startswith('client-vm-example-') and len(recreated['name']) == len('client-vm-example-') + 6, recreated
         assert any(key[1:] == ('connectors', 'client-vm-example') for key in Platform.objects), 'the previous Connector must not be deleted'
-        roundtrip()
+        # The server learns new project devices on its periodic refresh, so a
+        # new key may be refused briefly.
+        deadline = time.monotonic() + 75
+        while True:
+            try:
+                roundtrip()
+                break
+            except (OSError, urllib.error.URLError):
+                assert time.monotonic() < deadline, 'recreated dialer was never admitted'
+                time.sleep(2)
         print('PASS a recreated ephemeral dialer enrolls under a unique name without deleting the old Connector', flush=True)
 
         daemon = subprocess.run(['pgrep', '-P', str(procs['server'].pid), '-f', 'datum-connectd'], capture_output=True, text=True).stdout.split()
@@ -587,6 +613,45 @@ def container_e2e(args):
         os.kill(int(daemon[0]), signal.SIGKILL)
         assert procs['server'].wait(timeout=20) != 0, 'entrypoint must fail when the daemon dies'
         print('PASS entrypoint exits non-zero when the daemon dies', flush=True)
+
+        start('pinned')
+        wait_ready_until = time.monotonic() + 60
+        while not [line for line in log_lines('pinned') if line['message'] == 'apply_service']:
+            assert time.monotonic() < wait_ready_until, 'pinned server never tried to serve'
+            time.sleep(1)
+        assert [line['result'] for line in log_lines('pinned') if line['message'] == 'apply_service'][0] == 'error', \
+            'an allowlist key must resolve to an existing Connector'
+        print('PASS allowlisting a raw key fails until that Connector exists, and the entrypoint retries', flush=True)
+        key_stat = key_file.stat()
+        identities = []
+        for attempt in range(2):
+            # Each start uses a fresh, empty state directory.
+            shutil.rmtree(root / 'forwarder', ignore_errors=True)
+            start('forwarder')
+            wait_ready('forwarder')
+            wait_ready('pinned')
+            roundtrip(pinned_forward)
+            identities.append(status('forwarder')['connector'])
+            assert not list((root / 'forwarder').rglob('connector.key')), 'an injected key must not be copied into state'
+            procs['forwarder'].send_signal(signal.SIGTERM)
+            assert procs['forwarder'].wait(timeout=40) == 0
+        assert [identity['name'] for identity in identities] == ['forwarder-vm', 'forwarder-vm']
+        assert {identity['public_key'] for identity in identities} == {INJECTED_PUBLIC_KEY}
+        assert [key[2] for key in Platform.objects if key[1] == 'connectors' and key[2].startswith('forwarder-vm')] == ['forwarder-vm']
+        assert (key_file.stat().st_mode, key_file.stat().st_mtime_ns) == (key_stat.st_mode, key_stat.st_mtime_ns)
+        logged = [line for line in log_lines('forwarder') if line['message'] == 'apply_up' and line['result'] == 'applied']
+        assert len(logged) == 2, 'each fresh state directory enrolls by adopting the same Connector'
+        print('PASS an injected key keeps one Connector name and key across fresh state directories', flush=True)
+
+        environments['forwarder']['DATUM_CONNECT_CONNECTOR_KEY_FILE'] = str(other_key)
+        start('forwarder')
+        deadline = time.monotonic() + 60
+        while not any(line['message'] == 'apply_up' and 'connector_key_conflict' in line.get('error', '') for line in log_lines('forwarder')):
+            assert time.monotonic() < deadline, f'a different key must conflict with saved state; inspect {root}/forwarder.log'
+            time.sleep(1)
+        assert probe('forwarder').returncode != 0
+        assert status('forwarder')['connector']['public_key'] == INJECTED_PUBLIC_KEY, 'saved identity must not be overwritten'
+        print('PASS a different injected key conflicts with saved state instead of replacing it', flush=True)
     finally:
         for proc in procs.values():
             if proc.poll() is None:
@@ -603,7 +668,7 @@ def container_e2e(args):
     for name in environments:
         contents = (root / f'{name}.log').read_text()
         token = (root / name / 'daemon_auth/setup.token').read_text().strip()
-        for secret in ('test-access-secret', 'test-refresh-secret', token):
+        for secret in ('test-access-secret', 'test-refresh-secret', token, INJECTED_KEY_PEM.splitlines()[1]):
             assert secret not in contents, f'secret leaked in {name} logs'
     print('PASS entrypoint logs contain no tokens or credentials', flush=True)
 
