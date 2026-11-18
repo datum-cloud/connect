@@ -1,0 +1,3 @@
+# Build context for daemon/Dockerfile. Keep local build output out of it.
+**/target
+**/.git

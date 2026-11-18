@@ -17,6 +17,7 @@ Use these guides to install, operate, and develop Datum Connect.
 - [Publish a public HTTP service](guides/public-services.md)
 - [Access a managed project network](guides/project-network-access.md)
 - [Connect two devices directly](guides/direct-device-networking.md)
+- [Run Connect in a container](guides/run-in-a-container.md)
 
 ### Install and validate
 

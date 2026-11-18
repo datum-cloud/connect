@@ -12,6 +12,7 @@ from pathlib import Path
 import socket
 import socketserver
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -197,7 +198,12 @@ def main():
     parser.add_argument('--plugin', required=True, type=Path)
     parser.add_argument('--host', type=Path, help='Also validate datumctl dispatch using an installed Connect plugin')
     parser.add_argument('--oidc', action='store_true', help='Run isolated host-session helper enrollment/refresh/restart/logout tests instead of file credentials')
+    parser.add_argument('--container-entrypoint', type=Path, help='Test this connectd-container entrypoint with environment-driven serve and dial instead of the CLI')
     args = parser.parse_args()
+    if args.container_entrypoint:
+        if args.oidc or args.host:
+            parser.error('--container-entrypoint does not combine with --oidc or --host')
+        return container_e2e(args)
     if args.oidc:
         if args.host:
             parser.error('--oidc uses the direct plugin with a fake helper; do not combine with --host')
@@ -457,6 +463,149 @@ def main():
             assert secret not in contents, f'secret leaked in {name} logs'
         assert 'request_id' in contents
     print('PASS structured correlation logs contain no test credentials', flush=True)
+
+
+def container_e2e(args):
+    """Drive two connectd-container entrypoints through environment variables only."""
+    root = Path(tempfile.mkdtemp(prefix='datum-connect-container-e2e-'))
+    print(f'Artifacts: {root}', flush=True)
+    Platform.objects, Platform.writes = {}, []
+    platform, origin = server(Platform), server(Origin)
+    creds = root / 'credential.json'
+    creds.write_text(json.dumps({'type': 'connector', 'project_id': 'demo', 'api_endpoint': f'http://127.0.0.1:{platform.server_port}', 'token_uri': f'http://127.0.0.1:{platform.server_port}/token', 'client_id': 'local-test', 'refresh_token': 'test-refresh-secret'}))
+    creds.chmod(0o400)
+    forward = free_port()
+    environments = {
+        # A stable server with persistent state and the default project-wide
+        # allow, and an ephemeral dialer that gets a fresh key when recreated.
+        'server': {'DATUM_CONNECT_NAME': 'server-pod', 'DATUM_CONNECT_SERVICES': f'127.0.0.1:{origin.server_port}'},
+        'client': {'DATUM_CONNECT_EPHEMERAL': 'true', 'DATUM_CONNECT_NAME_HINT': 'Client_VM.example', 'DATUM_CONNECT_DIALS': f'server-pod:{origin.server_port}@0.0.0.0:{forward}'},
+    }
+    for name, env in environments.items():
+        env.update({
+            'DATUM_CONNECTD_BIN': str(args.daemon.resolve()),
+            'DATUM_CONNECT_DIR': str(root / name),
+            'DATUM_CONNECT_DAEMON_PORT': str(free_port()),
+            'DATUM_CONNECT_CREDENTIALS_FILE': str(creds),
+            'DATUM_CONNECT_PROJECT': 'demo',
+            'DATUM_CONNECT_RECONCILE_INTERVAL': '2',
+            'RUST_LOG': 'info',
+        })
+    entrypoint = str(args.container_entrypoint.resolve())
+    procs, logs = {}, []
+
+    def start(name):
+        log = (root / f'{name}.log').open('ab')
+        logs.append(log)
+        procs[name] = subprocess.Popen(['sh', entrypoint], stdout=log, stderr=log, env={**os.environ, **environments[name]})
+
+    def probe(name):
+        return subprocess.run(['sh', entrypoint, 'probe'], env={**os.environ, **environments[name]}, capture_output=True, text=True, timeout=30)
+
+    def wait_ready(name, timeout=90):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            assert procs[name].poll() is None, f'{name} entrypoint exited; inspect {root}/{name}.log'
+            result = probe(name)
+            if result.returncode == 0:
+                return
+            time.sleep(1)
+        raise AssertionError(f'{name} probe never passed: {result.stderr}; inspect {root}/{name}.log')
+
+    def status(name):
+        token = (root / name / 'daemon_auth/setup.token').read_text().strip()
+        request = urllib.request.Request(f"http://127.0.0.1:{environments[name]['DATUM_CONNECT_DAEMON_PORT']}/v1/status?project=demo", headers={'Authorization': f'Bearer {token}'})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.load(response)
+
+    def roundtrip():
+        with urllib.request.urlopen(f'http://127.0.0.1:{forward}/', timeout=15) as response:
+            assert response.read() == b'datum-connect-real-iroh-h3-roundtrip\n'
+
+    def log_lines(name):
+        lines = []
+        for line in (root / f'{name}.log').read_text().splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if value.get('target') == 'connectd_container':
+                lines.append(value['fields'])
+        return lines
+
+    try:
+        assert probe('server').returncode != 0, 'probe must fail before the daemon starts'
+        # The dialer starts first; its dial cannot resolve the server yet.
+        start('client')
+        time.sleep(8)
+        start('server')
+        for name in environments:
+            wait_ready(name)
+        print('PASS entrypoints enroll, serve, and dial from environment variables', flush=True)
+        client = status('client')
+        assert client['connector']['name'] == 'client-vm-example', client['connector']
+        assert [dial['bind_address'] for dial in client['dials']] == ['0.0.0.0']
+        roundtrip()
+        print('PASS dial bound to 0.0.0.0 forwards to the served origin', flush=True)
+        retried = [line for line in log_lines('client') if line['message'] == 'apply_dial' and line.get('result') == 'error']
+        assert retried, 'client must retry while the server is not enrolled'
+        time.sleep(5)
+        ups = [line for line in log_lines('client') if line['message'] == 'apply_up']
+        assert [line['result'] for line in ups].count('applied') == 1, ups
+        assert ups[-1]['result'] == 'unchanged', 'reapply must not restart a running project'
+        print('PASS periodic reapply is idempotent and does not restart the project', flush=True)
+
+        server_key = status('server')['connector']['public_key']
+        procs['server'].send_signal(signal.SIGTERM)
+        assert procs['server'].wait(timeout=40) == 0, 'SIGTERM must stop the daemon cleanly'
+        start('server')
+        wait_ready('server')
+        assert status('server')['connector']['public_key'] == server_key, 'restart must keep the Connector key'
+        ups = [line for line in log_lines('server') if line['message'] == 'apply_up']
+        assert [line['result'] for line in ups].count('applied') == 1, 'restart must reuse the saved enrollment'
+        wait_ready('client')
+        roundtrip()
+        print('PASS restart forwards SIGTERM, keeps the Connector identity, and resumes the service', flush=True)
+
+        # Recreate the ephemeral dialer without its state: the hinted name is
+        # owned by the previous key, so it enrolls under a suffixed name.
+        procs['client'].send_signal(signal.SIGTERM)
+        assert procs['client'].wait(timeout=40) == 0
+        old_client = client['connector']
+        shutil.rmtree(root / 'client')
+        start('client')
+        wait_ready('client')
+        recreated = status('client')['connector']
+        assert recreated['public_key'] != old_client['public_key']
+        assert recreated['name'].startswith('client-vm-example-') and len(recreated['name']) == len('client-vm-example-') + 6, recreated
+        assert any(key[1:] == ('connectors', 'client-vm-example') for key in Platform.objects), 'the previous Connector must not be deleted'
+        roundtrip()
+        print('PASS a recreated ephemeral dialer enrolls under a unique name without deleting the old Connector', flush=True)
+
+        daemon = subprocess.run(['pgrep', '-P', str(procs['server'].pid), '-f', 'datum-connectd'], capture_output=True, text=True).stdout.split()
+        assert len(daemon) == 1, daemon
+        os.kill(int(daemon[0]), signal.SIGKILL)
+        assert procs['server'].wait(timeout=20) != 0, 'entrypoint must fail when the daemon dies'
+        print('PASS entrypoint exits non-zero when the daemon dies', flush=True)
+    finally:
+        for proc in procs.values():
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=40)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        for log in logs:
+            log.close()
+        platform.shutdown()
+        origin.shutdown()
+    for name in environments:
+        contents = (root / f'{name}.log').read_text()
+        token = (root / name / 'daemon_auth/setup.token').read_text().strip()
+        for secret in ('test-access-secret', 'test-refresh-secret', token):
+            assert secret not in contents, f'secret leaked in {name} logs'
+    print('PASS entrypoint logs contain no tokens or credentials', flush=True)
 
 
 def oidc_e2e(args):
