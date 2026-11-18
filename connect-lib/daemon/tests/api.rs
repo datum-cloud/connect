@@ -1025,6 +1025,141 @@ async fn failed_dial_can_be_retried_without_duplicate_intent() {
 }
 
 #[tokio::test]
+async fn dial_bind_address_defaults_to_loopback_and_wider_binds_require_setup() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    let (base, client, server) = setup(repo.path(), control.clone()).await;
+    let token = enroll_test_project(&base, &client, repo.path()).await;
+    let url = format!("{base}/v1/dials?project=alpha");
+    let operator: Value = client
+        .post(format!("{base}/v1/tokens?project=alpha"))
+        .bearer_auth(&token)
+        .json(&json!({"role":"operate","scopes":["project"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let operator = operator["bearer"].as_str().unwrap();
+
+    let default = client
+        .post(&url)
+        .bearer_auth(operator)
+        .json(&json!({"connector":"peer", "port":22, "bind":2222}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(default.status(), StatusCode::CREATED);
+    let default: Value = default.json().await.unwrap();
+    assert_eq!(default["bind_address"], "127.0.0.1");
+    let explicit_loopback = client
+        .post(&url)
+        .bearer_auth(operator)
+        .json(&json!({"connector":"peer", "port":22, "bind":2222, "bind_address":"127.0.0.1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit_loopback.status(),
+        StatusCode::OK,
+        "explicit loopback is the same intent as the default"
+    );
+
+    for address in ["0.0.0.0", "::", "192.0.2.10", "2001:db8::10"] {
+        let denied = client
+            .post(&url)
+            .bearer_auth(operator)
+            .json(&json!({"connector":"peer", "port":80, "bind":8080, "bind_address":address}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{address}");
+        let body: Value = denied.json().await.unwrap();
+        assert_eq!(body["code"], "bind_address_requires_setup");
+    }
+    let ipv6_loopback = client
+        .post(&url)
+        .bearer_auth(operator)
+        .json(&json!({"connector":"peer", "port":53, "bind":5353, "bind_address":"::1", "protocol":"udp"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ipv6_loopback.status(), StatusCode::CREATED);
+
+    let wide = json!({"connector":"peer", "port":80, "bind":8080, "bind_address":"::"});
+    let created = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&wide)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(created.json::<Value>().await.unwrap()["bind_address"], "::");
+    let again = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&wide)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        again.status(),
+        StatusCode::OK,
+        "identical intent is idempotent"
+    );
+
+    for (port, address) in [(8080, "0.0.0.0"), (8080, "127.0.0.1"), (2222, "0.0.0.0")] {
+        let conflict = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&json!({"connector":"peer", "port": if port == 8080 { 80 } else { 22 }, "bind":port, "bind_address":address}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            conflict.status(),
+            StatusCode::CONFLICT,
+            "port {port} with {address} must not replace the saved dial"
+        );
+    }
+
+    let status: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let dials = status["dials"].as_array().unwrap();
+    assert_eq!(dials.len(), 3);
+    let address_for = |bind: u64| {
+        dials
+            .iter()
+            .find(|dial| dial["bind"] == bind)
+            .map(|dial| dial["bind_address"].clone())
+            .unwrap()
+    };
+    assert_eq!(address_for(2222), "127.0.0.1");
+    assert_eq!(address_for(5353), "::1");
+    assert_eq!(address_for(8080), "::");
+    let disk: Value = serde_json::from_slice(
+        &tokio::fs::read(repo.path().join("daemon/state.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        disk["projects"]["alpha"]["dials"]["8080"]["bind_address"],
+        "::"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn setup_errors_have_stable_codes_and_failed_ephemeral_dial_can_be_removed() {
     let repo = tempfile::tempdir().unwrap();
     let control = Arc::new(MockControl::default());

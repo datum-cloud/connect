@@ -46,6 +46,8 @@ func friendlyError(cmd *cobra.Command, opts *options, projectID string, err erro
 		return fmt.Errorf("Connect is not set up for project %q.\n\nConnect this device first:\n  %s\n\nIf you have not signed in, run `datumctl login`, then run the command above through datumctl.\nFor unattended servers, you can supply --credentials-file PATH.\nRun `datumctl connect up --help` for details", projectID, setupCommand(projectID))
 	case "project_down":
 		return fmt.Errorf("Connect is down for project %q.\nRun: %s", projectID, setupCommand(projectID))
+	case "bind_address_requires_setup":
+		return fmt.Errorf("%s\nRun the command with the daemon setup token, or omit --bind-address to listen on 127.0.0.1", strings.TrimSpace(response.Message))
 	}
 	switch response.StatusCode {
 	case http.StatusUnauthorized:

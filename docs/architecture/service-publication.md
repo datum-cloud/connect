@@ -18,7 +18,7 @@ flowchart LR
 
     owner -->|register Connector and advertisement| api
     caller -->|resolve name to pinned key| api
-    client -->|loopback TCP or UDP| caller
+    client -->|local TCP or UDP, loopback by default| caller
     caller -->|HTTP/3 CONNECT or CONNECT-UDP| owner
     owner -->|TCP or UDP| local
     internet --> ingress
@@ -56,7 +56,12 @@ support the same transport profile.
 
 `datumctl connect dial CONNECTOR:PORT --bind LOCALPORT` creates the inverse
 path. The daemon resolves the Connector name once, stores both its display name
-and public key, and binds only a loopback listener. TCP accepts independent
+and public key, and binds a listener on `127.0.0.1` unless the request names
+another `bind_address`. A non-loopback address, including `0.0.0.0` or `::`,
+lets other hosts use the forward with this device's Connector identity, so the
+daemon accepts it only from the setup token. Dials stay keyed by local port; a
+request for the same port with a different address is a conflict, not a
+replacement. Status reports each dial's `bind_address`. TCP accepts independent
 connections; UDP maintains datagram associations. A bind value of zero lets the
 operating system choose an available local port.
 

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::Ipv4Addr,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -986,7 +986,7 @@ impl Control for RealControl {
                     runtime.transport.clone(),
                     peer,
                     destination,
-                    dial.bind,
+                    SocketAddr::new(dial.bind_address, dial.bind),
                     cancel.clone(),
                 )
                 .await?
@@ -996,7 +996,7 @@ impl Control for RealControl {
                     runtime.transport.clone(),
                     peer,
                     destination,
-                    dial.bind,
+                    SocketAddr::new(dial.bind_address, dial.bind),
                     cancel.clone(),
                 )
                 .await?
@@ -1616,10 +1616,10 @@ async fn start_tcp_dial(
     transport: Transport,
     peer: EndpointAddr,
     destination: DestinationId,
-    port: u16,
+    local: SocketAddr,
     cancel: CancellationToken,
 ) -> Result<(u16, JoinHandle<()>), ApiError> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let listener = TcpListener::bind(local).await?;
     let local_port = listener.local_addr()?.port();
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
@@ -1661,10 +1661,10 @@ async fn start_udp_dial(
     transport: Transport,
     peer: EndpointAddr,
     destination: DestinationId,
-    port: u16,
+    local: SocketAddr,
     cancel: CancellationToken,
 ) -> Result<(u16, JoinHandle<()>), ApiError> {
-    let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).await?);
+    let socket = Arc::new(UdpSocket::bind(local).await?);
     let local_port = socket.local_addr()?.port();
     let first_tunnel = transport
         .connect_udp(peer.clone(), destination.clone(), cancel.child_token())

@@ -45,9 +45,12 @@ through a compatible gateway.
 
 ## Local forward
 
-A local forward is a loopback-only port created by `dial`. An application uses
-that local port as if the remote service were local, while Connect authenticates
-and carries the connection to the serving Connector.
+A local forward is a local port created by `dial`. An application uses that
+local port as if the remote service were local, while Connect authenticates and
+carries the connection to the serving Connector. Forwards listen on loopback by
+default. With the daemon setup token, `--bind-address` can listen on another
+address so other hosts on the network can share the forward; they then use the
+service with this device's identity.
 
 ```sh
 datumctl connect dial SERVER_CONNECTOR:8080 --bind 18080

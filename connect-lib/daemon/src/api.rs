@@ -865,6 +865,10 @@ struct DialRequest {
     connector: String,
     port: u16,
     bind: u16,
+    /// Local listener address; loopback when omitted. Any other address
+    /// exposes the forward to the local network and requires setup.
+    #[serde(default)]
+    bind_address: Option<std::net::IpAddr>,
     #[serde(default)]
     protocol: Protocol,
 }
@@ -883,6 +887,20 @@ async fn create_dial(
             "A Connector and remote port from 1 to 65535 are required.",
         ));
     }
+    let bind_address = request
+        .bind_address
+        .unwrap_or(crate::model::DEFAULT_DIAL_BIND_ADDRESS);
+    if !bind_address.is_loopback() {
+        // A non-loopback listener lets other hosts use this device's
+        // authenticated access to the remote service.
+        if actor.require_setup().is_err() {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "A dial bound to a non-loopback address exposes the remote service to the local network and requires the setup token.",
+            )
+            .with_code("bind_address_requires_setup"));
+        }
+    }
     let connector = state
         .control
         .resolve_peer_key(&query.project, &request.connector)
@@ -892,6 +910,7 @@ async fn create_dial(
         connector_name: Some(request.connector),
         port: request.port,
         bind: request.bind,
+        bind_address,
         local_port: None,
         protocol: request.protocol,
         desired_active: true,
@@ -910,7 +929,8 @@ async fn create_dial(
             }
             if let Some(existing) = project.dials.get_mut(&request.bind) {
                 if existing.desired_active && existing.connector == desired.connector
-                    && existing.port == desired.port && existing.protocol == desired.protocol {
+                    && existing.port == desired.port && existing.protocol == desired.protocol
+                    && existing.bind_address == desired.bind_address {
                     existing.last_actor = actor.label();
                     return Ok((existing.clone(), false));
                 }

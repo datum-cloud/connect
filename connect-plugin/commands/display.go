@@ -33,6 +33,7 @@ type dialDisplay struct {
 	ConnectorName  string  `json:"connector_name"`
 	Port           uint16  `json:"port"`
 	Bind           uint16  `json:"bind"`
+	BindAddress    string  `json:"bind_address"`
 	LocalPort      *uint16 `json:"local_port"`
 	Protocol       string  `json:"protocol"`
 	DesiredActive  bool    `json:"desired_active"`
@@ -358,6 +359,9 @@ func writeHuman(cmd *cobra.Command, data json.RawMessage) error {
 		fmt.Fprintf(&out, "%s: %s -> %s:%d (%s).\n", strings.Title(dialState(d)), dialAddress(d), dialPeerName(d), d.Port, strings.ToUpper(d.Protocol))
 		if d.Running {
 			out.WriteString("Applications can use this local port; each new connection still depends on the remote service.\n")
+			if ip := net.ParseIP(d.BindAddress); ip != nil && !ip.IsLoopback() {
+				out.WriteString("Other hosts that can reach this address can also use the remote service through this device.\n")
+			}
 		}
 		writeFailure(&out, d.LastErrorStage, d.LastError)
 		port := d.Bind
@@ -562,7 +566,12 @@ func dialAddress(d dialDisplay) string {
 	if port == 0 {
 		return "not allocated"
 	}
-	return fmt.Sprintf("127.0.0.1:%d", port)
+	// Daemons that predate bind_address always listen on loopback.
+	address := d.BindAddress
+	if address == "" {
+		address = "127.0.0.1"
+	}
+	return net.JoinHostPort(address, strconv.Itoa(int(port)))
 }
 
 func dialPeerName(d dialDisplay) string {
