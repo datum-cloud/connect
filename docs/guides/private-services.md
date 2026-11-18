@@ -39,8 +39,8 @@ On an allowed device in the same project, connect the device first:
 datumctl connect up
 ```
 
-Then create a loopback-only local forward. `CONNECTOR` is the server's name or
-public key, not an IP address:
+Then create a local forward. `CONNECTOR` is the server's name or public key,
+not an IP address:
 
 ```sh
 datumctl connect dial CONNECTOR:8080 --bind 18080
@@ -58,6 +58,30 @@ For UDP, the protocol must match the service:
 ```sh
 datumctl connect dial CONNECTOR:5353 --protocol udp --bind 5353
 ```
+
+### Share a forward with other hosts
+
+A forward listens on `127.0.0.1` by default, so only applications on the same
+device can use it. To let other hosts on your network use it, for example
+other machines in the same VPC, choose a listener address with
+`--bind-address`:
+
+```sh
+datumctl connect dial CONNECTOR:8080 --bind 18080 --bind-address 0.0.0.0
+```
+
+The address can be any local IPv4 or IPv6 address, including `0.0.0.0` or `::`
+for all addresses. On most Linux hosts `::` also accepts IPv4 connections.
+
+A non-loopback forward exposes the remote service to every host that can reach
+that address. Those hosts use the service with your Connector's identity and
+the serving Connector cannot tell them apart. Connect does not authenticate
+them, so restrict access with a firewall, security group, or network policy.
+For this reason the daemon requires its setup token for any address other than
+loopback; delegated operate tokens can create only loopback forwards.
+
+Local ports stay unique across addresses. To change the address of an existing
+forward, run `hangup` for its port and dial again.
 
 ## Inspect and manage
 

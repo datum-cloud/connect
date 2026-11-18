@@ -61,7 +61,7 @@ func TestHelpExplainsScopeAndPreviewLimitations(t *testing.T) {
 		want []string
 	}{
 		{newServe(&options{}), []string{"project devices can connect", "approved by your Connector's class", "allowing a gateway can expose", "not a listen address", "after this command exits", "datumctl connect serve localhost:8080 --public"}},
-		{newDial(&options{}), []string{"loopback-only", "Traffic connects when your application", "hangup LOCALPORT"}},
+		{newDial(&options{}), []string{"127.0.0.1 by default", "requires\nthe daemon setup token", "Traffic connects when your application", "hangup LOCALPORT"}},
 		{newUp(&options{}), upWants},
 		{newPing(&options{}), []string{"CONNECTOR", "ICMP ping are not supported"}},
 		{newJoin(&options{}), []string{"--peer", "Administrator approval", "reconnect when the daemon", "fail closed", "Scripts never prompt or elevate"}},

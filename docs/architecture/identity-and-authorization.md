@@ -42,7 +42,9 @@ The loopback API accepts bearer tokens with three roles:
 | `viewer` | Read-only project status and diagnostics |
 
 Operate tokens may be scoped to the whole project or to a specific
-`service:<id>` or `dial:<port>`. Status output for a resource-scoped operator
+`service:<id>` or `dial:<port>`. Only the setup token can create a dial that
+listens on a non-loopback address, because that forward lets other hosts use the
+device's Connector identity. Status output for a resource-scoped operator
 omits Connector, authentication, transport, and network details outside that
 scope. The daemon stores a salted hash, supports expiry and revocation, and
 keeps a bounded mutation audit trail.
@@ -75,6 +77,14 @@ binding is created. Saved intent uses the key. Cloud resources created by the
 daemon carry the Connector owner label and owner reference; reconciliation
 refuses to overwrite a foreign object or an administrator-edited incompatible
 specification.
+
+By default the daemon generates each project's key in its private state.
+`--connector-key-file` instead reads one key, for every project, from a
+read-only file such as a mounted Secret, so a container without persistent
+state keeps one identity. The daemon never writes that file. Enrollment from
+empty state adopts an existing Connector only when its public key matches, and
+a key that disagrees with saved state is a conflict. See
+[Run Connect in a container](../guides/run-in-a-container.md#injected-identity).
 
 Deleting the Connector is an immediate revocation boundary. Refresh does not
 silently recreate a deleted Connector. Current key rotation requires resource

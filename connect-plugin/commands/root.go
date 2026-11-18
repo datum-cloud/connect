@@ -346,8 +346,9 @@ func newUnserve(opts *options) *cobra.Command {
 
 func newDial(opts *options) *cobra.Command {
 	var bind uint16
+	var bindAddress string
 	var protocol string
-	cmd := &cobra.Command{Use: "dial CONNECTOR:PORT", Short: "Forward a local port to a service on another Connector", Long: "Open a loopback-only local port that forwards to a service shared by another\nConnector in your project. CONNECTOR is its name or public key, not an IP\naddress. Its service must allow your Connector. Use the same protocol as serve.\n\nRun datumctl connect up first. If you omit --bind, the daemon chooses a port\nand reports it. Traffic connects when your application uses that local port.\nThe forward persists after this command exits; use hangup LOCALPORT to remove it.", Example: "  datumctl connect dial SERVER_CONNECTOR:22 --bind 2222\n  ssh -p 2222 localhost\n  datumctl connect dial SERVER_CONNECTOR:5353 --protocol udp --bind 5353\n  datumctl connect hangup 2222", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "dial CONNECTOR:PORT", Short: "Forward a local port to a service on another Connector", Long: "Open a local port that forwards to a service shared by another Connector in\nyour project. CONNECTOR is its name or public key, not an IP address. Its\nservice must allow your Connector. Use the same protocol as serve.\n\nRun datumctl connect up first. If you omit --bind, the daemon chooses a port\nand reports it. Traffic connects when your application uses that local port.\nThe forward persists after this command exits; use hangup LOCALPORT to remove it.\n\nThe port listens on 127.0.0.1 by default. --bind-address listens on another\nlocal address, such as 0.0.0.0 or ::. Any host that can reach a non-loopback\naddress can then use the remote service through this device, so it requires\nthe daemon setup token. Local ports remain unique across addresses.", Example: "  datumctl connect dial SERVER_CONNECTOR:22 --bind 2222\n  ssh -p 2222 localhost\n  datumctl connect dial SERVER_CONNECTOR:5353 --protocol udp --bind 5353\n  datumctl connect dial SERVER_CONNECTOR:8080 --bind 8080 --bind-address 0.0.0.0\n  datumctl connect hangup 2222", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		connector, port, err := splitConnector(args[0])
 		if err != nil {
 			return err
@@ -360,9 +361,18 @@ func newDial(opts *options) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		return runRequest(cmd, opts, true, http.MethodPost, "/v1/dials", p, map[string]any{"connector": connector, "port": port, "bind": bind, "protocol": protocol})
+		body := map[string]any{"connector": connector, "port": port, "bind": bind, "protocol": protocol}
+		if cmd.Flags().Changed("bind-address") {
+			address, err := parseBindAddress(bindAddress)
+			if err != nil {
+				return err
+			}
+			body["bind_address"] = address
+		}
+		return runRequest(cmd, opts, true, http.MethodPost, "/v1/dials", p, body)
 	}}
 	cmd.Flags().Uint16Var(&bind, "bind", 0, "Local port (0 lets the daemon choose)")
+	cmd.Flags().StringVar(&bindAddress, "bind-address", "127.0.0.1", "Local IPv4 or IPv6 address to listen on; non-loopback addresses require the setup token")
 	cmd.Flags().StringVar(&protocol, "protocol", "tcp", "Transport protocol: tcp or udp")
 	return cmd
 }
@@ -445,6 +455,20 @@ func splitConnector(value string) (string, uint16, error) {
 		return "", 0, fmt.Errorf("connector port %q: %w", portText, err)
 	}
 	return host, port, nil
+}
+
+// parseBindAddress accepts a literal IP address, optionally in brackets.
+// Host names are rejected so the listener address is never ambiguous.
+func parseBindAddress(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+		trimmed = trimmed[1 : len(trimmed)-1]
+	}
+	ip := net.ParseIP(trimmed)
+	if ip == nil || strings.Contains(trimmed, "%") {
+		return "", fmt.Errorf("--bind-address must be an IPv4 or IPv6 address, for example 127.0.0.1, 0.0.0.0, or ::")
+	}
+	return ip.String(), nil
 }
 
 func parsePort(value string) (uint16, error) {

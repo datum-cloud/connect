@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -122,8 +125,12 @@ pub struct DialState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connector_name: Option<String>,
     pub port: u16,
-    /// Requested loopback port. Zero asks the OS for an ephemeral port.
+    /// Requested local port. Zero asks the OS for an ephemeral port.
     pub bind: u16,
+    /// Local listener address. State written before this field existed
+    /// always bound loopback, so a missing value keeps that behavior.
+    #[serde(default = "default_dial_bind_address")]
+    pub bind_address: IpAddr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_port: Option<u16>,
     #[serde(default)]
@@ -136,6 +143,13 @@ pub struct DialState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_stage: Option<String>,
     pub last_actor: String,
+}
+
+/// Dials listen on loopback unless setup explicitly chooses another address.
+pub const DEFAULT_DIAL_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+fn default_dial_bind_address() -> IpAddr {
+    DEFAULT_DIAL_BIND_ADDRESS
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,5 +196,45 @@ pub fn append_audit(state: &mut DaemonState, entry: AuditEntry) {
     state.audit.push(entry);
     if state.audit.len() > MAX_AUDIT {
         state.audit.drain(..state.audit.len() - MAX_AUDIT);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dial_state_from_an_older_version_keeps_loopback() {
+        let dial: DialState = serde_json::from_value(serde_json::json!({
+            "connector": "peer-key",
+            "port": 22,
+            "bind": 2222,
+            "local_port": 2222,
+            "protocol": "tcp",
+            "desired_active": true,
+            "running": true,
+            "last_actor": "setup"
+        }))
+        .unwrap();
+        assert_eq!(dial.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            serde_json::to_value(&dial).unwrap()["bind_address"],
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn dial_state_round_trips_ipv6_unspecified_bind_address() {
+        let dial: DialState = serde_json::from_value(serde_json::json!({
+            "connector": "peer-key",
+            "port": 22,
+            "bind": 2222,
+            "bind_address": "::",
+            "desired_active": true,
+            "last_actor": "setup"
+        }))
+        .unwrap();
+        assert!(dial.bind_address.is_unspecified() && dial.bind_address.is_ipv6());
+        assert_eq!(serde_json::to_value(&dial).unwrap()["bind_address"], "::");
     }
 }
