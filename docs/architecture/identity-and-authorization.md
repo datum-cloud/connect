@@ -42,7 +42,9 @@ The loopback API accepts bearer tokens with three roles:
 | `viewer` | Read-only project status and diagnostics |
 
 Operate tokens may be scoped to the whole project or to a specific
-`service:<id>` or `dial:<port>`. Status output for a resource-scoped operator
+`service:<id>` or `dial:<port>`. Only the setup token can create a dial that
+listens on a non-loopback address, because that forward lets other hosts use the
+device's Connector identity. Status output for a resource-scoped operator
 omits Connector, authentication, transport, and network details outside that
 scope. The daemon stores a salted hash, supports expiry and revocation, and
 keeps a bounded mutation audit trail.

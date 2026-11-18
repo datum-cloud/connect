@@ -39,7 +39,7 @@ datumctl connect
   join NETWORK | leave NETWORK | ping CONNECTOR
   serve HOST:PORT [--public] [--hostname H] [--allow CONNECTOR,...]
   unserve HOST:PORT | NAME
-  dial CONNECTOR:PORT --bind LOCALPORT
+  dial CONNECTOR:PORT --bind LOCALPORT [--bind-address ADDR]
   hangup LOCALPORT
   install (optional; serve guides first-time user setup)
   daemon install | uninstall | start | stop | status
