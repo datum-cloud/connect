@@ -477,9 +477,17 @@ def container_e2e(args):
     print(f'Artifacts: {root}', flush=True)
     Platform.objects, Platform.writes = {}, []
     platform, origin = server(Platform), server(Origin)
-    creds = root / 'credential.json'
-    creds.write_text(json.dumps({'type': 'connector', 'project_id': 'demo', 'api_endpoint': f'http://127.0.0.1:{platform.server_port}', 'token_uri': f'http://127.0.0.1:{platform.server_port}/token', 'client_id': 'local-test', 'refresh_token': 'test-refresh-secret'}))
-    creds.chmod(0o400)
+    # Lay the credentials out like a Kubernetes Secret volume: a group- and
+    # world-readable file reached through the ..data symlink. The daemon only
+    # imports owner-only regular files, so the entrypoint must stage a copy.
+    secret_volume = root / 'credentials-volume'
+    (secret_volume / '..2026_01_01_00_00_00.000000000').mkdir(parents=True)
+    real_creds = secret_volume / '..2026_01_01_00_00_00.000000000' / 'credential.json'
+    real_creds.write_text(json.dumps({'type': 'connector', 'project_id': 'demo', 'api_endpoint': f'http://127.0.0.1:{platform.server_port}', 'token_uri': f'http://127.0.0.1:{platform.server_port}/token', 'client_id': 'local-test', 'refresh_token': 'test-refresh-secret'}))
+    real_creds.chmod(0o444)
+    (secret_volume / '..data').symlink_to('..2026_01_01_00_00_00.000000000')
+    creds = secret_volume / 'credential.json'
+    creds.symlink_to('..data/credential.json')
     forward, pinned_forward = free_port(), free_port()
     key_file = root / 'secret' / 'connector.pem'
     key_file.parent.mkdir()

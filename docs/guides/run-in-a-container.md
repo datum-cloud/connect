@@ -354,7 +354,7 @@ docker run -d --name connect-forwarder --restart unless-stopped \
   ghcr.io/datum-cloud/connectd:v0.0.0-SHORTSHA
 ```
 
-The credentials file must be readable by UID `65532`. Other hosts connect to
+The credentials file must be readable by UID `65532`. The entrypoint copies it into a private file in `DATUM_CONNECT_DIR` before starting the daemon, so a group-readable Secret mount works. Other hosts connect to
 port 8080 on this host. Restrict which hosts can reach it with your network's
 firewall rules. To keep a stable identity instead, replace the `tmpfs` with a
 persistent volume and replace `DATUM_CONNECT_EPHEMERAL` with
