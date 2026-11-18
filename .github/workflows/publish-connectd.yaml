@@ -1,0 +1,19 @@
+name: Publish Connect Daemon Image
+
+on:
+  push:
+    branches: ["**"]
+
+jobs:
+  publish-connectd-image:
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+    uses: datum-cloud/actions/.github/workflows/publish-docker.yaml@v1.21.0
+    with:
+      image-name: connectd
+      context: connect-lib
+      dockerfile-path: connect-lib/daemon/Dockerfile
+      platforms: linux/amd64,linux/arm64
+    secrets: inherit
