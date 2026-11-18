@@ -1,0 +1,411 @@
+#!/bin/sh
+# connectd-container runs datum-connectd as a long-lived container process and
+# applies the Connect configuration described by environment variables.
+#
+#   connectd-container [DAEMON_ARGS...]  run the daemon and apply configuration
+#   connectd-container probe             exit 0 only when the configuration is live
+#   connectd-container version           print the daemon version
+#
+# See docs/guides/run-in-a-container.md for the environment contract.
+
+set -eu
+set -f
+
+DAEMON=${DATUM_CONNECTD_BIN:-/usr/local/bin/datum-connectd}
+DATUM_CONNECT_DIR=${DATUM_CONNECT_DIR:-/var/lib/datum-connect}
+export DATUM_CONNECT_DIR
+PROJECT=${DATUM_CONNECT_PROJECT:-}
+NAME=${DATUM_CONNECT_NAME:-}
+NAME_HINT=${DATUM_CONNECT_NAME_HINT:-}
+EPHEMERAL=${DATUM_CONNECT_EPHEMERAL:-false}
+SERVICES=${DATUM_CONNECT_SERVICES:-}
+SERVICE_ALLOW=${DATUM_CONNECT_SERVICE_ALLOW:-}
+DIALS=${DATUM_CONNECT_DIALS:-}
+INTERVAL=${DATUM_CONNECT_RECONCILE_INTERVAL:-300}
+API="http://127.0.0.1:${DATUM_CONNECT_DAEMON_PORT:-47780}"
+TOKEN_FILE="$DATUM_CONNECT_DIR/daemon_auth/setup.token"
+RESUME_WAITS=0
+NL='
+'
+
+# log LEVEL MESSAGE [KEY=VALUE...] writes one JSON line to stderr in the same
+# shape as the daemon's own logs. Never pass tokens or credentials to it.
+log() {
+	_level=$1
+	_message=$2
+	shift 2
+	_count=$#
+	set -- "$@" --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg level "$_level" --arg message "$_message"
+	while [ "$_count" -gt 0 ]; do
+		_pair=$1
+		shift
+		set -- "$@" --arg "${_pair%%=*}" "${_pair#*=}"
+		_count=$((_count - 1))
+	done
+	jq -nc "$@" '$ARGS.named as $a | {timestamp: $a.timestamp, level: $a.level, target: "connectd_container", fields: ($a | del(.timestamp, .level))}' >&2 || true
+}
+
+fail() {
+	log ERROR "$1" error="$2"
+	exit 2
+}
+
+is_port() {
+	case $1 in '' | *[!0-9]*) return 1 ;; esac
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# api METHOD PATH [JSON] sets HTTP_STATUS and HTTP_BODY. The setup token is read
+# on every call and handed to curl on stdin so it never appears in argv.
+api() {
+	_method=$1
+	_path=$2
+	_token=$(cat "$TOKEN_FILE" 2>/dev/null) || _token=
+	if [ -z "$_token" ]; then
+		HTTP_STATUS=000
+		HTTP_BODY='{"error":"setup token is not readable","code":"setup_token_unavailable"}'
+		return 1
+	fi
+	if [ $# -ge 3 ]; then
+		_out=$(printf 'header = "Authorization: Bearer %s"\n' "$_token" |
+			curl -sS --config - -m 120 -X "$_method" -H 'Content-Type: application/json' \
+				--data-binary "$3" -w "$NL%{http_code}" "$API$_path" 2>/dev/null) || true
+	else
+		_out=$(printf 'header = "Authorization: Bearer %s"\n' "$_token" |
+			curl -sS --config - -m 30 -X "$_method" -w "$NL%{http_code}" "$API$_path" 2>/dev/null) || true
+	fi
+	_token=
+	case $_out in
+	*"$NL"*)
+		HTTP_STATUS=${_out##*"$NL"}
+		HTTP_BODY=${_out%"$NL"*}
+		;;
+	*)
+		HTTP_STATUS=${_out:-000}
+		HTTP_BODY=
+		;;
+	esac
+	case $HTTP_STATUS in 2??) return 0 ;; esac
+	return 1
+}
+
+api_error() {
+	printf '%s' "$HTTP_BODY" | jq -r '[.code // empty, .error // empty] | join(": ")' 2>/dev/null || printf 'HTTP %s' "$HTTP_STATUS"
+}
+
+project_query() {
+	printf 'project=%s' "$(jq -rn --arg p "$PROJECT" '$p | @uri')"
+}
+
+# parse_service SPEC sets SVC_ENDPOINT and SVC_PROTOCOL from host:port[/udp|/tcp].
+parse_service() {
+	SVC_ENDPOINT=$1
+	SVC_PROTOCOL=tcp
+	case $1 in
+	*/udp) SVC_ENDPOINT=${1%/udp} SVC_PROTOCOL=udp ;;
+	*/tcp) SVC_ENDPOINT=${1%/tcp} ;;
+	*/*) return 1 ;;
+	esac
+	case $SVC_ENDPOINT in *:*) ;; *) return 1 ;; esac
+	is_port "${SVC_ENDPOINT##*:}"
+}
+
+# parse_dial SPEC sets DIAL_* from CONNECTOR:PORT@BIND_ADDRESS:BIND_PORT[/udp].
+# IPv6 bind addresses use brackets, for example peer:53@[::]:53/udp.
+parse_dial() {
+	_spec=$1
+	DIAL_PROTOCOL=tcp
+	case $_spec in
+	*/udp) _spec=${_spec%/udp} DIAL_PROTOCOL=udp ;;
+	*/tcp) _spec=${_spec%/tcp} ;;
+	*/*) return 1 ;;
+	esac
+	case $_spec in *@*@*) return 1 ;; *@*) ;; *) return 1 ;; esac
+	_remote=${_spec%@*}
+	_local=${_spec#*@}
+	DIAL_CONNECTOR=${_remote%:*}
+	DIAL_PORT=${_remote##*:}
+	case $DIAL_CONNECTOR in '' | *:*) return 1 ;; esac
+	is_port "$DIAL_PORT" || return 1
+	case $_local in
+	\[*\]:*)
+		DIAL_BIND_ADDRESS=${_local#\[}
+		DIAL_BIND_ADDRESS=${DIAL_BIND_ADDRESS%%\]:*}
+		DIAL_BIND_PORT=${_local##*\]:}
+		;;
+	*:*:*) return 1 ;;
+	*:*)
+		DIAL_BIND_ADDRESS=${_local%:*}
+		DIAL_BIND_PORT=${_local##*:}
+		;;
+	*) return 1 ;;
+	esac
+	[ -n "$DIAL_BIND_ADDRESS" ] || return 1
+	is_port "$DIAL_BIND_PORT"
+}
+
+# sanitize_name VALUE prints a valid Connector name stem: lowercase letters,
+# digits, and inner hyphens, short enough to append a 7-character suffix.
+sanitize_name() {
+	_name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | cut -c1-56)
+	while :; do
+		case $_name in -*) _name=${_name#-} ;; *-) _name=${_name%-} ;; *) break ;; esac
+	done
+	printf '%s' "${_name:-connector}"
+}
+
+validate_config() {
+	case $INTERVAL in '' | *[!0-9]* | 0) fail config_invalid "DATUM_CONNECT_RECONCILE_INTERVAL must be a positive number of seconds" ;; esac
+	[ -n "$PROJECT" ] || return 0
+	case $EPHEMERAL in
+	true)
+		[ -z "$NAME" ] || fail config_invalid "DATUM_CONNECT_EPHEMERAL=true cannot be combined with DATUM_CONNECT_NAME; a fixed name needs persistent state"
+		;;
+	false) ;;
+	*) fail config_invalid "DATUM_CONNECT_EPHEMERAL must be true or false" ;;
+	esac
+	if [ -z "$NAME" ]; then
+		NAME_HINT=$(sanitize_name "${NAME_HINT:-$(uname -n)}")
+	fi
+	for _s in $SERVICES; do
+		parse_service "$_s" || fail config_invalid "DATUM_CONNECT_SERVICES entry $_s must be HOST:PORT or HOST:PORT/udp"
+	done
+	for _d in $DIALS; do
+		parse_dial "$_d" || fail config_invalid "DATUM_CONNECT_DIALS entry $_d must be CONNECTOR:PORT@BIND_ADDRESS:BIND_PORT[/udp]"
+	done
+}
+
+wait_for_daemon() {
+	_waited=0
+	until curl -fsS -m 5 "$API/v1/health" >/dev/null 2>&1 && [ -s "$TOKEN_FILE" ]; do
+		_waited=$((_waited + 1))
+		if [ $((_waited % 30)) -eq 0 ]; then
+			log WARN daemon_waiting waited_seconds="$_waited"
+		fi
+		sleep 1
+	done
+	log INFO daemon_ready api="$API"
+}
+
+# apply_up enrolls or reconnects the project. A running project is left alone:
+# POST /v1/up restarts the project runtime, so it is only sent when needed.
+apply_up() {
+	if ! api GET "/v1/status?$(project_query)"; then
+		log WARN apply_up result=error error="$(api_error)" project="$PROJECT"
+		return 1
+	fi
+	_enrolled_as=$(printf '%s' "$HTTP_BODY" | jq -r '.connector.name // empty')
+	if [ -n "$NAME" ] && [ -n "$_enrolled_as" ] && [ "$_enrolled_as" != "$NAME" ]; then
+		log ERROR apply_up result=conflict project="$PROJECT" name="$NAME" enrolled_as="$_enrolled_as" \
+			error="this volume is already enrolled under another Connector name; use that name or a new volume"
+		return 1
+	fi
+	_state=$(printf '%s' "$HTTP_BODY" | jq -r '
+		if .desired_up and .running then "running"
+		elif .desired_up and .enrolled and (.last_error == null) then "resuming"
+		else "down" end')
+	case $_state in
+	running)
+		RESUME_WAITS=0
+		log INFO apply_up result=unchanged project="$PROJECT" name="$_enrolled_as"
+		return 0
+		;;
+	resuming)
+		# The daemon resumes saved projects on start; give it a few attempts
+		# before asking it to reconnect explicitly.
+		RESUME_WAITS=$((RESUME_WAITS + 1))
+		if [ "$RESUME_WAITS" -le 5 ]; then
+			log INFO apply_up result=pending project="$PROJECT" name="$_enrolled_as" reason="daemon is resuming the saved project"
+			return 1
+		fi
+		;;
+	esac
+	RESUME_WAITS=0
+	if [ -n "$NAME" ]; then
+		_body=$(jq -nc --arg project "$PROJECT" --arg name "$NAME" '{project: $project, name: $name}')
+	elif [ -n "$_enrolled_as" ]; then
+		# Already enrolled: the daemon keeps the saved name and ignores hints.
+		_body=$(jq -nc --arg project "$PROJECT" '{project: $project}')
+	else
+		_body=$(jq -nc --arg project "$PROJECT" --arg hint "$NAME_HINT" '{project: $project, name_hint: $hint}')
+	fi
+	if api POST /v1/up "$_body"; then
+		log INFO apply_up result=applied project="$PROJECT" name="$(printf '%s' "$HTTP_BODY" | jq -r '.connector.name // empty')" status="$HTTP_STATUS"
+		return 0
+	fi
+	# A hinted name is not made unique by the daemon: when another Connector
+	# (for example this container's previous incarnation) owns it, enrollment
+	# fails with a conflict. Without a fixed name, retry with a random suffix.
+	# Existing Connectors are never adopted or deleted.
+	if [ -z "$NAME" ] && [ -z "$_enrolled_as" ] && [ "$HTTP_STATUS" = 409 ] &&
+		printf '%s' "$HTTP_BODY" | jq -e '.error | test("already owned")' >/dev/null 2>&1; then
+		_unique="$NAME_HINT-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+		log WARN apply_up result=name_taken project="$PROJECT" name_hint="$NAME_HINT" retry_name="$_unique"
+		_body=$(jq -nc --arg project "$PROJECT" --arg name "$_unique" '{project: $project, name: $name}')
+		if api POST /v1/up "$_body"; then
+			log INFO apply_up result=applied project="$PROJECT" name="$_unique" status="$HTTP_STATUS"
+			return 0
+		fi
+	fi
+	log WARN apply_up result=error project="$PROJECT" name="${NAME:-$NAME_HINT}" status="$HTTP_STATUS" error="$(api_error)"
+	return 1
+}
+
+apply_service() {
+	parse_service "$1"
+	_body=$(jq -nc --arg endpoint "$SVC_ENDPOINT" --arg protocol "$SVC_PROTOCOL" --arg allow "$SERVICE_ALLOW" \
+		'{endpoint: $endpoint, protocol: $protocol,
+		  allow: ($allow | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)))}')
+	if api POST "/v1/services?$(project_query)" "$_body"; then
+		case $HTTP_STATUS in 201) _result=applied ;; *) _result=unchanged ;; esac
+		log INFO apply_service result="$_result" service="$1" status="$HTTP_STATUS"
+		return 0
+	fi
+	log WARN apply_service result=error service="$1" status="$HTTP_STATUS" error="$(api_error)"
+	return 1
+}
+
+apply_dial() {
+	parse_dial "$1"
+	_body=$(jq -nc --arg connector "$DIAL_CONNECTOR" --argjson port "$DIAL_PORT" --argjson bind "$DIAL_BIND_PORT" \
+		--arg bind_address "$DIAL_BIND_ADDRESS" --arg protocol "$DIAL_PROTOCOL" \
+		'{connector: $connector, port: $port, bind: $bind, bind_address: $bind_address, protocol: $protocol}')
+	if api POST "/v1/dials?$(project_query)" "$_body"; then
+		case $HTTP_STATUS in 201) _result=applied ;; *) _result=unchanged ;; esac
+		_saved=$(printf '%s' "$HTTP_BODY" | jq -r '.bind_address // empty')
+		if [ -n "$_saved" ] && [ "$_saved" != "$DIAL_BIND_ADDRESS" ]; then
+			log WARN apply_dial result="$_result" dial="$1" bind_address="$_saved" \
+				reason="write the bind address in this canonical form so probe can match it"
+		else
+			log INFO apply_dial result="$_result" dial="$1" status="$HTTP_STATUS"
+		fi
+		return 0
+	fi
+	log WARN apply_dial result=error dial="$1" status="$HTTP_STATUS" error="$(api_error)"
+	return 1
+}
+
+apply_all() {
+	apply_up || return 1
+	_ok=0
+	for _s in $SERVICES; do apply_service "$_s" || _ok=1; done
+	for _d in $DIALS; do apply_dial "$_d" || _ok=1; done
+	return $_ok
+}
+
+reconcile_loop() {
+	wait_for_daemon
+	if [ -z "$PROJECT" ]; then
+		log INFO reconcile_disabled reason="DATUM_CONNECT_PROJECT is not set"
+		return 0
+	fi
+	_delay=2
+	_converged=false
+	while :; do
+		if apply_all; then
+			if [ "$_converged" = false ]; then
+				log INFO desired_state_applied project="$PROJECT" next_seconds="$INTERVAL"
+				_converged=true
+			fi
+			_delay=2
+			sleep "$INTERVAL"
+		else
+			_converged=false
+			log WARN desired_state_retry project="$PROJECT" retry_seconds="$_delay"
+			sleep "$_delay"
+			_delay=$((_delay * 2))
+			[ "$_delay" -le 60 ] || _delay=60
+		fi
+	done
+}
+
+# probe exits 0 only when the project is connected and every configured
+# service and dial is running.
+probe() {
+	if ! curl -fsS -m 5 "$API/v1/health" >/dev/null 2>&1; then
+		echo "daemon API is not reachable" >&2
+		return 1
+	fi
+	[ -n "$PROJECT" ] || return 0
+	if ! api GET "/v1/status?$(project_query)"; then
+		echo "status request failed: $(api_error)" >&2
+		return 1
+	fi
+	_status=$HTTP_BODY
+	if ! printf '%s' "$_status" | jq -e --arg name "$NAME" \
+		'.desired_up and .running and .enrolled and ($name == "" or .connector.name == $name)' >/dev/null; then
+		echo "project $PROJECT is not connected${NAME:+ as $NAME}" >&2
+		return 1
+	fi
+	for _s in $SERVICES; do
+		parse_service "$_s" || return 1
+		if ! printf '%s' "$_status" | jq -e --arg e "$SVC_ENDPOINT" --arg p "$SVC_PROTOCOL" \
+			'any(.services[]?; .endpoint == $e and .protocol == $p and .desired_active and .running)' >/dev/null; then
+			echo "service $_s is not running" >&2
+			return 1
+		fi
+	done
+	for _d in $DIALS; do
+		parse_dial "$_d" || return 1
+		if ! printf '%s' "$_status" | jq -e --arg c "$DIAL_CONNECTOR" --argjson port "$DIAL_PORT" \
+			--argjson bind "$DIAL_BIND_PORT" --arg a "$DIAL_BIND_ADDRESS" --arg p "$DIAL_PROTOCOL" \
+			'any(.dials[]?; (.local_port // .bind) == $bind and (.bind_address // "127.0.0.1") == $a
+			   and .port == $port and .protocol == $p and .connector_name == $c
+			   and .desired_active and .running)' >/dev/null; then
+			echo "dial $_d is not running" >&2
+			return 1
+		fi
+	done
+	return 0
+}
+
+DAEMON_PID=
+RECONCILE_PID=
+STOPPING=false
+
+stop() {
+	STOPPING=true
+	log INFO shutdown_requested signal="$1"
+	[ -z "$RECONCILE_PID" ] || kill -TERM "$RECONCILE_PID" 2>/dev/null || true
+	[ -z "$DAEMON_PID" ] || kill -"$1" "$DAEMON_PID" 2>/dev/null || true
+}
+
+run() {
+	validate_config
+	trap 'stop TERM' TERM
+	trap 'stop INT' INT
+	"$DAEMON" "$@" &
+	DAEMON_PID=$!
+	log INFO daemon_started pid="$DAEMON_PID" project="$PROJECT"
+	reconcile_loop &
+	RECONCILE_PID=$!
+	while :; do
+		_code=0
+		wait "$DAEMON_PID" || _code=$?
+		# wait also returns when a trapped signal arrives; keep waiting for the daemon.
+		kill -0 "$DAEMON_PID" 2>/dev/null || break
+	done
+	kill -TERM "$RECONCILE_PID" 2>/dev/null || true
+	wait "$RECONCILE_PID" 2>/dev/null || true
+	if [ "$STOPPING" = true ]; then
+		log INFO daemon_stopped exit_code="$_code"
+		exit "$_code"
+	fi
+	log ERROR daemon_exited exit_code="$_code"
+	[ "$_code" -ne 0 ] || _code=1
+	exit "$_code"
+}
+
+case ${1:-} in
+probe)
+	set +e
+	probe
+	exit $?
+	;;
+version | --version)
+	exec "$DAEMON" --version
+	;;
+*)
+	run "$@"
+	;;
+esac

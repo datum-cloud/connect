@@ -136,6 +136,8 @@ tasks:
         silent: false
       - cmd: 'python3 {{.E2E_SCRIPT}} --daemon {{.CARGO_TARGET_DIR}}/debug/{{.DAEMON_BINARY}} --plugin {{.ROOT_DIR}}/{{.GO_PROJECT}}/{{.PLUGIN_BINARY}} --oidc'
         silent: false
+      - cmd: 'python3 {{.E2E_SCRIPT}} --daemon {{.CARGO_TARGET_DIR}}/debug/{{.DAEMON_BINARY}} --plugin {{.ROOT_DIR}}/{{.GO_PROJECT}}/{{.PLUGIN_BINARY}} --container-entrypoint {{.ROOT_DIR}}/connect-lib/daemon/container/connectd-container'
+        silent: false
 
   test:masque-interop:
     desc: "Run an independent masque-go client through standard H3 and the real Connect UDP transport"

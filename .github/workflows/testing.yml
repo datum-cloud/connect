@@ -17,6 +17,7 @@ on:
       - 'scripts/windows-service-smoke.ps1'
       - 'scripts/daemon-e2e.py'
       - 'scripts/fixtures/**'
+      - 'connect-lib/daemon/container/**'
   pull_request:
     paths:
       - 'connect-plugin/**/*.go'
@@ -33,6 +34,7 @@ on:
       - 'scripts/windows-service-smoke.ps1'
       - 'scripts/daemon-e2e.py'
       - 'scripts/fixtures/**'
+      - 'connect-lib/daemon/container/**'
 
 permissions:
   contents: read
@@ -205,3 +207,5 @@ jobs:
         run: python3 ../scripts/daemon-e2e.py --daemon target/debug/datum-connectd --plugin ../connect-plugin/datumctl-connect
       - name: Verify OIDC session enrollment and renewal
         run: python3 ../scripts/daemon-e2e.py --daemon target/debug/datum-connectd --plugin ../connect-plugin/datumctl-connect --oidc
+      - name: Verify the container entrypoint applies serve and dial configuration
+        run: python3 ../scripts/daemon-e2e.py --daemon target/debug/datum-connectd --plugin ../connect-plugin/datumctl-connect --container-entrypoint daemon/container/connectd-container
