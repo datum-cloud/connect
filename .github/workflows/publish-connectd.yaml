@@ -3,6 +3,8 @@ name: Publish Connect Daemon Image
 on:
   push:
     branches: ["**"]
+    # Version tags publish the image as vX.Y.Z[-pre] too.
+    tags: ["v*"]
 
 jobs:
   publish-connectd-image:
