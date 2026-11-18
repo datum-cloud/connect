@@ -34,3 +34,10 @@ spec:
     - connect.datumapis.com/connectnetworkbindings.update
     - connect.datumapis.com/connectnetworkbindings.patch
     - connect.datumapis.com/connectnetworkbindings.delete
+    # A daemon renews its Connector's Lease to stay Ready.
+    - coordination.k8s.io/leases.get
+    - coordination.k8s.io/leases.update
+    - coordination.k8s.io/leases.patch
+    # Private serve checks that no public HTTPProxy is left for the service.
+    # Creating a public service still needs a role that manages HTTPProxies.
+    - networking.datumapis.com/httpproxies.get
