@@ -379,8 +379,28 @@ stop() {
 	[ -z "$DAEMON_PID" ] || kill -"$1" "$DAEMON_PID" 2>/dev/null || true
 }
 
+# stage_credentials copies a mounted credentials file into the private state
+# directory. The daemon only imports a regular, owner-only file, and Secret
+# mounts are symlinks owned by root that a non-root user reads through its group.
+stage_credentials() {
+	_source=${DATUM_CONNECT_CREDENTIALS_FILE:-}
+	[ -n "$_source" ] || return 0
+	[ -r "$_source" ] || fail config_invalid "DATUM_CONNECT_CREDENTIALS_FILE is not readable"
+	_staged="$DATUM_CONNECT_DIR/mounted-credentials.json"
+	(
+		umask 077
+		mkdir -p "$DATUM_CONNECT_DIR"
+		cat "$_source" >"$_staged.tmp"
+		mv -f "$_staged.tmp" "$_staged"
+	) || fail config_invalid "cannot stage DATUM_CONNECT_CREDENTIALS_FILE in DATUM_CONNECT_DIR"
+	DATUM_CONNECT_CREDENTIALS_FILE=$_staged
+	export DATUM_CONNECT_CREDENTIALS_FILE
+	log INFO credentials_staged
+}
+
 run() {
 	validate_config
+	stage_credentials
 	trap 'stop TERM' TERM
 	trap 'stop INT' INT
 	"$DAEMON" "$@" &
