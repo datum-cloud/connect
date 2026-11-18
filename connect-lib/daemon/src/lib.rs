@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod connector_key;
 pub mod control;
 pub mod error;
 pub mod local_ip;

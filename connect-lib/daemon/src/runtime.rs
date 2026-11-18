@@ -43,6 +43,8 @@ pub struct RealControl {
     mutation_lock: Arc<Mutex<()>>,
     local_ip: Option<Arc<crate::local_ip::LocalIpConfig>>,
     relay_urls: Option<Vec<iroh::RelayUrl>>,
+    /// Injected identity shared by every project; see `connector_key`.
+    connector_key_file: Option<PathBuf>,
 }
 
 struct ProjectRuntime {
@@ -150,6 +152,7 @@ impl RealControl {
             mutation_lock,
             local_ip: None,
             relay_urls: None,
+            connector_key_file: None,
         }
     }
 
@@ -160,6 +163,13 @@ impl RealControl {
 
     pub fn with_relay_urls(mut self, relays: Option<Vec<iroh::RelayUrl>>) -> Self {
         self.relay_urls = relays;
+        self
+    }
+
+    /// Use the key in this read-only file for every project instead of a
+    /// generated per-project key. Intended for single-project containers.
+    pub fn with_connector_key_file(mut self, path: Option<PathBuf>) -> Self {
+        self.connector_key_file = path;
         self
     }
 
@@ -523,7 +533,24 @@ impl RealControl {
         let credentials = Credentials::load(credentials_file)
             .await
             .map_err(cloud_error)?;
-        let key = load_project_key(&self.repo, project).await?;
+        let persisted = self
+            .store
+            .snapshot()
+            .await
+            .projects
+            .get(project)
+            .and_then(|state| state.connector.as_ref())
+            .map(|connector| connector.public_key.clone());
+        let key = load_project_key(
+            &self.repo,
+            project,
+            self.connector_key_file.as_deref(),
+            expected
+                .map(|identity| identity.public_key.clone())
+                .or(persisted)
+                .as_deref(),
+        )
+        .await?;
         let public_key = key.public().to_string();
         if let Some(previous) = self.projects.lock().await.remove(project) {
             Self::stop_runtime(previous, false).await?;
@@ -1647,12 +1674,34 @@ fn cloud_details(transport: &Transport) -> CloudConnectionDetails {
     }
 }
 
-async fn load_project_key(repo: &Path, project: &str) -> Result<SecretKey, ApiError> {
+async fn load_project_key(
+    repo: &Path,
+    project: &str,
+    key_file: Option<&Path>,
+    persisted_public_key: Option<&str>,
+) -> Result<SecretKey, ApiError> {
     let path = repo
         .join("daemon")
         .join("projects")
         .join(project)
         .join("connector.key");
+    if let Some(key_file) = key_file {
+        // Never write or chmod the injected file, and never save a copy: the
+        // state directory may be ephemeral, and the Secret stays the source.
+        let key = crate::connector_key::read_connector_key_file(key_file).await?;
+        let stored = match tokio::fs::read(&path).await {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        crate::connector_key::check_injected_key(
+            project,
+            &key,
+            stored.as_deref(),
+            persisted_public_key,
+        )?;
+        return Ok(key);
+    }
     if tokio::fs::try_exists(&path).await? {
         connect_lib::secure_fs::set_private_file_permissions(&path).await?;
     }
