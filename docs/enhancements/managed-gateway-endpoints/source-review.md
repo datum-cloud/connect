@@ -54,6 +54,13 @@ the reviewed development snapshots. It does not bring their code onto `main`.
 The requested `galactic/internal/connectip` path resolves in this snapshot to
 `galactic/internal/edge/connectip`; source links use the actual path.
 
+## Design decision after source review
+
+On 2026-11-19, the design chose a Connect service-provider Project control plane
+for internal lifecycle resources. This is an architectural decision, not an
+implemented capability established by the pinned source snapshots. Dependent
+systems retain their own issuance, distribution, and cell runtime resources.
+
 ## Important boundaries established by the sources
 
 - The newer Connect guide explicitly distinguishes `managed-network-v1` from

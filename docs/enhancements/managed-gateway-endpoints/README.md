@@ -14,8 +14,8 @@ trusted certificate for each hostname. Existing Galactic MASQUE infrastructure
 serves these endpoints. Creating a gateway does not create a Workload or a
 separate provider deployment.
 
-Connect coordinates DNS, certificate issuance, and endpoint registration across
-control planes. Galactic owns tunnel admission and the packet path into the VPC.
+Connect owns endpoint provisioning in a dedicated service-provider Project
+control plane and coordinates DNS, certificate issuance, and cell registration. Galactic owns tunnel admission and the packet path into the VPC.
 The certificate service owns issuance and renewal; infra supplies the deployment
 and distribution wiring.
 
@@ -39,26 +39,38 @@ between cells are outside this proposal.
 
 ![Control planes and ownership for a managed gateway endpoint](diagrams/control-planes.svg)
 
-The project control plane holds the user's gateway, connection policy, and
-bindings. Connect resolves the selected Locations into metros and keeps a
-service-owned endpoint record for each gateway and metro. Several Locations in
-one metro share that endpoint.
+The **customer Project control plane** holds the user's gateway, connection
+policy, and bindings. It exposes endpoint status to the customer.
 
-The endpoint record tracks the reserved name, network, selected cell, certificate,
-DNS records, and progress. It also retains enough information to finish cleanup
-if the project disappears. Its exact API representation remains open: it could
-be an internal resource referenced by existing placements.
+The **Connect service-provider Project control plane** holds Connect's internal
+resources: endpoint assignments, hostname reservations, certificate requests,
+references to DNS records, desired cell registrations, and distribution progress.
+It also holds readiness, pending operations, and cleanup records. Connect resolves
+customer Locations into metros and keeps one endpoint per gateway and metro;
+several Locations in one metro share that endpoint.
 
-The certificate service issues centrally. Karmada delivers the resulting TLS
-Secret and endpoint registration only to the selected serving cell. Galactic
-reports when its listeners have applied them. The cell control plane is a separate
-boundary; Karmada delivers configuration across that boundary and receives status
-back. Delivery alone does not establish
-that an endpoint is ready.
+This service project is the durable home for Connect's lifecycle state. The exact
+resource types and their relationship to placements remain to be defined. Records
+retain the customer project and gateway UIDs so cleanup can continue after the
+customer project disappears. Customer credentials cannot modify them. The service
+project must remain available until its endpoints and cleanup work are released.
+
+**DNS, Certificates, and Karmada** are dependent systems, not components inside
+Connect's service project. DNS realizes records in the project that owns the
+managed zone. Certificates accepts authorized requests from the service project
+and retains issuance resources and private keys in its own service infrastructure.
+Karmada holds the downstream distribution resources. Connect records the desired
+state and results without taking ownership of these systems' internal resources.
+
+The **cell control plane** is separate. It holds the delivered TLS Secrets,
+Galactic endpoint registrations, and runtime networking resources. Karmada delivers
+configuration to the selected cell and returns status. Galactic reports when the
+configuration is applied; delivery alone does not make an endpoint ready.
 
 ### Stable names
 
-Reserve the hostname against the project UID, gateway UID, and metro ID. Keep it
+Reserve the hostname in the service project against the customer project UID,
+gateway UID, and metro ID. Keep it
 through temporary capacity failures and pod replacements. A gateway recreated
 under the same resource name receives a new hostname.
 
@@ -75,8 +87,9 @@ than allocate another name.
 
 1. **Resolve the request.** Check project permissions, network identity, and metro
    membership. Select existing Galactic capacity in one cell and save the endpoint
-   record before making changes in other control planes.
-2. **Request the certificate.** Use the existing certificate service with explicit
+   record in the service-provider project before changing other control planes.
+2. **Request the certificate.** Create the request in the service-provider project
+   for Certificates to reconcile, with explicit
    `issuance: DNS01`. Its `Auto` mode chooses HTTP-01 for non-wildcard names, which
    would introduce an unnecessary HTTP challenge listener.
 3. **Publish validation DNS.** Read the exact CNAME from
@@ -100,16 +113,17 @@ challenge CNAME for renewal. Neither record grants access to the VPC.
 The certificate service currently rejects protected platform domains. Before
 using it for Connect names, add an internal issuance path that checks the reserved
 hostname and the requesting service's authority. Ordinary project requests must
-not gain permission to issue for the entire Connect domain. The location and API
-of this internal request remain open.
+not gain permission to issue for the entire Connect domain. Requests belong in
+the Connect service-provider project; the authorization API remains open. Hosting
+the request there does not itself bypass protected-domain validation.
 
 Reuse the service's stored-certificate contract. Wait for `TLSCertificate`
 readiness, derive the Secret name with `StoredSecretName(uid)`, and check its
 upstream UID label. Validate the certificate's name, validity, and matching key
 before delivery. Use the stored Secret, not the temporary issuance Secret.
 
-Private keys remain in service infrastructure and the selected serving cell.
-They never enter project status or connection descriptors. Cells receive the
+Private keys remain in Certificates infrastructure and the selected serving cell.
+They never enter either Project control plane or connection descriptors. Cells receive the
 resulting Secret, not ACME accounts, issuance resources, or DNS-writing credentials.
 The private CA used between Galactic providers and their grant authority remains
 separate from the public endpoint certificate.
@@ -195,8 +209,8 @@ tombstones and shared serving infrastructure throughout cleanup.
 
 ### Open decisions
 
-- **Connect:** choose endpoint storage, metro metadata, hostname format, and how
-  placements reference their shared endpoint.
+- **Connect:** define the service-project resource types, metro metadata, hostname
+  format, and how customer placements reference their shared endpoint.
 - **Certificates:** define managed-domain authorization and reliable replacement
   notifications, including emergency rekeys.
 - **Galactic:** define registration, gateway-scoped admission, session revocation,
@@ -236,7 +250,8 @@ not need. Issuing in every cell would duplicate ACME state and credentials.
 
 ## Infrastructure needed
 
-Reuse DNS, Certificates, Karmada, and existing Galactic MASQUE capacity. Add scoped service permissions,
+Provision the Connect service-provider project and scoped service identities.
+Reuse DNS, Certificates, Karmada, and existing Galactic MASQUE capacity. Add
 managed-domain issuance, endpoint registration, certificate delivery, and probes.
 Connect owns the end-to-end contract; each service owns its implementation.
 
@@ -245,3 +260,6 @@ Connect owns the end-to-end contract; each service owns its implementation.
 2026-11-18: proposed the lifecycle and reviewed source capabilities. Simplified the
 design and added SVG diagrams in the style of Fleet's machine-lifecycle enhancement.
 No runtime implementation, deployment, or live validation accompanies this document.
+
+2026-11-19: chose a Connect service-provider Project control plane for internal
+lifecycle resources and separated it from customer projects and cell runtime state.

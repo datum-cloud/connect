@@ -5,7 +5,8 @@ change does not implement or run them.
 
 ## Setup
 
-Use two projects, two Locations in the same metro, another metro, and two cells.
+Use two customer projects, a separate Connect service-provider project, two
+Locations in the same metro, another metro, and two cells.
 Exercise the real DNS, certificate, distribution, and Galactic integrations.
 Keep another tenant connected to the same listeners during failure tests.
 
@@ -14,6 +15,12 @@ certificate fingerprints, DNS answers, and packet results. Never record keys or
 bearer credentials. A TLS handshake alone does not prove VPC connectivity.
 
 ## Names and authorization
+
+- Internal endpoint, reservation, request, and cleanup records live in the Connect
+  service-provider project. Customer credentials cannot modify them. Private keys
+  remain outside both customer and service-provider Project control planes.
+- Customer project deletion leaves service-project cleanup records available.
+  Service-project retirement waits for its endpoints and cleanup work to finish.
 
 - Two Locations in one metro produce one endpoint and certificate. Controller
   retries and restarts do not create duplicates.
