@@ -48,21 +48,21 @@
 <text x="840" y="70" class="detail" text-anchor="middle">Cell control plane</text>
 <rect x="10" y="103" width="290" height="48" rx="10" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="155" y="133" class="label" text-anchor="middle">Save endpoint in service project</text>
-<text x="240.0" y="183" class="label" text-anchor="middle">Request DNS-01 certificate</text>
+<text x="240.0" y="183" class="label" text-anchor="middle">Reconcile TLSCertificate</text>
 <path d="M 120 195 L 360 195" class="line"/>
 <text x="240.0" y="243" class="label" text-anchor="middle">Required challenge CNAME</text>
 <path d="M 360 255 L 120 255" class="line" stroke-dasharray="5 4"/>
-<text x="360.0" y="303" class="label" text-anchor="middle">Publish exact challenge CNAME</text>
+<text x="360.0" y="303" class="label" text-anchor="middle">Reconcile challenge DNSRecordSet</text>
 <path d="M 120 315 L 600 315" class="line"/>
 <rect x="285" y="345" width="390" height="48" rx="10" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="480" y="375" class="label" text-anchor="middle">Validate DNS; complete ACME issuance</text>
-<text x="240.0" y="423" class="label" text-anchor="middle">Ready certificate + stored Secret</text>
+<text x="240.0" y="423" class="label" text-anchor="middle">Ready status; key stays in Certificates</text>
 <path d="M 360 435 L 120 435" class="line" stroke-dasharray="5 4"/>
-<text x="480.0" y="483" class="label" text-anchor="middle">Deliver TLS Secret + registration through Karmada</text>
+<text x="480.0" y="483" class="label" text-anchor="middle">Deliver registration + service-held TLS Secret through Karmada</text>
 <path d="M 120 495 L 840 495" class="line"/>
 <text x="480.0" y="543" class="label" text-anchor="middle">Acknowledge applied endpoint and certificate versions</text>
 <path d="M 840 555 L 120 555" class="line" stroke-dasharray="5 4"/>
-<text x="360.0" y="603" class="label" text-anchor="middle">Publish routing DNS to selected cell</text>
+<text x="360.0" y="603" class="label" text-anchor="middle">Reconcile routing DNSRecordSet</text>
 <path d="M 120 615 L 600 615" class="line"/>
 <text x="480.0" y="663" class="label" text-anchor="middle">External TLS, transport, and VPC packet checks</text>
 <path d="M 120 675 L 840 675" class="line"/>

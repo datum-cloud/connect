@@ -57,7 +57,9 @@ The requested `galactic/internal/connectip` path resolves in this snapshot to
 ## Design decision after source review
 
 On 2026-11-19, the design chose a Connect service-provider Project control plane
-for internal lifecycle resources. This is an architectural decision, not an
+for internal lifecycle resources, managed DNS zone/record resources, and
+certificate requests. DNS and Certificates reconcile those project resources.
+This is an architectural decision, not an
 implemented capability established by the pinned source snapshots. Dependent
 systems retain their own issuance, distribution, and cell runtime resources.
 

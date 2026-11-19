@@ -16,8 +16,9 @@ bearer credentials. A TLS handshake alone does not prove VPC connectivity.
 
 ## Names and authorization
 
-- Internal endpoint, reservation, request, and cleanup records live in the Connect
-  service-provider project. Customer credentials cannot modify them. Private keys
+- Internal endpoint and cleanup records, the managed `DNSZone`, routing and
+  challenge `DNSRecordSet` resources, and `TLSCertificate` requests live in the
+  Connect service-provider project. Customer credentials cannot modify them. Private keys
   remain outside both customer and service-provider Project control planes.
 - Customer project deletion leaves service-project cleanup records available.
   Service-project retirement waits for its endpoints and cleanup work to finish.
@@ -62,7 +63,8 @@ bearer credentials. A TLS handshake alone does not prove VPC connectivity.
   forwarding cutoff, and route withdrawal separately from DNS removal.
 - Delete a gateway, namespace, or project. Confirm removal of routing records,
   registrations, delivered keys, and issuance requests. Leave shared providers,
-  unrelated endpoints, certificate-service anchors, and Galactic allocation
+  the shared DNS zone, unrelated records/endpoints, certificate-service anchors,
+  and Galactic allocation
   tombstones intact.
 - Lose a cell during deletion. Keep cleanup pending until removal is confirmed or
   the agreed permanent-loss recovery procedure completes.

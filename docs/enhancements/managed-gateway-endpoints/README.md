@@ -43,24 +43,30 @@ The **customer Project control plane** holds the user's gateway, connection
 policy, and bindings. It exposes endpoint status to the customer.
 
 The **Connect service-provider Project control plane** holds Connect's internal
-resources: endpoint assignments, hostname reservations, certificate requests,
-references to DNS records, desired cell registrations, and distribution progress.
+resources: endpoint assignments, hostname reservations, `TLSCertificate` requests,
+the managed `DNSZone` and its `DNSRecordSet` resources, desired cell registrations,
+and distribution progress.
 It also holds readiness, pending operations, and cleanup records. Connect resolves
 customer Locations into metros and keeps one endpoint per gateway and metro;
 several Locations in one metro share that endpoint.
 
 This service project is the durable home for Connect's lifecycle state. The exact
-resource types and their relationship to placements remain to be defined. Records
+Connect-specific resource types and their relationship to placements remain to
+be defined; DNS and certificate requests use the existing project APIs. Records
 retain the customer project and gateway UIDs so cleanup can continue after the
 customer project disappears. Customer credentials cannot modify them. The service
 project must remain available until its endpoints and cleanup work are released.
 
-**DNS, Certificates, and Karmada** are dependent systems, not components inside
-Connect's service project. DNS realizes records in the project that owns the
-managed zone. Certificates accepts authorized requests from the service project
-and retains issuance resources and private keys in its own service infrastructure.
-Karmada holds the downstream distribution resources. Connect records the desired
-state and results without taking ownership of these systems' internal resources.
+**DNS and Certificates** reconcile resources in the service-provider project.
+Their controllers and serving infrastructure run outside that project. DNS
+publishes the zone and records; Certificates reconciles `TLSCertificate` requests
+and reports issuance status. Creating these resources in the project does not mean
+running the dependent systems there.
+
+Certificates keeps its underlying issuance resources and private keys in its own
+infrastructure. Karmada holds downstream distribution resources and delivers the
+issued Secret to the selected cell. The project holds desired state and status,
+not a copy of the certificate's private key.
 
 The **cell control plane** is separate. It holds the delivered TLS Secrets,
 Galactic endpoint registrations, and runtime networking resources. Karmada delivers
@@ -74,7 +80,9 @@ gateway UID, and metro ID. Keep it
 through temporary capacity failures and pod replacements. A gateway recreated
 under the same resource name receives a new hostname.
 
-Use a platform-owned zone and an opaque gateway identifier. The domain and label
+Keep the platform-owned Connect `DNSZone` in the service-provider project and
+use an opaque gateway identifier. Provision the zone and its parent delegation
+once; individual gateway endpoints share it. The domain and label
 format are still to be chosen. Reserve names with a uniqueness check that works
 across controller replicas. Retries must continue the same reservation rather
 than allocate another name.
@@ -88,19 +96,20 @@ than allocate another name.
 1. **Resolve the request.** Check project permissions, network identity, and metro
    membership. Select existing Galactic capacity in one cell and save the endpoint
    record in the service-provider project before changing other control planes.
-2. **Request the certificate.** Create the request in the service-provider project
-   for Certificates to reconcile, with explicit
+2. **Request the certificate.** Create a `TLSCertificate` in the service-provider
+   project for Certificates to reconcile, with explicit
    `issuance: DNS01`. Its `Auto` mode chooses HTTP-01 for non-wildcard names, which
    would introduce an unnecessary HTTP challenge listener.
 3. **Publish validation DNS.** Read the exact CNAME from
-   `TLSCertificate.status.requiredDNSRecords` and create it through `DNSRecordSet`.
+   `TLSCertificate.status.requiredDNSRecords` and create a `DNSRecordSet` in the
+   same service-provider project, referencing its managed zone. DNS publishes it.
    The certificate service manages the validation TXT record at the delegated
    target and completes issuance through central cert-manager.
 4. **Deliver and apply.** Validate the issued key pair and send it with the endpoint
    registration to the selected cell. Wait for Galactic to report the applied
    endpoint and certificate versions.
-5. **Publish routing DNS.** Point the hostname at the selected cell's public
-   frontend. Verify TLS and the advertised transports from outside the cell, and
+5. **Publish routing DNS.** Create or update the service project's routing
+   `DNSRecordSet` to point at the selected cell's public frontend. Verify TLS and the advertised transports from outside the cell, and
    test a VPC packet exchange with a restricted test identity.
 6. **Enable client connections.** Mark the endpoint ready and allow the credential
    broker to return it to authorized connectors.
@@ -197,7 +206,8 @@ When the gateway is deleted or its last desired placement leaves a metro:
 2. Verify forwarding has stopped, withdraw routing DNS, and allow for cached DNS.
 3. Remove registrations and delivered keys from every recorded target cell.
 4. Delete the issuance request, verify certificate cleanup, and remove the owned
-   challenge CNAME. Leave certificate-service delegation anchors to their owner.
+   challenge CNAME record. Preserve the shared `DNSZone` and other endpoints'
+   records. Leave certificate-service delegation anchors to their owner.
 5. Finish release only after cleanup is confirmed. Retain a hostname tombstone so
    another gateway cannot acquire it.
 
@@ -263,3 +273,6 @@ No runtime implementation, deployment, or live validation accompanies this docum
 
 2026-11-19: chose a Connect service-provider Project control plane for internal
 lifecycle resources and separated it from customer projects and cell runtime state.
+
+The service-provider project also owns DNS zone/record resources and certificate
+requests; DNS and Certificates reconcile them from outside the project.
