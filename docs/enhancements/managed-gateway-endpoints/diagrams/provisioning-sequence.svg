@@ -3,6 +3,37 @@
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
 <style>text { font-family: Arial, Helvetica, sans-serif; fill: #172b4d; } .heading { font-size: 21px; font-weight: 700; } .label { font-size: 18px; } .detail { font-size: 17px; fill: #475569; } .line { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }</style>
 <rect width="960" height="800" fill="white"/>
+<g aria-label="System lifelines" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 5">
+<path d="M 120 85 L 120 101"/>
+<path d="M 120 153 L 120 162"/>
+<path d="M 120 188 L 120 222"/>
+<path d="M 120 248 L 120 402"/>
+<path d="M 120 428 L 120 705"/>
+<path d="M 360 85 L 360 162"/>
+<path d="M 360 188 L 360 222"/>
+<path d="M 360 248 L 360 282"/>
+<path d="M 360 308 L 360 310"/>
+<path d="M 360 320 L 360 343"/>
+<path d="M 360 395 L 360 402"/>
+<path d="M 360 428 L 360 462"/>
+<path d="M 360 488 L 360 490"/>
+<path d="M 360 500 L 360 522"/>
+<path d="M 360 548 L 360 550"/>
+<path d="M 360 560 L 360 582"/>
+<path d="M 360 608 L 360 610"/>
+<path d="M 360 620 L 360 642"/>
+<path d="M 360 668 L 360 670"/>
+<path d="M 360 680 L 360 705"/>
+<path d="M 600 85 L 600 343"/>
+<path d="M 600 395 L 600 462"/>
+<path d="M 600 488 L 600 490"/>
+<path d="M 600 500 L 600 522"/>
+<path d="M 600 548 L 600 550"/>
+<path d="M 600 560 L 600 642"/>
+<path d="M 600 668 L 600 670"/>
+<path d="M 600 680 L 600 705"/>
+<path d="M 840 85 L 840 705"/>
+</g>
 <rect x="15" y="20" width="210" height="65" rx="10" fill="#eff6ff" stroke="#93b4df" stroke-width="1.5"/>
 <text x="120" y="47" class="heading" text-anchor="middle">Connect</text>
 <text x="120" y="70" class="detail" text-anchor="middle">Endpoint lifecycle</text>
