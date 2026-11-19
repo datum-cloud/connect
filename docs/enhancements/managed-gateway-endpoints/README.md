@@ -234,8 +234,7 @@ not need. Issuing in every cell would duplicate ACME state and credentials.
 
 ## Infrastructure needed
 
-Reuse the DNS operator, certificate service, central cert-manager, Karmada, and
-existing Galactic MASQUE and Edge capacity. Add scoped service permissions,
+Reuse DNS, Certificates, Karmada, and existing Galactic MASQUE capacity. Add scoped service permissions,
 managed-domain issuance, endpoint registration, certificate delivery, and probes.
 Connect owns the end-to-end contract; each service owns its implementation.
 
