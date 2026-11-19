@@ -51,7 +51,9 @@ be an internal resource referenced by existing placements.
 
 The certificate service issues centrally. Karmada delivers the resulting TLS
 Secret and endpoint registration only to the selected serving cell. Galactic
-reports when its listeners have applied them. Delivery alone does not establish
+reports when its listeners have applied them. The cell control plane is a separate
+boundary; Karmada delivers configuration across that boundary and receives status
+back. Delivery alone does not establish
 that an endpoint is ready.
 
 ### Stable names

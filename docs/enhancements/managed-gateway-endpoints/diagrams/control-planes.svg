@@ -1,10 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="760" viewBox="0 0 960 760" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="1010" viewBox="0 0 960 1010" role="img" aria-labelledby="title description">
 <title id="title">Managed gateway systems and control planes</title>
-<desc id="description">Project intent goes to Connect. Connect uses Certificates for issuance and DNS for routing and validation records. Karmada delivers the certificate and registration to Galactic in the selected cell and returns applied status. Dependencies are shown as systems, with separate, noncrossing connections.</desc>
+<desc id="description">Project intent goes to Connect. Connect uses Certificates for issuance and DNS for routing and validation records. Karmada delivers the certificate and registration to Galactic in the selected cell and returns applied status. The selected cell control plane is a separate boundary outside the service and infrastructure control planes. Karmada delivery and applied status cross that boundary.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
 <style>text { font-family: Arial, Helvetica, sans-serif; fill: #172b4d; } .heading { font-size: 21px; font-weight: 700; } .label { font-size: 18px; } .detail { font-size: 17px; fill: #475569; } .line { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }</style>
 
-<rect width="960" height="760" fill="white"/>
+<rect width="960" height="1010" fill="white"/>
 <rect x="50" y="30" width="330" height="110" rx="10" fill="#eff6ff" stroke="#93b4df" stroke-width="1.5"/>
 <text x="215" y="65" class="heading" text-anchor="middle">Project control plane</text>
 <text x="215" y="97" class="label" text-anchor="middle">Gateway, network, and policy</text>
@@ -26,11 +26,11 @@
 <rect x="50" y="610" width="330" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="215" y="645" class="heading" text-anchor="middle">Karmada</text>
 <text x="215" y="675" class="detail" text-anchor="middle">Selected-cell distribution</text>
-<rect x="630" y="560" width="300" height="160" rx="10" fill="#f0fdf4" stroke="#96bda1" stroke-width="1.5"/>
-<text x="780" y="589" class="detail" text-anchor="middle">Selected cell</text>
-<rect x="650" y="610" width="260" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
-<text x="780" y="645" class="heading" text-anchor="middle">Galactic</text>
-<text x="780" y="674" class="detail" text-anchor="middle">MASQUE access to the VPC</text>
+<rect x="20" y="830" width="920" height="160" rx="10" fill="#f0fdf4" stroke="#96bda1" stroke-width="1.5"/>
+<text x="910" y="865" class="heading" text-anchor="end">Selected cell control plane</text>
+<rect x="50" y="880" width="330" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="215" y="915" class="heading" text-anchor="middle">Galactic</text>
+<text x="215" y="944" class="detail" text-anchor="middle">MASQUE access to the VPC</text>
 <path d="M 215 140 L 215 290" class="line"/>
 <text x="235" y="192" class="detail" text-anchor="start">Resolve intent</text>
 <path d="M 380 330 L 650 330" class="line" marker-start="url(#arrow)"/>
@@ -40,6 +40,6 @@
 <path d="M 215 490 L 215 610" class="line" marker-start="url(#arrow)"/>
 <text x="235" y="536" class="detail" text-anchor="start">Certificate + registration</text>
 <text x="235" y="562" class="detail" text-anchor="start">Applied status returns</text>
-<path d="M 380 655 L 650 655" class="line" marker-start="url(#arrow)"/>
-<text x="505" y="640" class="detail" text-anchor="middle">Deliver / report applied</text>
+<path d="M 215 700 L 215 880" class="line" marker-start="url(#arrow)"/>
+<text x="235" y="780" class="detail" text-anchor="start">Deliver / report applied</text>
 </svg>
