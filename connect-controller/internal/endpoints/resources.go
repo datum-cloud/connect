@@ -250,7 +250,7 @@ func (d *KubernetesDriver) Apply(ctx context.Context, endpoint *connect.ConnectE
 	if !enabled && certificateRevision == "" {
 		certificateRevision = strings.Repeat("0", 64)
 	}
-	registration.Object["spec"] = map[string]interface{}{"metro": endpoint.Spec.Metro, "cell": assignment.Cell, "provider": assignment.Provider, "hostname": endpoint.Spec.Hostname, "revision": endpoint.Status.Revision, "certificateRef": map[string]interface{}{"name": secretName, "revision": certificateRevision}, "enabled": enabled}
+	registration.Object["spec"] = map[string]interface{}{"provider": assignment.Provider, "hostname": endpoint.Spec.Hostname, "revision": endpoint.Status.Revision, "certificateRef": map[string]interface{}{"name": secretName, "revision": certificateRevision}, "enabled": enabled}
 	if err := d.ensureDelivery(ctx, endpoint, registration); err != nil {
 		return err
 	}

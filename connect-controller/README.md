@@ -15,6 +15,12 @@ credential-free `ConnectGrant` cleanup receipts. TLS keys stay in Certificates,
 Karmada and the selected cell. The older gateway slice described below is a
 separate legacy contract.
 
+Each cell has its own control-plane API. Connect keeps metro/cell placement in
+the service Project and targets one API with scoped credentials and distribution.
+The local `MASQUEEndpoint` has no cell or metro fields; its provider selects a
+named EdgeProvider within that API. Missing selected clients never fall back to
+another control plane for readiness, credentials or cleanup.
+
 A managed gateway has no fixed Network. Each binding names its gateway,
 Connector and Network; matching policies must explicitly list that Network in
 `spec.networkRefs`. An existing policy without this list denies managed access.

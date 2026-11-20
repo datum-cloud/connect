@@ -128,7 +128,7 @@ func (d *KubernetesDriver) ensureDelivery(ctx context.Context, endpoint *connect
 		if oldRevision >= newRevision {
 			return fmt.Errorf("stale registration update")
 		}
-		for _, field := range []string{"hostname", "cell", "provider", "metro"} {
+		for _, field := range []string{"hostname", "provider"} {
 			oldValue, _, _ := unstructured.NestedString(current.Object, "spec", field)
 			newValue, _, _ := unstructured.NestedString(desired.Object, "spec", field)
 			if oldValue != newValue {

@@ -61,7 +61,7 @@ publish the certificate name, create the request, then bind its returned UID.
 Publish the exact `status.requiredDNSRecords` CNAME. Keys never enter Projects.
 
 Galactic agreed: namespaced `galactic.datumapis.com/v1alpha1 MASQUEEndpoint`
-spec contains `metro`, `cell`, `provider`, `hostname`,
+spec contains `provider`, `hostname`,
 positive monotonic `revision`, `certificateRef:{name,revision}`, and `enabled`.
 Identity is immutable. Revision increases for certificate changes and disable.
 Certificate revision is leaf DER SHA256, never ordered by expiry.
@@ -69,8 +69,31 @@ Certificate revision is leaf DER SHA256, never ordered by expiry.
 `observedRevision`, `appliedRevision`, `appliedCertificateRevision`,
 `state` (Applied/Disabled/Error), `forwardingStopped`, `lastHeartbeatTime`,
 and `message`. Provider durable fences use namespace plus canonical hostname,
-pin the registration name/cell/provider and retain revision/revocation tombstones.
+pin the registration name/provider and retain revision/revocation tombstones.
 Neither metadata nor wire fields substitute hidden identity UID annotations.
+
+Each cell/metro has a separate control plane. Placement stays in the service
+Project assignment, not in the local registration or its fence. Exact single-cell
+distribution, scoped credentials and the configured selected API client enforce
+placement. Missing selected clients never fall back to another API. Identically
+named registrations and instances in another control plane cannot supply apply,
+stop or cleanup evidence. Grant authority selection, CreateRequest.Cell and
+VPC/cell allocation ledgers remain scoped to the saved assignment.
+
+Provider remains explicit: multiple named EdgeProviders may coexist in the same
+API/namespace, with separate ServiceAccounts/approval. Runtime `--provider`,
+membership providerRef and authority provider checks select that local provider.
+Galactic removes the redundant provider `--cell` flag, not authority `--cell`.
+Probe cell is independently trusted operator evidence, never copied from the
+registration. No controller configuration flags or certificate contracts change.
+
+Coordinate CRDs, provider arguments and binaries on the original control plane.
+Never reset delivery receipts or hostname fences for this schema change. Connect
+accepts an unchanged resource incarnation with the exact new desired spec; if
+legacy placement fields still make that spec differ at the same revision, it
+fails closed instead of mutating the revision in place. A subsequent real config
+change must still increase the revision. Placement-requiring provider rollback
+is unsupported once new-format fences are written.
 
 Relevant instances come from provider-matching EdgeInstances and their
 same-name, owner-UID-bound Leases, never the acknowledgment list. Check Lease
@@ -234,6 +257,12 @@ stale acknowledgments, durable deletion, retry-safe metro collapse, reactivation
 epochs and real Kubernetes CRD immutability validation. Fake clients do not
 establish DNS propagation, ACME issuance, Karmada behavior or packet forwarding.
 
+Placement regressions use separate API clients with identical registration and
+instance names. Only the selected API can satisfy apply, forwarding-stop and
+cleanup checks; missing selected clients fail closed. Grant tests separately
+require the selected authority and VPC reader, preserving cell-scoped receipts
+and allocation retries. Provider filtering and all-replica stop checks remain.
+
 Passed locally: the full controller race suite (including Kubernetes 1.37
 envtest), native macOS build, Linux/amd64 cross-build, and stock Kustomize renders
 of both service-only and default customer exports. The resource fixture drives
@@ -254,12 +283,13 @@ kubectl kustomize config/components/managed-endpoints/crd
 Dependencies:
 
 - Certificates: `4cec00395b3647737685addd697e40f2e94d3214`, draft PR milo-os/certificates#83.
-- Infrastructure: prior published `d7353b7f159770412560c3dad0cd18cee34e35f7`,
-  draft PR datum-cloud/infra#9647. The name-based follow-up awaits this Connect
+- Infrastructure: prior published `7446644655199c612f5366d56c032b3d34241646`,
+  draft PR datum-cloud/infra#9647. The placement follow-up awaits this Connect
   publication for exact-source validation; the earlier green run is not its CI.
-- Galactic: `de6b48f549dc1e10977e8046d029521d835be323`, draft PR datum-cloud/galactic#1465;
-  Go module `v0.9.5-0.20261120170557-de6b48f549dc`, without local replacements.
-  This revision implements the frozen name-only facade, registration, instance
+- Galactic: `87aaa9537653e9ae5a67d64ff062ad1c334dc8f5`, draft PR datum-cloud/galactic#1465;
+  Go module `v0.9.5-0.20261120175747-87aaa9537653`, without local replacements.
+  This revision removes copied registration placement and provider `--cell`,
+  retaining the name-only facade, local provider selection, instance
   acknowledgments and authority wire contract. Providers require the get-only
   tenant service/VPC reader role before upgrade. Previous experimental managed
   records fail closed; drain them with the old version before upgrading rather

@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -17,7 +18,7 @@ func TestDeliveryUsesPrivateIncarnationReceipts(t *testing.T) {
 	karmada := resourceClient(t)
 	driver := &KubernetesDriver{Project: project, Karmada: karmada}
 	desired := object(registrationGVK, "masque", endpoint.Name)
-	desired.Object["spec"] = map[string]interface{}{"hostname": endpoint.Spec.Hostname, "cell": "cell-a", "provider": "shared", "metro": "dfw", "revision": int64(1), "enabled": true}
+	desired.Object["spec"] = map[string]interface{}{"hostname": endpoint.Spec.Hostname, "provider": "shared", "revision": int64(1), "enabled": true}
 	if err := karmada.Create(ctx, desired); err != nil {
 		t.Fatal(err)
 	}
@@ -46,6 +47,46 @@ func TestDeliveryUsesPrivateIncarnationReceipts(t *testing.T) {
 	}
 	if _, err := driver.removeDeliveryResource(ctx, endpoint, desired); err == nil {
 		t.Fatal("replaced registration deleted")
+	}
+}
+
+func TestPlacementRemovalPreservesDeliveryReceiptAndRevision(t *testing.T) {
+	ctx := context.Background()
+	endpoint := endpointFixture()
+	karmada := resourceClient(t)
+	driver := &KubernetesDriver{Project: resourceClient(t, endpoint), Karmada: karmada}
+	current := object(registrationGVK, "masque", endpoint.Name)
+	current.Object["spec"] = map[string]interface{}{"hostname": endpoint.Spec.Hostname, "provider": "shared", "cell": "cell-a", "metro": "dfw", "revision": int64(1), "enabled": true}
+	if err := karmada.Create(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.rememberDelivery(ctx, endpoint, current); err != nil {
+		t.Fatal(err)
+	}
+	desired := current.DeepCopy()
+	unstructured.RemoveNestedField(desired.Object, "spec", "cell")
+	unstructured.RemoveNestedField(desired.Object, "spec", "metro")
+	if err := driver.ensureDelivery(ctx, endpoint, desired); err == nil {
+		t.Fatal("changed same-revision snapshot accepted")
+	}
+	_ = unstructured.SetNestedField(desired.Object, int64(2), "spec", "revision")
+	_ = unstructured.SetNestedField(desired.Object, false, "spec", "enabled")
+	if err := driver.ensureDelivery(ctx, endpoint, desired); err != nil {
+		t.Fatal("higher revision local update rejected", err)
+	}
+	if receipt := deliveryReceipt(endpoint, desired); receipt == nil || receipt.UID != string(current.GetUID()) || len(endpoint.Status.DeliveryReceipts) != 1 {
+		t.Fatal("placement removal reset the private incarnation receipt")
+	}
+	if err := karmada.Get(ctx, client.ObjectKeyFromObject(current), current); err != nil {
+		t.Fatal(err)
+	}
+	if revision, _, _ := unstructured.NestedInt64(current.Object, "spec", "revision"); revision != 2 {
+		t.Fatal("registration revision lost")
+	}
+	for _, field := range []string{"cell", "metro"} {
+		if _, exists, _ := unstructured.NestedFieldNoCopy(current.Object, "spec", field); exists {
+			t.Fatal("placement copied into local registration", field)
+		}
 	}
 }
 

@@ -171,7 +171,10 @@ func TestExactDNS01AndSeparateKeyCustody(t *testing.T) {
 	if err := karmada.Get(ctx, client.ObjectKeyFromObject(desired), desired); err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"endpointUID", "customerProjectUID", "gatewayUID", "networkUID", "vpcRef"} {
+	if spec, _, err := unstructured.NestedMap(desired.Object, "spec"); err != nil || len(spec) != 5 {
+		t.Fatal("registration does not match five-field local contract", spec, err)
+	}
+	for _, field := range []string{"endpointUID", "customerProjectUID", "gatewayUID", "networkUID", "vpcRef", "cell", "metro"} {
 		if _, exists, err := unstructured.NestedFieldNoCopy(desired.Object, "spec", field); err != nil || exists {
 			t.Fatalf("removed registration field delivered: %s", field)
 		}
@@ -231,7 +234,7 @@ func TestExactDNS01AndSeparateKeyCustody(t *testing.T) {
 func membershipFixture(t *testing.T, endpoint *connect.ConnectEndpoint, now time.Time) (client.Client, *unstructured.Unstructured) {
 	t.Helper()
 	registration := object(registrationGVK, "masque", endpoint.Name)
-	registration.Object["spec"] = map[string]interface{}{"revision": endpoint.Status.Revision, "hostname": endpoint.Spec.Hostname, "cell": endpoint.Spec.Assignment.Cell, "provider": endpoint.Spec.Assignment.Provider, "metro": endpoint.Spec.Metro, "enabled": true, "certificateRef": map[string]interface{}{"revision": endpoint.Status.CertificateRevision}}
+	registration.Object["spec"] = map[string]interface{}{"revision": endpoint.Status.Revision, "hostname": endpoint.Spec.Hostname, "provider": endpoint.Spec.Assignment.Provider, "enabled": true, "certificateRef": map[string]interface{}{"revision": endpoint.Status.CertificateRevision}}
 	_ = unstructured.SetNestedField(registration.Object, SecretName(endpoint), "spec", "certificateRef", "name")
 	registration.Object["status"] = map[string]interface{}{"instances": []interface{}{map[string]interface{}{"instanceName": "ei-pod-a", "observedRevision": endpoint.Status.Revision, "appliedRevision": endpoint.Status.Revision, "appliedCertificateRevision": endpoint.Status.CertificateRevision, "state": "Applied", "forwardingStopped": false, "lastHeartbeatTime": now.Format(time.RFC3339)}}}
 	instance := object(schema.GroupVersionKind{Group: registrationGVK.Group, Version: registrationGVK.Version, Kind: "EdgeInstance"}, "masque", "ei-pod-a")
@@ -244,6 +247,96 @@ func membershipFixture(t *testing.T, endpoint *connect.ConnectEndpoint, now time
 	acquired := metav1.NewMicroTime(now.Add(-30 * time.Second))
 	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: instance.GetName(), Namespace: "masque", UID: "lease-a", Annotations: map[string]string{"galactic.datumapis.com/edge-pod-uid": "pod-a"}, OwnerReferences: []metav1.OwnerReference{{Kind: "EdgeInstance", UID: instance.GetUID()}}}, Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renew, AcquireTime: &acquired}}
 	return resourceClient(t, registration, instance, lease), registration
+}
+
+func TestAcknowledgmentsStayInSelectedControlPlane(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, enabled := range []bool{true, false} {
+		state := "apply"
+		if !enabled {
+			state = "stop"
+		}
+		t.Run(state, func(t *testing.T) {
+			endpoint := endpointFixture()
+			endpoint.Status.Revision = 4
+			endpoint.Status.CertificateRevision = strings.Repeat("a", 64)
+			selected, registration := membershipFixture(t, endpoint, now)
+			other, otherRegistration := membershipFixture(t, endpoint, now)
+			if !enabled {
+				for _, fixture := range []struct {
+					target   client.Client
+					resource *unstructured.Unstructured
+				}{{selected, registration}, {other, otherRegistration}} {
+					resource := fixture.resource
+					_ = unstructured.SetNestedField(resource.Object, false, "spec", "enabled")
+					entries, _, _ := unstructured.NestedSlice(resource.Object, "status", "instances")
+					entries[0].(map[string]interface{})["state"] = "Disabled"
+					entries[0].(map[string]interface{})["forwardingStopped"] = true
+					_ = unstructured.SetNestedSlice(resource.Object, entries, "status", "instances")
+					if err := fixture.target.Update(ctx, resource); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			driver := &KubernetesDriver{Cells: map[string]client.Client{"cell-a": selected, "cell-b": other}, RuntimeNamespace: "masque", Now: func() time.Time { return now }}
+			if err := driver.Applied(ctx, endpoint, enabled); err != nil {
+				t.Fatal(err)
+			}
+			_ = unstructured.SetNestedSlice(registration.Object, nil, "status", "instances")
+			if err := selected.Update(ctx, registration); err != nil {
+				t.Fatal(err)
+			}
+			if err := driver.Applied(ctx, endpoint, enabled); err == nil {
+				t.Fatal("identically named acknowledgment from another control plane accepted")
+			}
+			driver.Cells["cell-a"] = resourceClient(t)
+			if err := driver.Applied(ctx, endpoint, enabled); err == nil {
+				t.Fatal("missing selected registration fell back to another control plane")
+			}
+			delete(driver.Cells, "cell-a")
+			if err := driver.Applied(ctx, endpoint, enabled); err == nil {
+				t.Fatal("unconfigured selected control plane accepted")
+			}
+		})
+	}
+}
+
+func TestCleanupStaysInSelectedControlPlane(t *testing.T) {
+	ctx := context.Background()
+	endpoint := endpointFixture()
+	registration := object(registrationGVK, "masque", endpoint.Name)
+	selected := resourceClient(t, registration)
+	other := resourceClient(t, registration.DeepCopy())
+	driver := &KubernetesDriver{Karmada: resourceClient(t), Cells: map[string]client.Client{"cell-a": selected, "cell-b": other}, RuntimeNamespace: "masque"}
+	if done, err := driver.RemoveDelivery(ctx, endpoint); err != nil || done {
+		t.Fatalf("selected registration still exists: done=%v err=%v", done, err)
+	}
+	if err := other.Delete(ctx, registration); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := driver.RemoveDelivery(ctx, endpoint); err != nil || done {
+		t.Fatalf("absence in another control plane completed cleanup: done=%v err=%v", done, err)
+	}
+	restored := registration.DeepCopy()
+	restored.SetResourceVersion("")
+	if err := other.Create(ctx, restored); err != nil {
+		t.Fatal(err)
+	}
+	delete(driver.Cells, "cell-a")
+	if done, err := driver.RemoveDelivery(ctx, endpoint); err == nil || done {
+		t.Fatal("cleanup accepted unconfigured selected control plane")
+	}
+	driver.Cells["cell-a"] = selected
+	if err := selected.Delete(ctx, registration); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := driver.RemoveDelivery(ctx, endpoint); err != nil || !done {
+		t.Fatalf("unrelated registration affected selected cleanup: done=%v err=%v", done, err)
+	}
+	if err := other.Get(ctx, client.ObjectKeyFromObject(registration), registration); err != nil {
+		t.Fatal("other control plane registration was removed", err)
+	}
 }
 
 func TestReadinessUsesMembershipNotAckCount(t *testing.T) {
@@ -259,8 +352,26 @@ func TestReadinessUsesMembershipNotAckCount(t *testing.T) {
 	}
 	second := object(schema.GroupVersionKind{Group: registrationGVK.Group, Version: registrationGVK.Version, Kind: "EdgeInstance"}, "masque", "ei-pod-b")
 	second.SetUID("instance-b")
-	second.Object["spec"] = map[string]interface{}{"providerRef": map[string]interface{}{"name": "shared"}, "podUID": "pod-b"}
+	second.SetCreationTimestamp(metav1.NewTime(now.Add(-time.Minute)))
+	second.Object["spec"] = map[string]interface{}{"providerRef": map[string]interface{}{"name": "other-provider"}, "podUID": "pod-b"}
 	if err := cell.Create(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.Applied(ctx, endpoint, true); err != nil {
+		t.Fatal("independently selected provider affected readiness", err)
+	}
+	_ = unstructured.SetNestedField(second.Object, "shared", "spec", "providerRef", "name")
+	if err := cell.Update(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	secondLease := &coordinationv1.Lease{}
+	if err := cell.Get(ctx, client.ObjectKey{Namespace: "masque", Name: "ei-pod-a"}, secondLease); err != nil {
+		t.Fatal(err)
+	}
+	secondLease.Name, secondLease.UID, secondLease.ResourceVersion = second.GetName(), "lease-b", ""
+	secondLease.OwnerReferences[0].UID = second.GetUID()
+	secondLease.Annotations["galactic.datumapis.com/edge-pod-uid"] = "pod-b"
+	if err := cell.Create(ctx, secondLease); err != nil {
 		t.Fatal(err)
 	}
 	if err := driver.Applied(ctx, endpoint, true); err == nil {
@@ -290,6 +401,16 @@ func TestReadinessUsesMembershipNotAckCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := driver.Applied(ctx, endpoint, false); err != nil {
+		t.Fatal(err)
+	}
+	second.SetResourceVersion("")
+	if err := cell.Create(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.Applied(ctx, endpoint, false); err == nil {
+		t.Fatal("second live replica without forwarding-stop ack was ignored")
+	}
+	if err := cell.Delete(ctx, second); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(11 * time.Second)

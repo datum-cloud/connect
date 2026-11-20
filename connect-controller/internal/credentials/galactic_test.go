@@ -35,7 +35,7 @@ func TestRealGalacticGrantLifecycle(t *testing.T) {
 	}
 	vpc := &cloud.VPC{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "vpc", UID: "11111111-1111-1111-1111-111111111111"}, Spec: cloud.VPCSpec{Networks: []cloud.Network{"fd20:a1b:2c3d::/48"}}}
 	ref := masquegrant.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name}
-	registration := &galactic.MASQUEEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "masque-system", UID: "registration-incarnation"}, Spec: galactic.MASQUEEndpointSpec{Cell: "cell-a", Hostname: "gateway.example.test", Metro: "dfw", Provider: "shared", Revision: 1, Enabled: true, CertificateRef: galactic.MASQUEEndpointCertificateReference{Name: "tls", Revision: strings.Repeat("a", 64)}}}
+	registration := &galactic.MASQUEEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "masque-system", UID: "registration-incarnation"}, Spec: galactic.MASQUEEndpointSpec{Hostname: "gateway.example.test", Provider: "shared", Revision: 1, Enabled: true, CertificateRef: galactic.MASQUEEndpointCertificateReference{Name: "tls", Revision: strings.Repeat("a", 64)}}}
 	cell := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vpc, registration).Build()
 	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: registration.Spec.Hostname, CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Assignment: connect.EndpointAssignment{Cell: "cell-a"}}, Status: connect.ConnectEndpointStatus{Ready: true, Phase: "Active", Revision: 1, CertificateRevision: registration.Spec.CertificateRef.Revision, NotAfter: &expires, VerifiedAt: &verified}}
 	project := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&connect.ConnectEndpoint{}, &connect.ConnectGrant{}).WithObjects(endpoint).Build()
@@ -187,6 +187,24 @@ func TestManagedGrantRetryRetainsCellScopeAndPrefix(t *testing.T) {
 	cell := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&cloud.VPC{ObjectMeta: metav1.ObjectMeta{Namespace: "vpc", Name: "network", UID: "vpc-uid"}}).Build()
 	issuer := &ManagedIssuer{Project: project, Namespace: "service", RuntimeNamespace: "masque-system", Cells: map[string]client.Reader{"selected": cell}, Authorities: map[string]GrantAPI{"selected": selected, "other": other}, Now: func() time.Time { return now }}
 	binding := Binding{NetworkName: "network", NetworkUID: "network-uid", VPC: connect.EndpointVPCReference{Namespace: "vpc", Name: "network", UID: "vpc-uid"}, Name: "binding", UID: "binding-uid", PolicyRevision: "policy-1", Endpoint: endpoint, NetworkPlan: NetworkPlan{DestinationPrefixes: []string{"fd00::/48"}, MTU: 1280}}
+	issuer.Cells["other"] = fake.NewClientBuilder().WithScheme(scheme).WithObjects(&cloud.VPC{ObjectMeta: metav1.ObjectMeta{Namespace: "vpc", Name: "network", UID: "vpc-uid"}}).Build()
+	for _, scenario := range []string{"unconfigured-authority", "unconfigured-reader", "missing-selected-vpc"} {
+		t.Run(scenario, func(t *testing.T) {
+			switch scenario {
+			case "unconfigured-authority":
+				delete(issuer.Authorities, "selected")
+			case "unconfigured-reader":
+				delete(issuer.Cells, "selected")
+			case "missing-selected-vpc":
+				issuer.Cells["selected"] = fake.NewClientBuilder().WithScheme(scheme).Build()
+			}
+			if result, err := issuer.Mint(ctx, binding); err == nil || result.Credential != "" || len(selected.requests) != 0 || len(other.requests) != 0 {
+				t.Fatal("mint fell back to another control plane")
+			}
+			issuer.Authorities["selected"] = selected
+			issuer.Cells["selected"] = cell
+		})
+	}
 	first, err := issuer.Mint(ctx, binding)
 	if err != nil {
 		t.Fatal(err)

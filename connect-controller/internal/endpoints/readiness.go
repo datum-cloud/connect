@@ -40,7 +40,7 @@ func (d *KubernetesDriver) Applied(ctx context.Context, endpoint *connect.Connec
 	if revision != endpoint.Status.Revision || registration.GetDeletionTimestamp() != nil {
 		return fmt.Errorf("registration identity or revision not delivered")
 	}
-	for field, wanted := range map[string]string{"hostname": endpoint.Spec.Hostname, "cell": endpoint.Spec.Assignment.Cell, "provider": endpoint.Spec.Assignment.Provider, "metro": endpoint.Spec.Metro} {
+	for field, wanted := range map[string]string{"hostname": endpoint.Spec.Hostname, "provider": endpoint.Spec.Assignment.Provider} {
 		actual, _, _ := unstructured.NestedString(registration.Object, "spec", field)
 		if actual != wanted {
 			return fmt.Errorf("registration scope differs")
