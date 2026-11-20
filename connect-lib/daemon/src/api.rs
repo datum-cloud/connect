@@ -586,6 +586,10 @@ async fn create_service(
         last_actor: actor.label(),
     };
     let service_for_state = service.clone();
+    state
+        .control
+        .validate_service(&query.project, &service)
+        .await?;
     let (service, created) = state
         .store
         .transact(|root| {

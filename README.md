@@ -52,6 +52,12 @@ approved by your Connector's class and aliases of those keys. Use `--allow` to
 select specific Connectors. Explicitly allowing a gateway can expose your
 service through that gateway's ingress.
 Use `--protocol udp` with `serve` and `dial` for UDP; TCP is the default.
+Public services require platform-approved ingress gateway identities on the
+ConnectorClass. Connect checks service prerequisites before saving a new share
+or creating its cloud resources. An unsupported saved service reports an error
+without disabling the project; use `unserve` to remove it. Cleanup still checks
+cloud permissions and resource ownership, even when the local data plane has
+been disabled.
 Use `--project PROJECT` to select a project or use your `datumctl` context.
 Use `datumctl get` and `datumctl edit` to inspect and edit cloud resources.
 Connect does not provide another general-purpose resource-management CLI.

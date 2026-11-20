@@ -24,6 +24,7 @@ struct MockControl {
     resume_failures: AtomicUsize,
     service_calls: AtomicUsize,
     fail_service: AtomicBool,
+    reject_public_service: AtomicBool,
     fail_dial: AtomicBool,
     fail_network: AtomicBool,
     approval_required: AtomicBool,
@@ -86,6 +87,17 @@ impl Control for MockControl {
     async fn down(&self, _project: &str) -> Result<(), ApiError> {
         Ok(())
     }
+    async fn validate_service(
+        &self,
+        _project: &str,
+        service: &ServiceState,
+    ) -> Result<(), ApiError> {
+        if service.public && self.reject_public_service.load(Ordering::SeqCst) {
+            return Err(ApiError::bad_request("public ingress is unavailable"));
+        }
+        Ok(())
+    }
+
     async fn reconcile_service(
         &self,
         _project: &str,
@@ -746,6 +758,44 @@ async fn oidc_invalid_modes_and_unprivileged_binding_never_persist_credentials()
             .join("daemon/projects/alpha/credentials.json")
             .exists()
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn unsupported_public_service_is_not_saved_or_published() {
+    let repo = tempfile::tempdir().unwrap();
+    let control = Arc::new(MockControl::default());
+    control.reject_public_service.store(true, Ordering::SeqCst);
+    let (base, client, server) = setup(repo.path(), control.clone()).await;
+    let token = enroll_test_project(&base, &client, repo.path()).await;
+    let url = format!("{base}/v1/services?project=alpha");
+    let response = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&json!({"endpoint":"localhost:8817", "public":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(control.service_calls.load(Ordering::SeqCst), 0);
+    let status: Value = client
+        .get(format!("{base}/v1/status?project=alpha"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status["services"].as_array().unwrap().is_empty());
+    let response = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&json!({"endpoint":"localhost:8817"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
     server.abort();
 }
 

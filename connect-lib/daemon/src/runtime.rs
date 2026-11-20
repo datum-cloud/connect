@@ -877,17 +877,29 @@ impl Control for RealControl {
         Self::stop_runtime(runtime, true).await
     }
 
-    async fn reconcile_service(
+    async fn validate_service(
         &self,
         project: &str,
         service: &ServiceState,
-    ) -> Result<ServiceOutcome, ApiError> {
+    ) -> Result<(), ApiError> {
         if service.public && service.protocol == Protocol::Udp {
             return Err(ApiError::new(
                 axum::http::StatusCode::NOT_IMPLEMENTED,
                 "public UDP services are not supported by the control plane",
             ));
         }
+        let runtime = self.project(project).await?;
+        resolve_target(service).await?;
+        resolve_service_peers(&runtime.cloud, service).await?;
+        Ok(())
+    }
+
+    async fn reconcile_service(
+        &self,
+        project: &str,
+        service: &ServiceState,
+    ) -> Result<ServiceOutcome, ApiError> {
+        self.validate_service(project, service).await?;
         let runtime = self.project(project).await?;
         let cloud_service = runtime
             .cloud
@@ -918,9 +930,24 @@ impl Control for RealControl {
     }
 
     async fn pause_service(&self, project: &str, service: &ServiceState) -> Result<(), ApiError> {
-        let runtime = self.project(project).await?;
+        let runtime = self
+            .projects
+            .lock()
+            .await
+            .get(project)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::new(axum::http::StatusCode::CONFLICT, "project is down")
+                    .with_code("project_down")
+            })?;
         runtime.services.lock().await.remove(&service.id);
-        Self::refresh_policy(&runtime).await?;
+        if runtime.authorized.load(Ordering::Acquire)
+            && !runtime.cancel.is_cancelled()
+            && let Err(error) = Self::refresh_policy(&runtime).await
+        {
+            self.fail_closed(project, &runtime, "service_authorization", &error.message)
+                .await;
+        }
         runtime
             .cloud
             .delete_service(&service.id)
@@ -1355,6 +1382,175 @@ fn helper_approves_managed_attachment(
             .managed_policy
             .as_ref()
             .is_some_and(|policy| policy.approve(expected).is_ok())
+}
+
+#[cfg(test)]
+mod service_recovery_tests {
+    use super::*;
+    use axum::{
+        Json, Router,
+        http::{Method, StatusCode, Uri},
+        response::IntoResponse,
+    };
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        RealControl,
+        Arc<ProjectRuntime>,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+        JoinHandle<()>,
+    ) {
+        let repo = tempfile::tempdir().unwrap();
+        let store = Store::open(repo.path()).await.unwrap();
+        let control = RealControl::new(repo.path().into(), store, Arc::new(Mutex::new(())));
+        let key = SecretKey::generate();
+        let public_key = key.public().to_string();
+        let name = format!("connect-{}", &public_key[..40]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let writes = Arc::new(AtomicUsize::new(0));
+        let deny_deletion = Arc::new(AtomicBool::new(false));
+        let app = Router::new().fallback({
+            let public_key = public_key.clone();
+            let name = name.clone();
+            let writes = writes.clone();
+            let deny_deletion = deny_deletion.clone();
+            move |method: Method, uri: Uri| {
+                let public_key = public_key.clone();
+                let name = name.clone();
+                let writes = writes.clone();
+                let deny_deletion = deny_deletion.clone();
+                async move {
+                    if uri.path() == "/token" {
+                        return Json(json!({"access_token":"test-token","token_type":"Bearer","expires_in":3600})).into_response();
+                    }
+                    if method == Method::DELETE {
+                        if deny_deletion.load(Ordering::SeqCst) {
+                            return StatusCode::FORBIDDEN.into_response();
+                        }
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        return Json(json!({})).into_response();
+                    }
+                    if method != Method::GET {
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    if uri.path().ends_with(&format!("/connectors/{name}")) {
+                        return Json(json!({"metadata":{"name":name,"uid":"connector-uid"},"spec":{"publicKey":public_key,"classRef":"masque"}})).into_response();
+                    }
+                    if uri.path().ends_with("/connectorclasses/masque") {
+                        return Json(json!({"metadata":{"name":"masque"}})).into_response();
+                    }
+                    Json(json!({"metadata":{"name":"service","uid":"service-uid","resourceVersion":"1","labels":{"connect.datum.net/connector":name},"ownerReferences":[{"kind":"Connector","name":name,"uid":"connector-uid"}]}})).into_response()
+                }
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let credentials: Credentials = serde_json::from_value(json!({"type":"connector","project_id":"alpha","api_endpoint":base,"token_uri":format!("{base}/token"),"client_id":"test","refresh_token":"test-refresh"})).unwrap();
+        let cloud = CloudConnector::new(credentials, "alpha".into(), public_key.clone()).unwrap();
+        let transport =
+            Transport::bind(TransportConfig::new(key).bind_addr("127.0.0.1:0".parse().unwrap()))
+                .await
+                .unwrap();
+        let runtime = Arc::new(ProjectRuntime {
+            underlay: None,
+            cloud,
+            transport,
+            services: Mutex::new(HashMap::new()),
+            dials: Mutex::new(HashMap::new()),
+            networks: Mutex::new(HashMap::new()),
+            policy_lock: Mutex::new(()),
+            cancel: CancellationToken::new(),
+            refresh_task: Mutex::new(None),
+            liveness_task: Mutex::new(None),
+            authorized: AtomicBool::new(true),
+            identity: ConnectorState {
+                name,
+                uid: "connector-uid".into(),
+                public_key,
+            },
+        });
+        control
+            .projects
+            .lock()
+            .await
+            .insert("alpha".into(), runtime.clone());
+        (repo, control, runtime, writes, deny_deletion, server)
+    }
+
+    fn service() -> ServiceState {
+        ServiceState {
+            id: "service".into(),
+            endpoint: "127.0.0.1:8817".into(),
+            protocol: Protocol::Tcp,
+            public: true,
+            hostname: None,
+            allow: vec![],
+            desired_active: true,
+            running: false,
+            ready: false,
+            hostnames: vec![],
+            last_error: None,
+            last_error_stage: None,
+            last_actor: "setup".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_saved_service_does_not_disable_project_or_publish_resources() {
+        let (_repo, control, runtime, writes, _, server) = fixture().await;
+        for _ in 0..2 {
+            let error = control
+                .reconcile_service("alpha", &service())
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("no approved MASQUE gateway identities")
+            );
+            assert!(runtime.authorized.load(Ordering::Acquire));
+            assert!(runtime.services.lock().await.is_empty());
+            assert!(control.project("alpha").await.is_ok());
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        runtime.transport.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cleanup_works_after_fail_closed_without_reauthorizing_runtime() {
+        let (_repo, control, runtime, writes, deny_deletion, server) = fixture().await;
+        runtime
+            .services
+            .lock()
+            .await
+            .insert("service".into(), service());
+        control
+            .fail_closed(
+                "alpha",
+                &runtime,
+                "service_authorization",
+                "missing ingress",
+            )
+            .await;
+        deny_deletion.store(true, Ordering::SeqCst);
+        assert!(control.delete_service("alpha", &service()).await.is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        deny_deletion.store(false, Ordering::SeqCst);
+        control.delete_service("alpha", &service()).await.unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+        assert!(runtime.services.lock().await.is_empty());
+        assert!(!runtime.authorized.load(Ordering::Acquire));
+        assert!(control.project("alpha").await.is_err());
+        runtime.transport.shutdown().await;
+        server.abort();
+    }
 }
 
 #[cfg(test)]

@@ -43,6 +43,9 @@ pub trait Control: Send + Sync + 'static {
         ))
     }
 
+    async fn validate_service(&self, project: &str, service: &ServiceState)
+    -> Result<(), ApiError>;
+
     async fn reconcile_service(
         &self,
         project: &str,
@@ -140,6 +143,13 @@ impl Control for UnsupportedControl {
     }
     async fn down(&self, _project: &str) -> Result<(), ApiError> {
         Ok(())
+    }
+    async fn validate_service(
+        &self,
+        _project: &str,
+        _service: &ServiceState,
+    ) -> Result<(), ApiError> {
+        self.unsupported()
     }
     async fn reconcile_service(
         &self,
