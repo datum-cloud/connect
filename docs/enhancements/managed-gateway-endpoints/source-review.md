@@ -16,8 +16,10 @@ implementation remains in draft Connect PR #74, based on required prototype
 documentation-only on main. The historical November 18 evidence below does not
 describe the newer implementation.
 
-Published Connect implementation `6e2653ff93614c56a1590092f51a16cc8664db13`
+Published Connect implementation `10b848a10b7d226429cd03e6878052b296688e73`
 records the frozen contracts in `implementation.md` on its feature branch.
+Its opt-in runtime component exports static managed mounts, without enabling
+flags or permissions; Infrastructure selects it instead of a large inline patch.
 Controller race tests with Kubernetes 1.37 envtest, native/Linux builds and both
 Kustomize exports pass. Rust daemon tests report 41 passed/1 opt-in ignored;
 successor tests report 39 passed/1 opt-in ignored. Run the physical-connection
