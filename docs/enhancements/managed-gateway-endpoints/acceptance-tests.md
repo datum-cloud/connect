@@ -108,6 +108,17 @@ bearer credentials. A TLS handshake alone does not prove VPC connectivity.
 
 - Stop controllers after writes but before responses. Retry without duplicate
   names or grants; reject delayed updates from an older configuration.
+- Customer placement status includes hostname, metro and readiness conditions,
+  without certificate expiry or a service-project endpoint reference.
+- Recover planned and confirmed deliveries from one inventory after a restart,
+  including a successful create whose response was lost. Preserve resource
+  incarnation checks and cleanup of old certificate Secrets.
+- Persist grant Retiring before revocation. Interrupt the authority call and
+  restart; mint and refresh remain denied until retirement completes.
+- Bind the grant service to its configured cell. Requests cannot select another
+  cell, and saved receipts still direct revocation after the endpoint disappears.
+- Upgrade lifecycle/status representations without losing pending cleanup,
+  retirement state, delivery receipts, authorization checks or tombstones.
 - Interrupt project API access, DNS, issuance, distribution, and cell access.
   Report the failing dependency and do not mistake an outage for deletion.
 - Remove selected-cell reachability for one network. That binding becomes

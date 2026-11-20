@@ -6,6 +6,16 @@ issuance, Karmada placement, certificate propagation or production listeners.
 Statements about historical deployment inside infra documentation are that
 document's evidence, not observations made during this review.
 
+## Agreed API simplification (2026-11-20)
+
+The design also removes customer placement certificate expiry and internal
+assignment references, consolidates delivery tracking, replaces redundant endpoint
+status with conditions and a cleanup stage, uses one grant retirement state, and
+binds cell context when configuring the grant service. This follow-up is being
+implemented; the published revisions and test evidence below do not establish
+that it is complete. Certificate authorization readers and Infra contracts must
+be updated together where these status changes affect them.
+
 ## Control-plane placement clarification (2026-11-20)
 
 Connect `07b0023245cad1ad467463b9f61bc6f76373ddaf` pins Galactic

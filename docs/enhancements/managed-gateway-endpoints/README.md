@@ -54,7 +54,7 @@ several Locations in one metro share that endpoint.
 
 This service project is the durable home for Connect's lifecycle state. `ConnectEndpoint` owns the durable reservation and selected cell;
 `ConnectGrant` pins each binding to resolved Network and VPC identities. Customer
-placements reference the shared endpoint. DNS and certificate requests use the
+placements report the shared hostname without exposing the internal endpoint reference. DNS and certificate requests use the
 existing project APIs. Records
 retain the customer project and gateway UIDs so cleanup can continue after the
 customer project disappears. Customer credentials cannot modify them. The service
@@ -230,7 +230,11 @@ gateway must not interrupt other gateways sharing the listener.
 ### Client connections and cell selection
 
 The broker checks the current binding and policy, selects a ready endpoint, and
-obtains a grant from Galactic for its actual serving cell. The existing descriptor
+obtains a grant from Galactic for its actual serving cell. Bind cell identity when
+configuring the grant service, rather than accepting it on each create request.
+Keep cell scoping in the allocation ledger and the durable Connect grant receipt
+so revocation still reaches the right authority after source resources disappear.
+The existing descriptor
 carries the hostname, credential, expiry, VPC selector, transports, and network
 plan. The client verifies WebPKI and checks the granted prefix and routes before
 activating its interface.
@@ -254,9 +258,24 @@ establish access to every network. Each binding separately needs explicit policy
 current Network/VPC identity and selected-cell reachability. Real packet checks
 remain a per-binding release gate. A ready pod or Secret delivery is insufficient.
 
-Project status should explain whether the endpoint is waiting on a certificate,
-DNS or listener configuration. Binding status separately explains network access. It may show the hostname, metro,
-and validity dates. Keep private references and credentials out of that status.
+Customer placement status exposes hostname, resolved metro and conditions that
+explain readiness. Binding status separately explains network access. Certificate
+expiry and the service project's endpoint reference remain internal.
+
+The internal endpoint keeps desired lifecycle in spec and a durable cleanup stage
+in status. Use standard conditions for readiness and errors instead of separate
+ready/reason fields, and remove the redundant phase field. Keep one delivery
+inventory for Secrets, registrations and policies, recording planned writes and
+confirmed resource incarnations. It must support recovery after a lost response
+and cleanup after deletion without a second list of Secret names.
+
+A grant has one state: Active, Retiring or Retired. Persist Retiring before calling
+the authority, and refuse credential issuance or refresh from that point onward.
+Keep activation revisions separate from configuration revisions: certificate
+renewal must not act like endpoint reactivation. Retain certificate digests,
+per-instance observed/applied revisions and forwarding-stop evidence, private UID
+pins, reservation authorization and receipt digests. These protect different
+lifecycle and authorization boundaries.
 
 Controllers save object UIDs, desired versions, and pending work so they can
 resume after a restart or a lost response. Old workers must not overwrite a newer
