@@ -6,7 +6,8 @@ cover parts of the contract; they do not replace deployed packet qualification.
 ## Setup
 
 Use two customer projects, a separate Connect service-provider project, two
-Locations in the same metro, another metro, and two cells.
+Locations in the same metro, another metro, and two cells with separate control
+planes. Include multiple serving replicas in at least one control plane.
 Exercise the real DNS, certificate, distribution, and Galactic integrations.
 Keep another tenant connected to the same listeners during failure tests.
 
@@ -45,6 +46,23 @@ bearer credentials. A TLS handshake alone does not prove VPC connectivity.
 - A valid credential cannot access another gateway by changing SNI, HTTP authority,
   or the VPC selector. Test each transport, including multiple HTTP/2 requests
   sharing a connection.
+
+## Placement and local acknowledgments
+
+- Keep metro and cell assignments in Connect's service-provider Project. Delivered
+  `MASQUEEndpoint` specs have no `cell` or `metro` fields. Galactic does not require
+  those fields to accept an otherwise valid local registration.
+- Verify distribution targeting and credentials reach only the selected control
+  plane. A misplaced registration must be prevented by that boundary, not by a
+  redundant field check inside Galactic. Read readiness from the selected API.
+- When multiple providers are independently selectable in one control plane,
+  verify the local provider reference selects only the intended provider. When
+  selection is implicit, do not require a redundant provider field.
+- With multiple serving replicas, delay one replica's apply acknowledgment. The
+  endpoint stays unready even if another replica reports success. On removal,
+  require forwarding-stop confirmation from every relevant replica.
+- Resolve each `instanceName` locally against current membership and its Lease.
+  A same-named instance in another control plane cannot satisfy readiness.
 
 ## Multiple networks on one connection
 

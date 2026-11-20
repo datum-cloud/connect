@@ -71,10 +71,17 @@ infrastructure. Karmada holds downstream distribution resources and delivers the
 issued Secret to the selected cell. The project holds desired state and status,
 not a copy of the certificate's private key.
 
-The **cell control plane** is separate. It holds the delivered TLS Secrets,
-Galactic endpoint registrations, and runtime networking resources. Karmada delivers
-configuration to the selected cell and returns status. Galactic reports when the
-configuration is applied; delivery alone does not make an endpoint ready.
+Each cell/metro has a **separate control plane**. Connect selects that destination
+and retains the metro and cell assignment in its service-provider Project. The
+destination control plane holds delivered TLS Secrets, Galactic endpoint
+registrations, and runtime networking resources. Karmada delivers configuration
+to that control plane and returns status. Galactic reports when the configuration
+is applied; delivery alone does not make an endpoint ready.
+
+Connect owns placement across control planes. Galactic applies and serves the
+endpoint within its local control plane. Distribution targeting and credentials
+must enforce that boundary; the registration does not repeat the destination as
+`cell` or `metro` fields.
 
 ### Customer APIs and shared transport
 
@@ -174,10 +181,15 @@ track which certificate each serving instance has applied.
 ### Galactic listener integration
 
 `MASQUEEndpoint` associates each hostname with its certificate, not a customer
-Project, gateway UID, Network or VPC. Its spec contains only hostname, metro,
-cell, provider, revision, certificateRef and enabled. It retains one cell, provider, monotonic endpoint
-revision and leaf-DER SHA256 certificate revision. Per-instance applied status
-must match both revisions. Private keys live only in cell Secrets and the central
+Project, gateway UID, Network or VPC. Its spec contains `hostname`, `revision`,
+`certificateRef` and `enabled`. The destination control plane supplies the cell
+and metro context, so `spec.cell` and `spec.metro` are omitted. Retain `provider`
+only when that control plane hosts multiple independently selectable Galactic
+providers; otherwise provider selection is implicit.
+
+The endpoint revision increases with configuration changes; the certificate
+revision is the leaf-DER SHA256 digest. Per-instance applied status must match
+both revisions. Private keys live only in cell Secrets and the central
 Certificates infrastructure.
 
 The grant API takes a namespaced endpoint reference and a name-only VPC reference.
@@ -187,11 +199,21 @@ privately bind service and VPC incarnations; public authorization and refresh
 messages carry name-only references, never copied UIDs. A shared connection never
 broadens that per-stream authorization.
 
-Applied status identifies an instance by its actual name, not copied instance or
-pod UIDs. Connect checks authoritative EdgeInstance and Lease membership and
-requires the acknowledgment after both instance creation and Lease acquisition.
-The durable hostname fence binds the registration name, cell and provider and
-retains monotonic/revoked revisions through recreation. Distributed registrations,
+`status.instances[].instanceName` references a local `EdgeInstance`; it does not
+select a destination or a VPC. One control plane can have multiple serving
+replicas. Each reports the endpoint and certificate revisions it applied, or
+confirms that forwarding stopped. A single successful replica must not hide a
+stale or missing acknowledgment from another replica that may receive traffic.
+
+Connect queries the selected control plane, checks authoritative `EdgeInstance`
+and Lease membership, and requires fresh acknowledgments after instance creation
+and Lease acquisition. Instance references must not introduce copied UID fields;
+the current `ei-<podUID>` naming is an implementation detail to resolve before
+claiming that status names conceal internal UIDs.
+
+The durable hostname fence is local to the destination control plane and binds
+the registration name and applicable provider. It retains monotonic/revoked
+revisions through recreation; it does not need copied cell or metro fields. Distributed registrations,
 Secrets and policies carry no endpoint identity UID labels or annotations.
 Connect keeps cleanup incarnation receipts privately in its service Project.
 

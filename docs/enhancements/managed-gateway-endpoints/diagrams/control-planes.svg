@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="1420" viewBox="0 0 960 1420" role="img" aria-labelledby="title description">
 <title id="title">Project resources and dependent systems</title>
-<desc id="description">The customer project holds gateway intent. The Connect service-provider project holds endpoint records, TLSCertificate requests, DNSZone and DNSRecordSet resources. Certificates and DNS reconcile these project resources from outside the project. Issued keys remain in Certificates infrastructure and are delivered through Karmada to the separate cell control plane.</desc>
+<desc id="description">The customer project holds gateway intent. The Connect service-provider project holds endpoint records, TLSCertificate requests, DNSZone and DNSRecordSet resources. Certificates and DNS reconcile these project resources from outside the project. Issued keys remain in Certificates infrastructure and are delivered through Karmada to the selected cell control plane. Each cell/metro has its own control plane; placement stays in Connect.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
 <style>text { font-family: Arial, Helvetica, sans-serif; fill: #172b4d; } .heading { font-size: 21px; font-weight: 700; } .label { font-size: 18px; } .detail { font-size: 17px; fill: #475569; } .line { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }</style>
 
@@ -37,7 +37,7 @@
 <text x="215" y="835" class="heading" text-anchor="middle">Karmada</text>
 <text x="215" y="865" class="detail" text-anchor="middle">Named registration + Secret</text>
 <rect x="20" y="1000" width="920" height="400" rx="10" fill="#f0fdf4" stroke="#96bda1" stroke-width="1.5"/>
-<text x="500" y="1035" class="heading" text-anchor="middle">Selected cell</text>
+<text x="500" y="1035" class="heading" text-anchor="middle">Selected cell control plane</text>
 <rect x="50" y="1050" width="330" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="215" y="1085" class="heading" text-anchor="middle">Galactic</text>
 <text x="215" y="1114" class="detail" text-anchor="middle">Per-stream VPC authorization</text>

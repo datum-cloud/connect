@@ -6,6 +6,23 @@ issuance, Karmada placement, certificate propagation or production listeners.
 Statements about historical deployment inside infra documentation are that
 document's evidence, not observations made during this review.
 
+## Control-plane placement clarification (2026-11-20)
+
+The design now treats each cell/metro as a separate control plane. Connect keeps
+placement in its service-provider Project; the delivered `MASQUEEndpoint` omits
+`spec.cell` and `spec.metro`. Local provider selection is needed only when the
+control plane has multiple independently selectable providers. Per-instance
+acknowledgments remain local status, checked against current membership/Leases.
+
+This is a design change, not a claim that the published implementation already
+matches it. Galactic's inspected schema still requires cell and metro, filters
+registrations by cell/provider, and includes them in immutable identity/fences.
+Connect's inspected delivery/readiness code still copies and compares these
+fields. Implementation must remove those assumptions and enforce placement via
+distribution targeting, credentials and reads from the selected control plane.
+The current `ei-<podUID>` instance naming also remains an internal-identity concern.
+Earlier test and CI evidence below does not validate this new design change.
+
 ## Structural reference
 
 ### November 20 shared-transport revision
