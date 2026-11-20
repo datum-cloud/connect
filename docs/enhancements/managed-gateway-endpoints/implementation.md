@@ -238,8 +238,10 @@ Dependencies:
 - Certificates: `4cec00395b3647737685addd697e40f2e94d3214`, draft PR milo-os/certificates#83.
 - Infrastructure: `c77e72527ed35ecb3d55cca8b5d49427427258c4` (implementation base
   `4edfe175ce00fd0c044bd6072a834ae1461b35ec`), draft PR datum-cloud/infra#9647.
-- Galactic: `ed8dddbeca8ccb1b38623de0a5f4f344ef0b0e27`, draft PR datum-cloud/galactic#1465;
-  Go module `v0.9.5-0.20261120141021-ed8dddbeca8c`, without local replacements.
+- Galactic: `df3279afb62d05c82e964fcc7345cfeacf6fd3a8`, draft PR datum-cloud/galactic#1465;
+  Go module `v0.9.5-0.20261120152434-df3279afb62d`, without local replacements.
+  This CI correction changes API comments and the load-safe CRD export, not
+  endpoint, grant or runtime contracts.
 
 The Galactic dependency requires Go 1.26.4 and Kubernetes Go modules 0.37.2;
 the controller module follows those minimum versions. Controller generation
