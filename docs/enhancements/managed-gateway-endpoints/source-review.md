@@ -10,14 +10,22 @@ document's evidence, not observations made during this review.
 
 ### November 20 shared-transport revision
 
-The later name-based revision is now agreed and being implemented. It removes
+The later name-based revision is published in Connect
+`e560567b5ad9bed7f7ad4508951b3c85adce7089` and Galactic
+`de6b48f549dc1e10977e8046d029521d835be323`. It removes
 customer Project and identity UID fields from the Galactic managed registration,
 public grant facade and authority wire messages. Endpoint/VPC/service references
 are namespaced names; private incarnation pins and receipt validation remain.
 Status carries instance names, with acknowledgments required after authoritative
 instance creation and Lease acquisition. Distributed UID labels/annotations are
-removed; Connect holds private cleanup receipts. The published revisions below
-describe the previous contract, not completion or CI evidence for this new work.
+removed; Connect holds private cleanup receipts. Its pending create receipts
+store a content digest before creation and bind the returned object incarnation,
+allowing exact-content recovery after a lost response. VPC checks before and after
+minting retire a raced credential without returning it. Controller race/envtest,
+vet, native/Linux builds, restricted Kustomize exports and actual Rust H3/H2 pooling
+tests pass against the published dependency without local replacements.
+Final-head GitHub CI remains a separate required check. The older published
+revisions below describe previous evidence, not CI for this new work.
 
 The updated design separates gateway endpoints from network bindings. The
 implementation remains in draft Connect PR #74, based on required prototype
