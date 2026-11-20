@@ -26,6 +26,12 @@ successor tests report 39 passed/1 opt-in ignored. Run the physical-connection
 fixtures with `cd connect-lib && cargo test -p datum-connect-daemon pool_tests --lib`
 using Rust 1.98. Both protocols and separate security-context pools pass.
 
+Infrastructure `baab918a7fad312b2bd46829594c1671d69f5704` (PR #9647) pins that
+Connect revision and the dependencies below. Clean-source validation passes four
+CRD fixtures, 24 native workload resources and the opt-in mounts/token checks.
+Its patch-size guard passes without exceptions. Independently rerun Rust pooling
+and Galactic authority tests pass; these remain separate from live qualification.
+
 Published Galactic dependency `ed8dddbeca8ccb1b38623de0a5f4f344ef0b0e27`
 (PR #1465) removes Network/VPC fields from endpoint registrations. Managed grant
 creation instead requires Network UID, binding UID and a UID-pinned VPC reference.
