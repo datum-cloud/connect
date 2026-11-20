@@ -101,6 +101,8 @@ spec:
               gatewayRef:
                 properties:
                   name:
+                    maxLength: 253
+                    minLength: 1
                     type: string
                 required:
                 - name
@@ -154,6 +156,18 @@ spec:
                     type: object
                 type: object
                 x-kubernetes-map-type: atomic
+              networkRefs:
+                items:
+                  properties:
+                    name:
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                  required:
+                  - name
+                  type: object
+                maxItems: 64
+                type: array
             required:
             - access
             - connectorSelector

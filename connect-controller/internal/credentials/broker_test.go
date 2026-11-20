@@ -9,7 +9,48 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	connect "go.datum.net/connect-controller/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestBrokerDeniesRevocationDuringMint(t *testing.T) {
+	for _, change := range []string{"binding", "policy", "endpoint", "activation"} {
+		t.Run(change, func(t *testing.T) {
+			reads := 0
+			broker := &Broker{
+				Authenticator: authenticatorFunc(func(context.Context, string) (string, error) { return "laptop", nil }),
+				Resolver: resolverFunc(func(context.Context, string) (Binding, error) {
+					reads++
+					binding := Binding{Name: "binding", UID: "binding-uid", Connector: "laptop", PolicyRevision: "policy", Endpoint: &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{UID: "endpoint-uid"}, Status: connect.ConnectEndpointStatus{ActivationRevision: 1}}}
+					if reads > 1 {
+						switch change {
+						case "binding":
+							binding.UID = "replacement"
+						case "policy":
+							binding.PolicyRevision = "replacement"
+						case "endpoint":
+							binding.Endpoint.UID = "replacement"
+						case "activation":
+							binding.Endpoint.Status.ActivationRevision = 2
+						}
+					}
+					return binding, nil
+				}),
+				Issuer: issuerFunc(func(context.Context, Binding) (IssuedTransport, error) {
+					return IssuedTransport{Credential: "must-not-return"}, nil
+				}),
+			}
+			request := httptest.NewRequest(http.MethodPost, "/connectnetworkbindings/binding/connection-credentials", nil)
+			request.Header.Set("Authorization", "Bearer token")
+			response := httptest.NewRecorder()
+			broker.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden || strings.Contains(response.Body.String(), "must-not-return") || response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatal("mint race disclosed credential", response.Code)
+			}
+		})
+	}
+}
 
 type resolverFunc func(context.Context, string) (Binding, error)
 

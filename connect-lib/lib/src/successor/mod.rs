@@ -543,15 +543,29 @@ impl CloudConnector {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        let managed = items
+        let mut managed = items
             .iter()
             .copied()
-            .filter(|gateway| {
-                gateway["spec"]["networkRef"] == network
-                    && gateway["spec"]["contractVersion"] == "managed-network-v1"
-            })
+            .filter(|gateway| gateway["spec"]["contractVersion"] == "managed-network-v1")
             .cloned()
             .collect::<Vec<_>>();
+        if managed.len() > 1
+            && let Some(binding) = self
+                .connect_get(
+                    "connectnetworkbindings",
+                    &network_binding_name(network, &self.name),
+                )
+                .await?
+            && binding["spec"]["connectorRef"] == self.name
+            && binding["spec"]["networkRef"] == network
+        {
+            managed.retain(|gateway| gateway["metadata"]["name"] == binding["spec"]["gatewayRef"]);
+            if managed.is_empty() {
+                return Err(Error::Ownership(
+                    "existing network binding references an unavailable managed gateway".into(),
+                ));
+            }
+        }
         if managed.len() > 1 {
             let names = managed
                 .iter()
@@ -559,7 +573,7 @@ impl CloudConnector {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(Error::Unsupported(format!(
-                "multiple managed ConnectGateways exist for network {network:?}: {names}; select one explicitly or ask your administrator to resolve the duplicate"
+                "multiple managed ConnectGateways exist for joining network {network:?}: {names}; create a ConnectNetworkBinding with explicit gatewayRef, connectorRef and networkRef to choose one"
             )));
         }
         let (gateway, selected_location) = if let Some(gateway) = managed.into_iter().next() {
@@ -634,6 +648,7 @@ impl CloudConnector {
             Some(value) => {
                 if value["spec"]["connectorRef"] != self.name
                     || value["spec"]["gatewayRef"] != gateway_name
+                    || (gateway["spec"]["contractVersion"] == "managed-network-v1" && value["spec"]["networkRef"] != network)
                 {
                     return Err(Error::Ownership(format!(
                         "network binding {binding_name} already targets another Connector or gateway; remove it with `datumctl connect leave {network}` first"
@@ -648,7 +663,7 @@ impl CloudConnector {
                         "apiVersion": CONNECT_GROUP,
                         "kind": "ConnectNetworkBinding",
                         "metadata": {"name": binding_name},
-                        "spec": {"gatewayRef": gateway_name, "connectorRef": self.name}
+                        "spec": {"gatewayRef": gateway_name, "connectorRef": self.name, "networkRef": network}
                     }),
                 )
                 .await?
@@ -998,7 +1013,11 @@ impl CloudConnector {
                         "ConnectNetworkBinding {name} references a missing gateway"
                     ))
                 })?;
-            let network = string(&gateway, "/spec/networkRef")?;
+            let network = if gateway["spec"]["contractVersion"] == "managed-network-v1" {
+                string(binding, "/spec/networkRef")?
+            } else {
+                string(&gateway, "/spec/networkRef")?
+            };
             let status = &binding["status"];
             result.push(json!({
                 "network": network,

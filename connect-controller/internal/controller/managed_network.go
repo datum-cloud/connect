@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	connectv1alpha1 "go.datum.net/connect-controller/api/v1alpha1"
+	"go.datum.net/connect-controller/internal/endpoints"
 )
 
 const (
@@ -46,9 +47,6 @@ func effectiveGatewayContract(spec connectv1alpha1.ConnectGatewaySpec) string {
 }
 
 func validateManagedGatewaySpec(spec connectv1alpha1.ConnectGatewaySpec) error {
-	if spec.NetworkRef == "" {
-		return fmt.Errorf("networkRef is required")
-	}
 	if spec.Placement == nil {
 		return fmt.Errorf("placement is required")
 	}
@@ -140,10 +138,17 @@ func resolvePolicyGateways(policy *connectv1alpha1.ConnectConnectionPolicy, gate
 	return resolved, nil
 }
 
-func effectivePolicyRevision(policies []connectv1alpha1.ConnectConnectionPolicy, connector *connectv1alpha1.Connector, gateway *connectv1alpha1.ConnectGateway, networkPrefix string) (string, int, error) {
+func effectivePolicyRevision(policies []connectv1alpha1.ConnectConnectionPolicy, connector *connectv1alpha1.Connector, gateway *connectv1alpha1.ConnectGateway, networkPrefix string, networkNames ...string) (string, int, error) {
+	networkName := gateway.Spec.NetworkRef
+	if len(networkNames) > 0 {
+		networkName = networkNames[0]
+	}
 	var revisions []string
 	for i := range policies {
 		policy := &policies[i]
+		if !policy.DeletionTimestamp.IsZero() {
+			continue
+		}
 		if policy.Namespace != connector.Namespace {
 			continue
 		}
@@ -159,7 +164,11 @@ func effectivePolicyRevision(policies []connectv1alpha1.ConnectConnectionPolicy,
 			gatewaySelector, _ := metav1.LabelSelectorAsSelector(policy.Spec.GatewaySelector)
 			matches = gatewaySelector.Matches(labels.Set(gateway.Labels))
 		}
-		if matches {
+		allowedNetwork := false
+		for _, reference := range policy.Spec.NetworkRefs {
+			allowedNetwork = allowedNetwork || reference.Name == networkName
+		}
+		if matches && allowedNetwork && networkName != "" {
 			revisions = append(revisions, fmt.Sprintf("%s:%d:%s", policy.Name, policy.Generation, policy.Status.Revision))
 		}
 	}
@@ -167,7 +176,7 @@ func effectivePolicyRevision(policies []connectv1alpha1.ConnectConnectionPolicy,
 	if len(revisions) == 0 {
 		return "", 0, nil
 	}
-	sum := sha256.Sum256([]byte(strings.Join(revisions, "\n") + "\nnetwork=" + networkPrefix))
+	sum := sha256.Sum256([]byte(strings.Join(revisions, "\n") + "\nnetwork=" + networkName + "\nprefix=" + networkPrefix))
 	return hex.EncodeToString(sum[:]), len(revisions), nil
 }
 
@@ -204,7 +213,7 @@ func listPlacementLocations(ctx context.Context, c client.Client) ([]placementLo
 
 // reconcileManagedGatewayPlacements is kept separate from provider assignment:
 // it owns only selector expansion and the bounded parent summary.
-func reconcileManagedGatewayPlacements(ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway, locations []placementLocation) error {
+func reconcileManagedGatewayPlacements(ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway, locations []placementLocation, deferSummary bool) error {
 	if err := validateManagedGatewaySpec(gateway.Spec); err != nil {
 		return updateManagedGatewayStatus(ctx, c, gateway, 0, 0, 0, false, err.Error())
 	}
@@ -252,7 +261,35 @@ func reconcileManagedGatewayPlacements(ctx context.Context, c client.Client, gat
 		}
 	}
 	count := int32(len(matched))
+	if deferSummary {
+		return nil
+	}
 	return updateManagedGatewayStatus(ctx, c, gateway, count, ready, count-ready, true, "selector resolved")
+}
+
+func updateManagedEndpointStatus(ctx context.Context, customer client.Client, gateway *connectv1alpha1.ConnectGateway, locations map[string]string) error {
+	metros := map[string]bool{}
+	for _, metro := range locations {
+		metros[metro] = false
+	}
+	var placements connectv1alpha1.ConnectGatewayPlacementList
+	if err := customer.List(ctx, &placements, client.InNamespace(gateway.Namespace)); err != nil {
+		return err
+	}
+	for _, placement := range placements.Items {
+		metro, selected := locations[placement.Spec.LocationRef]
+		if selected && placement.Spec.GatewayRef == gateway.Name && placement.DeletionTimestamp.IsZero() && placement.Status.Metro == metro && meta.IsStatusConditionTrue(placement.Status.Conditions, "Ready") {
+			metros[metro] = true
+		}
+	}
+	var ready int32
+	for _, available := range metros {
+		if available {
+			ready++
+		}
+	}
+	matched := int32(len(metros))
+	return updateManagedGatewayStatus(ctx, customer, gateway, matched, ready, matched-ready, true, "selector resolved to distinct metro endpoints")
 }
 
 func updateManagedGatewayStatus(ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway, matched, ready, unavailable int32, resolved bool, message string) error {
@@ -347,6 +384,9 @@ func networkPrefix(ctx context.Context, c client.Client, namespace, name string)
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, network); err != nil {
 		return "", err
 	}
+	if !network.GetDeletionTimestamp().IsZero() {
+		return "", fmt.Errorf("Network %s is deleting", name)
+	}
 	prefix, found, err := unstructured.NestedString(network.Object, "status", "ipam", "ipv6Prefix")
 	if err != nil {
 		return "", err
@@ -361,7 +401,7 @@ func networkPrefix(ctx context.Context, c client.Client, namespace, name string)
 	return parsed.Masked().String(), nil
 }
 
-func reconcileManagedNetworkBinding(ctx context.Context, c client.Client, binding *connectv1alpha1.ConnectNetworkBinding, gateway *connectv1alpha1.ConnectGateway) error {
+func reconcileManagedNetworkBinding(ctx context.Context, c client.Client, binding *connectv1alpha1.ConnectNetworkBinding, gateway *connectv1alpha1.ConnectGateway, services ...*endpoints.Service) error {
 	binding.Status.EndpointID = ""
 	binding.Status.AssignedAddress = ""
 	binding.Status.PeerAddress = ""
@@ -397,15 +437,39 @@ func reconcileManagedNetworkBinding(ctx context.Context, c client.Client, bindin
 	if selected == "" {
 		return setCondition(metav1.ConditionFalse, "NoReadyPlacement", "logical gateway has no ready placement")
 	}
-	prefix, err := networkPrefix(ctx, c, binding.Namespace, gateway.Spec.NetworkRef)
+	prefix, err := networkPrefix(ctx, c, binding.Namespace, binding.Spec.NetworkRef)
 	if err != nil {
 		return setCondition(metav1.ConditionFalse, "NetworkNotReady", err.Error())
+	}
+	if len(services) > 0 && services[0] != nil {
+		service := services[0]
+		network := &unstructured.Unstructured{}
+		network.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.datumapis.com", Version: "v1alpha", Kind: "Network"})
+		if err := c.Get(ctx, client.ObjectKey{Namespace: binding.Namespace, Name: binding.Spec.NetworkRef}, network); err != nil {
+			return err
+		}
+		for _, placement := range placements.Items {
+			if placement.Name != selected {
+				continue
+			}
+			endpoint, err := service.EndpointForGateway(ctx, gateway, placement.Status.Metro)
+			if err != nil {
+				return setCondition(metav1.ConditionFalse, "NetworkNotReachable", "endpoint assignment unavailable")
+			}
+			vpc, err := service.ResolveVPC(string(network.GetUID()), endpoint.Spec.Assignment.Cell)
+			if err != nil {
+				return setCondition(metav1.ConditionFalse, "NetworkNotReachable", err.Error())
+			}
+			if err := service.ValidateBindingIdentity(ctx, string(binding.UID), string(network.GetUID()), endpoint.Spec.Assignment.Cell, vpc); err != nil {
+				return setCondition(metav1.ConditionFalse, "NetworkIdentityChanged", err.Error())
+			}
+		}
 	}
 	var policies connectv1alpha1.ConnectConnectionPolicyList
 	if err := c.List(ctx, &policies, client.InNamespace(binding.Namespace)); err != nil {
 		return err
 	}
-	revision, count, err := effectivePolicyRevision(policies.Items, &connector, gateway, prefix)
+	revision, count, err := effectivePolicyRevision(policies.Items, &connector, gateway, prefix, binding.Spec.NetworkRef)
 	if err != nil {
 		return setCondition(metav1.ConditionFalse, "PolicyInvalid", err.Error())
 	}

@@ -49,12 +49,21 @@ jobs:
         with:
           go-version-file: connect-controller/go.mod
           cache-dependency-path: connect-controller/go.sum
+      - name: Install pinned envtest assets
+        run: |
+          assets=$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.2 use 1.37.0 -p path)
+          test -x "$assets/kube-apiserver"
+          echo "KUBEBUILDER_ASSETS=$assets" >> "$GITHUB_ENV"
       - name: Test
-        run: go test -timeout 5m ./...
+        run: go test -race -count=1 -timeout 5m ./...
       - name: Build
-        run: go build ./cmd/controller
+        run: go build ./cmd/...
       - name: Render deployment
-        run: kubectl kustomize config/default >/dev/null
+        run: |
+          kubectl kustomize config/default >/dev/null
+          kubectl kustomize config/components/managed-endpoints/crd >/dev/null
+          kubectl kustomize config/components/managed-endpoints/admission >/dev/null
+          kubectl kustomize config/components/managed-endpoints/iam >/dev/null
 
   windows-gnu-link:
     runs-on: ubuntu-latest

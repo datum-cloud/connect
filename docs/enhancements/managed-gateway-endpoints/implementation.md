@@ -1,0 +1,433 @@
+# Managed endpoints implementation
+
+This branch depends on gateway prototype commit
+`73adbc35d08a3599bcd7075ec9e04e2144f8a750`, not the scaffolding on main.
+Design: Connect PR #73. Staging deployment is now explicitly authorized, with
+Infra as sole cluster configuration writer. Production and merges are not authorized.
+
+## Revised shared transport contract (2026-11-20)
+
+Agreed with Galactic, Certificates and Infrastructure: gateways and endpoints
+are independent of networks. Customer bindings explicitly name gateway,
+connector and network. Policies must explicitly list allowed `networkRefs`;
+an old policy without this list grants no managed network access. Gateway
+permission alone never authorizes a stream.
+
+The latest name-based contract removes all identity UID fields and customer
+project information from `MASQUEEndpoint`. Galactic's public CreateRequest takes
+`EndpointRef:{namespace,name}` and `VPC:{namespace,name}`, with no Network or
+Binding fields. Galactic resolves its own VPC incarnation internally. Connect
+retains private ConnectGrant network/binding/VPC pins and checks the local VPC
+before and after minting; recreation retires the credential rather than returning
+it. Source-project authorization stays in the authenticated Connect broker.
+Certificates' reservation authorization and certificate revision are unchanged.
+The new Galactic dependency is published and pinned below; final-head GitHub CI
+must be verified separately from local tests.
+
+Operator JSON separates `capacity:[{metro,assignment:{cell,provider,frontend}}]`
+from `reachability:[{networkUID,cell,vpcRef:{namespace,name,uid}}]`.
+`cells` and `probeURL` retain their existing shape. A binding requires an exact
+reachability mapping in the already selected cell; no roaming is allowed.
+Endpoint probe fields are `endpointRef:{namespace,name}`, `hostname`, `revision`, `certificateRevision`,
+`cell`, `checkedAt`, `h3`, `h2`, `dns`; the old `vpc` boolean is removed.
+Network forwarding qualification is separate, per binding.
+
+Public hostname labels are allocated randomly once and stored in the reservation.
+UIDs remain internal recreation fences, never user inputs or public host labels.
+The client shares one physical transport per endpoint and security context,
+with separately authenticated streams, refresh and cancellation per binding.
+Local overlapping routes remain unsupported. Server fake-backend tests, actual
+Rust client pooling tests, and deployed packet qualification are separate gates.
+
+The controller and Rust client implement this contract. Certificates dependency is
+`61c89782b9f45f1430a5a1bfd861a93f2024bab3` (lifecycle-only reservation authorization; reader-first upgrade).
+
+## Lifecycle contracts
+
+Managed CRD definitions are installed globally in core Milo, with Project-local
+instances. The opt-in native admission guard and separately scoped IAM grants
+are required; Project discovery is not an access boundary. Follow the
+[ordered bootstrap and live authorization gates](../../../connect-controller/config/components/managed-endpoints/admission/README.md).
+The guard defaults to denial and requires observed writer username/UID and
+trusted singleton service Project context. It never substitutes for GET/LIST/WATCH
+authorization. The credential mechanism must support renewal.
+
+Connect owns namespaced `connect.datumapis.com/v1alpha1 ConnectEndpoint`
+(`connectendpoints`) in an explicitly configured service-provider Project.
+It has no customer owner reference. Immutable identity is
+`spec.customerProjectUID`, `gatewayUID`, `metro`, `hostname`. `spec.lifecycle`
+is `Active`, `Deleting`, or `Retired`. Assignment pins one existing cell, independent of VPCs.
+Customer placements share the endpoint when Locations resolve to the same metro.
+Gateway availability counts distinct metros, not duplicate Location placements.
+
+Certificates agreed: `TLSCertificate.spec.managedAuthorization` contains
+`reservationName` and `reservationUID`. Requests use DNS01 and exactly one name.
+Authorization reads the pinned service Project, checks the trusted writer and
+cluster, reservation UID, identity, hostname, namespace, `spec.lifecycle=Active`,
+and `status.certificateRef.name/uid`. Phase and Ready are not issuance gates. Create the reservation,
+publish the certificate name, create the request, then bind its returned UID.
+`TLSCertificate.status.certificateRevision` is lowercase SHA256 of leaf DER.
+Publish the exact `status.requiredDNSRecords` CNAME. Keys never enter Projects.
+
+Galactic agreed: namespaced `galactic.datumapis.com/v1alpha1 MASQUEEndpoint`
+spec contains `provider`, `hostname`,
+positive monotonic `revision`, `certificateRef:{name,revision}`, and `enabled`.
+Identity is immutable. Revision increases for certificate changes and disable.
+Certificate revision is leaf DER SHA256, never ordered by expiry.
+`status.instances[]` keys on actual `instanceName`, with
+`observedRevision`, `appliedRevision`, `appliedCertificateRevision`,
+`state` (Applied/Disabled/Error), `forwardingStopped`, `lastHeartbeatTime`,
+and `message`. Provider durable fences use namespace plus canonical hostname,
+pin the registration name/provider and retain revision/revocation tombstones.
+Neither metadata nor wire fields substitute hidden identity UID annotations.
+
+Each cell/metro has a separate control plane. Placement stays in the service
+Project assignment, not in the local registration or its fence. Exact single-cell
+distribution, scoped credentials and the configured selected API client enforce
+placement. Missing selected clients never fall back to another API. Identically
+named registrations and instances in another control plane cannot supply apply,
+stop or cleanup evidence. Grant authority selection, CreateRequest.Cell and
+VPC/cell allocation ledgers remain scoped to the saved assignment.
+
+Provider remains explicit: multiple named EdgeProviders may coexist in the same
+API/namespace, with separate ServiceAccounts/approval. Runtime `--provider`,
+membership providerRef and authority provider checks select that local provider.
+Galactic removes the redundant provider `--cell` flag, not authority `--cell`.
+Probe cell is independently trusted operator evidence, never copied from the
+registration. No controller configuration flags or certificate contracts change.
+
+Coordinate CRDs, provider arguments and binaries on the original control plane.
+Never reset delivery receipts or hostname fences for this schema change. Connect
+accepts an unchanged resource incarnation with the exact new desired spec; if
+legacy placement fields still make that spec differ at the same revision, it
+fails closed instead of mutating the revision in place. A subsequent real config
+change must still increase the revision. Placement-requiring provider rollback
+is unsupported once new-format fences are written.
+
+Relevant instances come from provider-matching EdgeInstances and their
+same-name, owner-UID-bound Leases, never the acknowledgment list. Check Lease
+renewal/duration/released state and acknowledgments no older than ten seconds.
+Each acknowledgment must be strictly after both instance creation and Lease
+acquireTime. Missing incarnation timestamps fail closed; no UID is copied into
+the acknowledgment. Existing internal Edge membership fields remain unchanged.
+Readiness requires all relevant instances, exact revisions, and fresh external
+DNS/TLS/H3/H2 probes. A Karmada delivery acknowledgment alone is insufficient.
+
+Infrastructure agreed: per-endpoint Karmada PropagationPolicy exact resource
+selectors for registration and Secret, `propagateDeps:false`, one clusterNames
+entry, no failover. Direct read-only cell clients inspect membership and applied
+status. Shared zone and capacity are operator-owned and never endpoint-owned.
+
+## Durable lifecycle
+
+`ConnectEndpoint` also records customer Project/name and gateway namespace/name.
+Assignment contains only `cell`, `provider` and `frontend`. Identity and an established assignment are
+immutable. Reservation creation is deterministic and retry-safe. No endpoint
+owns a Project, shared zone, VPC or provider deployment.
+
+`status.revision` fences registration changes. `status.certificateRevision`
+tracks the desired leaf, `status.deliveryReceipts` records every versioned
+Secret before delivery, and `status.verifiedAt` expires readiness after ten
+seconds. Secret names are `<endpoint-name>-<leaf-DER-sha256>`. Each carries only
+the `masque.galactic.datumapis.com/certificate-revision` annotation. Distributed
+Secret, registration and policy objects have no endpoint UID label. Private
+`status.deliveryReceipts[]` stores `{apiVersion,kind,namespace,name,uid,contentDigest,state}`
+for cleanup preconditions. A content digest is saved before creation, with an
+empty UID until the returned incarnation is bound. Cleanup can recover a crash
+between those writes only if content still matches. The digest contains no key
+bytes. After an uncertain create, adoption requires
+exact desired registration/policy spec or versioned Secret bytes and revision;
+a recorded incarnation can never be replaced or silently adopted. Legacy
+identity-bearing deliveries require explicit migration, not automatic relabeling.
+Karmada policy
+selects the registration and all retained versions in exactly one cell. Previous
+versions are removed only after the replacement is applied and externally
+verified; actual hub and selected-cell absence is required before marking receipts
+Removed. Their names, digests and incarnation receipts remain durable.
+
+The consumer requires current-generation TLSCertificate Ready, pinned request
+UID and source Secret UID label, matching key/certificate, exact hostname,
+validity and leaf revision. Shorter-lived rekeys are accepted. Five minutes
+before expiry, DNS is withdrawn even if issuance is failing.
+
+Readiness reads the selected cell directly, including exact registration scope,
+certificate name/revision and enable state. It does not rely on reflected
+Karmada ResourceBinding status. Stale or unavailable membership blocks readiness
+and cleanup conservatively. Galactic's runtime lease gate remains authoritative;
+`forwardingStopped` is not a claim of verified kernel route withdrawal.
+
+Cleanup is persisted in `status.cleanupStep`: disable at a new revision, await
+all fresh Disabled/forwardingStopped acknowledgments, withdraw DNS, drain cached
+DNS for two minutes, remove registration and all keys, delete the certificate
+request, await central stored-key removal, remove challenge, retire grants, retain
+the reservation. A customer Project deletion cannot garbage-collect this state.
+API failures are not interpreted as deletion or allowed to stop independent
+certificate renewal and expiry handling. Endpoint DELETE is not granted to
+the runtime identity; service Project retention is an infrastructure prerequisite.
+
+Re-adding a metro for the same live Project/gateway UIDs may reactivate
+only after complete retirement. Hostname, endpoint UID and cell stay unchanged.
+`status.activationRevision` starts a new credential epoch above the disable
+revision. Old grant receipts and allocation tombstones remain retired. Draining
+reservations cannot reactivate. Recreated gateways get different reservations.
+
+`ConnectGrant` (`connect.datumapis.com/v1alpha1`, plural `connectgrants`) stores
+immutable endpointName/UID, bindingName/UID, networkName/UID, vpcRef,
+policyRevision, connectorID and cell,
+plus `status.state` (`Active`, `Retiring`, `Retired`). It never stores a credential. The broker uses
+Galactic's public `pkg/masquegrant` facade, not a new authority HTTP API. Retries
+rotate the same deterministic connector, preserving its /96; revocation retains
+the allocation tombstone. No broker call initializes a missing ledger.
+
+## API simplification and upgrade
+
+This follow-up implements the simplification; previous published CI evidence does
+not qualify its final head. Certificates reader commit
+`61c89782b9f45f1430a5a1bfd861a93f2024bab3` removes the phase gate while retaining
+all reservation identity, lifecycle, deletion, writer and certificate binding
+checks. Deploy that reader first, then upgrade Connect and its schemas.
+
+Managed customer placements publish hostname, metro and conditions, not the
+service Project reservation name or certificate expiry. `assignmentRef` remains
+legacy-only and managed writers clear it. Internal lookup uses resolved gateway
+identity and metro. Internal expiry remains part of readiness and renewal.
+
+Endpoint `spec.lifecycle` is desired state; `status.cleanupStep` is durable
+progress. Standard `Ready` conditions require current observedGeneration plus
+the existing fresh verification and expiry checks. Old phase/ready/reason fields
+are retained temporarily in the schema for read compatibility, ignored for
+authorization/readiness, and cleared by reconciliation. No legacy Ready boolean
+is promoted to a successful condition.
+
+The sole delivery inventory is `deliveryReceipts`. Planned records precede
+creation; Created records bind returned UID; Removed records retain history.
+Legacy deliveredSecrets names are converted before delivery or cleanup without
+dropping existing receipts. A name without a UID/digest becomes Planned but
+cannot adopt a preexisting object. After confirming absence a new desired digest
+can be persisted before creation. Lost-response recovery requires the exact
+persisted digest. Selectors use nonRemoved Secret records; stable Ready requires
+every active receipt Created and UID-bound. Cleanup checks historical names too.
+Reactivation retains receipt history and starts a new activation revision.
+Changing the configured runtime namespace while receipts remain is rejected,
+not treated as proof that their original objects disappeared.
+
+Grant migration gives legacy retired precedence over retiring and Active.
+Retiring is persisted before contacting the selected authority, even when it is
+unavailable. Mint/refresh refuse nonActive receipts; successful retirement writes
+Retired and clears the deprecated booleans. State transitions never resurrect a
+tombstone. Retain compatibility fields until stored objects have been migrated;
+do not prune them before conversion or roll back to legacy writers afterward.
+
+Galactic's agreed facade is `New(client, namespace, cell)`; CreateRequest has no
+Cell. The configured service injects cell scope and rejects foreign-cell records
+on mutation. Administrative ledger Init keeps its explicit cell; Connect receipt
+`spec.cell` remains essential for revocation after customer resources disappear.
+
+## Runtime configuration
+
+The existing Connect controller/ServiceAccount owns reconciliation. Required
+flags when enabled:
+
+Opt-in component `connect-controller/config/components/managed-endpoints/runtime`
+provides only static read-only mounts/volumes, including the projected Karmada
+token. From `config/base/manager`, select
+`../../components/managed-endpoints/runtime`. It does not enable the feature,
+create credentials, change RBAC or add flags; Infra supplies those separately.
+
+```text
+--managed-endpoints
+--endpoint-project-kubeconfig=/etc/connect/endpoint-project/kubeconfig.yaml
+--endpoint-namespace=<service-project-namespace>
+--endpoint-domain=<shared-zone-domain>
+--endpoint-zone=<existing-DNSZone-name>
+--karmada-kubeconfig=<delivery-kubeconfig>
+--certificate-kubeconfig=/etc/connect/certificates/kubeconfig.yaml
+--certificate-namespace=<central-certificate-secret-namespace>
+--endpoint-runtime-namespace=masque-system
+--endpoint-config=<operator-config.json>
+```
+
+`--endpoint-provisioning=false` stops new reservation creation/reactivation,
+not renewal or cleanup. Configuration shape (all values operator supplied):
+
+```json
+{
+  "capacity": [{
+    "metro": "metro-id",
+    "assignment": {
+      "cell": "existing-cell", "provider": "existing-provider",
+      "frontend": "existing-cell-frontend.example.test"
+    }
+  }],
+  "reachability": [{
+    "networkUID": "customer-network-uid", "cell": "existing-cell",
+    "vpcRef": {"namespace": "vpc-namespace", "name": "vpc", "uid": "vpc-uid"}
+  }],
+  "cells": {"existing-cell": {
+    "kubeconfig": "/etc/connect/cells/reader.yaml",
+    "grantKubeconfig": "/etc/connect/cells/grants.yaml"
+  }},
+  "probeURL": "https://trusted-probe.example.test/endpoints"
+}
+```
+
+The probe GET path appends the URL-encoded runtime namespace and registration
+name as separate path segments. Its JSON report must contain exact
+`endpointRef:{namespace,name}` for the selected-cell MASQUEEndpoint, `hostname`,
+`revision`, `certificateRevision`, `cell`, a `checkedAt` timestamp
+no older than ten seconds, and `h3`, `h2`, `dns` all true. HTTPS trust comes
+from the controller's configured trust store. The image supplies `/endpoint-probe`,
+but an operator must deploy and qualify its mTLS route and selected API credentials;
+no synthetic success is permitted, and omission fails closed.
+
+The optional broker requires `--credential-listen-address`,
+`--credential-tls-cert` and `--credential-tls-key`. Its POST route is:
+
+```text
+/apis/resourcemanager.miloapis.com/v1alpha1/projects/{project}/control-plane/apis/connect.datumapis.com/v1alpha1/namespaces/{namespace}/connectnetworkbindings/{binding}/connection-credentials
+```
+
+It uses only the caller's bearer token for a named binding `create`
+`connectnetworkbindings/connection-credentials` SelfSubjectAccessReview and GET.
+Fresh privileged reads then enforce Connector readiness, policy, Project,
+gateway, Network and endpoint UIDs. A final read rejects revocation during mint.
+Responses are no-store, errors never return credentials. Frontend routing to this
+listener is a separate release gate and remains disabled by default.
+
+The service-project writer is an authenticated Milo IAM ServiceAccount, not a
+synthetic mTLS group or system:masters. Configure the guard from observed username
+and UID; the staging controller observed username is
+`connect-endpoint-controller@connect-managed-svc-staging.identity.miloapis.com`.
+Certificates uses its separate pinned reservation reader and must configure the
+same observed writer username for its exact writer/Project admission checks.
+The image supplies a [renewable exec credential helper](../../../connect-controller/cmd/service-account-credential/README.md)
+for these kubeconfigs. Its five-minute local cache is not a five-minute bearer
+revocation guarantee and does not terminate already-open watches.
+Cell observer clients read registration, EdgeInstance and Lease objects;
+Secret GET is also needed to verify cleanup. Central source Secret GET currently
+has namespace scope. Both key-read residual privileges are explicit; they must
+not be granted to customer identities. Grant clients are separate and may update
+only operator-provisioned named ledgers, never endpoint fences.
+
+## Validation and release gates
+
+Simplification validation passes locally: full controller race suite with real
+Kubernetes 1.37 envtest, vet, macOS/Linux builds and both Kustomize exports.
+New tests cover migration field preservation by the API server, irreversible
+grant state transitions (including attempted field removal), unavailable-authority
+revocation, denied mint/refresh while Retiring, no legacy readiness fallback,
+condition generation fencing, lost-response inventory recovery, unproven legacy
+adoption denial, retained cleanup history across reactivation, namespace drift
+and managed placement redaction. Rust 1.98 H3/H2 pooling rerun passes 2 tests with
+zero ignored. Final-head GitHub checks remain a separate pending publication gate.
+
+Local tests cover real Galactic facade mint/rotate/retire and retained /96,
+missing ledger/fence denial, source key/UID/revision checks, exact DNS challenge,
+single-cell policy, shorter rekey, expiry withdrawal, partial membership and
+stale acknowledgments, durable deletion, retry-safe metro collapse, reactivation
+epochs and real Kubernetes CRD immutability validation. Fake clients do not
+establish DNS propagation, ACME issuance, Karmada behavior or packet forwarding.
+
+Placement regressions use separate API clients with identical registration and
+instance names. Only the selected API can satisfy apply, forwarding-stop and
+cleanup checks; missing selected clients fail closed. Grant tests separately
+require the selected authority and VPC reader, preserving cell-scoped receipts
+and allocation retries. Provider filtering and all-replica stop checks remain.
+
+Passed locally: the full controller race suite (including Kubernetes 1.37
+envtest), native macOS build, Linux/amd64 cross-build, and stock Kustomize renders
+of both opt-in managed and default customer exports. The resource fixture drives
+central certificate consumption through generated delivery, instance/Lease
+acknowledgments, DNS and readiness, with an explicitly simulated probe. The
+separate broker fixture calls the published Galactic grant/ledger implementation.
+
+Commands used:
+
+```sh
+make manifests CONTROLLER_GEN='go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.21.0'
+KUBEBUILDER_ASSETS=<Kubernetes-1.37-envtest> go test -race ./...
+go build -o /tmp/connect-managed-controller ./cmd/controller
+GOOS=linux GOARCH=amd64 go build -o /tmp/connect-managed-controller-linux ./cmd/controller
+kubectl kustomize config/components/managed-endpoints/crd
+```
+
+Dependencies:
+
+- Certificates: `61c89782b9f45f1430a5a1bfd861a93f2024bab3`, draft PR milo-os/certificates#83.
+- Infrastructure: prior published `62cf66fbbfb323554ad3aeaf26b6ac950592c683`,
+  draft PR datum-cloud/infra#9647. The dependency-pin follow-up awaits this Connect
+  publication for exact-source validation; the earlier green run is not its CI.
+- Galactic: `ac27e20e247792060eb9a7505b4f9e4ede2b1339`, draft PR datum-cloud/galactic#1465;
+  Go module `v0.9.5-0.20261120213516-ac27e20e2477`, without local replacements.
+  The configured-cell facade removes request-supplied cell and rejects foreign
+  cell mutations. Administrative ledger scoping is unchanged.
+  This revision removes copied registration placement and provider `--cell`,
+  retaining the name-only facade, local provider selection, instance
+  acknowledgments and authority wire contract. Providers require the get-only
+  tenant service/VPC reader role before upgrade. Previous experimental managed
+  records fail closed; drain them with the old version before upgrading rather
+  than reinterpreting them as legacy grants.
+
+The Galactic dependency requires Go 1.26.4 and Kubernetes Go modules 0.37.2;
+the controller module follows those minimum versions. Controller generation
+remains pinned to 0.21.0 for consistent existing manifests.
+
+Release remains blocked on qualified image/OCI digests, real trusted probe
+service, authenticated credential frontend routing and live ACME/DNS/Karmada/
+Galactic H3/H2/VPC qualification. Infrastructure wrappers are opt-in/suspended.
+Nothing in this branch merges, deploys or claims those live results.
+
+## Shared-transport validation and migration
+
+Run `cd connect-lib && cargo test -p datum-connect-daemon pool_tests --lib` with
+Rust 1.98. The actual Rust client tests use real loopback TLS/TCP and QUIC peers,
+count physical connections and compare distinct stream IDs. They cover two VPC
+streams, denied third/replayed selectors, one-stream revocation, credential expiry,
+refresh and reconnect after a physical connection failure. No OS adapter is
+created. Separate project/security-context pools open separate connections.
+The privileged helper continues to reject overlapping active routes.
+The daemon owns a pool per enrolled project/security context; each request has
+its own bearer. A single H3 datagram reader dispatches by stream ID. Cancel/reset
+never closes a sibling's connection. Credential refresh terminates only the
+expiring stream; the durable network reconciler remints each attachment separately.
+
+Controller tests cover shared endpoints, named network policy, missing reachability,
+Network deletion/recreation, durable UID pins and unchanged sibling availability.
+Real envtest validates the regenerated schemas. Galactic's separate
+`TestManagedEndpointMultiplexedAuthority` uses its real authority and a fake packet
+backend. Neither suite qualifies live DNS/ACME/Karmada or operating-system routing.
+
+`legacy-v1` retains required gateway networkRef and its old transport. Managed
+bindings require explicit networkRef; unscoped policies deny access until an
+administrator adds networkRefs. Never infer a wildcard during migration. Drain
+experimental old managed endpoints before upgrading their internal schemas;
+there is no live migration claim. Old operator JSON with endpoint Network/VPC
+fields is rejected rather than silently reinterpreted. Recreate bindings to approve
+replacement Network/VPC identities; old durable receipts continue fencing reuse.
+
+Final local Rust validation: daemon library 41 passed/1 ignored; successor client
+39 passed/1 ignored (serial); both H3/H2 pooling tests and the helper's live-route
+overlap rejection test passed. The ignored tests are existing opt-in cases, not
+same-connection coverage. No live credentials, interfaces or deployments were used.
+
+## Staging enablement in progress
+
+The Galactic staging candidate adds explicit default-off legacy coexistence on
+the existing named provider. Only the configured legacy authority/SNI uses its
+file certificate and unscoped legacy grants; managed names still require registry
+and fence validation. Unknown/disabled managed names never fall back. Infra must
+preserve the existing legacy mount/authority and qualify both protocols before
+enabling this option. Candidate GitHub CI is not yet claimed successful.
+
+Added a read-only mTLS endpoint probe executable to the controller image and
+explicit probe client trust flags. It performs real public DNS, fresh H2/H3 TLS,
+exact leaf digest and selected-control-plane replica verification, with before/
+after race checks. Local tests use real TLS/QUIC sockets but are not staging
+evidence. Full controller race/envtest, vet and Linux probe build pass locally.
+
+`tests/e2e/managed-gateways` owns the production Rust client packet qualification
+runner and coordination runbook. It has no cluster-write capability and requires
+real credential APIs and IPv6 responders; local checksum tests do not qualify
+staging. Infra remains the sole staging configuration writer. Public frontend,
+Project/DNS allocation, deployed probe/broker routes, artifact provenance and
+observed lifecycle runs remain pending; no staging success is claimed here.

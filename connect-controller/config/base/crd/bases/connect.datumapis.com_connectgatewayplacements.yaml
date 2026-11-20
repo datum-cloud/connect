@@ -62,6 +62,8 @@ spec:
           status:
             properties:
               assignmentRef:
+                description: AssignmentRef is reserved for legacy placements; managed
+                  placements omit it.
                 type: string
               conditions:
                 items:
@@ -119,6 +121,10 @@ spec:
                   - type
                   type: object
                 type: array
+              hostname:
+                type: string
+              metro:
+                type: string
               observedGeneration:
                 format: int64
                 type: integer

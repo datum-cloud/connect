@@ -6,6 +6,10 @@ rust-version.workspace = true
 autobins = false
 build = "build.rs"
 
+[[example]]
+name = "managed-gateway-e2e"
+path = "../../tests/e2e/managed-gateways/live.rs"
+
 [[bin]]
 name = "datum-connectd"
 path = "src/main.rs"
@@ -52,6 +56,7 @@ url = { workspace = true }
 webpki-roots = "1"
 
 [dev-dependencies]
+rcgen = "0.13"
 reqwest = { workspace = true }
 tempfile = "3"
 

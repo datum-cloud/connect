@@ -1,0 +1,34 @@
+apiVersion: iam.miloapis.com/v1alpha1
+kind: Role
+metadata:
+  name: connect.datumapis.com-managed-state-writer
+spec:
+  launchStage: Beta
+  includedPermissions:
+  - connect.datumapis.com/connectendpoints.get
+  - connect.datumapis.com/connectendpoints.list
+  - connect.datumapis.com/connectendpoints.watch
+  - connect.datumapis.com/connectendpoints.create
+  - connect.datumapis.com/connectendpoints.update
+  - connect.datumapis.com/connectendpoints.patch
+  - connect.datumapis.com/connectendpoints/status.get
+  - connect.datumapis.com/connectendpoints/status.update
+  - connect.datumapis.com/connectendpoints/status.patch
+  - connect.datumapis.com/connectgrants.get
+  - connect.datumapis.com/connectgrants.list
+  - connect.datumapis.com/connectgrants.watch
+  - connect.datumapis.com/connectgrants.create
+  - connect.datumapis.com/connectgrants.update
+  - connect.datumapis.com/connectgrants.patch
+  - connect.datumapis.com/connectgrants/status.get
+  - connect.datumapis.com/connectgrants/status.update
+  - connect.datumapis.com/connectgrants/status.patch
+---
+apiVersion: iam.miloapis.com/v1alpha1
+kind: Role
+metadata:
+  name: connect.datumapis.com-managed-endpoint-reader
+spec:
+  launchStage: Beta
+  includedPermissions:
+  - connect.datumapis.com/connectendpoints.get

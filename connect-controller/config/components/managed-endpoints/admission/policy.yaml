@@ -1,0 +1,47 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: connect-managed-service-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [connect.datumapis.com]
+      apiVersions: ['*']
+      operations: ['*']
+      resources: [connectendpoints, connectendpoints/*, connectgrants, connectgrants/*]
+      scope: Namespaced
+  variables:
+  - name: serviceProject
+    expression: "'UNCONFIGURED'"
+  - name: serviceNamespace
+    expression: "'UNCONFIGURED'"
+  - name: writer
+    expression: "'UNCONFIGURED'"
+  - name: writerUID
+    expression: "'UNCONFIGURED'"
+  validations:
+  - expression: >-
+      variables.serviceProject != 'UNCONFIGURED' && variables.serviceProject != '' &&
+      variables.serviceNamespace != 'UNCONFIGURED' && variables.serviceNamespace != '' &&
+      variables.writer != 'UNCONFIGURED' && variables.writer != '' &&
+      variables.writerUID != 'UNCONFIGURED' && variables.writerUID != ''
+    message: Managed endpoint service scope is not configured.
+    reason: Forbidden
+  - expression: request.operation in ['CREATE', 'UPDATE']
+    message: Managed endpoint and grant tombstones must be retained; deletion is forbidden.
+    reason: Forbidden
+  - expression: >-
+      request.namespace == variables.serviceNamespace &&
+      request.userInfo.username == variables.writer &&
+      has(request.userInfo.uid) &&
+      request.userInfo.uid == variables.writerUID &&
+      has(request.userInfo.extra) &&
+      'iam.miloapis.com/parent-type' in request.userInfo.extra &&
+      request.userInfo.extra['iam.miloapis.com/parent-type'] == ['Project'] &&
+      'iam.miloapis.com/parent-name' in request.userInfo.extra &&
+      request.userInfo.extra['iam.miloapis.com/parent-name'] == [variables.serviceProject] &&
+      'iam.miloapis.com/parent-api-group' in request.userInfo.extra &&
+      request.userInfo.extra['iam.miloapis.com/parent-api-group'] == ['resourcemanager.miloapis.com']
+    message: Only the configured service Project writer may mutate managed endpoint state.
+    reason: Forbidden

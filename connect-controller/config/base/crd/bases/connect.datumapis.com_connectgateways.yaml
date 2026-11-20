@@ -154,8 +154,6 @@ spec:
                 maxItems: 32
                 minItems: 1
                 type: array
-            required:
-            - networkRef
             type: object
             x-kubernetes-validations:
             - message: managed-network-v1 requires placement and forbids legacy gateway
@@ -163,9 +161,10 @@ spec:
               rule: self.contractVersion != 'managed-network-v1' || (has(self.placement)
                 && !has(self.gatewayClassRef) && !has(self.locationRef) && !has(self.routes)
                 && !has(self.relayURLs) && !has(self.peerRouting))
-            - message: legacy-v1 requires gatewayClassRef, locationRef, and routes
-              rule: self.contractVersion != 'legacy-v1' || (has(self.gatewayClassRef)
-                && has(self.locationRef) && has(self.routes))
+            - message: legacy-v1 requires networkRef, gatewayClassRef, locationRef,
+                and routes
+              rule: self.contractVersion != 'legacy-v1' || (has(self.networkRef) &&
+                has(self.gatewayClassRef) && has(self.locationRef) && has(self.routes))
           status:
             properties:
               classRef:

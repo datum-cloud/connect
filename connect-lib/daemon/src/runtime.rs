@@ -46,6 +46,7 @@ pub struct RealControl {
 }
 
 struct ProjectRuntime {
+    managed_pool: crate::galactic_masque::TransportPool,
     underlay: Option<std::net::IpAddr>,
     cloud: CloudConnector,
     transport: Transport,
@@ -628,6 +629,7 @@ impl RealControl {
             ));
         }
         let runtime = Arc::new(ProjectRuntime {
+            managed_pool: crate::galactic_masque::TransportPool::default(),
             underlay,
             cloud,
             transport,
@@ -1140,21 +1142,19 @@ impl Control for RealControl {
                     previous.stop().await;
                 }
                 let mut descriptor = mint_managed_descriptor(&runtime.cloud, &binding_name).await?;
-                let mut session = crate::galactic_masque::connect_preferred(
-                    &descriptor,
-                    runtime.cancel.child_token(),
-                )
-                .await;
+                let mut session = runtime
+                    .managed_pool
+                    .connect_preferred(&descriptor, runtime.cancel.child_token())
+                    .await;
                 if matches!(
                     session,
                     Err(crate::galactic_masque::AttemptFailure::HttpStatus(401))
                 ) {
                     descriptor = mint_managed_descriptor(&runtime.cloud, &binding_name).await?;
-                    session = crate::galactic_masque::connect_preferred(
-                        &descriptor,
-                        runtime.cancel.child_token(),
-                    )
-                    .await;
+                    session = runtime
+                        .managed_pool
+                        .connect_preferred(&descriptor, runtime.cancel.child_token())
+                        .await;
                 }
                 let session = session.map_err(managed_connect_error)?;
                 #[cfg(unix)]

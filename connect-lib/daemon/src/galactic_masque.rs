@@ -4,10 +4,10 @@
 //! intentionally shares no field meanings with the legacy iroh gateway path.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fmt,
     net::{Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -27,6 +27,9 @@ use async_trait::async_trait;
 pub const TRANSPORT_TYPE: &str = "masque.connect.datum.net/v1";
 pub const CONNECT_IP_PATH: &str = "/.well-known/masque/ip/*/*/";
 pub const EFFECTIVE_MTU: u16 = 1280;
+
+#[cfg(test)]
+mod pool_tests;
 
 #[derive(Clone, Deserialize)]
 #[serde(transparent)]
@@ -304,14 +307,15 @@ const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 pub struct H3Session {
     pub observed: ObservedProviderPlan,
     stream_id: u64,
-    connection: quinn::Connection,
-    endpoint: quinn::Endpoint,
+    transport: Arc<H3Transport>,
     outgoing: mpsc::Sender<Bytes>,
     incoming: Mutex<mpsc::Receiver<Bytes>>,
     cancel: CancellationToken,
 }
 
 pub struct H2Session {
+    transport: Arc<H2Transport>,
+    stream_id: u32,
     pub observed: ObservedProviderPlan,
     outgoing: mpsc::Sender<Bytes>,
     incoming: Mutex<mpsc::Receiver<Bytes>>,
@@ -540,6 +544,9 @@ pub async fn activate(
 }
 
 impl H3Session {
+    pub fn connection_id(&self) -> usize {
+        Arc::as_ptr(&self.transport) as usize
+    }
     pub async fn send(&self, packet: impl Into<Bytes>) -> Result<(), AttemptFailure> {
         self.outgoing
             .send(packet.into())
@@ -553,10 +560,6 @@ impl H3Session {
 
     pub fn cancel(&self) {
         self.cancel.cancel();
-        self.connection
-            .close(0u32.into(), b"managed CONNECT-IP closed");
-        self.endpoint
-            .close(0u32.into(), b"managed CONNECT-IP closed");
     }
 
     pub fn stream_id(&self) -> u64 {
@@ -567,12 +570,16 @@ impl H3Session {
 impl Drop for H3Session {
     fn drop(&mut self) {
         self.cancel.cancel();
-        self.connection
-            .close(0u32.into(), b"managed CONNECT-IP dropped");
     }
 }
 
 impl H2Session {
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+    pub fn connection_id(&self) -> usize {
+        Arc::as_ptr(&self.transport) as usize
+    }
     pub async fn send(&self, packet: impl Into<Bytes>) -> Result<(), AttemptFailure> {
         self.outgoing
             .send(packet.into())
@@ -602,39 +609,178 @@ pub async fn connect_h3(
     descriptor: &ConnectionDescriptor,
     cancel: CancellationToken,
 ) -> Result<H3Session, AttemptFailure> {
-    tokio::time::timeout(SETUP_TIMEOUT, connect_h3_inner(descriptor, cancel))
+    TransportPool::default()
+        .connect_h3(descriptor, cancel)
         .await
-        .map_err(|_| AttemptFailure::Connectivity)?
 }
 
-/// Prefer HTTP/3 and use HTTP/2 only when the UDP/QUIC path itself is
-/// unreachable. Provider HTTP responses and plan failures never change
-/// transports because doing so would bypass an authorization decision.
 pub async fn connect_preferred(
     descriptor: &ConnectionDescriptor,
     cancel: CancellationToken,
 ) -> Result<ManagedSession, AttemptFailure> {
-    match connect_h3(descriptor, cancel.child_token()).await {
-        Ok(session) => Ok(ManagedSession::H3(session)),
-        Err(AttemptFailure::Connectivity)
-            if descriptor
-                .transport
-                .transports
-                .iter()
-                .any(|transport| transport == "h2") =>
-        {
-            connect_h2(descriptor, cancel).await.map(ManagedSession::H2)
+    TransportPool::default()
+        .connect_preferred(descriptor, cancel)
+        .await
+}
+
+pub struct TransportPool {
+    selection: Mutex<()>,
+    h3: Mutex<HashMap<String, Weak<H3Transport>>>,
+    h2: Mutex<HashMap<String, Weak<H2Transport>>>,
+    roots: rustls::RootCertStore,
+}
+
+impl Default for TransportPool {
+    fn default() -> Self {
+        Self {
+            selection: Mutex::new(()),
+            h3: Mutex::new(HashMap::new()),
+            h2: Mutex::new(HashMap::new()),
+            roots: rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
         }
-        Err(error) => Err(error),
     }
 }
 
-async fn connect_h3_inner(
-    descriptor: &ConnectionDescriptor,
-    cancel: CancellationToken,
-) -> Result<H3Session, AttemptFailure> {
-    let authority = Url::parse(&format!("https://{}", descriptor.transport.authority))
-        .map_err(|_| AttemptFailure::TlsIdentity)?;
+struct H3Transport {
+    sender: Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
+    connection: quinn::Connection,
+    endpoint: quinn::Endpoint,
+    datagrams: Arc<Mutex<HashMap<u64, mpsc::Sender<Bytes>>>>,
+}
+
+impl Drop for H3Transport {
+    fn drop(&mut self) {
+        self.connection
+            .close(0u32.into(), b"last attachment closed");
+        self.endpoint.close(0u32.into(), b"last attachment closed");
+    }
+}
+
+struct H2Transport {
+    sender: h2::client::SendRequest<Bytes>,
+    closed: CancellationToken,
+}
+
+impl Drop for H2Transport {
+    fn drop(&mut self) {
+        self.closed.cancel();
+    }
+}
+
+impl TransportPool {
+    pub async fn connect_preferred(
+        &self,
+        descriptor: &ConnectionDescriptor,
+        cancel: CancellationToken,
+    ) -> Result<ManagedSession, AttemptFailure> {
+        let _selection = self.selection.lock().await;
+        let http2_active = self
+            .h2
+            .lock()
+            .await
+            .get(&descriptor.transport.authority)
+            .and_then(Weak::upgrade)
+            .is_some_and(|value| !value.closed.is_cancelled());
+        if http2_active
+            && descriptor
+                .transport
+                .transports
+                .iter()
+                .any(|value| value == "h2")
+        {
+            return self
+                .connect_h2(descriptor, cancel)
+                .await
+                .map(ManagedSession::H2);
+        }
+        match self.connect_h3(descriptor, cancel.child_token()).await {
+            Ok(session) => Ok(ManagedSession::H3(session)),
+            Err(AttemptFailure::Connectivity)
+                if descriptor
+                    .transport
+                    .transports
+                    .iter()
+                    .any(|value| value == "h2") =>
+            {
+                self.connect_h2(descriptor, cancel)
+                    .await
+                    .map(ManagedSession::H2)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn connect_h3(
+        &self,
+        descriptor: &ConnectionDescriptor,
+        cancel: CancellationToken,
+    ) -> Result<H3Session, AttemptFailure> {
+        tokio::time::timeout(SETUP_TIMEOUT, async {
+            let mut entries = self.h3.lock().await;
+            entries.retain(|_, value| value.strong_count() > 0);
+            let transport = match entries
+                .get(&descriptor.transport.authority)
+                .and_then(Weak::upgrade)
+                .filter(|value| value.connection.close_reason().is_none())
+            {
+                Some(value) => value,
+                None => {
+                    let value = Arc::new(
+                        dial_h3(&descriptor.transport.authority, self.roots.clone()).await?,
+                    );
+                    entries.insert(
+                        descriptor.transport.authority.clone(),
+                        Arc::downgrade(&value),
+                    );
+                    value
+                }
+            };
+            drop(entries);
+            open_h3(descriptor, cancel, transport).await
+        })
+        .await
+        .map_err(|_| AttemptFailure::Connectivity)?
+    }
+
+    pub async fn connect_h2(
+        &self,
+        descriptor: &ConnectionDescriptor,
+        cancel: CancellationToken,
+    ) -> Result<H2Session, AttemptFailure> {
+        tokio::time::timeout(SETUP_TIMEOUT, async {
+            let mut entries = self.h2.lock().await;
+            entries.retain(|_, value| value.strong_count() > 0);
+            let transport = match entries
+                .get(&descriptor.transport.authority)
+                .and_then(Weak::upgrade)
+                .filter(|value| !value.closed.is_cancelled())
+            {
+                Some(value) => value,
+                None => {
+                    let value = Arc::new(
+                        dial_h2(&descriptor.transport.authority, self.roots.clone()).await?,
+                    );
+                    entries.insert(
+                        descriptor.transport.authority.clone(),
+                        Arc::downgrade(&value),
+                    );
+                    value
+                }
+            };
+            drop(entries);
+            open_h2(descriptor, cancel, transport).await
+        })
+        .await
+        .map_err(|_| AttemptFailure::Connectivity)?
+    }
+}
+
+async fn dial_h3(
+    authority: &str,
+    roots: rustls::RootCertStore,
+) -> Result<H3Transport, AttemptFailure> {
+    let authority =
+        Url::parse(&format!("https://{authority}")).map_err(|_| AttemptFailure::TlsIdentity)?;
     let host = authority.host_str().ok_or(AttemptFailure::TlsIdentity)?;
     let port = authority.port().unwrap_or(443);
     let addresses = tokio::net::lookup_host((host, port))
@@ -648,7 +794,6 @@ async fn connect_h3_inner(
         .or_else(|| addresses.first().copied())
         .ok_or(AttemptFailure::Connectivity)?;
 
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -674,12 +819,48 @@ async fn connect_h3_inner(
         return Err(AttemptFailure::Connectivity);
     }
 
-    let (mut driver, mut sender) = h3::client::builder()
+    let (mut driver, sender) = h3::client::builder()
         .enable_datagram(true)
         .enable_extended_connect(true)
         .build::<_, _, Bytes>(h3_quinn::Connection::new(connection.clone()))
         .await
         .map_err(|_| AttemptFailure::Connectivity)?;
+    let datagrams: Arc<Mutex<HashMap<u64, mpsc::Sender<Bytes>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let destinations = datagrams.clone();
+    let reader = connection.clone();
+    tokio::spawn(async move {
+        let drive = std::future::poll_fn(|cx| driver.poll_close(cx));
+        tokio::pin!(drive);
+        loop {
+            tokio::select! {
+                _ = &mut drive => break,
+                wire = reader.read_datagram() => {
+                    let Ok(wire) = wire else { break };
+                    let Some((quarter_id, _)) = decode_varint(&wire) else { continue };
+                    let Some(stream_id) = quarter_id.checked_mul(4) else { continue };
+                    if let Some(sender) = destinations.lock().await.get(&stream_id) {
+                        let _ = sender.try_send(wire);
+                    }
+                }
+            }
+        }
+        reader.close(0u32.into(), b"transport ended");
+        destinations.lock().await.clear();
+    });
+    Ok(H3Transport {
+        sender: Mutex::new(sender),
+        connection,
+        endpoint,
+        datagrams,
+    })
+}
+
+async fn open_h3(
+    descriptor: &ConnectionDescriptor,
+    cancel: CancellationToken,
+    transport: Arc<H3Transport>,
+) -> Result<H3Session, AttemptFailure> {
     let mut request = Request::builder()
         .method(Method::CONNECT)
         .uri(format!(
@@ -695,7 +876,10 @@ async fn connect_h3_inner(
         .body(())
         .map_err(|_| AttemptFailure::Connectivity)?;
     request.extensions_mut().insert(Protocol::CONNECT_IP);
-    let mut stream = sender
+    let mut stream = transport
+        .sender
+        .lock()
+        .await
         .send_request(request)
         .await
         .map_err(|_| AttemptFailure::Connectivity)?;
@@ -728,24 +912,31 @@ async fn connect_h3_inner(
     }
     let advertised = decode_route_advertisement(&routes)?;
 
+    let refresh_after =
+        (descriptor.transport.expires_at - Utc::now() - chrono::Duration::seconds(30))
+            .to_std()
+            .unwrap_or_default();
     let local = cancel.child_token();
     let task_cancel = local.clone();
-    let task_connection = connection.clone();
+    let task_connection = transport.connection.clone();
+    let destinations = transport.datagrams.clone();
+    let (datagram_sender, mut datagram_receiver) = mpsc::channel(64);
+    destinations.lock().await.insert(stream_id, datagram_sender);
     let task_advertised = advertised.clone();
     let (outgoing, mut packets_to_provider) = mpsc::channel::<Bytes>(64);
     let (packets_from_provider, incoming) = mpsc::channel::<Bytes>(64);
     tokio::spawn(async move {
-        let drive = async move {
-            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-        };
-        tokio::pin!(drive);
+        let refresh = tokio::time::sleep(refresh_after);
+        tokio::pin!(refresh);
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => break,
-                _ = &mut drive => break,
+                _ = &mut refresh => break,
+                _ = task_connection.closed() => break,
                 update = stream.recv_data() => {
                     // Dynamic address or route changes require a fresh descriptor.
-                    if !matches!(update, Ok(None)) { break; }
+                    let _ = update;
+                    break;
                 }
                 packet = packets_to_provider.recv() => {
                     let Some(packet) = packet else { break };
@@ -753,16 +944,18 @@ async fn connect_h3_inner(
                     let wire = encode_http_datagram(stream_id, &packet);
                     if task_connection.send_datagram(wire).is_err() { break; }
                 }
-                wire = task_connection.read_datagram() => {
-                    let Ok(wire) = wire else { break };
+                wire = datagram_receiver.recv() => {
+                    let Some(wire) = wire else { break };
                     let Ok(Some(packet)) = decode_http_datagram(wire, stream_id) else { continue };
                     if !packet_allowed(&packet, assigned, &task_advertised, false) { continue; }
-                    if packets_from_provider.send(packet).await.is_err() { break; }
+                    if let Err(mpsc::error::TrySendError::Closed(_)) = packets_from_provider.try_send(packet) { break; }
                 }
             }
         }
         task_cancel.cancel();
-        task_connection.close(0u32.into(), b"managed CONNECT-IP ended");
+        destinations.lock().await.remove(&stream_id);
+        stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+        stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
     });
 
     Ok(H3Session {
@@ -771,8 +964,7 @@ async fn connect_h3_inner(
             advertised,
         },
         stream_id,
-        connection,
-        endpoint,
+        transport,
         outgoing,
         incoming: Mutex::new(incoming),
         cancel: local,
@@ -783,17 +975,17 @@ pub async fn connect_h2(
     descriptor: &ConnectionDescriptor,
     cancel: CancellationToken,
 ) -> Result<H2Session, AttemptFailure> {
-    tokio::time::timeout(SETUP_TIMEOUT, connect_h2_inner(descriptor, cancel))
+    TransportPool::default()
+        .connect_h2(descriptor, cancel)
         .await
-        .map_err(|_| AttemptFailure::Connectivity)?
 }
 
-async fn connect_h2_inner(
-    descriptor: &ConnectionDescriptor,
-    cancel: CancellationToken,
-) -> Result<H2Session, AttemptFailure> {
-    let authority = Url::parse(&format!("https://{}", descriptor.transport.authority))
-        .map_err(|_| AttemptFailure::TlsIdentity)?;
+async fn dial_h2(
+    authority: &str,
+    roots: rustls::RootCertStore,
+) -> Result<H2Transport, AttemptFailure> {
+    let authority =
+        Url::parse(&format!("https://{authority}")).map_err(|_| AttemptFailure::TlsIdentity)?;
     let host = authority.host_str().ok_or(AttemptFailure::TlsIdentity)?;
     let port = authority.port().unwrap_or(443);
     let addresses = tokio::net::lookup_host((host, port))
@@ -813,7 +1005,6 @@ async fn connect_h2_inner(
         }
     }
     let tcp = tcp.ok_or(AttemptFailure::Connectivity)?;
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -828,15 +1019,36 @@ async fn connect_h2_inner(
         .connect(server_name, tcp)
         .await
         .map_err(|_| AttemptFailure::TlsIdentity)?;
-    let (mut sender, connection) = h2::client::handshake(tls)
+    let (sender, connection) = h2::client::handshake(tls)
         .await
         .map_err(|_| AttemptFailure::Connectivity)?;
+    let closed = CancellationToken::new();
+    let task_closed = closed.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = task_closed.cancelled() => {},
+            _ = connection => {},
+        }
+        task_closed.cancel();
+    });
+    Ok(H2Transport { sender, closed })
+}
+
+async fn open_h2(
+    descriptor: &ConnectionDescriptor,
+    cancel: CancellationToken,
+    transport: Arc<H2Transport>,
+) -> Result<H2Session, AttemptFailure> {
+    let mut sender = transport.sender.clone();
     sender = sender
         .ready()
         .await
         .map_err(|_| AttemptFailure::Connectivity)?;
-    if !sender.is_extended_connect_protocol_enabled() {
-        return Err(AttemptFailure::Connectivity);
+    while !sender.is_extended_connect_protocol_enabled() {
+        if transport.closed.is_cancelled() {
+            return Err(AttemptFailure::Connectivity);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     let mut request = Request::builder()
         .method(Method::CONNECT)
@@ -858,6 +1070,7 @@ async fn connect_h2_inner(
     let (response, mut send_stream) = sender
         .send_request(request, false)
         .map_err(|_| AttemptFailure::Connectivity)?;
+    let stream_id = send_stream.stream_id().as_u32();
     let response = response.await.map_err(|_| AttemptFailure::Connectivity)?;
     if !response.status().is_success() {
         return Err(AttemptFailure::HttpStatus(response.status().as_u16()));
@@ -883,18 +1096,24 @@ async fn connect_h2_inner(
     }
     let advertised = decode_route_advertisement(&routes)?;
 
+    let refresh_after =
+        (descriptor.transport.expires_at - Utc::now() - chrono::Duration::seconds(30))
+            .to_std()
+            .unwrap_or_default();
     let local = cancel.child_token();
     let task_cancel = local.clone();
     let task_advertised = advertised.clone();
     let (outgoing, mut packets_to_provider) = mpsc::channel::<Bytes>(64);
     let (packets_from_provider, incoming) = mpsc::channel::<Bytes>(64);
+    let transport_closed = transport.closed.clone();
     tokio::spawn(async move {
-        let drive = connection;
-        tokio::pin!(drive);
+        let refresh = tokio::time::sleep(refresh_after);
+        tokio::pin!(refresh);
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => break,
-                _ = &mut drive => break,
+                _ = &mut refresh => break,
+                _ = transport_closed.cancelled() => break,
                 capsule = next_h2_capsule(&mut recv_stream, &mut capsule_bytes) => {
                     let Ok((kind, payload)) = capsule else { break };
                     if kind != 0 { break; }
@@ -902,7 +1121,7 @@ async fn connect_h2_inner(
                     if context != 0 { continue; }
                     let packet = payload.slice(context_len..);
                     if !packet_allowed(&packet, assigned, &task_advertised, false) { continue; }
-                    if packets_from_provider.send(packet).await.is_err() { break; }
+                    if let Err(mpsc::error::TrySendError::Closed(_)) = packets_from_provider.try_send(packet) { break; }
                 }
                 packet = packets_to_provider.recv() => {
                     let Some(packet) = packet else { break };
@@ -920,6 +1139,8 @@ async fn connect_h2_inner(
     });
 
     Ok(H2Session {
+        transport,
+        stream_id,
         observed: ObservedProviderPlan {
             assigned,
             advertised,

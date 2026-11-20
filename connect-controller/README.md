@@ -4,6 +4,47 @@ This module defines the Connect-owned `connect.datumapis.com/v1alpha1` API and
 the Milo multi-cluster controller. The controller provisions VPC gateways and
 bindings; the Rust daemon and `datumctl` plugin consume the binding API.
 
+## Shared managed endpoints
+
+With `--managed-endpoints`, managed-network gateways are logical resources on
+existing Galactic capacity, not Compute Workloads. Locations in one metro share
+one stable hostname and pinned cell. The customer Project contains intent and
+status; an explicitly configured service-provider Project contains durable
+`ConnectEndpoint` reservations, DNS records, `TLSCertificate` requests and
+credential-free `ConnectGrant` cleanup receipts. TLS keys stay in Certificates,
+Karmada and the selected cell. The older gateway slice described below is a
+separate legacy contract.
+
+Each cell has its own control-plane API. Connect keeps metro/cell placement in
+the service Project and targets one API with scoped credentials and distribution.
+The local `MASQUEEndpoint` has no cell or metro fields; its provider selects a
+named EdgeProvider within that API. Missing selected clients never fall back to
+another control plane for readiness, credentials or cleanup.
+
+A managed gateway has no fixed Network. Each binding names its gateway,
+Connector and Network; matching policies must explicitly list that Network in
+`spec.networkRefs`. An existing policy without this list denies managed access.
+Endpoint readiness is independent of per-binding VPC reachability. Internal
+grant receipts pin resolved Network and VPC UIDs against name reuse.
+
+The Rust daemon shares one H3 or H2 connection per endpoint and enrolled project
+context, with separately authenticated CONNECT-IP streams. Revoking one binding
+does not revoke its siblings. Local overlapping routes remain prohibited.
+
+Install `config/components/managed-endpoints/crd` as core-global Milo definitions,
+with Project-local instances. First install the fail-closed admission export;
+then configure separate service-Project IAM authorization. Project discovery is
+not authorization, and a write admission policy does not restrict reads. See
+[managed admission bootstrap](config/components/managed-endpoints/admission/README.md).
+This feature is off by default. It requires
+operator-provisioned cells, VPC ledgers, shared DNS zone, separate kubeconfigs
+and a trusted external probe. Missing capacity, credentials, fresh provider
+acknowledgments or a probe keeps readiness false. Disabling new provisioning
+does not stop renewal or durable cleanup.
+
+See [implementation and integration contracts](../docs/enhancements/managed-gateway-endpoints/implementation.md)
+for configuration, exact schemas, dependency commits, tests and rollout gates.
+
 ## Resource ownership
 
 `ConnectorClass` is cluster-scoped platform configuration in the management
@@ -17,7 +58,7 @@ project resources and carry Milo's
 uses `go.miloapis.com/milo/pkg/multicluster-runtime/milo` and registers these
 project controllers with `WithEngageWithLocalCluster(false)`.
 
-The controller provisions the first single-project CONNECT-IP gateway slice:
+The legacy controller provisions the first single-project CONNECT-IP gateway slice:
 
 - ConnectorClass reports whether its transport configuration is valid.
 - Connector checks its hex public key and resolves its class from the

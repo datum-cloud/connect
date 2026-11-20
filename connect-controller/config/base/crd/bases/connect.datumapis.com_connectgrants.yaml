@@ -1,0 +1,139 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+    discovery.miloapis.com/parent-contexts: Project
+  name: connectgrants.connect.datumapis.com
+spec:
+  group: connect.datumapis.com
+  names:
+    kind: ConnectGrant
+    listKind: ConnectGrantList
+    plural: connectgrants
+    singular: connectgrant
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              bindingName:
+                maxLength: 253
+                type: string
+              bindingUID:
+                maxLength: 253
+                type: string
+              cell:
+                maxLength: 253
+                type: string
+              connectorID:
+                maxLength: 253
+                type: string
+              endpointName:
+                maxLength: 253
+                type: string
+              endpointUID:
+                maxLength: 253
+                type: string
+              networkName:
+                type: string
+              networkUID:
+                type: string
+              policyRevision:
+                maxLength: 253
+                type: string
+              vpcRef:
+                properties:
+                  name:
+                    maxLength: 253
+                    type: string
+                  namespace:
+                    maxLength: 253
+                    type: string
+                  uid:
+                    maxLength: 253
+                    type: string
+                required:
+                - name
+                - namespace
+                - uid
+                type: object
+            required:
+            - bindingName
+            - bindingUID
+            - cell
+            - connectorID
+            - endpointName
+            - endpointUID
+            - networkName
+            - networkUID
+            - policyRevision
+            - vpcRef
+            type: object
+            x-kubernetes-validations:
+            - message: grant identity is immutable
+              rule: self == oldSelf
+          status:
+            properties:
+              retired:
+                description: 'Deprecated: consumed during migration; true always preserves
+                  the tombstone.'
+                type: boolean
+              retiring:
+                description: 'Deprecated: consumed during migration; true always takes
+                  precedence over Active.'
+                type: boolean
+              state:
+                enum:
+                - Active
+                - Retiring
+                - Retired
+                type: string
+                x-kubernetes-validations:
+                - message: retired grants cannot reactivate
+                  rule: oldSelf != 'Retired' || self == 'Retired'
+                - message: retiring grants cannot reactivate
+                  rule: oldSelf != 'Retiring' || self != 'Active'
+            type: object
+            x-kubernetes-validations:
+            - message: retired state cannot be cleared
+              rule: '!has(oldSelf.state) || oldSelf.state != ''Retired'' || (has(self.state)
+                && self.state == ''Retired'')'
+            - message: retiring state cannot be cleared
+              rule: '!has(oldSelf.state) || oldSelf.state != ''Retiring'' || (has(self.state)
+                && self.state in [''Retiring'', ''Retired''])'
+            - message: legacy tombstone must be preserved or migrated
+              rule: '!has(oldSelf.retired) || !oldSelf.retired || ((has(self.retired)
+                && self.retired) || (has(self.state) && self.state == ''Retired''))'
+            - message: legacy revocation must be preserved or migrated
+              rule: '!has(oldSelf.retiring) || !oldSelf.retiring || ((has(self.retiring)
+                && self.retiring) || (has(self.state) && self.state in [''Retiring'',
+                ''Retired'']))'
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
