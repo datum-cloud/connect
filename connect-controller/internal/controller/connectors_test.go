@@ -69,6 +69,33 @@ func reconcileTestGateway(t *testing.T, ctx context.Context, c client.Client, ga
 	}
 }
 
+func TestAdvertisementResolvesConnectorInItsNamespace(t *testing.T) {
+	for _, namespace := range []string{"default", "other"} {
+		t.Run(namespace, func(t *testing.T) {
+			connector := &connectv1alpha1.Connector{
+				ObjectMeta: metav1.ObjectMeta{Name: "jm-home", Namespace: namespace},
+				Status:     connectv1alpha1.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}},
+			}
+			advertisement := &connectv1alpha1.ConnectorAdvertisement{
+				ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "default"},
+				Spec:       connectv1alpha1.ConnectorAdvertisementSpec{ConnectorRef: "jm-home"},
+			}
+			projectClient := testClient(t, connector, advertisement).Build()
+			if err := reconcileAdvertisement(context.Background(), projectClient, advertisement); err != nil {
+				t.Fatal(err)
+			}
+			condition := meta.FindStatusCondition(advertisement.Status.Conditions, "Accepted")
+			if namespace == "default" {
+				if condition == nil || condition.Status != metav1.ConditionTrue {
+					t.Fatalf("same-namespace Connector was not accepted: %+v", condition)
+				}
+			} else if condition == nil || condition.Reason != "ConnectorNotFound" || condition.Status != metav1.ConditionFalse {
+				t.Fatalf("cross-namespace Connector must not be accepted: %+v", condition)
+			}
+		})
+	}
+}
+
 func TestReconcileConnectorChecksPlatformClass(t *testing.T) {
 	ctx := context.Background()
 	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", UID: types.UID("laptop-uid")}, Spec: connectv1alpha1.ConnectorSpec{ClassRef: "masque", PublicKey: strings.Repeat("a", 64)}}

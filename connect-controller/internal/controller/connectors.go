@@ -351,7 +351,7 @@ func reconcileAdvertisement(ctx context.Context, c client.Client, obj *connectv1
 	before := obj.Status.DeepCopy()
 	status, reason, message := metav1.ConditionTrue, "Accepted", "advertisement is accepted"
 	var connector connectv1alpha1.Connector
-	err := c.Get(ctx, types.NamespacedName{Name: obj.Spec.ConnectorRef}, &connector)
+	err := c.Get(ctx, types.NamespacedName{Name: obj.Spec.ConnectorRef, Namespace: obj.Namespace}, &connector)
 	if apierrors.IsNotFound(err) {
 		status, reason, message = metav1.ConditionFalse, "ConnectorNotFound", "referenced Connector does not exist in this project"
 	} else if err != nil {
