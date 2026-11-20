@@ -156,8 +156,9 @@ challenge CNAME for renewal. Neither record grants access to the VPC.
 
 The certificate service rejects protected platform domains unless its managed
 issuance path verifies a live reservation in the pinned service project and the
-exact authenticated Connect writer. Both reservation lifecycle and phase must
-be Active, and `status.certificateRef` must match the request name and UID. Ordinary project requests must
+exact authenticated Connect writer. Reservation lifecycle must be Active, and `status.certificateRef` must match
+the request name and UID. Issuance does not depend on phase or endpoint readiness;
+readiness itself requires the issued certificate. Ordinary project requests must
 not gain permission to issue for the entire Connect domain. Requests belong in
 the Connect service-provider project; requests carry `managedAuthorization:{reservationName,reservationUID}`. Hosting
 the request there does not itself bypass protected-domain validation.
@@ -264,10 +265,12 @@ expiry and the service project's endpoint reference remain internal.
 
 The internal endpoint keeps desired lifecycle in spec and a durable cleanup stage
 in status. Use standard conditions for readiness and errors instead of separate
-ready/reason fields, and remove the redundant phase field. Keep one delivery
-inventory for Secrets, registrations and policies, recording planned writes and
-confirmed resource incarnations. It must support recovery after a lost response
-and cleanup after deletion without a second list of Secret names.
+ready/reason fields and a redundant phase field. Ready must refer to the current
+generation and also requires fresh verification and sufficient certificate lifetime.
+Keep one delivery inventory for Secrets, registrations and policies. Receipts move
+through Planned, Created and Removed, retaining names, digests and resource UIDs.
+Build distribution selectors from active receipts. Retained history supports
+recovery after a lost response and cleanup without a second list of Secret names.
 
 A grant has one state: Active, Retiring or Retired. Persist Retiring before calling
 the authority, and refuse credential issuance or refresh from that point onward.
@@ -276,6 +279,12 @@ renewal must not act like endpoint reactivation. Retain certificate digests,
 per-instance observed/applied revisions and forwarding-stop evidence, private UID
 pins, reservation authorization and receipt digests. These protect different
 lifecycle and authorization boundaries.
+
+During upgrade, retain deprecated fields in the schema only long enough to convert
+saved records without loss. They never provide a readiness fallback. Legacy
+retiring or retired grant state takes precedence over Active; converted writes
+clear the old fields. Upgrade the Certificates reader before Connect stops writing
+phase, preserving exact reservation and certificate-reference checks.
 
 Controllers save object UIDs, desired versions, and pending work so they can
 resume after a restart or a lost response. Old workers must not overwrite a newer

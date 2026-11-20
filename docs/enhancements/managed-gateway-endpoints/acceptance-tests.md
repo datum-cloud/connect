@@ -119,6 +119,13 @@ bearer credentials. A TLS handshake alone does not prove VPC connectivity.
   cell, and saved receipts still direct revocation after the endpoint disappears.
 - Upgrade lifecycle/status representations without losing pending cleanup,
   retirement state, delivery receipts, authorization checks or tombstones.
+  Legacy retiring/retired grants never become Active during conversion; new writes
+  clear deprecated fields and readiness never falls back to them.
+- Request issuance for an Active reservation with exact reservation/certificate
+  pins before the endpoint is Ready. Issuance succeeds without phase or Ready;
+  wrong pins or an inactive lifecycle remain denied.
+- Reject stale-generation Ready conditions, stale verification and certificates
+  inside the expiry margin, even when deprecated ready fields say true.
 - Interrupt project API access, DNS, issuance, distribution, and cell access.
   Report the failing dependency and do not mistake an outage for deletion.
 - Remove selected-cell reachability for one network. That binding becomes
