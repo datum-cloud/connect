@@ -31,8 +31,12 @@ The Rust daemon shares one H3 or H2 connection per endpoint and enrolled project
 context, with separately authenticated CONNECT-IP streams. Revoking one binding
 does not revoke its siblings. Local overlapping routes remain prohibited.
 
-Install `config/components/managed-endpoints/crd` only in the service Project,
-not through customer API discovery. This feature is off by default. It requires
+Install `config/components/managed-endpoints/crd` as core-global Milo definitions,
+with Project-local instances. First install the fail-closed admission export;
+then configure separate service-Project IAM authorization. Project discovery is
+not authorization, and a write admission policy does not restrict reads. See
+[managed admission bootstrap](config/components/managed-endpoints/admission/README.md).
+This feature is off by default. It requires
 operator-provisioned cells, VPC ledgers, shared DNS zone, separate kubeconfigs
 and a trusted external probe. Missing capacity, credentials, fresh provider
 acknowledgments or a probe keeps readiness false. Disabling new provisioning

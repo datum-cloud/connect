@@ -47,7 +47,7 @@ func TestManagedEndpointRuntimeIsOptIn(t *testing.T) {
 	}
 }
 
-func TestManagedEndpointCRDsAreServiceProjectOnly(t *testing.T) {
+func TestManagedEndpointCRDsAreOptInGlobalDefinitions(t *testing.T) {
 	if _, err := exec.LookPath("kubectl"); err != nil {
 		t.Skip("kubectl is required for export validation")
 	}
@@ -64,7 +64,41 @@ func TestManagedEndpointCRDsAreServiceProjectOnly(t *testing.T) {
 			t.Fatalf("%s has wrong project scope", resource)
 		}
 	}
-	if strings.Contains(string(managed), "discovery.miloapis.com/parent-contexts") || strings.Count(string(managed), "kind: CustomResourceDefinition") != 2 {
-		t.Fatal("service-only export contains customer discovery or unrelated APIs")
+	if strings.Count(string(managed), "discovery.miloapis.com/parent-contexts: Project") != 2 || strings.Count(string(managed), "kind: CustomResourceDefinition") != 2 {
+		t.Fatal("global definitions must expose Project-local instances; discovery is not authorization")
+	}
+}
+
+func TestManagedAuthorizationExportsAreUnbound(t *testing.T) {
+	if _, err := exec.LookPath("kubectl"); err != nil {
+		t.Skip("kubectl is required for export validation")
+	}
+	managed, err := exec.Command("kubectl", "kustomize", "components/managed-endpoints/iam").CombinedOutput()
+	if err != nil {
+		t.Fatalf("IAM export: %v: %s", err, managed)
+	}
+	if strings.Count(string(managed), "kind: ProtectedResource") != 2 || strings.Count(string(managed), "kind: Role\n") != 2 {
+		t.Fatal("expected exact internal resource catalog and two unbound roles")
+	}
+	for _, forbidden := range []string{"kind: PolicyBinding", "kind: RoleBinding", "kind: ClusterRole", ".delete", "- delete", "inheritedRoles", "system:dedicated"} {
+		if strings.Contains(string(managed), forbidden) {
+			t.Fatalf("unsafe IAM export: %s", forbidden)
+		}
+	}
+	customer, err := exec.Command("kubectl", "kustomize", "components/iam").CombinedOutput()
+	if err != nil {
+		t.Fatalf("customer IAM export: %v: %s", err, customer)
+	}
+	for _, resource := range []string{"connectendpoints", "connectgrants"} {
+		if strings.Contains(string(customer), resource) {
+			t.Fatalf("internal resource inherited by customer IAM: %s", resource)
+		}
+	}
+	guard, err := exec.Command("kubectl", "kustomize", "components/managed-endpoints/admission").CombinedOutput()
+	if err != nil {
+		t.Fatalf("admission export: %v: %s", err, guard)
+	}
+	if strings.Count(string(guard), "kind: ValidatingAdmissionPolicy\n") != 1 || strings.Count(string(guard), "kind: ValidatingAdmissionPolicyBinding\n") != 1 || strings.Contains(string(guard), "objectSelector") || strings.Contains(string(guard), "namespaceSelector") {
+		t.Fatal("guard must cover every internal resource without opt-out selectors")
 	}
 }

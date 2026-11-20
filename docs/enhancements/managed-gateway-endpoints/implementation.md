@@ -44,6 +44,14 @@ The controller and Rust client implement this contract. Certificates dependency 
 
 ## Lifecycle contracts
 
+Managed CRD definitions are installed globally in core Milo, with Project-local
+instances. The opt-in native admission guard and separately scoped IAM grants
+are required; Project discovery is not an access boundary. Follow the
+[ordered bootstrap and live authorization gates](../../../connect-controller/config/components/managed-endpoints/admission/README.md).
+The guard defaults to denial and requires observed writer username/UID and
+trusted singleton service Project context. It never substitutes for GET/LIST/WATCH
+authorization. The credential mechanism must support renewal.
+
 Connect owns namespaced `connect.datumapis.com/v1alpha1 ConnectEndpoint`
 (`connectendpoints`) in an explicitly configured service-provider Project.
 It has no customer owner reference. Immutable identity is
@@ -268,8 +276,9 @@ name as separate path segments. Its JSON report must contain exact
 `endpointRef:{namespace,name}` for the selected-cell MASQUEEndpoint, `hostname`,
 `revision`, `certificateRevision`, `cell`, a `checkedAt` timestamp
 no older than ten seconds, and `h3`, `h2`, `dns` all true. HTTPS trust comes
-from the controller's configured trust store. No probe service is bundled, no
-synthetic success is permitted, and omission fails closed.
+from the controller's configured trust store. The image supplies `/endpoint-probe`,
+but an operator must deploy and qualify its mTLS route and selected API credentials;
+no synthetic success is permitted, and omission fails closed.
 
 The optional broker requires `--credential-listen-address`,
 `--credential-tls-cert` and `--credential-tls-key`. Its POST route is:
@@ -285,10 +294,16 @@ gateway, Network and endpoint UIDs. A final read rejects revocation during mint.
 Responses are no-store, errors never return credentials. Frontend routing to this
 listener is a separate release gate and remains disabled by default.
 
-The pinned service-project identity is
-`system:managed-endpoints@connect.datumapis.com`, not system:masters. Certificates
-uses its separate pinned reservation reader and exact writer/Project admission
-checks. Cell observer clients read registration, EdgeInstance and Lease objects;
+The service-project writer is an authenticated Milo IAM ServiceAccount, not a
+synthetic mTLS group or system:masters. Configure the guard from observed username
+and UID; the staging controller observed username is
+`connect-endpoint-controller@connect-managed-svc-staging.identity.miloapis.com`.
+Certificates uses its separate pinned reservation reader and must configure the
+same observed writer username for its exact writer/Project admission checks.
+The image supplies a [renewable exec credential helper](../../../connect-controller/cmd/service-account-credential/README.md)
+for these kubeconfigs. Its five-minute local cache is not a five-minute bearer
+revocation guarantee and does not terminate already-open watches.
+Cell observer clients read registration, EdgeInstance and Lease objects;
 Secret GET is also needed to verify cleanup. Central source Secret GET currently
 has namespace scope. Both key-read residual privileges are explicit; they must
 not be granted to customer identities. Grant clients are separate and may update
@@ -321,7 +336,7 @@ and allocation retries. Provider filtering and all-replica stop checks remain.
 
 Passed locally: the full controller race suite (including Kubernetes 1.37
 envtest), native macOS build, Linux/amd64 cross-build, and stock Kustomize renders
-of both service-only and default customer exports. The resource fixture drives
+of both opt-in managed and default customer exports. The resource fixture drives
 central certificate consumption through generated delivery, instance/Lease
 acknowledgments, DNS and readiness, with an explicitly simulated probe. The
 separate broker fixture calls the published Galactic grant/ledger implementation.

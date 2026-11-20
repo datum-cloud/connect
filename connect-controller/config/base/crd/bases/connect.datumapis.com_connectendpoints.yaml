@@ -4,6 +4,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
+    discovery.miloapis.com/parent-contexts: Project
   name: connectendpoints.connect.datumapis.com
 spec:
   group: connect.datumapis.com
