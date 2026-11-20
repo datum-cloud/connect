@@ -62,7 +62,7 @@ func (fixture *driverFixture) RemoveCertificate(context.Context, *connect.Connec
 }
 
 func endpointFixture() *connect.ConnectEndpoint {
-	return &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "reservation-uid"}, Spec: connect.ConnectEndpointSpec{CustomerProjectUID: "customer-uid", GatewayUID: "gateway-uid", Metro: "dfw", Hostname: "endpoint.connect.example.test", CustomerProject: "customer", GatewayNamespace: "default", GatewayName: "gateway", NetworkUID: "network-uid", Lifecycle: "Active", Assignment: connect.EndpointAssignment{Cell: "cell-a", Provider: "shared", Frontend: "a.example.test", VPC: connect.EndpointVPCReference{Namespace: "vpc", Name: "network", UID: "vpc-uid"}}}}
+	return &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "reservation-uid"}, Spec: connect.ConnectEndpointSpec{CustomerProjectUID: "customer-uid", GatewayUID: "gateway-uid", Metro: "dfw", Hostname: "endpoint.connect.example.test", CustomerProject: "customer", GatewayNamespace: "default", GatewayName: "gateway", Lifecycle: "Active", Assignment: connect.EndpointAssignment{Cell: "cell-a", Provider: "shared", Frontend: "a.example.test"}}}
 }
 
 func projectFixture(t *testing.T, objects ...client.Object) client.Client {

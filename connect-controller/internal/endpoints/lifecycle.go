@@ -2,6 +2,7 @@ package endpoints
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -52,7 +53,11 @@ func Reserve(ctx context.Context, project client.Client, namespace, domain strin
 		return nil, fmt.Errorf("reservation requires project UID, gateway UID, metro and domain")
 	}
 	name := Name(spec.CustomerProjectUID, spec.GatewayUID, spec.Metro)
-	spec.Hostname = name + "." + strings.TrimSuffix(domain, ".")
+	label := make([]byte, 20)
+	if _, err := rand.Read(label); err != nil {
+		return nil, err
+	}
+	spec.Hostname = "gw-" + hex.EncodeToString(label) + "." + strings.TrimSuffix(domain, ".")
 	spec.Lifecycle = "Active"
 	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Spec: spec}
 	if err := project.Create(ctx, endpoint); err != nil {
@@ -62,7 +67,7 @@ func Reserve(ctx context.Context, project client.Client, namespace, domain strin
 		if err := project.Get(ctx, client.ObjectKeyFromObject(endpoint), endpoint); err != nil {
 			return nil, err
 		}
-		if endpoint.Spec.CustomerProjectUID != spec.CustomerProjectUID || endpoint.Spec.GatewayUID != spec.GatewayUID || endpoint.Spec.Metro != spec.Metro || endpoint.Spec.Hostname != spec.Hostname || endpoint.Spec.NetworkUID != spec.NetworkUID {
+		if endpoint.Spec.CustomerProjectUID != spec.CustomerProjectUID || endpoint.Spec.GatewayUID != spec.GatewayUID || endpoint.Spec.Metro != spec.Metro || !strings.HasSuffix(endpoint.Spec.Hostname, "."+strings.TrimSuffix(domain, ".")) {
 			return nil, fmt.Errorf("reservation identity collision")
 		}
 		if endpoint.Spec.Lifecycle != "Active" {

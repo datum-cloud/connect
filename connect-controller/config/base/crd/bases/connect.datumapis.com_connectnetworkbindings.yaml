@@ -43,8 +43,20 @@ spec:
             properties:
               connectorRef:
                 type: string
+                x-kubernetes-validations:
+                - message: connector reference is immutable
+                  rule: self == oldSelf
               gatewayRef:
                 type: string
+                x-kubernetes-validations:
+                - message: gateway reference is immutable
+                  rule: self == oldSelf
+              networkRef:
+                type: string
+                x-kubernetes-validations:
+                - message: network reference is immutable; recreate the binding to
+                    change networks
+                  rule: self == oldSelf
             required:
             - connectorRef
             - gatewayRef

@@ -26,7 +26,7 @@ func policySelector() *metav1.LabelSelector {
 }
 
 func TestPolicySelectorSupportsInAndExists(t *testing.T) {
-	policy := &connectv1alpha1.ConnectConnectionPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "project"}, Spec: connectv1alpha1.ConnectConnectionPolicySpec{
+	policy := &connectv1alpha1.ConnectConnectionPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "project"}, Spec: connectv1alpha1.ConnectConnectionPolicySpec{NetworkRefs: []connectv1alpha1.LocalObjectReference{{Name: "network"}},
 		GatewaySelector: policySelector(), ConnectorSelector: *policySelector(), Access: connectv1alpha1.ConnectPolicyAccess{Permission: "Network"},
 	}}
 	gateways := []connectv1alpha1.ConnectGateway{
@@ -43,7 +43,7 @@ func TestPolicySelectorSupportsInAndExists(t *testing.T) {
 }
 
 func TestPolicyRejectsEmptyNegativeAndUnprotectedSelectors(t *testing.T) {
-	base := connectv1alpha1.ConnectConnectionPolicy{Spec: connectv1alpha1.ConnectConnectionPolicySpec{GatewaySelector: policySelector(), ConnectorSelector: *policySelector(), Access: connectv1alpha1.ConnectPolicyAccess{Permission: "Network"}}}
+	base := connectv1alpha1.ConnectConnectionPolicy{Spec: connectv1alpha1.ConnectConnectionPolicySpec{NetworkRefs: []connectv1alpha1.LocalObjectReference{{Name: "network"}}, GatewaySelector: policySelector(), ConnectorSelector: *policySelector(), Access: connectv1alpha1.ConnectPolicyAccess{Permission: "Network"}}}
 	cases := []struct {
 		name   string
 		mutate func(*connectv1alpha1.ConnectConnectionPolicy)
@@ -143,10 +143,10 @@ func TestApplicablePoliciesComposeAdditively(t *testing.T) {
 	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Namespace: "project", Labels: map[string]string{"policy.connect.datum.net/environment": "staging", "policy.connect.datum.net/access-domain": "application", "policy.connect.datum.net/developer-access": "true"}}}
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "production", Namespace: "project", Labels: map[string]string{"policy.connect.datum.net/environment": "staging", "policy.connect.datum.net/access-domain": "application", "policy.connect.datum.net/developer-access": "true"}}}
 	policies := []connectv1alpha1.ConnectConnectionPolicy{
-		{ObjectMeta: metav1.ObjectMeta{Name: "direct", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectConnectionPolicySpec{GatewayRef: &connectv1alpha1.LocalObjectReference{Name: "production"}, ConnectorSelector: *policySelector(), Access: connectv1alpha1.ConnectPolicyAccess{Permission: "Network"}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "selected", Namespace: "project", Generation: 2}, Spec: connectv1alpha1.ConnectConnectionPolicySpec{GatewaySelector: policySelector(), ConnectorSelector: *policySelector(), Access: connectv1alpha1.ConnectPolicyAccess{Permission: "Network"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "direct", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectConnectionPolicySpec{NetworkRefs: []connectv1alpha1.LocalObjectReference{{Name: "network"}}, GatewayRef: &connectv1alpha1.LocalObjectReference{Name: "production"}, ConnectorSelector: *policySelector(), Access: connectv1alpha1.ConnectPolicyAccess{Permission: "Network"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "selected", Namespace: "project", Generation: 2}, Spec: connectv1alpha1.ConnectConnectionPolicySpec{NetworkRefs: []connectv1alpha1.LocalObjectReference{{Name: "network"}}, GatewaySelector: policySelector(), ConnectorSelector: *policySelector(), Access: connectv1alpha1.ConnectPolicyAccess{Permission: "Network"}}},
 	}
-	revision, count, err := effectivePolicyRevision(policies, connector, gateway, "fd20:0:27::/48")
+	revision, count, err := effectivePolicyRevision(policies, connector, gateway, "fd20:0:27::/48", "network")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,8 +164,8 @@ func TestGatewayPlacementBindingResolution(t *testing.T) {
 	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "production", Namespace: "project", Labels: map[string]string{"policy.connect.datum.net/environment": "staging"}}, Spec: connectv1alpha1.ConnectGatewaySpec{ContractVersion: managedGatewayContract, NetworkRef: "network"}}
 	placement := &connectv1alpha1.ConnectGatewayPlacement{ObjectMeta: metav1.ObjectMeta{Name: "production-dfw", Namespace: "project", Labels: map[string]string{"connect.datum.net/gateway": "production"}}, Spec: connectv1alpha1.ConnectGatewayPlacementSpec{GatewayRef: "production", LocationRef: "dfw"}, Status: connectv1alpha1.ConnectGatewayPlacementStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Assigned"}}}}
 	connector := &connectv1alpha1.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "project", Labels: map[string]string{"policy.connect.datum.net/environment": "staging"}}}
-	policy := &connectv1alpha1.ConnectConnectionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectConnectionPolicySpec{GatewayRef: &connectv1alpha1.LocalObjectReference{Name: "production"}, ConnectorSelector: metav1.LabelSelector{MatchLabels: map[string]string{"policy.connect.datum.net/environment": "staging"}}, Access: connectv1alpha1.ConnectPolicyAccess{Permission: "Network"}}}
-	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-production", Namespace: "project", Generation: 2}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{GatewayRef: "production", ConnectorRef: "laptop"}, Status: connectv1alpha1.ConnectNetworkBindingStatus{NetworkPlan: &connectv1alpha1.ConnectNetworkPlanSummary{ExpectedPrefix: "fd20:0:27:10:1:1::/96"}}}
+	policy := &connectv1alpha1.ConnectConnectionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow", Namespace: "project", Generation: 1}, Spec: connectv1alpha1.ConnectConnectionPolicySpec{NetworkRefs: []connectv1alpha1.LocalObjectReference{{Name: "network"}}, GatewayRef: &connectv1alpha1.LocalObjectReference{Name: "production"}, ConnectorSelector: metav1.LabelSelector{MatchLabels: map[string]string{"policy.connect.datum.net/environment": "staging"}}, Access: connectv1alpha1.ConnectPolicyAccess{Permission: "Network"}}}
+	binding := &connectv1alpha1.ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Name: "laptop-production", Namespace: "project", Generation: 2}, Spec: connectv1alpha1.ConnectNetworkBindingSpec{NetworkRef: "network", GatewayRef: "production", ConnectorRef: "laptop"}, Status: connectv1alpha1.ConnectNetworkBindingStatus{NetworkPlan: &connectv1alpha1.ConnectNetworkPlanSummary{ExpectedPrefix: "fd20:0:27:10:1:1::/96"}}}
 	network := &unstructured.Unstructured{Object: map[string]interface{}{"apiVersion": "networking.datumapis.com/v1alpha", "kind": "Network", "metadata": map[string]interface{}{"name": "network", "namespace": "project"}, "status": map[string]interface{}{"ipam": map[string]interface{}{"ipv6Prefix": "fd20:0:27::/48"}}}}
 	network.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.datumapis.com", Version: "v1alpha", Kind: "Network"})
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(binding).WithObjects(gateway, placement, connector, policy, binding, network).Build()

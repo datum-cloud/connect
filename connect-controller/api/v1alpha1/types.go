@@ -197,7 +197,7 @@ type ConnectGateway struct {
 }
 
 // +kubebuilder:validation:XValidation:message="managed-network-v1 requires placement and forbids legacy gateway implementation fields",rule="self.contractVersion != 'managed-network-v1' || (has(self.placement) && !has(self.gatewayClassRef) && !has(self.locationRef) && !has(self.routes) && !has(self.relayURLs) && !has(self.peerRouting))"
-// +kubebuilder:validation:XValidation:message="legacy-v1 requires gatewayClassRef, locationRef, and routes",rule="self.contractVersion != 'legacy-v1' || (has(self.gatewayClassRef) && has(self.locationRef) && has(self.routes))"
+// +kubebuilder:validation:XValidation:message="legacy-v1 requires networkRef, gatewayClassRef, locationRef, and routes",rule="self.contractVersion != 'legacy-v1' || (has(self.networkRef) && has(self.gatewayClassRef) && has(self.locationRef) && has(self.routes))"
 type ConnectGatewaySpec struct {
 	// ContractVersion selects the reconciliation contract without exposing the
 	// gateway provider. Existing preview objects default to legacy-v1; new
@@ -207,8 +207,7 @@ type ConnectGatewaySpec struct {
 	ContractVersion string `json:"contractVersion,omitempty"`
 	// GatewayClassRef names a cluster-scoped ConnectGatewayClass in this project.
 	GatewayClassRef string `json:"gatewayClassRef,omitempty"`
-	// +kubebuilder:validation:Required
-	NetworkRef string `json:"networkRef"`
+	NetworkRef      string `json:"networkRef,omitempty"`
 	// LocationRef is the fully qualified Compute Location name (for example, us-central-1).
 	LocationRef string `json:"locationRef,omitempty"`
 	// +kubebuilder:validation:MinItems=1
@@ -275,8 +274,12 @@ type ConnectNetworkBinding struct {
 }
 
 type ConnectNetworkBindingSpec struct {
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="network reference is immutable; recreate the binding to change networks"
+	NetworkRef string `json:"networkRef,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="gateway reference is immutable"
 	// +kubebuilder:validation:Required
 	GatewayRef string `json:"gatewayRef"`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="connector reference is immutable"
 	// +kubebuilder:validation:Required
 	ConnectorRef string `json:"connectorRef"`
 }
@@ -328,12 +331,12 @@ type ConnectGatewayPlacementSpec struct {
 }
 
 type ConnectGatewayPlacementStatus struct {
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
-	AssignmentRef      string             `json:"assignmentRef,omitempty"`
-	Hostname string `json:"hostname,omitempty"`
-	Metro string `json:"metro,omitempty"`
-	CertificateNotAfter *metav1.Time `json:"certificateNotAfter,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	ObservedGeneration  int64              `json:"observedGeneration,omitempty"`
+	AssignmentRef       string             `json:"assignmentRef,omitempty"`
+	Hostname            string             `json:"hostname,omitempty"`
+	Metro               string             `json:"metro,omitempty"`
+	CertificateNotAfter *metav1.Time       `json:"certificateNotAfter,omitempty"`
+	Conditions          []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -359,8 +362,10 @@ type ConnectConnectionPolicy struct {
 // +kubebuilder:validation:XValidation:message="gatewaySelector must use nonempty protected In/Exists requirements",rule="!has(self.gatewaySelector) || ((has(self.gatewaySelector.matchLabels) ? size(self.gatewaySelector.matchLabels) : 0) + (has(self.gatewaySelector.matchExpressions) ? size(self.gatewaySelector.matchExpressions) : 0) > 0 && (!has(self.gatewaySelector.matchLabels) || self.gatewaySelector.matchLabels.all(k, v, k.startsWith('policy.connect.datum.net/'))) && (!has(self.gatewaySelector.matchExpressions) || self.gatewaySelector.matchExpressions.all(r, r.key.startsWith('policy.connect.datum.net/') && (r.operator == 'In' || r.operator == 'Exists'))))"
 // +kubebuilder:validation:XValidation:message="connectorSelector must use nonempty protected In/Exists requirements",rule="((has(self.connectorSelector.matchLabels) ? size(self.connectorSelector.matchLabels) : 0) + (has(self.connectorSelector.matchExpressions) ? size(self.connectorSelector.matchExpressions) : 0) > 0) && (!has(self.connectorSelector.matchLabels) || self.connectorSelector.matchLabels.all(k, v, k.startsWith('policy.connect.datum.net/'))) && (!has(self.connectorSelector.matchExpressions) || self.connectorSelector.matchExpressions.all(r, r.key.startsWith('policy.connect.datum.net/') && (r.operator == 'In' || r.operator == 'Exists')))"
 type ConnectConnectionPolicySpec struct {
-	GatewayRef      *LocalObjectReference `json:"gatewayRef,omitempty"`
-	GatewaySelector *metav1.LabelSelector `json:"gatewaySelector,omitempty"`
+	// +kubebuilder:validation:MaxItems=64
+	NetworkRefs     []LocalObjectReference `json:"networkRefs,omitempty"`
+	GatewayRef      *LocalObjectReference  `json:"gatewayRef,omitempty"`
+	GatewaySelector *metav1.LabelSelector  `json:"gatewaySelector,omitempty"`
 	// ConnectorSelector is the prototype trusted subject mechanism. Only
 	// controller/IAM-owned policy.connect.datum.net labels are accepted.
 	ConnectorSelector metav1.LabelSelector `json:"connectorSelector"`
@@ -368,6 +373,8 @@ type ConnectConnectionPolicySpec struct {
 }
 
 type LocalObjectReference struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	Name string `json:"name"`
 }
 

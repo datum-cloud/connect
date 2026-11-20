@@ -55,9 +55,29 @@ spec:
               endpointUID:
                 maxLength: 253
                 type: string
+              networkName:
+                type: string
+              networkUID:
+                type: string
               policyRevision:
                 maxLength: 253
                 type: string
+              vpcRef:
+                properties:
+                  name:
+                    maxLength: 253
+                    type: string
+                  namespace:
+                    maxLength: 253
+                    type: string
+                  uid:
+                    maxLength: 253
+                    type: string
+                required:
+                - name
+                - namespace
+                - uid
+                type: object
             required:
             - bindingName
             - bindingUID
@@ -65,7 +85,10 @@ spec:
             - connectorID
             - endpointName
             - endpointUID
+            - networkName
+            - networkUID
             - policyRevision
+            - vpcRef
             type: object
             x-kubernetes-validations:
             - message: grant identity is immutable

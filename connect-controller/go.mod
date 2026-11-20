@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/google/uuid v1.6.0
-	go.datum.net/galactic v0.9.5-0.20261120015703-be12f3e9a55f
+	go.datum.net/galactic v0.9.5-0.20261120141021-ed8dddbeca8c
 	go.miloapis.com/milo v0.32.1
 	go.miloapis.com/service-catalog v0.13.1
 	k8s.io/api v0.37.2

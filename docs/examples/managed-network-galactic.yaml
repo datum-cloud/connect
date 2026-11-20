@@ -8,7 +8,6 @@ metadata:
     policy.connect.datum.net/developer-access: "true"
 spec:
   contractVersion: managed-network-v1
-  networkRef: default
   placement:
     locationSelector:
       matchExpressions:
@@ -37,6 +36,8 @@ spec:
       policy.connect.datum.net/environment: staging
   access:
     permission: Network
+  networkRefs:
+  - name: default
 ---
 # This second policy composes additively. The binding does not name either one.
 apiVersion: connect.datumapis.com/v1alpha1
@@ -51,6 +52,9 @@ spec:
       policy.connect.datum.net/access-domain: application
   access:
     permission: Network
+  networkRefs:
+  - name: default
+  - name: observability
 ---
 apiVersion: connect.datumapis.com/v1alpha1
 kind: ConnectNetworkBinding
@@ -59,4 +63,13 @@ metadata:
 spec:
   gatewayRef: production
   connectorRef: laptop
-
+  networkRef: default
+---
+apiVersion: connect.datumapis.com/v1alpha1
+kind: ConnectNetworkBinding
+metadata:
+  name: laptop-observability
+spec:
+  gatewayRef: production
+  connectorRef: laptop
+  networkRef: observability

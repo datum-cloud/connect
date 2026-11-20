@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -63,7 +64,9 @@ func (options endpointFlags) setup(mgr mcmanager.Manager, root client.Client, pr
 		return nil, err
 	}
 	var config endpoints.Config
-	if err := json.Unmarshal(encoded, &config); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
 		return nil, err
 	}
 	makeClient := func(path string) (client.Client, error) {
@@ -98,9 +101,17 @@ func (options endpointFlags) setup(mgr mcmanager.Manager, root client.Client, pr
 	}
 	for _, capacity := range config.Capacity {
 		assignment := capacity.Assignment
-		if capacity.Metro == "" || capacity.NetworkUID == "" || assignment.Cell == "" || assignment.Provider == "" || assignment.Frontend == "" || assignment.VPC.Name == "" || assignment.VPC.Namespace == "" || assignment.VPC.UID == "" || cells[assignment.Cell] == nil {
+		if capacity.Metro == "" || assignment.Cell == "" || assignment.Provider == "" || assignment.Frontend == "" || cells[assignment.Cell] == nil {
 			return nil, fmt.Errorf("incomplete operator capacity mapping")
 		}
+	}
+	seenReachability := map[string]bool{}
+	for _, mapping := range config.Reachability {
+		key := mapping.NetworkUID + "/" + mapping.Cell
+		if mapping.NetworkUID == "" || cells[mapping.Cell] == nil || mapping.VPC.Name == "" || mapping.VPC.Namespace == "" || mapping.VPC.UID == "" || seenReachability[key] {
+			return nil, fmt.Errorf("incomplete or ambiguous operator reachability mapping")
+		}
+		seenReachability[key] = true
 	}
 	sort.Slice(config.Capacity, func(left, right int) bool {
 		return config.Capacity[left].Assignment.Cell < config.Capacity[right].Assignment.Cell
@@ -112,7 +123,7 @@ func (options endpointFlags) setup(mgr mcmanager.Manager, root client.Client, pr
 			return nil, err
 		}
 	}
-	service := &endpoints.Service{Reconciler: &endpoints.Reconciler{Project: project, Driver: driver, Now: time.Now, ExpiryMargin: 5 * time.Minute, DNSDrain: 2 * time.Minute}, Root: root, Namespace: options.Namespace, Domain: options.Domain, Capacity: config.Capacity, Provision: options.Provision}
+	service := &endpoints.Service{Reconciler: &endpoints.Reconciler{Project: project, Driver: driver, Now: time.Now, ExpiryMargin: 5 * time.Minute, DNSDrain: 2 * time.Minute}, Root: root, Namespace: options.Namespace, Domain: options.Domain, Capacity: config.Capacity, Reachability: config.Reachability, Provision: options.Provision}
 	service.Customer = func(ctx context.Context, project string) (client.Client, error) {
 		cluster, err := mgr.GetCluster(ctx, multicluster.ClusterName(project))
 		if err != nil {

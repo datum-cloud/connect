@@ -32,7 +32,7 @@ type ManagedIssuer struct {
 }
 
 func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedTransport, error) {
-	if binding.Endpoint == nil || binding.UID == "" || binding.PolicyRevision == "" {
+	if binding.Endpoint == nil || binding.UID == "" || binding.PolicyRevision == "" || binding.NetworkUID == "" || binding.NetworkName == "" || binding.VPC.UID == "" {
 		return IssuedTransport{}, ErrUnavailable
 	}
 	endpoint := &connect.ConnectEndpoint{}
@@ -46,9 +46,9 @@ func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedT
 	if authority == nil {
 		return IssuedTransport{}, ErrUnavailable
 	}
-	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d", binding.UID, endpoint.UID, binding.PolicyRevision, endpoint.Status.ActivationRevision)))
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d", binding.UID, endpoint.UID, binding.PolicyRevision+"/"+binding.NetworkUID+"/"+binding.VPC.UID, endpoint.Status.ActivationRevision)))
 	connector := uuid.NewSHA1(uuid.NameSpaceOID, digest[:]).String()
-	receipt := &connect.ConnectGrant{ObjectMeta: metav1.ObjectMeta{Namespace: issuer.Namespace, Name: "cg-" + connector}, Spec: connect.ConnectGrantSpec{EndpointName: endpoint.Name, EndpointUID: string(endpoint.UID), BindingName: binding.Name, BindingUID: binding.UID, PolicyRevision: binding.PolicyRevision, ConnectorID: connector, Cell: endpoint.Spec.Assignment.Cell}}
+	receipt := &connect.ConnectGrant{ObjectMeta: metav1.ObjectMeta{Namespace: issuer.Namespace, Name: "cg-" + connector}, Spec: connect.ConnectGrantSpec{NetworkName: binding.NetworkName, NetworkUID: binding.NetworkUID, VPC: binding.VPC, EndpointName: endpoint.Name, EndpointUID: string(endpoint.UID), BindingName: binding.Name, BindingUID: binding.UID, PolicyRevision: binding.PolicyRevision, ConnectorID: connector, Cell: endpoint.Spec.Assignment.Cell}}
 	wanted := receipt.Spec
 	if err := issuer.Project.Create(ctx, receipt); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
@@ -71,8 +71,8 @@ func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedT
 	}
 	assignment := endpoint.Spec.Assignment
 	activation := endpoint.Status.ActivationRevision
-	scope := &galactic.MASQUEEndpointScope{EndpointUID: string(endpoint.UID), CustomerProjectUID: endpoint.Spec.CustomerProjectUID, GatewayUID: endpoint.Spec.GatewayUID, NetworkUID: endpoint.Spec.NetworkUID, Cell: assignment.Cell, Hostname: endpoint.Spec.Hostname}
-	issued, err := authority.Create(ctx, masquegrant.CreateRequest{VPC: masquegrant.VPCRef{Namespace: assignment.VPC.Namespace, Name: assignment.VPC.Name, UID: assignment.VPC.UID}, Cell: assignment.Cell, Connector: connector, Lifetime: 5 * time.Minute, Routes: routes, Endpoint: scope})
+	scope := &galactic.MASQUEEndpointScope{EndpointUID: string(endpoint.UID), CustomerProjectUID: endpoint.Spec.CustomerProjectUID, GatewayUID: endpoint.Spec.GatewayUID, Cell: assignment.Cell, Hostname: endpoint.Spec.Hostname}
+	issued, err := authority.Create(ctx, masquegrant.CreateRequest{NetworkUID: binding.NetworkUID, BindingUID: binding.UID, VPC: masquegrant.VPCRef{Namespace: binding.VPC.Namespace, Name: binding.VPC.Name, UID: binding.VPC.UID}, Cell: assignment.Cell, Connector: connector, Lifetime: 5 * time.Minute, Routes: routes, Endpoint: scope})
 	if apierrors.IsAlreadyExists(err) {
 		issued, err = authority.Rotate(ctx, connector, 5*time.Minute)
 	}
@@ -87,7 +87,7 @@ func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedT
 		_ = authority.Retire(ctx, connector)
 		return IssuedTransport{}, ErrUnavailable
 	}
-	if !issued.Prefix.IsValid() || !issued.Prefix.Addr().Is6() || issued.Prefix.Bits() != 96 || issued.Connector != connector || issued.VPC != assignment.VPC.Namespace+"/"+assignment.VPC.Name {
+	if !issued.Prefix.IsValid() || !issued.Prefix.Addr().Is6() || issued.Prefix.Bits() != 96 || issued.Connector != connector || issued.VPC != binding.VPC.Namespace+"/"+binding.VPC.Name {
 		return IssuedTransport{}, ErrUnavailable
 	}
 	return IssuedTransport{Authority: endpoint.Spec.Hostname, VPCSelector: issued.VPC, Credential: Credential(issued.Credential), ExpiresAt: issued.Expires, Transports: []string{"h3", "h2"}, ExpectedPrefix: issued.Prefix.String()}, nil

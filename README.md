@@ -12,9 +12,11 @@ to use the existing service publication APIs. See the
 For manual installation, follow the [installation guide](docs/INSTALL.txt).
 It covers plugin trust, checksum verification, first use, and upgrades.
 
-Managed VPC join creates a gateway automatically when the named Network does
-not have one. It uses the nearest Datum location and the project's Ready default
-`ConnectGatewayClass`, then waits for the gateway and binding to become usable.
+Managed VPC join uses a shared logical gateway and creates a name-based binding
+for the requested Network. Each Network requires explicit policy permission;
+bindings share a transport connection, never authorization. If no managed
+gateway exists, the legacy path creates a network-specific gateway using the
+nearest Datum location and the project's Ready default `ConnectGatewayClass`.
 
 ## Quickstart
 

@@ -43,7 +43,7 @@ func (d *KubernetesDriver) Applied(ctx context.Context, endpoint *connect.Connec
 	if uid != string(endpoint.UID) || revision != endpoint.Status.Revision {
 		return fmt.Errorf("registration identity or revision not delivered")
 	}
-	for field, wanted := range map[string]string{"customerProjectUID": endpoint.Spec.CustomerProjectUID, "gatewayUID": endpoint.Spec.GatewayUID, "networkUID": endpoint.Spec.NetworkUID, "hostname": endpoint.Spec.Hostname, "cell": endpoint.Spec.Assignment.Cell, "provider": endpoint.Spec.Assignment.Provider, "metro": endpoint.Spec.Metro} {
+	for field, wanted := range map[string]string{"customerProjectUID": endpoint.Spec.CustomerProjectUID, "gatewayUID": endpoint.Spec.GatewayUID, "hostname": endpoint.Spec.Hostname, "cell": endpoint.Spec.Assignment.Cell, "provider": endpoint.Spec.Assignment.Provider, "metro": endpoint.Spec.Metro} {
 		actual, _, _ := unstructured.NestedString(registration.Object, "spec", field)
 		if actual != wanted {
 			return fmt.Errorf("registration scope differs")
@@ -52,12 +52,6 @@ func (d *KubernetesDriver) Applied(ctx context.Context, endpoint *connect.Connec
 	actualEnabled, _, _ := unstructured.NestedBool(registration.Object, "spec", "enabled")
 	if actualEnabled != enabled {
 		return fmt.Errorf("registration enable state differs")
-	}
-	for field, wanted := range map[string]string{"namespace": endpoint.Spec.Assignment.VPC.Namespace, "name": endpoint.Spec.Assignment.VPC.Name, "uid": endpoint.Spec.Assignment.VPC.UID} {
-		actual, _, _ := unstructured.NestedString(registration.Object, "spec", "vpcRef", field)
-		if actual != wanted {
-			return fmt.Errorf("registration VPC differs")
-		}
 	}
 	if enabled {
 		name, _, _ := unstructured.NestedString(registration.Object, "spec", "certificateRef", "name")
@@ -138,7 +132,6 @@ type ProbeReport struct {
 	CheckedAt           time.Time `json:"checkedAt"`
 	HTTP3               bool      `json:"h3"`
 	HTTP2               bool      `json:"h2"`
-	VPC                 bool      `json:"vpc"`
 	DNS                 bool      `json:"dns"`
 }
 
@@ -164,7 +157,7 @@ func HTTPProbe(baseURL string, httpClient *http.Client, now func() time.Time) (f
 		if err := json.NewDecoder(io.LimitReader(response.Body, 65536)).Decode(&report); err != nil {
 			return fmt.Errorf("invalid probe response")
 		}
-		if report.EndpointUID != string(endpoint.UID) || report.Revision != endpoint.Status.Revision || report.CertificateRevision != endpoint.Status.CertificateRevision || report.Cell != endpoint.Spec.Assignment.Cell || report.CheckedAt.After(now()) || now().Sub(report.CheckedAt) > 10*time.Second || !report.HTTP3 || !report.HTTP2 || !report.VPC || !report.DNS {
+		if report.EndpointUID != string(endpoint.UID) || report.Revision != endpoint.Status.Revision || report.CertificateRevision != endpoint.Status.CertificateRevision || report.Cell != endpoint.Spec.Assignment.Cell || report.CheckedAt.After(now()) || now().Sub(report.CheckedAt) > 10*time.Second || !report.HTTP3 || !report.HTTP2 || !report.DNS {
 			return fmt.Errorf("external verification incomplete or stale")
 		}
 		return nil

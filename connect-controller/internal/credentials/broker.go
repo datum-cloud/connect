@@ -52,6 +52,9 @@ func (d Descriptor) Redacted() Descriptor {
 }
 
 type Binding struct {
+	NetworkName    string
+	NetworkUID     string
+	VPC            connect.EndpointVPCReference
 	UID            string
 	Endpoint       *connect.ConnectEndpoint
 	Name           string
@@ -135,7 +138,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if binding.Endpoint != nil {
 		current, err := b.Resolver.Resolve(ctx, name)
-		if err != nil || current.UID != binding.UID || current.Connector != binding.Connector || current.PolicyRevision != binding.PolicyRevision || current.Endpoint == nil || current.Endpoint.UID != binding.Endpoint.UID || current.Endpoint.Status.ActivationRevision != binding.Endpoint.Status.ActivationRevision {
+		if err != nil || current.UID != binding.UID || current.NetworkUID != binding.NetworkUID || current.VPC != binding.VPC || current.Connector != binding.Connector || current.PolicyRevision != binding.PolicyRevision || current.Endpoint == nil || current.Endpoint.UID != binding.Endpoint.UID || current.Endpoint.Status.ActivationRevision != binding.Endpoint.Status.ActivationRevision {
 			fail(http.StatusForbidden)
 			return
 		}
@@ -148,7 +151,7 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusServiceUnavailable)
 		return
 	}
-	if binding.Endpoint != nil && (issued.Authority != binding.Endpoint.Spec.Hostname || issued.VPCSelector != binding.Endpoint.Spec.Assignment.VPC.Namespace+"/"+binding.Endpoint.Spec.Assignment.VPC.Name) {
+	if binding.Endpoint != nil && (issued.Authority != binding.Endpoint.Spec.Hostname || issued.VPCSelector != binding.VPC.Namespace+"/"+binding.VPC.Name) {
 		fail(http.StatusServiceUnavailable)
 		return
 	}

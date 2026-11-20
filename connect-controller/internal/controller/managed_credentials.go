@@ -39,13 +39,13 @@ func GrantStillAuthorized(ctx context.Context, customer client.Client, endpoint 
 	}
 	network := &unstructured.Unstructured{}
 	network.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.datumapis.com", Version: "v1alpha", Kind: "Network"})
-	if err := customer.Get(ctx, client.ObjectKey{Namespace: binding.Namespace, Name: gateway.Spec.NetworkRef}, network); err != nil {
+	if err := customer.Get(ctx, client.ObjectKey{Namespace: binding.Namespace, Name: binding.Spec.NetworkRef}, network); err != nil {
 		return false, client.IgnoreNotFound(err)
 	}
-	if string(network.GetUID()) != endpoint.Spec.NetworkUID || !network.GetDeletionTimestamp().IsZero() {
+	if string(network.GetUID()) != receipt.Spec.NetworkUID || binding.Spec.NetworkRef != receipt.Spec.NetworkName || !network.GetDeletionTimestamp().IsZero() {
 		return false, nil
 	}
-	prefix, err := networkPrefix(ctx, customer, binding.Namespace, gateway.Spec.NetworkRef)
+	prefix, err := networkPrefix(ctx, customer, binding.Namespace, binding.Spec.NetworkRef)
 	if apierrors.IsNotFound(err) {
 		return false, nil
 	}
@@ -56,7 +56,7 @@ func GrantStillAuthorized(ctx context.Context, customer client.Client, endpoint 
 	if err := customer.List(ctx, &policies, client.InNamespace(binding.Namespace)); err != nil {
 		return false, err
 	}
-	revision, count, err := effectivePolicyRevision(policies.Items, connector, gateway, prefix)
+	revision, count, err := effectivePolicyRevision(policies.Items, connector, gateway, prefix, binding.Spec.NetworkRef)
 	if err != nil {
 		return false, err
 	}
@@ -93,7 +93,7 @@ func (resolver ManagedBindingResolver) Resolve(ctx context.Context, name string)
 	if !connector.DeletionTimestamp.IsZero() || !meta.IsStatusConditionTrue(connector.Status.Conditions, "Ready") {
 		return credentials.Binding{}, credentials.ErrUnavailable
 	}
-	prefix, err := networkPrefix(ctx, resolver.Customer, resolver.Namespace, gateway.Spec.NetworkRef)
+	prefix, err := networkPrefix(ctx, resolver.Customer, resolver.Namespace, binding.Spec.NetworkRef)
 	if err != nil {
 		return credentials.Binding{}, err
 	}
@@ -101,7 +101,7 @@ func (resolver ManagedBindingResolver) Resolve(ctx context.Context, name string)
 	if err := resolver.Customer.List(ctx, &policies, client.InNamespace(resolver.Namespace)); err != nil {
 		return credentials.Binding{}, err
 	}
-	revision, count, err := effectivePolicyRevision(policies.Items, connector, gateway, prefix)
+	revision, count, err := effectivePolicyRevision(policies.Items, connector, gateway, prefix, binding.Spec.NetworkRef)
 	if err != nil || count == 0 {
 		return credentials.Binding{}, fmt.Errorf("policy denied")
 	}
@@ -123,11 +123,18 @@ func (resolver ManagedBindingResolver) Resolve(ctx context.Context, name string)
 	}
 	network := &unstructured.Unstructured{}
 	network.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.datumapis.com", Version: "v1alpha", Kind: "Network"})
-	if err := resolver.Customer.Get(ctx, client.ObjectKey{Namespace: resolver.Namespace, Name: gateway.Spec.NetworkRef}, network); err != nil {
+	if err := resolver.Customer.Get(ctx, client.ObjectKey{Namespace: resolver.Namespace, Name: binding.Spec.NetworkRef}, network); err != nil {
 		return credentials.Binding{}, err
 	}
-	if endpoint.Spec.CustomerProjectUID != string(project.GetUID()) || endpoint.Spec.GatewayUID != string(gateway.UID) || endpoint.Spec.NetworkUID != string(network.GetUID()) || !endpoints.Ready(endpoint, resolver.Now(), 5*time.Minute) {
+	if endpoint.Spec.CustomerProjectUID != string(project.GetUID()) || endpoint.Spec.GatewayUID != string(gateway.UID) || network.GetUID() == "" || !network.GetDeletionTimestamp().IsZero() || !endpoints.Ready(endpoint, resolver.Now(), 5*time.Minute) {
 		return credentials.Binding{}, credentials.ErrUnavailable
 	}
-	return credentials.Binding{Name: binding.Name, UID: string(binding.UID), Connector: connector.Name, PolicyRevision: revision, Placement: placement.Name, Endpoint: endpoint, NetworkPlan: credentials.NetworkPlan{DestinationPrefixes: []string{prefix}, MTU: 1280}}, nil
+	vpc, err := resolver.Service.ResolveVPC(string(network.GetUID()), endpoint.Spec.Assignment.Cell)
+	if err != nil {
+		return credentials.Binding{}, err
+	}
+	if err := resolver.Service.ValidateBindingIdentity(ctx, string(binding.UID), string(network.GetUID()), endpoint.Spec.Assignment.Cell, vpc); err != nil {
+		return credentials.Binding{}, err
+	}
+	return credentials.Binding{NetworkName: binding.Spec.NetworkRef, NetworkUID: string(network.GetUID()), VPC: vpc, Name: binding.Name, UID: string(binding.UID), Connector: connector.Name, PolicyRevision: revision, Placement: placement.Name, Endpoint: endpoint, NetworkPlan: credentials.NetworkPlan{DestinationPrefixes: []string{prefix}, MTU: 1280}}, nil
 }

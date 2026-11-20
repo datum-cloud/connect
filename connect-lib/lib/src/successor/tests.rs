@@ -192,14 +192,13 @@ async fn managed_network_contract_returns_binding_and_mints_sensitive_descriptor
         "metadata":{"name":"production","generation":2},
         "spec":{
             "contractVersion":"managed-network-v1",
-            "networkRef":"staging-vpc",
             "placement":{"locationSelector":{"matchLabels":{"topology.datum.net/region":"us-central-1"}}}
         },
         "status":{"ready":1,"conditions":[{"type":"Ready","status":"True","observedGeneration":2}]}
     });
     let binding = json!({
         "metadata":{"name":binding_name.clone(),"uid":"binding-uid","resourceVersion":"1","generation":1},
-        "spec":{"gatewayRef":"production","connectorRef":connector_name.clone()},
+        "spec":{"gatewayRef":"production","connectorRef":connector_name.clone(),"networkRef":"staging-vpc"},
         "status":{
             "selectedPlacementRef":"production-us-central-1",
             "effectivePolicyRevision":"policy-rev",
@@ -235,6 +234,13 @@ async fn managed_network_contract_returns_binding_and_mints_sensitive_descriptor
     let bytes = cloud.mint_network_credentials(&binding_name).await.unwrap();
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), descriptor);
     let requests = task.await.unwrap();
+    let binding_create = requests
+        .iter()
+        .find(|(request, _)| {
+            request.starts_with("POST ") && request.contains("/connectnetworkbindings ")
+        })
+        .unwrap();
+    assert_eq!(binding_create.1["spec"]["networkRef"], "staging-vpc");
     assert!(requests.last().unwrap().0.starts_with("POST "));
     assert!(requests.last().unwrap().0.contains(&format!(
         "/connectnetworkbindings/{binding_name}/connection-credentials "

@@ -14,7 +14,7 @@ func TestProbeRequiresCurrentCompleteExternalEvidence(t *testing.T) {
 	endpoint := endpointFixture()
 	endpoint.Status.Revision = 4
 	endpoint.Status.CertificateRevision = "leaf-revision"
-	valid := ProbeReport{EndpointUID: string(endpoint.UID), Revision: 4, CertificateRevision: "leaf-revision", Cell: "cell-a", CheckedAt: now, HTTP3: true, HTTP2: true, VPC: true, DNS: true}
+	valid := ProbeReport{EndpointUID: string(endpoint.UID), Revision: 4, CertificateRevision: "leaf-revision", Cell: "cell-a", CheckedAt: now, HTTP3: true, HTTP2: true, DNS: true}
 	report := valid
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/endpoints/"+string(endpoint.UID) {
@@ -39,7 +39,6 @@ func TestProbeRequiresCurrentCompleteExternalEvidence(t *testing.T) {
 		"identity":    func(value *ProbeReport) { value.EndpointUID = "other" },
 		"h3":          func(value *ProbeReport) { value.HTTP3 = false },
 		"h2":          func(value *ProbeReport) { value.HTTP2 = false },
-		"vpc":         func(value *ProbeReport) { value.VPC = false },
 		"dns":         func(value *ProbeReport) { value.DNS = false },
 	} {
 		t.Run(name, func(t *testing.T) {

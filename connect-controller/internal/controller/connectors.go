@@ -236,7 +236,7 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 		var gateway connectv1alpha1.ConnectGateway
 		gatewayErr := c.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Spec.GatewayRef}, &gateway)
 		if gatewayErr == nil && effectiveGatewayContract(gateway.Spec) == managedGatewayContract {
-			if err := reconcileManagedNetworkBinding(ctx, c, &obj, &gateway); err != nil {
+			if err := reconcileManagedNetworkBinding(ctx, c, &obj, &gateway, r.Endpoints); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{RequeueAfter: 20 * time.Second}, nil

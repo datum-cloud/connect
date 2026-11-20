@@ -21,7 +21,7 @@ func TestEndpointCRDSchema(t *testing.T) {
 		t.Skip("set KUBEBUILDER_ASSETS to run real API schema validation")
 	}
 	environment := &envtest.Environment{}
-	for _, plural := range []string{"connectendpoints", "connectgrants"} {
+	for _, plural := range []string{"connectendpoints", "connectgrants", "connectgateways", "connectnetworkbindings"} {
 		encoded, err := os.ReadFile(filepath.Join("..", "..", "config", "base", "crd", "bases", "connect.datumapis.com_"+plural+".yaml"))
 		if err != nil {
 			t.Fatal(err)
@@ -52,11 +52,27 @@ func TestEndpointCRDSchema(t *testing.T) {
 	if err := project.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "service"}}); err != nil {
 		t.Fatal(err)
 	}
-	endpoint := &ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Namespace: "service", Name: "reservation"}, Spec: ConnectEndpointSpec{CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Metro: "dfw", Hostname: "reservation.example.test", CustomerProject: "customer", GatewayNamespace: "default", GatewayName: "gateway", NetworkUID: "network-uid", Lifecycle: "Active"}}
+	gateway := &ConnectGateway{ObjectMeta: metav1.ObjectMeta{Namespace: "service", Name: "shared"}, Spec: ConnectGatewaySpec{ContractVersion: "managed-network-v1", Placement: &ConnectGatewayPlacementPolicy{LocationSelector: metav1.LabelSelector{}}}}
+	if err := project.Create(ctx, gateway); err != nil {
+		t.Fatal("network-independent gateway rejected", err)
+	}
+	legacy := &ConnectGateway{ObjectMeta: metav1.ObjectMeta{Namespace: "service", Name: "legacy"}, Spec: ConnectGatewaySpec{ContractVersion: "legacy-v1", GatewayClassRef: "class", LocationRef: "location", Routes: []string{"fd00::/48"}}}
+	if err := project.Create(ctx, legacy); !apierrors.IsInvalid(err) {
+		t.Fatal("legacy gateway lost required network scope", err)
+	}
+	binding := &ConnectNetworkBinding{ObjectMeta: metav1.ObjectMeta{Namespace: "service", Name: "one"}, Spec: ConnectNetworkBindingSpec{GatewayRef: "shared", ConnectorRef: "laptop", NetworkRef: "one"}}
+	if err := project.Create(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+	binding.Spec.NetworkRef = "two"
+	if err := project.Update(ctx, binding); !apierrors.IsInvalid(err) {
+		t.Fatal("binding silently changed network scope", err)
+	}
+	endpoint := &ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Namespace: "service", Name: "reservation"}, Spec: ConnectEndpointSpec{CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Metro: "dfw", Hostname: "reservation.example.test", CustomerProject: "customer", GatewayNamespace: "default", GatewayName: "gateway", Lifecycle: "Active"}}
 	if err := project.Create(ctx, endpoint); err != nil {
 		t.Fatal(err)
 	}
-	endpoint.Spec.Assignment = EndpointAssignment{Cell: "cell", Provider: "provider", Frontend: "cell.example.test", VPC: EndpointVPCReference{Namespace: "vpc", Name: "network", UID: "vpc-uid"}}
+	endpoint.Spec.Assignment = EndpointAssignment{Cell: "cell", Provider: "provider", Frontend: "cell.example.test"}
 	if err := project.Update(ctx, endpoint); err != nil {
 		t.Fatal(err)
 	}

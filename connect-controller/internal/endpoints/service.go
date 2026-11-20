@@ -18,10 +18,47 @@ import (
 
 const MetroKey = "topology.datum.net/metro"
 
+func (s *Service) ValidateBindingIdentity(ctx context.Context, bindingUID, networkUID, cell string, vpc connect.EndpointVPCReference) error {
+	var receipts connect.ConnectGrantList
+	if err := s.Reconciler.Project.List(ctx, &receipts, client.InNamespace(s.Namespace)); err != nil {
+		return err
+	}
+	for _, receipt := range receipts.Items {
+		if receipt.Spec.BindingUID != bindingUID {
+			continue
+		}
+		if receipt.Spec.NetworkUID != networkUID || (receipt.Spec.Cell == cell && receipt.Spec.VPC != vpc) {
+			return fmt.Errorf("network identity changed; recreate the binding to authorize the replacement")
+		}
+	}
+	return nil
+}
+
+func (s *Service) ResolveVPC(networkUID, cell string) (connect.EndpointVPCReference, error) {
+	var result connect.EndpointVPCReference
+	for _, mapping := range s.Reachability {
+		if mapping.NetworkUID == networkUID && mapping.Cell == cell {
+			if result.UID != "" {
+				return result, fmt.Errorf("ambiguous network reachability")
+			}
+			result = mapping.VPC
+		}
+	}
+	if result.UID == "" || result.Name == "" || result.Namespace == "" {
+		return result, fmt.Errorf("selected cell does not support network")
+	}
+	return result, nil
+}
+
 type Capacity struct {
 	Metro      string                     `json:"metro"`
-	NetworkUID string                     `json:"networkUID"`
 	Assignment connect.EndpointAssignment `json:"assignment"`
+}
+
+type Reachability struct {
+	NetworkUID string                       `json:"networkUID"`
+	Cell       string                       `json:"cell"`
+	VPC        connect.EndpointVPCReference `json:"vpcRef"`
 }
 
 type CellConfig struct {
@@ -30,19 +67,21 @@ type CellConfig struct {
 }
 
 type Config struct {
-	Capacity []Capacity            `json:"capacity"`
-	Cells    map[string]CellConfig `json:"cells"`
-	ProbeURL string                `json:"probeURL"`
+	Reachability []Reachability        `json:"reachability"`
+	Capacity     []Capacity            `json:"capacity"`
+	Cells        map[string]CellConfig `json:"cells"`
+	ProbeURL     string                `json:"probeURL"`
 }
 
 type Service struct {
-	Reconciler *Reconciler
-	Root       client.Client
-	Customer   func(context.Context, string) (client.Client, error)
-	Namespace  string
-	Domain     string
-	Capacity   []Capacity
-	Provision  bool
+	Reachability []Reachability
+	Reconciler   *Reconciler
+	Root         client.Client
+	Customer     func(context.Context, string) (client.Client, error)
+	Namespace    string
+	Domain       string
+	Capacity     []Capacity
+	Provision    bool
 }
 
 func (s *Service) Sync(ctx context.Context, customer client.Client, projectName string, gateway *connect.ConnectGateway, locations map[string]string) error {
@@ -57,13 +96,6 @@ func (s *Service) Sync(ctx context.Context, customer client.Client, projectName 
 	if project.GetUID() == "" || gateway.UID == "" {
 		return fmt.Errorf("project and gateway UIDs are required")
 	}
-	network := object(schema.GroupVersionKind{Group: "networking.datumapis.com", Version: "v1alpha", Kind: "Network"}, gateway.Namespace, gateway.Spec.NetworkRef)
-	if err := customer.Get(ctx, client.ObjectKeyFromObject(network), network); err != nil {
-		return err
-	}
-	if network.GetUID() == "" {
-		return fmt.Errorf("network UID is required")
-	}
 	if !gateway.DeletionTimestamp.IsZero() {
 		metros = nil
 	}
@@ -73,12 +105,12 @@ func (s *Service) Sync(ctx context.Context, customer client.Client, projectName 
 		endpoint := &connect.ConnectEndpoint{}
 		err := s.Reconciler.Project.Get(ctx, key, endpoint)
 		if apierrors.IsNotFound(err) && s.Provision {
-			endpoint, err = Reserve(ctx, s.Reconciler.Project, s.Namespace, s.Domain, connect.ConnectEndpointSpec{CustomerProjectUID: string(project.GetUID()), GatewayUID: string(gateway.UID), Metro: metro, CustomerProject: projectName, GatewayNamespace: gateway.Namespace, GatewayName: gateway.Name, NetworkUID: string(network.GetUID())})
+			endpoint, err = Reserve(ctx, s.Reconciler.Project, s.Namespace, s.Domain, connect.ConnectEndpointSpec{CustomerProjectUID: string(project.GetUID()), GatewayUID: string(gateway.UID), Metro: metro, CustomerProject: projectName, GatewayNamespace: gateway.Namespace, GatewayName: gateway.Name})
 		}
 		if err != nil {
 			return err
 		}
-		if endpoint.Spec.Lifecycle == "Retired" && endpoint.Status.Phase == "Retired" && endpoint.Spec.NetworkUID == string(network.GetUID()) && s.Provision {
+		if endpoint.Spec.Lifecycle == "Retired" && endpoint.Status.Phase == "Retired" && s.Provision {
 			endpoint.Spec.Lifecycle = "Active"
 			if err := s.Reconciler.Project.Update(ctx, endpoint); err != nil {
 				return err
@@ -87,16 +119,9 @@ func (s *Service) Sync(ctx context.Context, customer client.Client, projectName 
 		if endpoint.Spec.Lifecycle != "Active" {
 			return fmt.Errorf("endpoint is draining or retired")
 		}
-		if endpoint.Spec.NetworkUID != string(network.GetUID()) {
-			endpoint.Spec.Lifecycle = "Deleting"
-			if err := s.Reconciler.Project.Update(ctx, endpoint); err != nil {
-				return err
-			}
-			return fmt.Errorf("network identity changed; draining endpoint")
-		}
 		if endpoint.Spec.Assignment.Cell == "" {
 			for _, capacity := range s.Capacity {
-				if capacity.Metro == metro && capacity.NetworkUID == string(network.GetUID()) {
+				if capacity.Metro == metro {
 					endpoint.Spec.Assignment = capacity.Assignment
 					if err := s.Reconciler.Project.Update(ctx, endpoint); err != nil {
 						return err

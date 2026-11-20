@@ -48,27 +48,10 @@ spec:
                   provider:
                     maxLength: 253
                     type: string
-                  vpcRef:
-                    properties:
-                      name:
-                        maxLength: 253
-                        type: string
-                      namespace:
-                        maxLength: 253
-                        type: string
-                      uid:
-                        maxLength: 253
-                        type: string
-                    required:
-                    - name
-                    - namespace
-                    - uid
-                    type: object
                 required:
                 - cell
                 - frontend
                 - provider
-                - vpcRef
                 type: object
                 x-kubernetes-validations:
                 - message: selected cell assignment is immutable
@@ -131,13 +114,6 @@ spec:
                 x-kubernetes-validations:
                 - message: identity is immutable
                   rule: self == oldSelf
-              networkUID:
-                maxLength: 253
-                minLength: 1
-                type: string
-                x-kubernetes-validations:
-                - message: identity is immutable
-                  rule: self == oldSelf
             required:
             - assignment
             - customerProject
@@ -148,7 +124,6 @@ spec:
             - hostname
             - lifecycle
             - metro
-            - networkUID
             type: object
           status:
             properties:

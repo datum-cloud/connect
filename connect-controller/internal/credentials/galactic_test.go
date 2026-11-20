@@ -35,12 +35,12 @@ func TestRealGalacticGrantLifecycle(t *testing.T) {
 	}
 	vpc := &cloud.VPC{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "vpc", UID: "11111111-1111-1111-1111-111111111111"}, Spec: cloud.VPCSpec{Networks: []cloud.Network{"fd20:a1b:2c3d::/48"}}}
 	ref := masquegrant.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name, UID: string(vpc.UID)}
-	registration := &galactic.MASQUEEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "masque-system"}, Spec: galactic.MASQUEEndpointSpec{MASQUEEndpointScope: galactic.MASQUEEndpointScope{EndpointUID: "endpoint-uid", CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", NetworkUID: "network-uid", Cell: "cell-a", Hostname: "gateway.example.test"}, VPCRef: galactic.MASQUEEndpointVPCReference(ref), Metro: "dfw", Provider: "shared", Revision: 1, Enabled: true, CertificateRef: galactic.MASQUEEndpointCertificateReference{Name: "tls", Revision: strings.Repeat("a", 64)}}}
+	registration := &galactic.MASQUEEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "masque-system"}, Spec: galactic.MASQUEEndpointSpec{MASQUEEndpointScope: galactic.MASQUEEndpointScope{EndpointUID: "endpoint-uid", CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Cell: "cell-a", Hostname: "gateway.example.test"}, Metro: "dfw", Provider: "shared", Revision: 1, Enabled: true, CertificateRef: galactic.MASQUEEndpointCertificateReference{Name: "tls", Revision: strings.Repeat("a", 64)}}}
 	cell := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vpc, registration).Build()
-	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: registration.Spec.Hostname, CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", NetworkUID: "network-uid", Assignment: connect.EndpointAssignment{Cell: "cell-a", VPC: connect.EndpointVPCReference(ref)}}, Status: connect.ConnectEndpointStatus{Ready: true, Phase: "Active", Revision: 1, CertificateRevision: registration.Spec.CertificateRef.Revision, NotAfter: &expires, VerifiedAt: &verified}}
+	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: registration.Spec.Hostname, CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Assignment: connect.EndpointAssignment{Cell: "cell-a"}}, Status: connect.ConnectEndpointStatus{Ready: true, Phase: "Active", Revision: 1, CertificateRevision: registration.Spec.CertificateRef.Revision, NotAfter: &expires, VerifiedAt: &verified}}
 	project := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&connect.ConnectEndpoint{}, &connect.ConnectGrant{}).WithObjects(endpoint).Build()
 	issuer := &ManagedIssuer{Project: project, Namespace: "service", Authorities: map[string]GrantAPI{"cell-a": masquegrant.New(cell, "masque-system")}, Now: func() time.Time { return now }}
-	binding := Binding{Name: "binding", UID: "binding-uid", PolicyRevision: "policy-1", Endpoint: endpoint, NetworkPlan: NetworkPlan{DestinationPrefixes: []string{"fd20:a1b:2c3d::/48"}, MTU: 1280}}
+	binding := Binding{NetworkName: "network", NetworkUID: "network-uid", VPC: connect.EndpointVPCReference(ref), Name: "binding", UID: "binding-uid", PolicyRevision: "policy-1", Endpoint: endpoint, NetworkPlan: NetworkPlan{DestinationPrefixes: []string{"fd20:a1b:2c3d::/48"}, MTU: 1280}}
 	if _, err := issuer.Mint(ctx, binding); err == nil {
 		t.Fatal("missing operator ledger/fence accepted")
 	}
@@ -125,14 +125,14 @@ func TestManagedGrantRetryRetainsCellScopeAndPrefix(t *testing.T) {
 	now := time.Now()
 	verified := metav1.NewTime(now)
 	expires := metav1.NewTime(now.Add(time.Hour))
-	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: "endpoint.example.test", CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", NetworkUID: "network-uid", Assignment: connect.EndpointAssignment{Cell: "selected", VPC: connect.EndpointVPCReference{Namespace: "vpc", Name: "network", UID: "vpc-uid"}}}, Status: connect.ConnectEndpointStatus{Ready: true, Phase: "Active", Revision: 1, CertificateRevision: "cert", NotAfter: &expires, VerifiedAt: &verified}}
+	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: "endpoint.example.test", CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Assignment: connect.EndpointAssignment{Cell: "selected"}}, Status: connect.ConnectEndpointStatus{Ready: true, Phase: "Active", Revision: 1, CertificateRevision: "cert", NotAfter: &expires, VerifiedAt: &verified}}
 	scheme := runtime.NewScheme()
 	_ = connect.AddToScheme(scheme)
 	project := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&connect.ConnectGrant{}, &connect.ConnectEndpoint{}).WithObjects(endpoint).Build()
 	selected := &authorityFixture{project: project, issued: masquegrant.Issued{Credential: "opaque", Prefix: netip.MustParsePrefix("fd00:0:0:1::/96"), Expires: now.Add(5 * time.Minute)}}
 	other := &authorityFixture{project: project}
 	issuer := &ManagedIssuer{Project: project, Namespace: "service", Authorities: map[string]GrantAPI{"selected": selected, "other": other}, Now: func() time.Time { return now }}
-	binding := Binding{Name: "binding", UID: "binding-uid", PolicyRevision: "policy-1", Endpoint: endpoint, NetworkPlan: NetworkPlan{DestinationPrefixes: []string{"fd00::/48"}, MTU: 1280}}
+	binding := Binding{NetworkName: "network", NetworkUID: "network-uid", VPC: connect.EndpointVPCReference{Namespace: "vpc", Name: "network", UID: "vpc-uid"}, Name: "binding", UID: "binding-uid", PolicyRevision: "policy-1", Endpoint: endpoint, NetworkPlan: NetworkPlan{DestinationPrefixes: []string{"fd00::/48"}, MTU: 1280}}
 	first, err := issuer.Mint(ctx, binding)
 	if err != nil {
 		t.Fatal(err)
@@ -145,7 +145,7 @@ func TestManagedGrantRetryRetainsCellScopeAndPrefix(t *testing.T) {
 		t.Fatal("retry drifted allocation/cell")
 	}
 	scope := selected.requests[0].Endpoint
-	if scope.EndpointUID != "endpoint-uid" || scope.CustomerProjectUID != "project-uid" || scope.NetworkUID != "network-uid" || scope.Cell != "selected" || scope.Hostname != endpoint.Spec.Hostname {
+	if scope.EndpointUID != "endpoint-uid" || scope.CustomerProjectUID != "project-uid" || selected.requests[0].NetworkUID != "network-uid" || selected.requests[0].BindingUID != "binding-uid" || scope.Cell != "selected" || scope.Hostname != endpoint.Spec.Hostname {
 		t.Fatal("incomplete admission scope", scope)
 	}
 	var receipts connect.ConnectGrantList

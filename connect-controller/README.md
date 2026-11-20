@@ -15,6 +15,16 @@ credential-free `ConnectGrant` cleanup receipts. TLS keys stay in Certificates,
 Karmada and the selected cell. The older gateway slice described below is a
 separate legacy contract.
 
+A managed gateway has no fixed Network. Each binding names its gateway,
+Connector and Network; matching policies must explicitly list that Network in
+`spec.networkRefs`. An existing policy without this list denies managed access.
+Endpoint readiness is independent of per-binding VPC reachability. Internal
+grant receipts pin resolved Network and VPC UIDs against name reuse.
+
+The Rust daemon shares one H3 or H2 connection per endpoint and enrolled project
+context, with separately authenticated CONNECT-IP streams. Revoking one binding
+does not revoke its siblings. Local overlapping routes remain prohibited.
+
 Install `config/components/managed-endpoints/crd` only in the service Project,
 not through customer API discovery. This feature is off by default. It requires
 operator-provisioned cells, VPC ledgers, shared DNS zone, separate kubeconfigs

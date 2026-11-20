@@ -40,10 +40,6 @@ type ConnectEndpointSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	GatewayName string `json:"gatewayName"`
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="identity is immutable"
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	NetworkUID string `json:"networkUID"`
 	// +kubebuilder:validation:Enum=Active;Deleting;Retired
 	// +kubebuilder:validation:XValidation:rule="oldSelf != 'Deleting' || self != 'Active'",message="draining endpoint cannot reactivate"
 	Lifecycle string `json:"lifecycle"`
@@ -57,8 +53,7 @@ type EndpointAssignment struct {
 	// +kubebuilder:validation:MaxLength=253
 	Provider string `json:"provider"`
 	// +kubebuilder:validation:MaxLength=253
-	Frontend string               `json:"frontend"`
-	VPC      EndpointVPCReference `json:"vpcRef"`
+	Frontend string `json:"frontend"`
 }
 
 type EndpointVPCReference struct {
@@ -110,6 +105,9 @@ type ConnectGrant struct {
 
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="grant identity is immutable"
 type ConnectGrantSpec struct {
+	NetworkName string               `json:"networkName"`
+	NetworkUID  string               `json:"networkUID"`
+	VPC         EndpointVPCReference `json:"vpcRef"`
 	// +kubebuilder:validation:MaxLength=253
 	EndpointName string `json:"endpointName"`
 	// +kubebuilder:validation:MaxLength=253

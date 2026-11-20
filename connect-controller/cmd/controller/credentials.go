@@ -84,6 +84,10 @@ func setupCredentials(mgr mcmanager.Manager, service *endpoints.Service, config 
 		if endpoint.UID == "" || string(endpoint.UID) != receipt.Spec.EndpointUID || endpoint.Spec.Lifecycle != "Active" {
 			return false, nil
 		}
+		vpc, err := service.ResolveVPC(receipt.Spec.NetworkUID, receipt.Spec.Cell)
+		if err != nil || vpc != receipt.Spec.VPC {
+			return false, nil
+		}
 		customer, err := service.Customer(ctx, endpoint.Spec.CustomerProject)
 		if err != nil {
 			return false, err

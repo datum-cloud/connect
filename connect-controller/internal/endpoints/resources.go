@@ -263,7 +263,7 @@ func (d *KubernetesDriver) Apply(ctx context.Context, endpoint *connect.ConnectE
 	if !enabled && certificateRevision == "" {
 		certificateRevision = strings.Repeat("0", 64)
 	}
-	registration.Object["spec"] = map[string]interface{}{"endpointUID": string(endpoint.UID), "customerProjectUID": endpoint.Spec.CustomerProjectUID, "gatewayUID": endpoint.Spec.GatewayUID, "networkUID": endpoint.Spec.NetworkUID, "metro": endpoint.Spec.Metro, "cell": assignment.Cell, "provider": assignment.Provider, "hostname": endpoint.Spec.Hostname, "vpcRef": map[string]interface{}{"namespace": assignment.VPC.Namespace, "name": assignment.VPC.Name, "uid": assignment.VPC.UID}, "revision": endpoint.Status.Revision, "certificateRef": map[string]interface{}{"name": secretName, "revision": certificateRevision}, "enabled": enabled}
+	registration.Object["spec"] = map[string]interface{}{"endpointUID": string(endpoint.UID), "customerProjectUID": endpoint.Spec.CustomerProjectUID, "gatewayUID": endpoint.Spec.GatewayUID, "metro": endpoint.Spec.Metro, "cell": assignment.Cell, "provider": assignment.Provider, "hostname": endpoint.Spec.Hostname, "revision": endpoint.Status.Revision, "certificateRef": map[string]interface{}{"name": secretName, "revision": certificateRevision}, "enabled": enabled}
 	if err := ensure(ctx, d.Karmada, endpoint, registration); err != nil {
 		return err
 	}

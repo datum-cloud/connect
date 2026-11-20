@@ -14,6 +14,29 @@ import (
 
 type unavailableReader struct{ client.Client }
 
+func TestReachabilityFailsClosed(t *testing.T) {
+	vpc := connect.EndpointVPCReference{Namespace: "vpcs", Name: "one", UID: "vpc-uid"}
+	mapping := Reachability{NetworkUID: "network", Cell: "cell", VPC: vpc}
+	for name, mappings := range map[string][]Reachability{
+		"missing":       nil,
+		"other cell":    {{NetworkUID: "network", Cell: "other", VPC: vpc}},
+		"other network": {{NetworkUID: "other", Cell: "cell", VPC: vpc}},
+		"ambiguous":     {mapping, mapping},
+		"incomplete":    {{NetworkUID: "network", Cell: "cell", VPC: connect.EndpointVPCReference{UID: "uid"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service := &Service{Reachability: mappings}
+			if _, err := service.ResolveVPC("network", "cell"); err == nil {
+				t.Fatal("invalid reachability accepted")
+			}
+		})
+	}
+	service := &Service{Reachability: []Reachability{mapping}}
+	if actual, err := service.ResolveVPC("network", "cell"); err != nil || actual != vpc {
+		t.Fatal("valid reachability rejected", err)
+	}
+}
+
 func (reader unavailableReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
 	return errors.New("temporary API failure")
 }
@@ -29,7 +52,7 @@ func TestServiceMetroCollapseAndDurableOwnership(t *testing.T) {
 	gateway := &connect.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gateway", UID: "gateway-uid"}, Spec: connect.ConnectGatewaySpec{NetworkRef: "network"}}
 	customer := resourceClient(t, gateway, network)
 	serviceProject := resourceClient(t)
-	service := &Service{Root: root, Namespace: "service", Domain: "connect.example.test", Provision: true, Reconciler: &Reconciler{Project: serviceProject}, Customer: func(context.Context, string) (client.Client, error) { return customer, nil }, Capacity: []Capacity{{Metro: "dfw", NetworkUID: "network-uid", Assignment: endpoint.Spec.Assignment}}}
+	service := &Service{Root: root, Namespace: "service", Domain: "connect.example.test", Provision: true, Reconciler: &Reconciler{Project: serviceProject}, Customer: func(context.Context, string) (client.Client, error) { return customer, nil }, Capacity: []Capacity{{Metro: "dfw", Assignment: endpoint.Spec.Assignment}}}
 	for range 2 {
 		if err := service.Sync(ctx, customer, "customer", gateway, map[string]string{"location-a": "dfw", "location-b": "dfw"}); err != nil {
 			t.Fatal(err)
@@ -40,6 +63,15 @@ func TestServiceMetroCollapseAndDurableOwnership(t *testing.T) {
 		t.Fatal("Locations did not collapse", err)
 	}
 	reserved := &reservations.Items[0]
+	if reserved.Spec.Hostname == reserved.Name+".connect.example.test" {
+		t.Fatal("public hostname exposes UID-derived reservation")
+	}
+	if err := customer.Delete(ctx, network); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Sync(ctx, customer, "customer", gateway, map[string]string{"location-a": "dfw"}); err != nil {
+		t.Fatal("network deletion affected shared endpoint", err)
+	}
 	if reserved.Spec.Assignment.Cell != "cell-a" || len(reserved.OwnerReferences) != 0 {
 		t.Fatal("assignment or durable ownership incorrect")
 	}
