@@ -36,9 +36,16 @@ exports passing against the published dependency. Actual Rust 1.98 H3/H2 pooling
 tests report two passed, none ignored. These remain loopback tests, not live
 OS/datapath qualification.
 
-Connect GitHub CI on this exact revision is pending at this evidence update.
-The Certificates owner reports exact-head CI success; integrated Infra pins and
-validation remain pending. No deployment or live qualification is established.
+Connect GitHub CI is successful on this exact revision: 14 check runs plus CLA,
+with testing runs `44803093927` / `44803078632` and publishing run `44803079166`
+successful. Galactic's pinned revision has 26 successful checks and two skipped,
+with none pending or failing. The Certificates owner reports exact-head CI success.
+
+Infra `59a903eda8f9a307e2a680ff9684d813ba5ac6e8` pins these three revisions and
+reports clean-source validation passing. Its final GitHub CI is unresolved:
+`validate-workload-probes` failed while downloading the Kyverno chart with a
+connection reset, before workload validation; the owner is handling the retry.
+No deployment or live qualification is established.
 
 ## Control-plane placement clarification (2026-11-20)
 
