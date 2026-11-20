@@ -283,11 +283,13 @@ kubectl kustomize config/components/managed-endpoints/crd
 Dependencies:
 
 - Certificates: `4cec00395b3647737685addd697e40f2e94d3214`, draft PR milo-os/certificates#83.
-- Infrastructure: prior published `7446644655199c612f5366d56c032b3d34241646`,
-  draft PR datum-cloud/infra#9647. The placement follow-up awaits this Connect
+- Infrastructure: prior published `172556e9a577ee60109ddd94de379d9c74a0687c`,
+  draft PR datum-cloud/infra#9647. The dependency-pin follow-up awaits this Connect
   publication for exact-source validation; the earlier green run is not its CI.
-- Galactic: `87aaa9537653e9ae5a67d64ff062ad1c334dc8f5`, draft PR datum-cloud/galactic#1465;
-  Go module `v0.9.5-0.20261120175747-87aaa9537653`, without local replacements.
+- Galactic: `01462607e4f7d0e7471f21dbbd35a6479d284b34`, draft PR datum-cloud/galactic#1465;
+  Go module `v0.9.5-0.20261120183023-01462607e4f7`, without local replacements.
+  The final CI-only correction replaces a slow Ubuntu package mirror without
+  changing package versions, signature verification, runtime or API contracts.
   This revision removes copied registration placement and provider `--cell`,
   retaining the name-only facade, local provider selection, instance
   acknowledgments and authority wire contract. Providers require the get-only
