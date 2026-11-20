@@ -181,11 +181,12 @@ track which certificate each serving instance has applied.
 ### Galactic listener integration
 
 `MASQUEEndpoint` associates each hostname with its certificate, not a customer
-Project, gateway UID, Network or VPC. Its spec contains `hostname`, `revision`,
-`certificateRef` and `enabled`. The destination control plane supplies the cell
-and metro context, so `spec.cell` and `spec.metro` are omitted. Retain `provider`
-only when that control plane hosts multiple independently selectable Galactic
-providers; otherwise provider selection is implicit.
+Project, gateway UID, Network or VPC. Its spec contains `hostname`, `provider`,
+`revision`, `certificateRef` and `enabled`. The destination control plane supplies
+the cell and metro context, so `spec.cell` and `spec.metro` are omitted.
+`provider` selects a named EdgeProvider within that control plane. Galactic supports
+separate providers with distinct ServiceAccounts and approval; runtime provider
+selection, instance membership and authority checks use that name.
 
 The endpoint revision increases with configuration changes; the certificate
 revision is the leaf-DER SHA256 digest. Per-instance applied status must match

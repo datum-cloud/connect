@@ -8,20 +8,44 @@ document's evidence, not observations made during this review.
 
 ## Control-plane placement clarification (2026-11-20)
 
-The design now treats each cell/metro as a separate control plane. Connect keeps
-placement in its service-provider Project; the delivered `MASQUEEndpoint` omits
-`spec.cell` and `spec.metro`. Local provider selection is needed only when the
-control plane has multiple independently selectable providers. Per-instance
-acknowledgments remain local status, checked against current membership/Leases.
+Connect `ef4be50315ee18b58003d01f4920c3a9fe6f0a5e` pins Galactic
+`87aaa9537653e9ae5a67d64ff062ad1c334dc8f5` without a local replacement.
+The published local `MASQUEEndpoint` spec has five fields: `hostname`, `provider`,
+`revision`, `certificateRef`, and `enabled`. Cell and metro remain in Connect's
+service-provider Project assignment. Distribution targets that cell, and
+readiness and cleanup read only its configured control-plane API.
 
-This is a design change, not a claim that the published implementation already
-matches it. Galactic's inspected schema still requires cell and metro, filters
-registrations by cell/provider, and includes them in immutable identity/fences.
-Connect's inspected delivery/readiness code still copies and compares these
-fields. Implementation must remove those assumptions and enforce placement via
-distribution targeting, credentials and reads from the selected control plane.
-The current `ei-<podUID>` instance naming also remains an internal-identity concern.
-Earlier test and CI evidence below does not validate this new design change.
+Provider remains explicit because separate named EdgeProviders can share a control
+plane, with distinct ServiceAccounts and approval. Runtime `--provider`, membership
+`providerRef` and authority checks select the provider. Only the provider's
+redundant `--cell` flag is removed; authority cell and grant-ledger scoping remain.
+Per-instance acknowledgments still require current membership and fresh Leases.
+The current `ei-<podUID>` instance naming remains an internal-identity concern.
+
+Connect's `TestAcknowledgmentsStayInSelectedControlPlane` and
+`TestCleanupStaysInSelectedControlPlane` cover identical names in separate control
+planes, missing selected clients, apply/stop evidence and cleanup isolation.
+`TestManagedGrantRetryRetainsCellScopeAndPrefix` checks that missing selected
+authority, reader or VPC never falls back elsewhere.
+`TestReadinessUsesMembershipNotAckCount` covers provider isolation and stop
+acknowledgments from every live replica.
+`TestPlacementRemovalPreservesDeliveryReceiptAndRevision` covers receipt and
+revision preservation across the schema change.
+
+The Connect implementation thread reports the full controller race suite with
+Kubernetes 1.37 envtest, vet, native/Linux builds and restricted Kustomize renders
+passing against the published Galactic dependency. Actual Rust client H3/H2
+pooling tests report two passed, none ignored; these use loopback servers, not a
+live OS/datapath. GitHub CI on this Connect revision was pending when this evidence
+was recorded. Infra validation and final-head CI remain separate gates.
+Certificates remains at `4cec00395b3647737685addd697e40f2e94d3214`.
+
+Upgrade CRDs, provider arguments and binaries together on the original control
+plane, preserving delivery receipts and hostname fences. Legacy placement fields
+that leave a different spec at the same revision fail closed; configuration
+changes still require a greater revision. Rolling back to a provider that requires
+placement fields is unsupported after new-format fences are written. These
+changes do not establish live DNS, ACME, Karmada or datapath qualification.
 
 ## Structural reference
 

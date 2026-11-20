@@ -55,9 +55,8 @@ bearer credentials. A TLS handshake alone does not prove VPC connectivity.
 - Verify distribution targeting and credentials reach only the selected control
   plane. A misplaced registration must be prevented by that boundary, not by a
   redundant field check inside Galactic. Read readiness from the selected API.
-- When multiple providers are independently selectable in one control plane,
-  verify the local provider reference selects only the intended provider. When
-  selection is implicit, do not require a redundant provider field.
+- With separate named EdgeProviders in one control plane, verify `provider`
+  selects only the intended provider for serving, membership and authority checks.
 - With multiple serving replicas, delay one replica's apply acknowledgment. The
   endpoint stays unready even if another replica reports success. On removal,
   require forwarding-stop confirmation from every relevant replica.
