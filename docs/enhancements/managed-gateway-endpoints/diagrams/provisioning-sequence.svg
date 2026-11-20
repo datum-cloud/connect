@@ -60,7 +60,7 @@
 <path d="M 360 435 L 120 435" class="line" stroke-dasharray="5 4"/>
 <text x="480.0" y="483" class="label" text-anchor="middle">Deliver registration + service-held TLS Secret through Karmada</text>
 <path d="M 120 495 L 840 495" class="line"/>
-<text x="480.0" y="543" class="label" text-anchor="middle">Acknowledge applied endpoint and certificate versions</text>
+<text x="480.0" y="543" class="label" text-anchor="middle">Named instance ack after creation and Lease acquisition</text>
 <path d="M 840 555 L 120 555" class="line" stroke-dasharray="5 4"/>
 <text x="360.0" y="603" class="label" text-anchor="middle">Reconcile routing DNSRecordSet</text>
 <path d="M 120 615 L 600 615" class="line"/>

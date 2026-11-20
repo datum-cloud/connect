@@ -10,6 +10,15 @@ document's evidence, not observations made during this review.
 
 ### November 20 shared-transport revision
 
+The later name-based revision is now agreed and being implemented. It removes
+customer Project and identity UID fields from the Galactic managed registration,
+public grant facade and authority wire messages. Endpoint/VPC/service references
+are namespaced names; private incarnation pins and receipt validation remain.
+Status carries instance names, with acknowledgments required after authoritative
+instance creation and Lease acquisition. Distributed UID labels/annotations are
+removed; Connect holds private cleanup receipts. The published revisions below
+describe the previous contract, not completion or CI evidence for this new work.
+
 The updated design separates gateway endpoints from network bindings. The
 implementation remains in draft Connect PR #74, based on required prototype
 `73adbc35d08a3599bcd7075ec9e04e2144f8a750`, not main. Design PR #73 remains

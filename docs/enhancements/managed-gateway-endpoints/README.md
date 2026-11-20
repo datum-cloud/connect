@@ -88,8 +88,9 @@ Legacy single-network gateways retain their separate `legacy-v1` contract.
 The client pools one HTTP/3 QUIC or HTTP/2 TLS/TCP connection per gateway endpoint
 and client security context. Each binding opens its own authenticated CONNECT-IP
 stream with an independently issued credential and network plan. A shared TLS
-connection is not shared authorization. The provider checks endpoint, grant,
-VPC selector and live VPC UID on every request and refresh.
+connection is not shared authorization. The provider checks the named endpoint,
+grant and VPC selector on every request and refresh. The authority privately pins
+the resolved VPC and service incarnations; its public API takes names, not UIDs.
 
 Users never provide UIDs, cell IDs or VPC identifiers. The broker resolves names
 and sends internal routing selectors only in the sensitive protocol descriptor.
@@ -172,11 +173,27 @@ track which certificate each serving instance has applied.
 
 ### Galactic listener integration
 
-`MASQUEEndpoint` associates each hostname with its certificate and gateway
-identity, not a Network or VPC. It retains one cell, provider, monotonic endpoint
+`MASQUEEndpoint` associates each hostname with its certificate, not a customer
+Project, gateway UID, Network or VPC. Its spec contains only hostname, metro,
+cell, provider, revision, certificateRef and enabled. It retains one cell, provider, monotonic endpoint
 revision and leaf-DER SHA256 certificate revision. Per-instance applied status
 must match both revisions. Private keys live only in cell Secrets and the central
 Certificates infrastructure.
+
+The grant API takes a namespaced endpoint reference and a name-only VPC reference.
+Connect authorizes customer Project access and retains private binding/network
+recreation pins. Galactic resolves the live VPC itself. Authorization receipts
+privately bind service and VPC incarnations; public authorization and refresh
+messages carry name-only references, never copied UIDs. A shared connection never
+broadens that per-stream authorization.
+
+Applied status identifies an instance by its actual name, not copied instance or
+pod UIDs. Connect checks authoritative EdgeInstance and Lease membership and
+requires the acknowledgment after both instance creation and Lease acquisition.
+The durable hostname fence binds the registration name, cell and provider and
+retains monotonic/revoked revisions through recreation. Distributed registrations,
+Secrets and policies carry no endpoint identity UID labels or annotations.
+Connect keeps cleanup incarnation receipts privately in its service Project.
 
 The listener must select the certificate by TLS SNI and check the HTTP authority
 on every CONNECT request, for both HTTP/3 and HTTP/2. The requested hostname and

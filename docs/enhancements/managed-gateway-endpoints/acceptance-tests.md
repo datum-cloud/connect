@@ -16,6 +16,17 @@ bearer credentials. A TLS handshake alone does not prove VPC connectivity.
 
 ## Names and authorization
 
+- Managed registration specs and public grant/authority messages contain named
+  references, no authored UID fields or customer Project field. Check distributed
+  registration, Secret and policy metadata for identity UID labels/annotations;
+  none may replace the removed fields. Kubernetes metadata.uid remains internal.
+- Recreate a VPC or service with the same name. Old authorization receipts must
+  fail, including refresh and retire against a replacement service. Recreate an
+  instance or reacquire its Lease: an acknowledgment preceding either incarnation
+  must not make the endpoint ready. Missing acquisition timestamps fail closed.
+- Recreate a delivered object with identical content and a new metadata UID.
+  Private cleanup receipts must reject its adoption/deletion. An uncertain initial
+  create may be adopted only after exact desired-content verification.
 - Internal endpoint and cleanup records, the managed `DNSZone`, routing and
   challenge `DNSRecordSet` resources, and `TLSCertificate` requests live in the
   Connect service-provider project. Customer credentials cannot modify them. Private keys

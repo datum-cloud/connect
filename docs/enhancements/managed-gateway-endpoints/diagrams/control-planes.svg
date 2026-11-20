@@ -35,7 +35,7 @@
 <text x="780" y="627" class="detail" text-anchor="middle">Zone and record publication</text>
 <rect x="50" y="800" width="330" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="215" y="835" class="heading" text-anchor="middle">Karmada</text>
-<text x="215" y="865" class="detail" text-anchor="middle">Selected-cell delivery</text>
+<text x="215" y="865" class="detail" text-anchor="middle">Named registration + Secret</text>
 <rect x="20" y="1000" width="920" height="400" rx="10" fill="#f0fdf4" stroke="#96bda1" stroke-width="1.5"/>
 <text x="500" y="1035" class="heading" text-anchor="middle">Selected cell</text>
 <rect x="50" y="1050" width="330" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
