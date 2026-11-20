@@ -66,9 +66,22 @@ type the exact checkpoint only afterward:
   stopped acknowledgment. Runner checks packet/reconnect denial. Retain the
   authoritative stop evidence separately; timeout alone is not that evidence.
 
-JSON lines on stdout contain observations only, never credentials. A nonzero exit
+Negative stream assertions require an actual HTTP 401/403 from the peer; TLS,
+connectivity, plan, and 5xx failures are inconclusive, not authorization denial.
+The third binding must return HTTP 403, not merely fail to mint. Both legitimate
+streams are reprobed afterward. Unit tests guard this distinction.
+
+JSON lines retain actual nonce-bearing request/reply packet hex, stream IDs and
+process-local client transport IDs, never credentials. These transport IDs identify
+the live Rust transport object, not a server-issued identifier or a portable ID
+across process restarts. Correlate timestamps/stream IDs with provider-side
+connection evidence when collecting the staging report; do not label client IDs
+as independently observed server accepts. A nonzero exit
 is a failed/incomplete run, even if earlier phases passed. Keep stderr and source
-SHAs alongside stdout. Then use Infra's `check-managed-endpoint cleaned` with the
+SHAs alongside stdout. Stream Drop cancels attachments on every error path; the
+failure message requires Infra's disable/cleanup rather than silently leaving
+fixtures active. The runner never removes control-plane resources itself. After
+success **or failure**, use Infra's `check-managed-endpoint cleaned` with the
 operator-bound selected-cell kubeconfig and retained receipt inventory. Runner
 completion is not proof of cleanup. Do not delete ledgers, fences or tombstones.
 

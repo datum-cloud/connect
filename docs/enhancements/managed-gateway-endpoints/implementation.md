@@ -2,7 +2,8 @@
 
 This branch depends on gateway prototype commit
 `73adbc35d08a3599bcd7075ec9e04e2144f8a750`, not the scaffolding on main.
-Design: Connect PR #73. No live deployment is authorized.
+Design: Connect PR #73. Staging deployment is now explicitly authorized, with
+Infra as sole cluster configuration writer. Production and merges are not authorized.
 
 ## Revised shared transport contract (2026-11-20)
 
@@ -341,8 +342,8 @@ Dependencies:
 - Infrastructure: prior published `62cf66fbbfb323554ad3aeaf26b6ac950592c683`,
   draft PR datum-cloud/infra#9647. The dependency-pin follow-up awaits this Connect
   publication for exact-source validation; the earlier green run is not its CI.
-- Galactic: `5a930d741cdc413f869d62f84a44a04ebe4ea457`, draft PR datum-cloud/galactic#1465;
-  Go module `v0.9.5-0.20261120192453-5a930d741cdc`, without local replacements.
+- Galactic: `ac27e20e247792060eb9a7505b4f9e4ede2b1339`, draft PR datum-cloud/galactic#1465;
+  Go module `v0.9.5-0.20261120213516-ac27e20e2477`, without local replacements.
   The configured-cell facade removes request-supplied cell and rejects foreign
   cell mutations. Administrative ledger scoping is unchanged.
   This revision removes copied registration placement and provider `--cell`,
@@ -395,6 +396,13 @@ overlap rejection test passed. The ignored tests are existing opt-in cases, not
 same-connection coverage. No live credentials, interfaces or deployments were used.
 
 ## Staging enablement in progress
+
+The Galactic staging candidate adds explicit default-off legacy coexistence on
+the existing named provider. Only the configured legacy authority/SNI uses its
+file certificate and unscoped legacy grants; managed names still require registry
+and fence validation. Unknown/disabled managed names never fall back. Infra must
+preserve the existing legacy mount/authority and qualify both protocols before
+enabling this option. Candidate GitHub CI is not yet claimed successful.
 
 Added a read-only mTLS endpoint probe executable to the controller image and
 explicit probe client trust flags. It performs real public DNS, fresh H2/H3 TLS,

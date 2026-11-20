@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/google/uuid v1.6.0
 	github.com/quic-go/quic-go v0.64.1
-	go.datum.net/galactic v0.9.5-0.20261120192453-5a930d741cdc
+	go.datum.net/galactic v0.9.5-0.20261120213516-ac27e20e2477
 	go.miloapis.com/milo v0.32.1
 	go.miloapis.com/service-catalog v0.13.1
 	golang.org/x/net v0.62.0

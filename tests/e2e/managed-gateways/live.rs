@@ -1,7 +1,9 @@
 use std::{error::Error, net::Ipv6Addr, path::PathBuf, time::Duration};
 
 use chrono::Utc;
-use datum_connect_daemon::galactic_masque::{ConnectionDescriptor, ManagedSession, TransportPool};
+use datum_connect_daemon::galactic_masque::{
+    AttemptFailure, ConnectionDescriptor, ManagedSession, TransportPool,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -48,6 +50,16 @@ async fn attach(
     descriptor: &ConnectionDescriptor,
     protocol: &str,
 ) -> Result<ManagedSession> {
+    attempt(pool, descriptor, protocol)
+        .await
+        .map_err(|failure| format!("CONNECT-IP attachment failed: {failure:?}").into())
+}
+
+async fn attempt(
+    pool: &TransportPool,
+    descriptor: &ConnectionDescriptor,
+    protocol: &str,
+) -> std::result::Result<ManagedSession, AttemptFailure> {
     let cancel = CancellationToken::new();
     match protocol {
         "h3" => pool
@@ -58,9 +70,36 @@ async fn attach(
             .connect_h2(descriptor, cancel)
             .await
             .map(ManagedSession::H2),
-        _ => return Err("protocol must be h3 or h2".into()),
+        _ => Err(AttemptFailure::PlanMismatch),
     }
-    .map_err(|_| "CONNECT-IP attachment rejected".into())
+}
+
+fn authorization_denied(failure: AttemptFailure) -> bool {
+    matches!(failure, AttemptFailure::HttpStatus(401 | 403))
+}
+
+async fn require_denial(
+    pool: &TransportPool,
+    descriptor: &ConnectionDescriptor,
+    protocol: &str,
+) -> Result<()> {
+    if descriptor.transport.expires_at <= Utc::now() + chrono::Duration::seconds(30) {
+        return Err("inconclusive denial: original credential expired or near expiry".into());
+    }
+    match attempt(pool, descriptor, protocol).await {
+        Err(failure) if authorization_denied(failure) => {
+            println!(
+                "{}",
+                json!({"event":"authorization-denied", "protocol":protocol, "result":format!("{failure:?}"), "observedAt":Utc::now()})
+            );
+            Ok(())
+        }
+        Err(failure) => Err(format!("inconclusive denial: {failure:?}").into()),
+        Ok(session) => {
+            session.cancel();
+            Err("unauthorized stream accepted".into())
+        }
+    }
 }
 
 fn identity(session: &ManagedSession) -> (usize, u64) {
@@ -136,6 +175,8 @@ async fn ping(
             pseudo.extend_from_slice(&[0, 0, 0, 58]);
             pseudo.extend_from_slice(&packet[40..]);
             if checksum(&pseudo) == 0 {
+                let encode = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+                println!("{}", json!({"event":"icmpv6-echo-reply", "protocol":session.transport(), "clientTransportId":identity(session).0, "streamId":identity(session).1, "observedAt":Utc::now(), "requestHex":encode(&request), "replyHex":encode(&packet)}));
                 return Ok(());
             }
         }
@@ -149,7 +190,7 @@ fn evidence(phase: &str, protocol: &str, sessions: &[ManagedSession; 2]) {
     let identities = sessions.iter().map(identity).collect::<Vec<_>>();
     println!(
         "{}",
-        json!({"phase": phase, "protocol": protocol, "observedAt": Utc::now(), "sameConnection": identities[0].0 == identities[1].0, "streamIds": [identities[0].1, identities[1].1]})
+        json!({"phase": phase, "protocol": protocol, "observedAt": Utc::now(), "sameConnection": identities[0].0 == identities[1].0, "clientTransportIds": [identities[0].0, identities[1].0], "streamIds": [identities[0].1, identities[1].1]})
     );
 }
 
@@ -168,10 +209,23 @@ async fn confirm(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let result = run().await;
+    if result.is_err() {
+        eprintln!(
+            "Qualification failed/incomplete. Sessions cancel on drop. Infra must disable and clean isolated fixtures using retained receipts; do not erase fences/ledgers or treat earlier phases as a complete run."
+        );
+    }
+    result
+}
+
+async fn run() -> Result<()> {
     let path = std::env::args()
         .nth(1)
         .ok_or("usage: managed-gateway-e2e CONFIG.json")?;
     let mut config: Config = serde_json::from_slice(&std::fs::read(&path)?)?;
+    if !matches!(config.protocol.as_str(), "h2" | "h3") {
+        return Err("protocol must be h2 or h3".into());
+    }
     for url in config
         .credential_urls
         .iter()
@@ -235,9 +289,7 @@ async fn main() -> Result<()> {
     evidence("two-vpc-packets", &config.protocol, &sessions);
     let mut replay = descriptors[0].clone();
     replay.transport.vpc_selector = descriptors[1].transport.vpc_selector.clone();
-    if attach(&pool, &replay, &config.protocol).await.is_ok() {
-        return Err("cross-VPC credential replay accepted".into());
-    }
+    require_denial(&pool, &replay, &config.protocol).await?;
     evidence("cross-vpc-replay-denied", &config.protocol, &sessions);
     let denied = http
         .post(&config.denied_credential_url)
@@ -260,12 +312,10 @@ async fn main() -> Result<()> {
     if ping(&sessions[0], &descriptors[0], config.targets[0])
         .await
         .is_ok()
-        || attach(&pool, &descriptors[0], &config.protocol)
-            .await
-            .is_ok()
     {
         return Err("revoked binding still forwards or reconnects".into());
     }
+    require_denial(&pool, &descriptors[0], &config.protocol).await?;
     ping(&sessions[1], &descriptors[1], config.targets[1]).await?;
     evidence("binding-revoked-sibling-alive", &config.protocol, &sessions);
     confirm(&mut lines, "binding-a-restored").await?;
@@ -283,12 +333,10 @@ async fn main() -> Result<()> {
     if ping(&sessions[0], &descriptors[0], config.targets[0])
         .await
         .is_ok()
-        || attach(&pool, &descriptors[0], &config.protocol)
-            .await
-            .is_ok()
     {
         return Err("old network incarnation still authorizes".into());
     }
+    require_denial(&pool, &descriptors[0], &config.protocol).await?;
     let stale = http
         .post(&config.credential_urls[0])
         .bearer_auth(token.trim())
@@ -347,6 +395,22 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_infrastructure_is_not_authorization_denial() {
+        for failure in [
+            AttemptFailure::Connectivity,
+            AttemptFailure::TlsIdentity,
+            AttemptFailure::PlanMismatch,
+            AttemptFailure::HttpStatus(500),
+            AttemptFailure::HttpStatus(503),
+            AttemptFailure::HttpStatus(421),
+        ] {
+            assert!(!authorization_denied(failure));
+        }
+        assert!(authorization_denied(AttemptFailure::HttpStatus(401)));
+        assert!(authorization_denied(AttemptFailure::HttpStatus(403)));
+    }
 
     #[test]
     fn icmpv6_echo_has_valid_pseudoheader_checksum() {
