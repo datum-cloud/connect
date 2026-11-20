@@ -135,6 +135,12 @@ the allocation tombstone. No broker call initializes a missing ledger.
 The existing Connect controller/ServiceAccount owns reconciliation. Required
 flags when enabled:
 
+Opt-in component `connect-controller/config/components/managed-endpoints/runtime`
+provides only static read-only mounts/volumes, including the projected Karmada
+token. From `config/base/manager`, select
+`../../components/managed-endpoints/runtime`. It does not enable the feature,
+create credentials, change RBAC or add flags; Infra supplies those separately.
+
 ```text
 --managed-endpoints
 --endpoint-project-kubeconfig=/etc/connect/endpoint-project/kubeconfig.yaml

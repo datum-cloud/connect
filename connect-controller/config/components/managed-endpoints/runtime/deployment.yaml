@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connect-controller
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          volumeMounts:
+            - name: endpoint-project
+              mountPath: /etc/connect/endpoint-project
+              readOnly: true
+            - name: endpoint-project-client
+              mountPath: /etc/connect/endpoint-project-client
+              readOnly: true
+            - name: endpoint-karmada
+              mountPath: /etc/connect/karmada
+              readOnly: true
+            - name: endpoint-certificates
+              mountPath: /etc/connect/certificates
+              readOnly: true
+            - name: endpoint-karmada-token
+              mountPath: /var/run/secrets/connect-karmada
+              readOnly: true
+            - name: endpoint-cell-readers
+              mountPath: /etc/connect/cells
+              readOnly: true
+            - name: endpoint-config
+              mountPath: /etc/connect/endpoints
+              readOnly: true
+      volumes:
+        - name: endpoint-project
+          configMap:
+            name: connect-endpoint-project-kubeconfig
+        - name: endpoint-project-client
+          secret:
+            secretName: connect-endpoint-project-client
+        - name: endpoint-karmada
+          configMap:
+            name: connect-endpoint-karmada-kubeconfig
+        - name: endpoint-certificates
+          configMap:
+            name: connect-endpoint-karmada-kubeconfig
+        - name: endpoint-karmada-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: https://karmada-apiserver.karmada-system.svc.cluster.local:5443
+                  expirationSeconds: 3600
+                  path: token
+        - name: endpoint-cell-readers
+          secret:
+            secretName: connect-endpoint-cell-readers
+        - name: endpoint-config
+          configMap:
+            name: connect-endpoint-config
