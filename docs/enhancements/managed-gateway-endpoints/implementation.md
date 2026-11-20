@@ -20,7 +20,8 @@ retains private ConnectGrant network/binding/VPC pins and checks the local VPC
 before and after minting; recreation retires the credential rather than returning
 it. Source-project authorization stays in the authenticated Connect broker.
 Certificates' reservation authorization and certificate revision are unchanged.
-The new Galactic dependency and final-head CI remain pending for this revision.
+The new Galactic dependency is published and pinned below; final-head GitHub CI
+must be verified separately from local tests.
 
 Operator JSON separates `capacity:[{metro,assignment:{cell,provider,frontend}}]`
 from `reachability:[{networkUID,cell,vpcRef:{namespace,name,uid}}]`.
@@ -253,12 +254,16 @@ kubectl kustomize config/components/managed-endpoints/crd
 Dependencies:
 
 - Certificates: `4cec00395b3647737685addd697e40f2e94d3214`, draft PR milo-os/certificates#83.
-- Infrastructure: `c77e72527ed35ecb3d55cca8b5d49427427258c4` (implementation base
-  `4edfe175ce00fd0c044bd6072a834ae1461b35ec`), draft PR datum-cloud/infra#9647.
-- Galactic: `df3279afb62d05c82e964fcc7345cfeacf6fd3a8`, draft PR datum-cloud/galactic#1465;
-  Go module `v0.9.5-0.20261120152434-df3279afb62d`, without local replacements.
-  This CI correction changes API comments and the load-safe CRD export, not
-  endpoint, grant or runtime contracts.
+- Infrastructure: prior published `d7353b7f159770412560c3dad0cd18cee34e35f7`,
+  draft PR datum-cloud/infra#9647. The name-based follow-up awaits this Connect
+  publication for exact-source validation; the earlier green run is not its CI.
+- Galactic: `de6b48f549dc1e10977e8046d029521d835be323`, draft PR datum-cloud/galactic#1465;
+  Go module `v0.9.5-0.20261120170557-de6b48f549dc`, without local replacements.
+  This revision implements the frozen name-only facade, registration, instance
+  acknowledgments and authority wire contract. Providers require the get-only
+  tenant service/VPC reader role before upgrade. Previous experimental managed
+  records fail closed; drain them with the old version before upgrading rather
+  than reinterpreting them as legacy grants.
 
 The Galactic dependency requires Go 1.26.4 and Kubernetes Go modules 0.37.2;
 the controller module follows those minimum versions. Controller generation

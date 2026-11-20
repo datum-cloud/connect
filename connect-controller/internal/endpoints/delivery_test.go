@@ -107,3 +107,30 @@ func TestCleanupRecoversCreateBeforeReceiptBinding(t *testing.T) {
 		t.Fatal("cleanup not complete", err)
 	}
 }
+
+func TestLegacyDistributedIdentityRequiresMigration(t *testing.T) {
+	ctx := context.Background()
+	for _, annotation := range []bool{false, true} {
+		endpoint := endpointFixture()
+		project := resourceClient(t, endpoint)
+		registration := object(registrationGVK, "masque", endpoint.Name)
+		registration.SetUID("old-registration")
+		registration.Object["spec"] = map[string]interface{}{"hostname": endpoint.Spec.Hostname, "revision": int64(1)}
+		if annotation {
+			registration.SetAnnotations(map[string]string{"masque.galactic.datumapis.com/endpoint-uid": string(endpoint.UID)})
+		} else {
+			registration.SetLabels(map[string]string{OwnerLabel: string(endpoint.UID)})
+		}
+		karmada := resourceClient(t, registration)
+		driver := &KubernetesDriver{Project: project, Karmada: karmada}
+		desired := registration.DeepCopy()
+		desired.SetLabels(nil)
+		desired.SetAnnotations(nil)
+		if err := driver.ensureDelivery(ctx, endpoint, desired); err == nil {
+			t.Fatal("legacy UID-bearing delivery silently adopted")
+		}
+		if len(endpoint.Status.DeliveryReceipts) != 0 {
+			t.Fatal("legacy delivery acquired a cleanup receipt")
+		}
+	}
+}

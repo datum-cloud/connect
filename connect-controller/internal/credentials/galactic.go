@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 	connect "go.datum.net/connect-controller/api/v1alpha1"
 	"go.datum.net/connect-controller/internal/endpoints"
-	galactic "go.datum.net/galactic/api/v1alpha1"
+	cloud "go.datum.net/galactic/api/cloud/v1alpha1"
 	"go.datum.net/galactic/pkg/masquegrant"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,14 +25,16 @@ type GrantAPI interface {
 }
 
 type ManagedIssuer struct {
-	Project     client.Client
-	Namespace   string
-	Authorities map[string]GrantAPI
-	Now         func() time.Time
+	Project          client.Client
+	Namespace        string
+	Authorities      map[string]GrantAPI
+	Cells            map[string]client.Reader
+	RuntimeNamespace string
+	Now              func() time.Time
 }
 
 func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedTransport, error) {
-	if binding.Endpoint == nil || binding.UID == "" || binding.PolicyRevision == "" || binding.NetworkUID == "" || binding.NetworkName == "" || binding.VPC.UID == "" {
+	if binding.Endpoint == nil || binding.UID == "" || binding.PolicyRevision == "" || binding.NetworkUID == "" || binding.NetworkName == "" || binding.VPC.UID == "" || issuer.RuntimeNamespace == "" {
 		return IssuedTransport{}, ErrUnavailable
 	}
 	endpoint := &connect.ConnectEndpoint{}
@@ -45,6 +47,9 @@ func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedT
 	authority := issuer.Authorities[endpoint.Spec.Assignment.Cell]
 	if authority == nil {
 		return IssuedTransport{}, ErrUnavailable
+	}
+	if err := issuer.validateVPC(ctx, endpoint.Spec.Assignment.Cell, binding.VPC); err != nil {
+		return IssuedTransport{}, err
 	}
 	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d", binding.UID, endpoint.UID, binding.PolicyRevision+"/"+binding.NetworkUID+"/"+binding.VPC.UID, endpoint.Status.ActivationRevision)))
 	connector := uuid.NewSHA1(uuid.NameSpaceOID, digest[:]).String()
@@ -62,6 +67,7 @@ func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedT
 		}
 	}
 	routes := make([]netip.Prefix, 0, len(binding.NetworkPlan.DestinationPrefixes))
+	receiptUID := receipt.UID
 	for _, raw := range binding.NetworkPlan.DestinationPrefixes {
 		prefix, err := netip.ParsePrefix(raw)
 		if err != nil || !prefix.Addr().Is6() || prefix != prefix.Masked() {
@@ -71,26 +77,43 @@ func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedT
 	}
 	assignment := endpoint.Spec.Assignment
 	activation := endpoint.Status.ActivationRevision
-	scope := &galactic.MASQUEEndpointScope{EndpointUID: string(endpoint.UID), CustomerProjectUID: endpoint.Spec.CustomerProjectUID, GatewayUID: endpoint.Spec.GatewayUID, Cell: assignment.Cell, Hostname: endpoint.Spec.Hostname}
-	issued, err := authority.Create(ctx, masquegrant.CreateRequest{NetworkUID: binding.NetworkUID, BindingUID: binding.UID, VPC: masquegrant.VPCRef{Namespace: binding.VPC.Namespace, Name: binding.VPC.Name, UID: binding.VPC.UID}, Cell: assignment.Cell, Connector: connector, Lifetime: 5 * time.Minute, Routes: routes, Endpoint: scope})
+	reference := &masquegrant.EndpointRef{Namespace: issuer.RuntimeNamespace, Name: endpoint.Name}
+	issued, err := authority.Create(ctx, masquegrant.CreateRequest{VPC: masquegrant.VPCRef{Namespace: binding.VPC.Namespace, Name: binding.VPC.Name}, Cell: assignment.Cell, Connector: connector, Lifetime: 5 * time.Minute, Routes: routes, EndpointRef: reference})
 	if apierrors.IsAlreadyExists(err) {
 		issued, err = authority.Rotate(ctx, connector, 5*time.Minute)
 	}
 	if err != nil {
 		return IssuedTransport{}, fmt.Errorf("authority mint failed")
 	}
-	if err := issuer.Project.Get(ctx, client.ObjectKeyFromObject(receipt), receipt); err != nil || receipt.Status.Retiring || receipt.Status.Retired {
+	if err := issuer.validateVPC(ctx, assignment.Cell, binding.VPC); err != nil {
+		_ = issuer.Retire(ctx, receipt)
+		return IssuedTransport{}, ErrUnavailable
+	}
+	if err := issuer.Project.Get(ctx, client.ObjectKeyFromObject(receipt), receipt); err != nil || receipt.UID != receiptUID || !reflect.DeepEqual(receipt.Spec, wanted) || receipt.Status.Retiring || receipt.Status.Retired {
 		_ = authority.Retire(ctx, connector)
 		return IssuedTransport{}, ErrUnavailable
 	}
-	if err := issuer.Project.Get(ctx, client.ObjectKeyFromObject(endpoint), endpoint); err != nil || endpoint.Status.ActivationRevision != activation || !endpoints.Ready(endpoint, issuer.Now(), 5*time.Minute) {
+	if err := issuer.Project.Get(ctx, client.ObjectKeyFromObject(endpoint), endpoint); err != nil || endpoint.UID != binding.Endpoint.UID || endpoint.Status.ActivationRevision != activation || !endpoints.Ready(endpoint, issuer.Now(), 5*time.Minute) {
 		_ = authority.Retire(ctx, connector)
 		return IssuedTransport{}, ErrUnavailable
 	}
 	if !issued.Prefix.IsValid() || !issued.Prefix.Addr().Is6() || issued.Prefix.Bits() != 96 || issued.Connector != connector || issued.VPC != binding.VPC.Namespace+"/"+binding.VPC.Name {
+		_ = issuer.Retire(ctx, receipt)
 		return IssuedTransport{}, ErrUnavailable
 	}
 	return IssuedTransport{Authority: endpoint.Spec.Hostname, VPCSelector: issued.VPC, Credential: Credential(issued.Credential), ExpiresAt: issued.Expires, Transports: []string{"h3", "h2"}, ExpectedPrefix: issued.Prefix.String()}, nil
+}
+
+func (issuer *ManagedIssuer) validateVPC(ctx context.Context, cellName string, expected connect.EndpointVPCReference) error {
+	reader := issuer.Cells[cellName]
+	if reader == nil {
+		return ErrUnavailable
+	}
+	vpc := &cloud.VPC{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: expected.Namespace, Name: expected.Name}, vpc); err != nil || vpc.UID == "" || string(vpc.UID) != expected.UID || vpc.DeletionTimestamp != nil {
+		return ErrUnavailable
+	}
+	return nil
 }
 
 func (issuer *ManagedIssuer) Retire(ctx context.Context, receipt *connect.ConnectGrant) error {

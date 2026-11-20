@@ -61,7 +61,7 @@ func setupCredentials(mgr mcmanager.Manager, service *endpoints.Service, config 
 	if err := authorizationv1.AddToScheme(scheme); err != nil {
 		return err
 	}
-	issuer := &credentials.ManagedIssuer{Project: service.Reconciler.Project, Namespace: service.Namespace, Now: time.Now, Authorities: map[string]credentials.GrantAPI{}}
+	issuer := &credentials.ManagedIssuer{Project: service.Reconciler.Project, Namespace: service.Namespace, RuntimeNamespace: options.RuntimeNamespace, Now: time.Now, Authorities: map[string]credentials.GrantAPI{}, Cells: map[string]client.Reader{}}
 	for name, cell := range config.Cells {
 		if cell.GrantKubeconfig == "" {
 			continue
@@ -75,6 +75,7 @@ func setupCredentials(mgr mcmanager.Manager, service *endpoints.Service, config 
 			return err
 		}
 		issuer.Authorities[name] = masquegrant.New(grantClient, options.RuntimeNamespace)
+		issuer.Cells[name] = grantClient
 	}
 	valid := func(ctx context.Context, receipt *connect.ConnectGrant) (bool, error) {
 		endpoint := &connect.ConnectEndpoint{}
