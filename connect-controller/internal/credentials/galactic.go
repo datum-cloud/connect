@@ -62,8 +62,14 @@ func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedT
 		if err := issuer.Project.Get(ctx, client.ObjectKeyFromObject(receipt), receipt); err != nil {
 			return IssuedTransport{}, err
 		}
-		if !reflect.DeepEqual(receipt.Spec, wanted) || receipt.Status.Retired || receipt.Status.Retiring {
+		if !reflect.DeepEqual(receipt.Spec, wanted) || receipt.Status.EffectiveState() != "Active" {
 			return IssuedTransport{}, ErrUnavailable
+		}
+	}
+	if receipt.Status.State != "Active" {
+		receipt.Status = connect.ConnectGrantStatus{State: "Active"}
+		if err := issuer.Project.Status().Update(ctx, receipt); err != nil {
+			return IssuedTransport{}, err
 		}
 	}
 	routes := make([]netip.Prefix, 0, len(binding.NetworkPlan.DestinationPrefixes))
@@ -78,7 +84,7 @@ func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedT
 	assignment := endpoint.Spec.Assignment
 	activation := endpoint.Status.ActivationRevision
 	reference := &masquegrant.EndpointRef{Namespace: issuer.RuntimeNamespace, Name: endpoint.Name}
-	issued, err := authority.Create(ctx, masquegrant.CreateRequest{VPC: masquegrant.VPCRef{Namespace: binding.VPC.Namespace, Name: binding.VPC.Name}, Cell: assignment.Cell, Connector: connector, Lifetime: 5 * time.Minute, Routes: routes, EndpointRef: reference})
+	issued, err := authority.Create(ctx, masquegrant.CreateRequest{VPC: masquegrant.VPCRef{Namespace: binding.VPC.Namespace, Name: binding.VPC.Name}, Connector: connector, Lifetime: 5 * time.Minute, Routes: routes, EndpointRef: reference})
 	if apierrors.IsAlreadyExists(err) {
 		issued, err = authority.Rotate(ctx, connector, 5*time.Minute)
 	}
@@ -89,7 +95,7 @@ func (issuer *ManagedIssuer) Mint(ctx context.Context, binding Binding) (IssuedT
 		_ = issuer.Retire(ctx, receipt)
 		return IssuedTransport{}, ErrUnavailable
 	}
-	if err := issuer.Project.Get(ctx, client.ObjectKeyFromObject(receipt), receipt); err != nil || receipt.UID != receiptUID || !reflect.DeepEqual(receipt.Spec, wanted) || receipt.Status.Retiring || receipt.Status.Retired {
+	if err := issuer.Project.Get(ctx, client.ObjectKeyFromObject(receipt), receipt); err != nil || receipt.UID != receiptUID || !reflect.DeepEqual(receipt.Spec, wanted) || receipt.Status.EffectiveState() != "Active" {
 		_ = authority.Retire(ctx, connector)
 		return IssuedTransport{}, ErrUnavailable
 	}
@@ -117,22 +123,22 @@ func (issuer *ManagedIssuer) validateVPC(ctx context.Context, cellName string, e
 }
 
 func (issuer *ManagedIssuer) Retire(ctx context.Context, receipt *connect.ConnectGrant) error {
-	authority := issuer.Authorities[receipt.Spec.Cell]
-	if authority == nil {
-		return ErrUnavailable
-	}
-	if !receipt.Status.Retiring {
-		receipt.Status.Retiring = true
+	if receipt.Status.EffectiveState() != "Retired" {
+		receipt.Status = connect.ConnectGrantStatus{State: "Retiring"}
 		if err := issuer.Project.Status().Update(ctx, receipt); err != nil {
 			return err
 		}
 	}
+	authority := issuer.Authorities[receipt.Spec.Cell]
+	if authority == nil {
+		return ErrUnavailable
+	}
 	if err := authority.Retire(ctx, receipt.Spec.ConnectorID); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	if receipt.Status.Retired {
+	if receipt.Status.State == "Retired" && !receipt.Status.Retired && !receipt.Status.Retiring {
 		return nil
 	}
-	receipt.Status.Retired = true
+	receipt.Status = connect.ConnectGrantStatus{State: "Retired"}
 	return issuer.Project.Status().Update(ctx, receipt)
 }

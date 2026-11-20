@@ -72,6 +72,51 @@ func TestEndpointCRDSchema(t *testing.T) {
 	if err := project.Create(ctx, endpoint); err != nil {
 		t.Fatal(err)
 	}
+	endpoint.Status = ConnectEndpointStatus{Phase: "Active", Ready: true, DeliveredSecrets: []string{"old-secret"}, DeliveryReceipts: []EndpointDeliveryReceipt{{APIVersion: "v1", Kind: "Secret", Namespace: "masque", Name: "old-secret", UID: "secret-uid", ContentDigest: "digest"}}}
+	if err := project.Status().Update(ctx, endpoint); err != nil {
+		t.Fatal("legacy migration state pruned or rejected", err)
+	}
+	if err := project.Get(ctx, client.ObjectKeyFromObject(endpoint), endpoint); err != nil || len(endpoint.Status.DeliveredSecrets) != 1 || endpoint.Status.DeliveryReceipts[0].UID != "secret-uid" {
+		t.Fatal("schema lost durable legacy receipt", err)
+	}
+	endpoint.Status.Phase, endpoint.Status.Ready = "", false
+	endpoint.Status.DeliveredSecrets = nil
+	endpoint.Status.DeliveryReceipts[0].State = "Created"
+	endpoint.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: "MigrationPending", Message: "verification required", LastTransitionTime: metav1.Now(), ObservedGeneration: endpoint.Generation}}
+	if err := project.Status().Update(ctx, endpoint); err != nil {
+		t.Fatal("condition/inventory migration rejected", err)
+	}
+	grant := &ConnectGrant{ObjectMeta: metav1.ObjectMeta{Namespace: "service", Name: "grant"}, Spec: ConnectGrantSpec{NetworkName: "network", NetworkUID: "network-uid", VPC: EndpointVPCReference{Namespace: "vpcs", Name: "network", UID: "vpc-uid"}, EndpointName: endpoint.Name, EndpointUID: string(endpoint.UID), BindingName: "one", BindingUID: "binding-uid", PolicyRevision: "policy", ConnectorID: "connector", Cell: "cell"}}
+	if err := project.Create(ctx, grant); err != nil {
+		t.Fatal(err)
+	}
+	grant.Status.Retiring = true
+	if err := project.Status().Update(ctx, grant); err != nil {
+		t.Fatal(err)
+	}
+	grant.Status = ConnectGrantStatus{State: "Retiring"}
+	if err := project.Status().Update(ctx, grant); err != nil {
+		t.Fatal("legacy revocation conversion rejected", err)
+	}
+	invalid := grant.DeepCopy()
+	invalid.Status.State = "Active"
+	if err := project.Status().Update(ctx, invalid); !apierrors.IsInvalid(err) {
+		t.Fatal("retiring grant reactivated", err)
+	}
+	grant.Status.State = "Retired"
+	if err := project.Status().Update(ctx, grant); err != nil {
+		t.Fatal(err)
+	}
+	invalid = grant.DeepCopy()
+	invalid.Status.State = "Retiring"
+	if err := project.Status().Update(ctx, invalid); !apierrors.IsInvalid(err) {
+		t.Fatal("retired grant tombstone reset", err)
+	}
+	invalid = grant.DeepCopy()
+	invalid.Status = ConnectGrantStatus{}
+	if err := project.Status().Update(ctx, invalid); !apierrors.IsInvalid(err) {
+		t.Fatal("retired grant state erased", err)
+	}
 	endpoint.Spec.Assignment = EndpointAssignment{Cell: "cell", Provider: "provider", Frontend: "cell.example.test"}
 	if err := project.Update(ctx, endpoint); err != nil {
 		t.Fatal(err)

@@ -331,12 +331,12 @@ type ConnectGatewayPlacementSpec struct {
 }
 
 type ConnectGatewayPlacementStatus struct {
-	ObservedGeneration  int64              `json:"observedGeneration,omitempty"`
-	AssignmentRef       string             `json:"assignmentRef,omitempty"`
-	Hostname            string             `json:"hostname,omitempty"`
-	Metro               string             `json:"metro,omitempty"`
-	CertificateNotAfter *metav1.Time       `json:"certificateNotAfter,omitempty"`
-	Conditions          []metav1.Condition `json:"conditions,omitempty"`
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// AssignmentRef is reserved for legacy placements; managed placements omit it.
+	AssignmentRef string             `json:"assignmentRef,omitempty"`
+	Hostname      string             `json:"hostname,omitempty"`
+	Metro         string             `json:"metro,omitempty"`
+	Conditions    []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -12,6 +12,7 @@ import (
 
 	connect "go.datum.net/connect-controller/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -104,14 +105,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, key types.NamespacedName) er
 	if endpoint.Spec.Lifecycle != "Active" || !endpoint.DeletionTimestamp.IsZero() {
 		return r.cleanup(ctx, endpoint)
 	}
-	if endpoint.Status.Phase == "Retired" {
-		endpoint.Status = connect.ConnectEndpointStatus{Revision: endpoint.Status.Revision}
+	if endpoint.Status.CleanupStep == "Retired" {
+		endpoint.Status = connect.ConnectEndpointStatus{Revision: endpoint.Status.Revision, DeliveryReceipts: endpoint.Status.DeliveryReceipts, DeliveredSecrets: endpoint.Status.DeliveredSecrets}
 	}
-	if endpoint.Status.Phase == "" {
-		endpoint.Status.Phase = "Active"
+	if endpoint.Status.CertificateRef.Name == "" {
 		endpoint.Status.ActivationRevision = endpoint.Status.Revision + 1
 		endpoint.Status.CertificateRef.Name = endpoint.Name
-		endpoint.Status.Reason = "CertificatePending"
+		setReady(endpoint, false, "CertificatePending")
 		return r.Project.Status().Update(ctx, endpoint)
 	}
 	if endpoint.Status.NotAfter != nil && !endpoint.Status.NotAfter.After(r.Now().Add(r.ExpiryMargin)) {
@@ -130,23 +130,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, key types.NamespacedName) er
 		return r.blocked(ctx, endpoint, "CertificateExpiring", fmt.Errorf("certificate inside expiry margin"))
 	}
 	if certificate.Revision != endpoint.Status.CertificateRevision {
-		endpoint.Status.Ready = false
+		setReady(endpoint, false, "ListenerPending")
 		endpoint.Status.VerifiedAt = nil
 		endpoint.Status.Revision++
 		endpoint.Status.CertificateRevision = certificate.Revision
-		secretName := SecretName(endpoint)
-		found := false
-		for _, name := range endpoint.Status.DeliveredSecrets {
-			if name == secretName {
-				found = true
-			}
-		}
-		if !found {
-			endpoint.Status.DeliveredSecrets = append(endpoint.Status.DeliveredSecrets, secretName)
-		}
 		expires := metav1.NewTime(certificate.NotAfter)
 		endpoint.Status.NotAfter = &expires
-		endpoint.Status.Reason = "ListenerPending"
 		return r.Project.Status().Update(ctx, endpoint)
 	}
 	if err := r.Driver.Apply(ctx, endpoint, true); err != nil {
@@ -164,18 +153,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, key types.NamespacedName) er
 	if err := r.Driver.Prune(ctx, endpoint); err != nil {
 		return r.blocked(ctx, endpoint, "PreviousCertificateCleanupPending", err)
 	}
-	endpoint.Status.DeliveredSecrets = []string{SecretName(endpoint)}
-	endpoint.Status.Ready = true
-	endpoint.Status.Reason = "Ready"
+	setReady(endpoint, true, "Ready")
 	verified := metav1.NewTime(r.Now())
 	endpoint.Status.VerifiedAt = &verified
 	return r.Project.Status().Update(ctx, endpoint)
 }
 
 func (r *Reconciler) blocked(ctx context.Context, endpoint *connect.ConnectEndpoint, reason string, cause error) error {
-	endpoint.Status.Ready = false
+	setReady(endpoint, false, reason)
 	endpoint.Status.VerifiedAt = nil
-	endpoint.Status.Reason = reason
 	if err := r.Project.Status().Update(ctx, endpoint); err != nil {
 		return err
 	}
@@ -183,9 +169,8 @@ func (r *Reconciler) blocked(ctx context.Context, endpoint *connect.ConnectEndpo
 }
 
 func (r *Reconciler) cleanup(ctx context.Context, endpoint *connect.ConnectEndpoint) error {
-	endpoint.Status.Ready = false
+	setReady(endpoint, false, "CleanupPending")
 	endpoint.Status.VerifiedAt = nil
-	endpoint.Status.Phase = "Deleting"
 	if endpoint.Status.CleanupStep == "" {
 		endpoint.Status.Revision++
 		endpoint.Status.CleanupStep = "Disable"
@@ -233,11 +218,11 @@ func (r *Reconciler) cleanup(ctx context.Context, endpoint *connect.ConnectEndpo
 			return err
 		}
 		for _, grant := range grants.Items {
-			if grant.Spec.EndpointUID == string(endpoint.UID) && !grant.Status.Retired {
+			if grant.Spec.EndpointUID == string(endpoint.UID) && grant.Status.EffectiveState() != "Retired" {
 				return nil
 			}
 		}
-		endpoint.Status.Phase = "Retired"
+		setReady(endpoint, false, "Retired")
 		if err := r.Project.Status().Update(ctx, endpoint); err != nil {
 			return err
 		}
@@ -246,10 +231,21 @@ func (r *Reconciler) cleanup(ctx context.Context, endpoint *connect.ConnectEndpo
 	default:
 		return fmt.Errorf("unknown cleanup step")
 	}
-	endpoint.Status.Reason = "CleanupPending"
 	return r.Project.Status().Update(ctx, endpoint)
 }
 
+func setReady(endpoint *connect.ConnectEndpoint, ready bool, reason string) {
+	status := metav1.ConditionFalse
+	if ready {
+		status = metav1.ConditionTrue
+	}
+	meta.SetStatusCondition(&endpoint.Status.Conditions, metav1.Condition{Type: "Ready", Status: status, Reason: reason, Message: reason, ObservedGeneration: endpoint.Generation})
+	endpoint.Status.Phase = ""
+	endpoint.Status.Ready = false
+	endpoint.Status.Reason = ""
+}
+
 func Ready(endpoint *connect.ConnectEndpoint, now time.Time, margin time.Duration) bool {
-	return endpoint.Spec.Lifecycle == "Active" && endpoint.DeletionTimestamp.IsZero() && endpoint.Status.Phase == "Active" && endpoint.Status.Ready && endpoint.Status.Revision > 0 && endpoint.Status.CertificateRevision != "" && endpoint.Status.NotAfter != nil && endpoint.Status.NotAfter.After(now.Add(margin)) && endpoint.Status.VerifiedAt != nil && !endpoint.Status.VerifiedAt.After(now) && now.Sub(endpoint.Status.VerifiedAt.Time) <= 10*time.Second
+	condition := meta.FindStatusCondition(endpoint.Status.Conditions, "Ready")
+	return endpoint.Spec.Lifecycle == "Active" && endpoint.DeletionTimestamp.IsZero() && condition != nil && condition.Status == metav1.ConditionTrue && condition.ObservedGeneration == endpoint.Generation && endpoint.Status.Revision > 0 && endpoint.Status.CertificateRevision != "" && endpoint.Status.NotAfter != nil && endpoint.Status.NotAfter.After(now.Add(margin)) && endpoint.Status.VerifiedAt != nil && !endpoint.Status.VerifiedAt.After(now) && now.Sub(endpoint.Status.VerifiedAt.Time) <= 10*time.Second
 }

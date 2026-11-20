@@ -37,9 +37,9 @@ func TestRealGalacticGrantLifecycle(t *testing.T) {
 	ref := masquegrant.VPCRef{Namespace: vpc.Namespace, Name: vpc.Name}
 	registration := &galactic.MASQUEEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "masque-system", UID: "registration-incarnation"}, Spec: galactic.MASQUEEndpointSpec{Hostname: "gateway.example.test", Provider: "shared", Revision: 1, Enabled: true, CertificateRef: galactic.MASQUEEndpointCertificateReference{Name: "tls", Revision: strings.Repeat("a", 64)}}}
 	cell := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vpc, registration).Build()
-	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: registration.Spec.Hostname, CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Assignment: connect.EndpointAssignment{Cell: "cell-a"}}, Status: connect.ConnectEndpointStatus{Ready: true, Phase: "Active", Revision: 1, CertificateRevision: registration.Spec.CertificateRef.Revision, NotAfter: &expires, VerifiedAt: &verified}}
+	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: registration.Spec.Hostname, CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Assignment: connect.EndpointAssignment{Cell: "cell-a"}}, Status: connect.ConnectEndpointStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"}}, Revision: 1, CertificateRevision: registration.Spec.CertificateRef.Revision, NotAfter: &expires, VerifiedAt: &verified}}
 	project := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&connect.ConnectEndpoint{}, &connect.ConnectGrant{}).WithObjects(endpoint).Build()
-	issuer := &ManagedIssuer{Project: project, Namespace: "service", RuntimeNamespace: "masque-system", Cells: map[string]client.Reader{"cell-a": cell}, Authorities: map[string]GrantAPI{"cell-a": masquegrant.New(cell, "masque-system")}, Now: func() time.Time { return now }}
+	issuer := &ManagedIssuer{Project: project, Namespace: "service", RuntimeNamespace: "masque-system", Cells: map[string]client.Reader{"cell-a": cell}, Authorities: map[string]GrantAPI{"cell-a": masquegrant.New(cell, "masque-system", "cell-a")}, Now: func() time.Time { return now }}
 	binding := Binding{NetworkName: "network", NetworkUID: "network-uid", VPC: connect.EndpointVPCReference{Namespace: ref.Namespace, Name: ref.Name, UID: string(vpc.UID)}, Name: "binding", UID: "binding-uid", PolicyRevision: "policy-1", Endpoint: endpoint, NetworkPlan: NetworkPlan{DestinationPrefixes: []string{"fd20:a1b:2c3d::/48"}, MTU: 1280}}
 	if _, err := issuer.Mint(ctx, binding); err == nil {
 		t.Fatal("missing operator ledger/fence accepted")
@@ -132,7 +132,7 @@ func TestManagedIssuerRetiresVPCRecreatedDuringMint(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	verified, expires := metav1.NewTime(now), metav1.NewTime(now.Add(time.Hour))
-	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: "endpoint.example.test", Assignment: connect.EndpointAssignment{Cell: "selected"}}, Status: connect.ConnectEndpointStatus{Ready: true, Phase: "Active", Revision: 1, CertificateRevision: "cert", NotAfter: &expires, VerifiedAt: &verified}}
+	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: "endpoint.example.test", Assignment: connect.EndpointAssignment{Cell: "selected"}}, Status: connect.ConnectEndpointStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"}}, Revision: 1, CertificateRevision: "cert", NotAfter: &expires, VerifiedAt: &verified}}
 	scheme := runtime.NewScheme()
 	_ = connect.AddToScheme(scheme)
 	_ = cloud.AddToScheme(scheme)
@@ -159,7 +159,7 @@ func TestManagedIssuerRetiresVPCRecreatedDuringMint(t *testing.T) {
 		t.Fatal("raced credential not retired")
 	}
 	var receipts connect.ConnectGrantList
-	if err := project.List(ctx, &receipts); err != nil || len(receipts.Items) != 1 || !receipts.Items[0].Status.Retired {
+	if err := project.List(ctx, &receipts); err != nil || len(receipts.Items) != 1 || receipts.Items[0].Status.State != "Retired" {
 		t.Fatal("revocation not durably recorded", err)
 	}
 	if _, err := issuer.Mint(ctx, binding); err == nil || len(authority.requests) != 1 {
@@ -177,7 +177,7 @@ func TestManagedGrantRetryRetainsCellScopeAndPrefix(t *testing.T) {
 	now := time.Now()
 	verified := metav1.NewTime(now)
 	expires := metav1.NewTime(now.Add(time.Hour))
-	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: "endpoint.example.test", CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Assignment: connect.EndpointAssignment{Cell: "selected"}}, Status: connect.ConnectEndpointStatus{Ready: true, Phase: "Active", Revision: 1, CertificateRevision: "cert", NotAfter: &expires, VerifiedAt: &verified}}
+	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{Lifecycle: "Active", Hostname: "endpoint.example.test", CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", Assignment: connect.EndpointAssignment{Cell: "selected"}}, Status: connect.ConnectEndpointStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"}}, Revision: 1, CertificateRevision: "cert", NotAfter: &expires, VerifiedAt: &verified}}
 	scheme := runtime.NewScheme()
 	_ = connect.AddToScheme(scheme)
 	_ = cloud.AddToScheme(scheme)
@@ -226,6 +226,14 @@ func TestManagedGrantRetryRetainsCellScopeAndPrefix(t *testing.T) {
 	}
 	if len(receipts.Items) != 1 {
 		t.Fatal("duplicate durable grants")
+	}
+	delete(issuer.Authorities, "selected")
+	if err := issuer.Retire(ctx, &receipts.Items[0]); err == nil {
+		t.Fatal("missing authority accepted revocation")
+	}
+	issuer.Authorities["selected"] = selected
+	if _, err := issuer.Mint(ctx, binding); err == nil {
+		t.Fatal("pending revocation allowed mint or refresh")
 	}
 	if err := issuer.Retire(ctx, &receipts.Items[0]); err != nil {
 		t.Fatal(err)

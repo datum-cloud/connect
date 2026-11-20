@@ -109,11 +109,11 @@ func (resolver ManagedBindingResolver) Resolve(ctx context.Context, name string)
 	if err := resolver.Customer.Get(ctx, client.ObjectKey{Namespace: resolver.Namespace, Name: binding.Status.SelectedPlacementRef}, placement); err != nil {
 		return credentials.Binding{}, err
 	}
-	if placement.Spec.GatewayRef != gateway.Name || placement.Status.AssignmentRef == "" {
+	if placement.Spec.GatewayRef != gateway.Name {
 		return credentials.Binding{}, credentials.ErrUnavailable
 	}
-	endpoint := &connect.ConnectEndpoint{}
-	if err := resolver.Service.Reconciler.Project.Get(ctx, client.ObjectKey{Namespace: resolver.Service.Namespace, Name: placement.Status.AssignmentRef}, endpoint); err != nil {
+	endpoint, err := resolver.Service.EndpointForGateway(ctx, gateway, placement.Status.Metro)
+	if err != nil {
 		return credentials.Binding{}, err
 	}
 	project := &unstructured.Unstructured{}

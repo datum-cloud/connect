@@ -96,10 +96,39 @@ spec:
           status:
             properties:
               retired:
+                description: 'Deprecated: consumed during migration; true always preserves
+                  the tombstone.'
                 type: boolean
               retiring:
+                description: 'Deprecated: consumed during migration; true always takes
+                  precedence over Active.'
                 type: boolean
+              state:
+                enum:
+                - Active
+                - Retiring
+                - Retired
+                type: string
+                x-kubernetes-validations:
+                - message: retired grants cannot reactivate
+                  rule: oldSelf != 'Retired' || self == 'Retired'
+                - message: retiring grants cannot reactivate
+                  rule: oldSelf != 'Retiring' || self != 'Active'
             type: object
+            x-kubernetes-validations:
+            - message: retired state cannot be cleared
+              rule: '!has(oldSelf.state) || oldSelf.state != ''Retired'' || (has(self.state)
+                && self.state == ''Retired'')'
+            - message: retiring state cannot be cleared
+              rule: '!has(oldSelf.state) || oldSelf.state != ''Retiring'' || (has(self.state)
+                && self.state in [''Retiring'', ''Retired''])'
+            - message: legacy tombstone must be preserved or migrated
+              rule: '!has(oldSelf.retired) || !oldSelf.retired || ((has(self.retired)
+                && self.retired) || (has(self.state) && self.state == ''Retired''))'
+            - message: legacy revocation must be preserved or migrated
+              rule: '!has(oldSelf.retiring) || !oldSelf.retiring || ((has(self.retiring)
+                && self.retiring) || (has(self.state) && self.state in [''Retiring'',
+                ''Retired'']))'
         required:
         - spec
         type: object

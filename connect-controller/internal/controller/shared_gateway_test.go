@@ -29,8 +29,8 @@ func TestSharedGatewayBindingsPinIndependentNetworkIdentities(t *testing.T) {
 	gateway := &connect.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default", UID: "gateway-uid"}, Spec: connect.ConnectGatewaySpec{ContractVersion: managedGatewayContract}}
 	connector := &connect.Connector{ObjectMeta: metav1.ObjectMeta{Name: "laptop", Namespace: "default", UID: "connector-uid", Labels: map[string]string{"policy.connect.datum.net/team": "one"}}, Status: connect.ConnectorStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"}}}}
 	policy := &connect.ConnectConnectionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow", Namespace: "default", Generation: 1}, Spec: connect.ConnectConnectionPolicySpec{GatewayRef: &connect.LocalObjectReference{Name: "shared"}, NetworkRefs: []connect.LocalObjectReference{{Name: "one"}, {Name: "two"}}, ConnectorSelector: metav1.LabelSelector{MatchLabels: connector.Labels}, Access: connect.ConnectPolicyAccess{Permission: "Network"}}}
-	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", GatewayNamespace: "default", Lifecycle: "Active", Hostname: "opaque.example.test", Assignment: connect.EndpointAssignment{Cell: "cell"}}, Status: connect.ConnectEndpointStatus{Phase: "Active", Revision: 1, CertificateRevision: "certificate", Ready: true, NotAfter: &expires, VerifiedAt: &verified}}
-	placement := &connect.ConnectGatewayPlacement{ObjectMeta: metav1.ObjectMeta{Name: "shared-dfw", Namespace: "default"}, Spec: connect.ConnectGatewayPlacementSpec{GatewayRef: "shared"}, Status: connect.ConnectGatewayPlacementStatus{AssignmentRef: "endpoint"}}
+	endpoint := &connect.ConnectEndpoint{ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "service", UID: "endpoint-uid"}, Spec: connect.ConnectEndpointSpec{CustomerProjectUID: "project-uid", GatewayUID: "gateway-uid", GatewayNamespace: "default", GatewayName: "shared", Metro: "dfw", Lifecycle: "Active", Hostname: "opaque.example.test", Assignment: connect.EndpointAssignment{Cell: "cell"}}, Status: connect.ConnectEndpointStatus{Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"}}, Revision: 1, CertificateRevision: "certificate", NotAfter: &expires, VerifiedAt: &verified}}
+	placement := &connect.ConnectGatewayPlacement{ObjectMeta: metav1.ObjectMeta{Name: "shared-dfw", Namespace: "default"}, Spec: connect.ConnectGatewayPlacementSpec{GatewayRef: "shared"}, Status: connect.ConnectGatewayPlacementStatus{Metro: "dfw"}}
 	objects := []client.Object{gateway, connector, policy, placement}
 	networks := map[string]*unstructured.Unstructured{}
 	for _, name := range []string{"one", "two", "denied"} {
@@ -97,7 +97,7 @@ func TestSharedGatewayBindingsPinIndependentNetworkIdentities(t *testing.T) {
 	if valid, err := GrantStillAuthorized(ctx, customer, endpoint, receipt); err != nil || valid {
 		t.Fatal("recreated network retained old grant", err)
 	}
-	if err := durable.Get(ctx, client.ObjectKeyFromObject(endpoint), endpoint); err != nil || !endpoint.Status.Ready || endpoint.Spec.Lifecycle != "Active" {
+	if err := durable.Get(ctx, client.ObjectKeyFromObject(endpoint), endpoint); err != nil || !endpoints.Ready(endpoint, now, 5*time.Minute) || endpoint.Spec.Lifecycle != "Active" {
 		t.Fatal("binding deletion changed shared endpoint", err)
 	}
 	policy.Spec.NetworkRefs = nil

@@ -74,7 +74,7 @@ func setupCredentials(mgr mcmanager.Manager, service *endpoints.Service, config 
 		if err != nil {
 			return err
 		}
-		issuer.Authorities[name] = masquegrant.New(grantClient, options.RuntimeNamespace)
+		issuer.Authorities[name] = masquegrant.New(grantClient, options.RuntimeNamespace, name)
 		issuer.Cells[name] = grantClient
 	}
 	valid := func(ctx context.Context, receipt *connect.ConnectGrant) (bool, error) {

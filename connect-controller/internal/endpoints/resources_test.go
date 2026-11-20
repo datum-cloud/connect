@@ -89,7 +89,7 @@ func resourceClient(t *testing.T, objects ...client.Object) client.Client {
 	_ = coordinationv1.AddToScheme(scheme)
 	_ = connect.AddToScheme(scheme)
 	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: registrationGVK.Group, Version: registrationGVK.Version, Kind: "EdgeInstanceList"}, &unstructured.UnstructuredList{})
-	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&connect.ConnectEndpoint{}, &connect.ConnectGrant{}).WithObjects(objects...).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, target client.WithWatch, resource client.Object, options ...client.CreateOption) error {
+	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&connect.ConnectEndpoint{}, &connect.ConnectGrant{}, &connect.ConnectGatewayPlacement{}).WithObjects(objects...).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, target client.WithWatch, resource client.Object, options ...client.CreateOption) error {
 		if resource.GetUID() == "" {
 			resource.SetUID(types.UID("created-" + resource.GetName()))
 		}

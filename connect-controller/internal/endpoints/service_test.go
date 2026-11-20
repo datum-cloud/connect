@@ -50,9 +50,10 @@ func TestServiceMetroCollapseAndDurableOwnership(t *testing.T) {
 	network := object(schema.GroupVersionKind{Group: "networking.datumapis.com", Version: "v1alpha", Kind: "Network"}, "default", "network")
 	network.SetUID("network-uid")
 	gateway := &connect.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gateway", UID: "gateway-uid"}, Spec: connect.ConnectGatewaySpec{NetworkRef: "network"}}
-	customer := resourceClient(t, gateway, network)
+	placement := &connect.ConnectGatewayPlacement{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "placement", Labels: map[string]string{"connect.datum.net/gateway": "gateway"}}, Spec: connect.ConnectGatewayPlacementSpec{GatewayRef: "gateway", LocationRef: "location-a"}, Status: connect.ConnectGatewayPlacementStatus{AssignmentRef: "private-reservation"}}
+	customer := resourceClient(t, gateway, network, placement)
 	serviceProject := resourceClient(t)
-	service := &Service{Root: root, Namespace: "service", Domain: "connect.example.test", Provision: true, Reconciler: &Reconciler{Project: serviceProject}, Customer: func(context.Context, string) (client.Client, error) { return customer, nil }, Capacity: []Capacity{{Metro: "dfw", Assignment: endpoint.Spec.Assignment}}}
+	service := &Service{Root: root, Namespace: "service", Domain: "connect.example.test", Provision: true, Reconciler: &Reconciler{Project: serviceProject, Now: time.Now}, Customer: func(context.Context, string) (client.Client, error) { return customer, nil }, Capacity: []Capacity{{Metro: "dfw", Assignment: endpoint.Spec.Assignment}}}
 	for range 2 {
 		if err := service.Sync(ctx, customer, "customer", gateway, map[string]string{"location-a": "dfw", "location-b": "dfw"}); err != nil {
 			t.Fatal(err)
@@ -63,6 +64,9 @@ func TestServiceMetroCollapseAndDurableOwnership(t *testing.T) {
 		t.Fatal("Locations did not collapse", err)
 	}
 	reserved := &reservations.Items[0]
+	if err := customer.Get(ctx, client.ObjectKeyFromObject(placement), placement); err != nil || placement.Status.AssignmentRef != "" || placement.Status.Hostname != reserved.Spec.Hostname {
+		t.Fatal("managed placement leaked service reservation or lost public hostname", err)
+	}
 	if reserved.Spec.Hostname == reserved.Name+".connect.example.test" {
 		t.Fatal("public hostname exposes UID-derived reservation")
 	}
@@ -82,7 +86,7 @@ func TestServiceMetroCollapseAndDurableOwnership(t *testing.T) {
 	driver := &driverFixture{fail: "certificate"}
 	service.Reconciler.Driver = driver
 	service.Reconciler.Now = time.Now
-	reserved.Status.Phase = "Active"
+	reserved.Status.CertificateRef.Name = reserved.Name
 	if err := serviceProject.Status().Update(ctx, reserved); err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +116,7 @@ func TestRetiredEndpointReactivationStartsNewCredentialEpoch(t *testing.T) {
 	now := time.Now()
 	endpoint := endpointFixture()
 	endpoint.Status = connect.ConnectEndpointStatus{Phase: "Retired", Revision: 8, ActivationRevision: 1, CleanupStep: "Retired", CertificateRef: connect.EndpointCertificateReference{Name: endpoint.Name, UID: "old-cert"}}
+	endpoint.Status.DeliveryReceipts = []connect.EndpointDeliveryReceipt{{State: "Removed", APIVersion: "v1", Kind: "Secret", Namespace: "masque", Name: "old-secret", UID: "old-uid", ContentDigest: "old-digest"}}
 	project := projectFixture(t, endpoint)
 	reconciler := &Reconciler{Project: project, Driver: &driverFixture{certificate: Certificate{Revision: "new-cert", NotAfter: now.Add(time.Hour)}}, Now: func() time.Time { return now }, ExpiryMargin: time.Minute}
 	key := client.ObjectKeyFromObject(endpoint)
@@ -123,6 +128,9 @@ func TestRetiredEndpointReactivationStartsNewCredentialEpoch(t *testing.T) {
 	}
 	if endpoint.Status.ActivationRevision != 9 || endpoint.Status.CertificateRef.UID != "" || endpoint.Status.Ready || endpoint.Status.CleanupStep != "" {
 		t.Fatal("old authorization leaked into reactivation", endpoint.Status)
+	}
+	if len(endpoint.Status.DeliveryReceipts) != 1 || endpoint.Status.DeliveryReceipts[0].State != "Removed" || endpoint.Status.DeliveryReceipts[0].UID != "old-uid" {
+		t.Fatal("reactivation erased cleanup history")
 	}
 	if err := reconciler.Reconcile(ctx, key); err != nil {
 		t.Fatal(err)

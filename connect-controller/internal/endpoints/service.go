@@ -18,6 +18,31 @@ import (
 
 const MetroKey = "topology.datum.net/metro"
 
+func (s *Service) EndpointForGateway(ctx context.Context, gateway *connect.ConnectGateway, metro string) (*connect.ConnectEndpoint, error) {
+	if gateway.UID == "" || metro == "" {
+		return nil, fmt.Errorf("gateway identity and metro required")
+	}
+	var reservations connect.ConnectEndpointList
+	if err := s.Reconciler.Project.List(ctx, &reservations, client.InNamespace(s.Namespace)); err != nil {
+		return nil, err
+	}
+	var selected *connect.ConnectEndpoint
+	for index := range reservations.Items {
+		endpoint := &reservations.Items[index]
+		if endpoint.Spec.GatewayUID != string(gateway.UID) || endpoint.Spec.Metro != metro || endpoint.Spec.GatewayName != gateway.Name || endpoint.Spec.GatewayNamespace != gateway.Namespace {
+			continue
+		}
+		if selected != nil {
+			return nil, fmt.Errorf("ambiguous endpoint reservation")
+		}
+		selected = endpoint
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("endpoint reservation unavailable")
+	}
+	return selected, nil
+}
+
 func (s *Service) ValidateBindingIdentity(ctx context.Context, bindingUID, networkUID, cell string, vpc connect.EndpointVPCReference) error {
 	var receipts connect.ConnectGrantList
 	if err := s.Reconciler.Project.List(ctx, &receipts, client.InNamespace(s.Namespace)); err != nil {
@@ -110,7 +135,7 @@ func (s *Service) Sync(ctx context.Context, customer client.Client, projectName 
 		if err != nil {
 			return err
 		}
-		if endpoint.Spec.Lifecycle == "Retired" && endpoint.Status.Phase == "Retired" && s.Provision {
+		if endpoint.Spec.Lifecycle == "Retired" && endpoint.Status.CleanupStep == "Retired" && s.Provision {
 			endpoint.Spec.Lifecycle = "Active"
 			if err := s.Reconciler.Project.Update(ctx, endpoint); err != nil {
 				return err
@@ -163,9 +188,7 @@ func (s *Service) Sync(ctx context.Context, customer client.Client, projectName 
 		placement.Status.Hostname = ""
 		placement.Status.Metro = locations[placement.Spec.LocationRef]
 		if endpoint != nil {
-			placement.Status.AssignmentRef = endpoint.Name
 			placement.Status.Hostname = endpoint.Spec.Hostname
-			placement.Status.CertificateNotAfter = endpoint.Status.NotAfter
 			if Ready(endpoint, s.Reconciler.Now(), s.Reconciler.ExpiryMargin) {
 				condition.Status = metav1.ConditionTrue
 				condition.Reason = "EndpointReady"

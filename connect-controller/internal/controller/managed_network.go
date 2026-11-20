@@ -278,7 +278,7 @@ func updateManagedEndpointStatus(ctx context.Context, customer client.Client, ga
 	}
 	for _, placement := range placements.Items {
 		metro, selected := locations[placement.Spec.LocationRef]
-		if selected && placement.Spec.GatewayRef == gateway.Name && placement.DeletionTimestamp.IsZero() && placement.Status.Metro == metro && placement.Status.AssignmentRef != "" && meta.IsStatusConditionTrue(placement.Status.Conditions, "Ready") {
+		if selected && placement.Spec.GatewayRef == gateway.Name && placement.DeletionTimestamp.IsZero() && placement.Status.Metro == metro && meta.IsStatusConditionTrue(placement.Status.Conditions, "Ready") {
 			metros[metro] = true
 		}
 	}
@@ -452,8 +452,8 @@ func reconcileManagedNetworkBinding(ctx context.Context, c client.Client, bindin
 			if placement.Name != selected {
 				continue
 			}
-			endpoint := &connectv1alpha1.ConnectEndpoint{}
-			if err := service.Reconciler.Project.Get(ctx, client.ObjectKey{Namespace: service.Namespace, Name: placement.Status.AssignmentRef}, endpoint); err != nil {
+			endpoint, err := service.EndpointForGateway(ctx, gateway, placement.Status.Metro)
+			if err != nil {
 				return setCondition(metav1.ConditionFalse, "NetworkNotReachable", "endpoint assignment unavailable")
 			}
 			vpc, err := service.ResolveVPC(string(network.GetUID()), endpoint.Spec.Assignment.Cell)

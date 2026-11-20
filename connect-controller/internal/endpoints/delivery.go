@@ -45,13 +45,25 @@ func (d *KubernetesDriver) prepareDelivery(ctx context.Context, endpoint *connec
 		return err
 	}
 	if receipt := deliveryReceipt(endpoint, desired); receipt != nil {
+		if receipt.State == "Removed" {
+			return d.appendPlannedDelivery(ctx, endpoint, desired, digest)
+		}
+		if receipt.UID == "" && receipt.ContentDigest == "" {
+			receipt.ContentDigest = digest
+			receipt.State = "Planned"
+			return d.Project.Status().Update(ctx, endpoint)
+		}
 		if receipt.UID != "" || receipt.ContentDigest != digest {
 			return fmt.Errorf("recorded delivery disappeared or pending content changed")
 		}
 		return nil
 	}
+	return d.appendPlannedDelivery(ctx, endpoint, desired, digest)
+}
+
+func (d *KubernetesDriver) appendPlannedDelivery(ctx context.Context, endpoint *connect.ConnectEndpoint, desired client.Object, digest string) error {
 	gvk := deliveryGVK(desired)
-	endpoint.Status.DeliveryReceipts = append(endpoint.Status.DeliveryReceipts, connect.EndpointDeliveryReceipt{APIVersion: gvk.GroupVersion().String(), Kind: gvk.Kind, Namespace: desired.GetNamespace(), Name: desired.GetName(), ContentDigest: digest})
+	endpoint.Status.DeliveryReceipts = append(endpoint.Status.DeliveryReceipts, connect.EndpointDeliveryReceipt{State: "Planned", APIVersion: gvk.GroupVersion().String(), Kind: gvk.Kind, Namespace: desired.GetNamespace(), Name: desired.GetName(), ContentDigest: digest})
 	return d.Project.Status().Update(ctx, endpoint)
 }
 
@@ -64,7 +76,7 @@ func deliveryGVK(resource client.Object) schema.GroupVersionKind {
 
 func deliveryReceipt(endpoint *connect.ConnectEndpoint, resource client.Object) *connect.EndpointDeliveryReceipt {
 	gvk := deliveryGVK(resource)
-	for index := range endpoint.Status.DeliveryReceipts {
+	for index := len(endpoint.Status.DeliveryReceipts) - 1; index >= 0; index-- {
 		receipt := &endpoint.Status.DeliveryReceipts[index]
 		if receipt.APIVersion == gvk.GroupVersion().String() && receipt.Kind == gvk.Kind && receipt.Namespace == resource.GetNamespace() && receipt.Name == resource.GetName() {
 			return receipt
@@ -81,12 +93,16 @@ func (d *KubernetesDriver) rememberDelivery(ctx context.Context, endpoint *conne
 		return fmt.Errorf("legacy identity-bearing delivery requires explicit migration")
 	}
 	if receipt := deliveryReceipt(endpoint, resource); receipt != nil {
+		if receipt.State == "Removed" {
+			return fmt.Errorf("removed delivery unexpectedly exists")
+		}
 		if receipt.UID == "" {
 			digest, err := deliveryDigest(resource)
 			if err != nil || digest != receipt.ContentDigest {
 				return fmt.Errorf("pending delivery content changed")
 			}
 			receipt.UID = string(resource.GetUID())
+			receipt.State = "Created"
 			return d.Project.Status().Update(ctx, endpoint)
 		}
 		if receipt.UID != string(resource.GetUID()) {
@@ -95,7 +111,65 @@ func (d *KubernetesDriver) rememberDelivery(ctx context.Context, endpoint *conne
 		return nil
 	}
 	gvk := deliveryGVK(resource)
-	endpoint.Status.DeliveryReceipts = append(endpoint.Status.DeliveryReceipts, connect.EndpointDeliveryReceipt{APIVersion: gvk.GroupVersion().String(), Kind: gvk.Kind, Namespace: resource.GetNamespace(), Name: resource.GetName(), UID: string(resource.GetUID())})
+	return fmt.Errorf("delivery has no durable creation intent: %s %s/%s", gvk.Kind, resource.GetNamespace(), resource.GetName())
+}
+
+func (d *KubernetesDriver) migrateInventory(ctx context.Context, endpoint *connect.ConnectEndpoint) error {
+	changed := false
+	for index := range endpoint.Status.DeliveryReceipts {
+		receipt := &endpoint.Status.DeliveryReceipts[index]
+		knownKind := (receipt.APIVersion == "v1" && receipt.Kind == "Secret") || (receipt.APIVersion == registrationGVK.GroupVersion().String() && receipt.Kind == registrationGVK.Kind) || (receipt.APIVersion == policyGVK.GroupVersion().String() && receipt.Kind == policyGVK.Kind)
+		if receipt.Namespace != d.RuntimeNamespace || !knownKind {
+			return fmt.Errorf("delivery inventory does not match configured runtime scope")
+		}
+		if receipt.State == "" {
+			receipt.State = "Planned"
+			if receipt.UID != "" {
+				receipt.State = "Created"
+			}
+			changed = true
+		}
+	}
+	for _, name := range endpoint.Status.DeliveredSecrets {
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: d.RuntimeNamespace, Name: name}}
+		if deliveryReceipt(endpoint, secret) == nil {
+			endpoint.Status.DeliveryReceipts = append(endpoint.Status.DeliveryReceipts, connect.EndpointDeliveryReceipt{State: "Planned", APIVersion: "v1", Kind: "Secret", Namespace: d.RuntimeNamespace, Name: name})
+		}
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	endpoint.Status.DeliveredSecrets = nil
+	return d.Project.Status().Update(ctx, endpoint)
+}
+
+func secretNames(endpoint *connect.ConnectEndpoint) []string {
+	return inventorySecretNames(endpoint, false)
+}
+
+func inventorySecretNames(endpoint *connect.ConnectEndpoint, includeRemoved bool) []string {
+	var names []string
+	seen := map[string]bool{}
+	for index := len(endpoint.Status.DeliveryReceipts) - 1; index >= 0; index-- {
+		receipt := endpoint.Status.DeliveryReceipts[index]
+		if receipt.APIVersion != "v1" || receipt.Kind != "Secret" || seen[receipt.Name] {
+			continue
+		}
+		seen[receipt.Name] = true
+		if includeRemoved || receipt.State != "Removed" {
+			names = append(names, receipt.Name)
+		}
+	}
+	return names
+}
+
+func (d *KubernetesDriver) markRemoved(ctx context.Context, endpoint *connect.ConnectEndpoint, resource client.Object) error {
+	receipt := deliveryReceipt(endpoint, resource)
+	if receipt == nil || receipt.State == "Removed" {
+		return nil
+	}
+	receipt.State = "Removed"
 	return d.Project.Status().Update(ctx, endpoint)
 }
 

@@ -226,6 +226,9 @@ func (d *KubernetesDriver) Route(ctx context.Context, endpoint *connect.ConnectE
 }
 
 func (d *KubernetesDriver) Apply(ctx context.Context, endpoint *connect.ConnectEndpoint, enabled bool) error {
+	if err := d.migrateInventory(ctx, endpoint); err != nil {
+		return err
+	}
 	latest := &connect.ConnectEndpoint{}
 	if err := d.Project.Get(ctx, client.ObjectKeyFromObject(endpoint), latest); err != nil {
 		return err
@@ -254,12 +257,16 @@ func (d *KubernetesDriver) Apply(ctx context.Context, endpoint *connect.ConnectE
 	if err := d.ensureDelivery(ctx, endpoint, registration); err != nil {
 		return err
 	}
+	return d.applyPolicy(ctx, endpoint)
+}
+
+func (d *KubernetesDriver) applyPolicy(ctx context.Context, endpoint *connect.ConnectEndpoint) error {
 	policy := object(policyGVK, d.RuntimeNamespace, endpoint.Name)
 	selectors := []interface{}{map[string]interface{}{"apiVersion": registrationGVK.GroupVersion().String(), "kind": registrationGVK.Kind, "name": endpoint.Name}}
-	for _, name := range endpoint.Status.DeliveredSecrets {
+	for _, name := range secretNames(endpoint) {
 		selectors = append(selectors, map[string]interface{}{"apiVersion": "v1", "kind": "Secret", "name": name})
 	}
-	policy.Object["spec"] = map[string]interface{}{"resourceSelectors": selectors, "propagateDeps": false, "placement": map[string]interface{}{"clusterAffinity": map[string]interface{}{"clusterNames": []interface{}{assignment.Cell}}}}
+	policy.Object["spec"] = map[string]interface{}{"resourceSelectors": selectors, "propagateDeps": false, "placement": map[string]interface{}{"clusterAffinity": map[string]interface{}{"clusterNames": []interface{}{endpoint.Spec.Assignment.Cell}}}}
 	return d.ensureDelivery(ctx, endpoint, policy)
 }
 
@@ -271,7 +278,10 @@ func SecretName(endpoint *connect.ConnectEndpoint) string {
 }
 
 func (d *KubernetesDriver) Prune(ctx context.Context, endpoint *connect.ConnectEndpoint) error {
-	for _, name := range endpoint.Status.DeliveredSecrets {
+	if err := d.migrateInventory(ctx, endpoint); err != nil {
+		return err
+	}
+	for _, name := range secretNames(endpoint) {
 		if name == SecretName(endpoint) {
 			continue
 		}
@@ -281,6 +291,14 @@ func (d *KubernetesDriver) Prune(ctx context.Context, endpoint *connect.ConnectE
 		}
 		if !done {
 			return fmt.Errorf("previous delivered certificate removal pending")
+		}
+	}
+	if err := d.applyPolicy(ctx, endpoint); err != nil {
+		return err
+	}
+	for _, receipt := range endpoint.Status.DeliveryReceipts {
+		if receipt.State != "Removed" && (receipt.State != "Created" || receipt.UID == "") {
+			return fmt.Errorf("delivery inventory is not fully bound")
 		}
 	}
 	return nil
@@ -297,7 +315,10 @@ func (d *KubernetesDriver) removeSecret(ctx context.Context, endpoint *connect.C
 		return false, err
 	}
 	err = cell.Get(ctx, client.ObjectKeyFromObject(secret), secret)
-	return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+	if apierrors.IsNotFound(err) {
+		return true, d.markRemoved(ctx, endpoint, secret)
+	}
+	return false, err
 }
 
 func (d *KubernetesDriver) Probe(ctx context.Context, endpoint *connect.ConnectEndpoint) error {
@@ -308,6 +329,9 @@ func (d *KubernetesDriver) Probe(ctx context.Context, endpoint *connect.ConnectE
 }
 
 func (d *KubernetesDriver) RemoveDelivery(ctx context.Context, endpoint *connect.ConnectEndpoint) (bool, error) {
+	if err := d.migrateInventory(ctx, endpoint); err != nil {
+		return false, err
+	}
 	cell := d.Cells[endpoint.Spec.Assignment.Cell]
 	if cell == nil {
 		return false, fmt.Errorf("selected cell unavailable")
@@ -323,14 +347,22 @@ func (d *KubernetesDriver) RemoveDelivery(ctx context.Context, endpoint *connect
 			}
 			return false, nil
 		}
+		if err := d.markRemoved(ctx, endpoint, resource); err != nil {
+			return false, err
+		}
 	}
-	for _, name := range endpoint.Status.DeliveredSecrets {
+	for _, name := range inventorySecretNames(endpoint, true) {
 		done, err := d.removeSecret(ctx, endpoint, name)
 		if err != nil || !done {
 			return false, err
 		}
 	}
-	return d.removeDeliveryResource(ctx, endpoint, object(policyGVK, d.RuntimeNamespace, endpoint.Name))
+	policy := object(policyGVK, d.RuntimeNamespace, endpoint.Name)
+	done, err := d.removeDeliveryResource(ctx, endpoint, policy)
+	if err != nil || !done {
+		return false, err
+	}
+	return true, d.markRemoved(ctx, endpoint, policy)
 }
 
 func (d *KubernetesDriver) RemoveCertificate(ctx context.Context, endpoint *connect.ConnectEndpoint) (bool, error) {

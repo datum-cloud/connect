@@ -21,7 +21,7 @@ func (sweeper *GrantSweeper) Sweep(ctx context.Context) error {
 	}
 	for index := range receipts.Items {
 		receipt := &receipts.Items[index]
-		if receipt.Status.Retired || receipt.Status.Retiring {
+		if receipt.Status.EffectiveState() != "Active" {
 			if err := sweeper.Issuer.Retire(ctx, receipt); err != nil {
 				log.FromContext(ctx).Error(err, "reaffirm grant tombstone", "grant", receipt.Name)
 			}

@@ -39,7 +39,7 @@ Local overlapping routes remain unsupported. Server fake-backend tests, actual
 Rust client pooling tests, and deployed packet qualification are separate gates.
 
 The controller and Rust client implement this contract. Certificates dependency is
-`4cec00395b3647737685addd697e40f2e94d3214` (unchanged runtime contract).
+`61c89782b9f45f1430a5a1bfd861a93f2024bab3` (lifecycle-only reservation authorization; reader-first upgrade).
 
 ## Lifecycle contracts
 
@@ -55,7 +55,7 @@ Certificates agreed: `TLSCertificate.spec.managedAuthorization` contains
 `reservationName` and `reservationUID`. Requests use DNS01 and exactly one name.
 Authorization reads the pinned service Project, checks the trusted writer and
 cluster, reservation UID, identity, hostname, namespace, `spec.lifecycle=Active`,
-`status.phase=Active`, and `status.certificateRef.name/uid`. Create the reservation,
+and `status.certificateRef.name/uid`. Phase and Ready are not issuance gates. Create the reservation,
 publish the certificate name, create the request, then bind its returned UID.
 `TLSCertificate.status.certificateRevision` is lowercase SHA256 of leaf DER.
 Publish the exact `status.requiredDNSRecords` CNAME. Keys never enter Projects.
@@ -117,12 +117,12 @@ immutable. Reservation creation is deterministic and retry-safe. No endpoint
 owns a Project, shared zone, VPC or provider deployment.
 
 `status.revision` fences registration changes. `status.certificateRevision`
-tracks the desired leaf, `status.deliveredSecrets` records every versioned
-Secret name before delivery, and `status.verifiedAt` expires readiness after ten
+tracks the desired leaf, `status.deliveryReceipts` records every versioned
+Secret before delivery, and `status.verifiedAt` expires readiness after ten
 seconds. Secret names are `<endpoint-name>-<leaf-DER-sha256>`. Each carries only
 the `masque.galactic.datumapis.com/certificate-revision` annotation. Distributed
 Secret, registration and policy objects have no endpoint UID label. Private
-`status.deliveryReceipts[]` stores `{apiVersion,kind,namespace,name,uid,contentDigest}`
+`status.deliveryReceipts[]` stores `{apiVersion,kind,namespace,name,uid,contentDigest,state}`
 for cleanup preconditions. A content digest is saved before creation, with an
 empty UID until the returned incarnation is bound. Cleanup can recover a crash
 between those writes only if content still matches. The digest contains no key
@@ -133,7 +133,8 @@ identity-bearing deliveries require explicit migration, not automatic relabeling
 Karmada policy
 selects the registration and all retained versions in exactly one cell. Previous
 versions are removed only after the replacement is applied and externally
-verified; actual cell absence is required before forgetting their names.
+verified; actual hub and selected-cell absence is required before marking receipts
+Removed. Their names, digests and incarnation receipts remain durable.
 
 The consumer requires current-generation TLSCertificate Ready, pinned request
 UID and source Secret UID label, matching key/certificate, exact hostname,
@@ -164,10 +165,54 @@ reservations cannot reactivate. Recreated gateways get different reservations.
 `ConnectGrant` (`connect.datumapis.com/v1alpha1`, plural `connectgrants`) stores
 immutable endpointName/UID, bindingName/UID, networkName/UID, vpcRef,
 policyRevision, connectorID and cell,
-plus `status.retiring/retired`. It never stores a credential. The broker uses
+plus `status.state` (`Active`, `Retiring`, `Retired`). It never stores a credential. The broker uses
 Galactic's public `pkg/masquegrant` facade, not a new authority HTTP API. Retries
 rotate the same deterministic connector, preserving its /96; revocation retains
 the allocation tombstone. No broker call initializes a missing ledger.
+
+## API simplification and upgrade
+
+This follow-up implements the simplification; previous published CI evidence does
+not qualify its final head. Certificates reader commit
+`61c89782b9f45f1430a5a1bfd861a93f2024bab3` removes the phase gate while retaining
+all reservation identity, lifecycle, deletion, writer and certificate binding
+checks. Deploy that reader first, then upgrade Connect and its schemas.
+
+Managed customer placements publish hostname, metro and conditions, not the
+service Project reservation name or certificate expiry. `assignmentRef` remains
+legacy-only and managed writers clear it. Internal lookup uses resolved gateway
+identity and metro. Internal expiry remains part of readiness and renewal.
+
+Endpoint `spec.lifecycle` is desired state; `status.cleanupStep` is durable
+progress. Standard `Ready` conditions require current observedGeneration plus
+the existing fresh verification and expiry checks. Old phase/ready/reason fields
+are retained temporarily in the schema for read compatibility, ignored for
+authorization/readiness, and cleared by reconciliation. No legacy Ready boolean
+is promoted to a successful condition.
+
+The sole delivery inventory is `deliveryReceipts`. Planned records precede
+creation; Created records bind returned UID; Removed records retain history.
+Legacy deliveredSecrets names are converted before delivery or cleanup without
+dropping existing receipts. A name without a UID/digest becomes Planned but
+cannot adopt a preexisting object. After confirming absence a new desired digest
+can be persisted before creation. Lost-response recovery requires the exact
+persisted digest. Selectors use nonRemoved Secret records; stable Ready requires
+every active receipt Created and UID-bound. Cleanup checks historical names too.
+Reactivation retains receipt history and starts a new activation revision.
+Changing the configured runtime namespace while receipts remain is rejected,
+not treated as proof that their original objects disappeared.
+
+Grant migration gives legacy retired precedence over retiring and Active.
+Retiring is persisted before contacting the selected authority, even when it is
+unavailable. Mint/refresh refuse nonActive receipts; successful retirement writes
+Retired and clears the deprecated booleans. State transitions never resurrect a
+tombstone. Retain compatibility fields until stored objects have been migrated;
+do not prune them before conversion or roll back to legacy writers afterward.
+
+Galactic's agreed facade is `New(client, namespace, cell)`; CreateRequest has no
+Cell. The configured service injects cell scope and rejects foreign-cell records
+on mutation. Administrative ledger Init keeps its explicit cell; Connect receipt
+`spec.cell` remains essential for revocation after customer resources disappear.
 
 ## Runtime configuration
 
@@ -250,6 +295,16 @@ only operator-provisioned named ledgers, never endpoint fences.
 
 ## Validation and release gates
 
+Simplification validation passes locally: full controller race suite with real
+Kubernetes 1.37 envtest, vet, macOS/Linux builds and both Kustomize exports.
+New tests cover migration field preservation by the API server, irreversible
+grant state transitions (including attempted field removal), unavailable-authority
+revocation, denied mint/refresh while Retiring, no legacy readiness fallback,
+condition generation fencing, lost-response inventory recovery, unproven legacy
+adoption denial, retained cleanup history across reactivation, namespace drift
+and managed placement redaction. Rust 1.98 H3/H2 pooling rerun passes 2 tests with
+zero ignored. Final-head GitHub checks remain a separate pending publication gate.
+
 Local tests cover real Galactic facade mint/rotate/retire and retained /96,
 missing ledger/fence denial, source key/UID/revision checks, exact DNS challenge,
 single-cell policy, shorter rekey, expiry withdrawal, partial membership and
@@ -282,14 +337,14 @@ kubectl kustomize config/components/managed-endpoints/crd
 
 Dependencies:
 
-- Certificates: `4cec00395b3647737685addd697e40f2e94d3214`, draft PR milo-os/certificates#83.
-- Infrastructure: prior published `172556e9a577ee60109ddd94de379d9c74a0687c`,
+- Certificates: `61c89782b9f45f1430a5a1bfd861a93f2024bab3`, draft PR milo-os/certificates#83.
+- Infrastructure: prior published `62cf66fbbfb323554ad3aeaf26b6ac950592c683`,
   draft PR datum-cloud/infra#9647. The dependency-pin follow-up awaits this Connect
   publication for exact-source validation; the earlier green run is not its CI.
-- Galactic: `01462607e4f7d0e7471f21dbbd35a6479d284b34`, draft PR datum-cloud/galactic#1465;
-  Go module `v0.9.5-0.20261120183023-01462607e4f7`, without local replacements.
-  The final CI-only correction replaces a slow Ubuntu package mirror without
-  changing package versions, signature verification, runtime or API contracts.
+- Galactic: `5a930d741cdc413f869d62f84a44a04ebe4ea457`, draft PR datum-cloud/galactic#1465;
+  Go module `v0.9.5-0.20261120192453-5a930d741cdc`, without local replacements.
+  The configured-cell facade removes request-supplied cell and rejects foreign
+  cell mutations. Administrative ledger scoping is unchanged.
   This revision removes copied registration placement and provider `--cell`,
   retaining the name-only facade, local provider selection, instance
   acknowledgments and authority wire contract. Providers require the get-only

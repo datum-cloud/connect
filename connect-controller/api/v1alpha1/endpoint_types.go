@@ -71,22 +71,31 @@ type EndpointCertificateReference struct {
 }
 
 type ConnectEndpointStatus struct {
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// Deprecated: read only during migration; lifecycle is authoritative.
 	Phase               string                       `json:"phase,omitempty"`
 	CertificateRef      EndpointCertificateReference `json:"certificateRef,omitempty"`
 	Revision            int64                        `json:"revision,omitempty"`
 	ActivationRevision  int64                        `json:"activationRevision,omitempty"`
 	CertificateRevision string                       `json:"certificateRevision,omitempty"`
-	DeliveredSecrets    []string                     `json:"deliveredSecrets,omitempty"`
-	DeliveryReceipts    []EndpointDeliveryReceipt    `json:"deliveryReceipts,omitempty"`
-	NotAfter            *metav1.Time                 `json:"notAfter,omitempty"`
-	Ready               bool                         `json:"ready,omitempty"`
-	Reason              string                       `json:"reason,omitempty"`
-	CleanupStep         string                       `json:"cleanupStep,omitempty"`
-	WithdrawnAt         *metav1.Time                 `json:"withdrawnAt,omitempty"`
-	VerifiedAt          *metav1.Time                 `json:"verifiedAt,omitempty"`
+	// Deprecated: migrated losslessly into deliveryReceipts before delivery or cleanup.
+	DeliveredSecrets []string                  `json:"deliveredSecrets,omitempty"`
+	DeliveryReceipts []EndpointDeliveryReceipt `json:"deliveryReceipts,omitempty"`
+	NotAfter         *metav1.Time              `json:"notAfter,omitempty"`
+	// Deprecated: ignored; Ready condition and verification freshness are authoritative.
+	Ready bool `json:"ready,omitempty"`
+	// Deprecated: replaced by conditions.
+	Reason      string       `json:"reason,omitempty"`
+	CleanupStep string       `json:"cleanupStep,omitempty"`
+	WithdrawnAt *metav1.Time `json:"withdrawnAt,omitempty"`
+	VerifiedAt  *metav1.Time `json:"verifiedAt,omitempty"`
 }
 
 type EndpointDeliveryReceipt struct {
+	// +kubebuilder:validation:Enum=Planned;Created;Removed
+	State         string `json:"state,omitempty"`
 	APIVersion    string `json:"apiVersion"`
 	Kind          string `json:"kind"`
 	Namespace     string `json:"namespace"`
@@ -134,9 +143,32 @@ type ConnectGrantSpec struct {
 	Cell string `json:"cell"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.state) || oldSelf.state != 'Retired' || (has(self.state) && self.state == 'Retired')",message="retired state cannot be cleared"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.state) || oldSelf.state != 'Retiring' || (has(self.state) && self.state in ['Retiring', 'Retired'])",message="retiring state cannot be cleared"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.retired) || !oldSelf.retired || ((has(self.retired) && self.retired) || (has(self.state) && self.state == 'Retired'))",message="legacy tombstone must be preserved or migrated"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.retiring) || !oldSelf.retiring || ((has(self.retiring) && self.retiring) || (has(self.state) && self.state in ['Retiring', 'Retired']))",message="legacy revocation must be preserved or migrated"
 type ConnectGrantStatus struct {
+	// +kubebuilder:validation:Enum=Active;Retiring;Retired
+	// +kubebuilder:validation:XValidation:rule="oldSelf != 'Retired' || self == 'Retired'",message="retired grants cannot reactivate"
+	// +kubebuilder:validation:XValidation:rule="oldSelf != 'Retiring' || self != 'Active'",message="retiring grants cannot reactivate"
+	State string `json:"state,omitempty"`
+	// Deprecated: consumed during migration; true always takes precedence over Active.
 	Retiring bool `json:"retiring,omitempty"`
-	Retired  bool `json:"retired,omitempty"`
+	// Deprecated: consumed during migration; true always preserves the tombstone.
+	Retired bool `json:"retired,omitempty"`
+}
+
+func (status ConnectGrantStatus) EffectiveState() string {
+	if status.Retired || status.State == "Retired" {
+		return "Retired"
+	}
+	if status.Retiring || status.State == "Retiring" {
+		return "Retiring"
+	}
+	if status.State == "" {
+		return "Active"
+	}
+	return status.State
 }
 
 // +kubebuilder:object:root=true

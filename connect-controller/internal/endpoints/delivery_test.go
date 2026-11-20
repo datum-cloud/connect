@@ -19,6 +19,9 @@ func TestDeliveryUsesPrivateIncarnationReceipts(t *testing.T) {
 	driver := &KubernetesDriver{Project: project, Karmada: karmada}
 	desired := object(registrationGVK, "masque", endpoint.Name)
 	desired.Object["spec"] = map[string]interface{}{"hostname": endpoint.Spec.Hostname, "provider": "shared", "revision": int64(1), "enabled": true}
+	if err := driver.prepareDelivery(ctx, endpoint, desired); err != nil {
+		t.Fatal(err)
+	}
 	if err := karmada.Create(ctx, desired); err != nil {
 		t.Fatal(err)
 	}
@@ -57,6 +60,9 @@ func TestPlacementRemovalPreservesDeliveryReceiptAndRevision(t *testing.T) {
 	driver := &KubernetesDriver{Project: resourceClient(t, endpoint), Karmada: karmada}
 	current := object(registrationGVK, "masque", endpoint.Name)
 	current.Object["spec"] = map[string]interface{}{"hostname": endpoint.Spec.Hostname, "provider": "shared", "cell": "cell-a", "metro": "dfw", "revision": int64(1), "enabled": true}
+	if err := driver.prepareDelivery(ctx, endpoint, current); err != nil {
+		t.Fatal(err)
+	}
 	if err := karmada.Create(ctx, current); err != nil {
 		t.Fatal(err)
 	}

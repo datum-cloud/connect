@@ -62,9 +62,8 @@ spec:
           status:
             properties:
               assignmentRef:
-                type: string
-              certificateNotAfter:
-                format: date-time
+                description: AssignmentRef is reserved for legacy placements; managed
+                  placements omit it.
                 type: string
               conditions:
                 items:
