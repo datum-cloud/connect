@@ -17,7 +17,7 @@ const CONNECT_GROUP: &str = "connect.datumapis.com/v1alpha1";
 const OWNER: &str = "connect.datum.net/connector";
 const GATEWAYS: &str = "connect.datum.net/gateway-connectors";
 const GATEWAY_CONTROLLER: &str = "connect.datum.net/gateway-controller";
-const EDGE_INFO_URL: &str = "https://edge.datum.net/";
+const EDGE_INFO_URL: &str = "https://edge.datum.net/api/edge-info";
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -757,12 +757,12 @@ impl CloudConnector {
             }
             body.extend_from_slice(&chunk);
         }
-        let body = String::from_utf8(body).map_err(|_| {
+        let body: Value = serde_json::from_slice(&body).map_err(|_| {
             Error::Unsupported("edge.datum.net returned an invalid location response".into())
         })?;
         let location = body
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("region="))
+            .get("region")
+            .and_then(Value::as_str)
             .map(str::trim)
             .filter(|location| {
                 !location.is_empty()

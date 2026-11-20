@@ -84,11 +84,51 @@ fn client(base: &str) -> CloudConnector {
 }
 
 fn set_edge_url(cloud: &mut CloudConnector, base: &str) {
-    cloud.edge_info_url = format!("{base}/edge");
+    cloud.edge_info_url = format!("{base}/api/edge-info");
 }
 
 fn edge_location() -> Reply {
-    Reply::Text(200, "colo=DAL\nloc=US\nregion=us-central-1\n".into())
+    Reply::Json(
+        200,
+        json!({"colo":"DAL","loc":"US","region":"us-central-1"}),
+    )
+}
+
+#[tokio::test]
+async fn edge_location_uses_the_json_api() {
+    assert_eq!(EDGE_INFO_URL, "https://edge.datum.net/api/edge-info");
+    let (base, task) = server(vec![edge_location()]).await;
+    let mut cloud = client(&base);
+    set_edge_url(&mut cloud, &base);
+    assert_eq!(cloud.edge_location().await.unwrap(), "us-central-1");
+    assert_eq!(task.await.unwrap()[0].0, "GET /api/edge-info HTTP/1.1");
+}
+
+#[tokio::test]
+async fn edge_location_rejects_html_and_invalid_regions() {
+    for reply in [
+        Reply::Text(
+            200,
+            "<!DOCTYPE html><html>region=us-central-1</html>".into(),
+        ),
+        Reply::Json(200, json!({})),
+        Reply::Json(200, json!({"region":42})),
+        Reply::Json(200, json!({"region":""})),
+        Reply::Json(200, json!({"region":"us-central-1/DAL"})),
+        Reply::Json(200, json!({"region":"-us-west-1"})),
+        Reply::Json(200, json!({"region":"us-west-1-"})),
+        Reply::Json(200, json!({"region":"US-WEST-1"})),
+        Reply::Json(200, json!({"region":"a".repeat(64)})),
+    ] {
+        let (base, task) = server(vec![reply]).await;
+        let mut cloud = client(&base);
+        set_edge_url(&mut cloud, &base);
+        assert!(matches!(
+            cloud.edge_location().await,
+            Err(Error::Unsupported(_))
+        ));
+        task.await.unwrap();
+    }
 }
 
 fn connect_connector() -> Value {
