@@ -6,20 +6,39 @@ issuance, Karmada placement, certificate propagation or production listeners.
 Statements about historical deployment inside infra documentation are that
 document's evidence, not observations made during this review.
 
-## Agreed API simplification (2026-11-20)
+## Published API simplification (2026-11-20)
 
-The design also removes customer placement certificate expiry and internal
-assignment references, consolidates delivery tracking, replaces redundant endpoint
-status with conditions and a cleanup stage, uses one grant retirement state, and
-binds cell context when configuring the grant service. This follow-up is being
-implemented; the published revisions and test evidence below do not establish
-that it is complete. The frozen contract retains deprecated schema fields only for lossless conversion,
-never readiness fallback. Delivery receipts retain Planned/Created/Removed history;
-grant state conversion gives legacy retirement precedence. Certificates removes
-its phase gate while retaining Active lifecycle and exact identity checks; its
-reader must ship first. Galactic binds cell in `New(client, namespace, cell)`
-instead of `CreateRequest.Cell`. These agreements still require integrated
-publication and final-head CI evidence.
+Connect `637daae4a1728a0ab7b3ddd5ac95d6a48689d5e3` implements the simplified
+contract and pins Galactic `5a930d741cdc413f869d62f84a44a04ebe4ea457`.
+The coordinated Certificates reader is
+`61c89782b9f45f1430a5a1bfd861a93f2024bab3`; deploy that reader before Connect
+stops writing the old phase. These revisions supersede the placement-era pins below.
+
+Managed customer placement status hides certificate expiry and internal assignment
+references. Endpoint readiness uses a Ready condition for the current generation,
+fresh verification and certificate lifetime. One delivery inventory retains
+Planned/Created/Removed receipts, including names, digests and resource UIDs;
+active receipts determine distribution selectors. Grant state is
+Active/Retiring/Retired, with Retiring persisted before contacting the authority.
+
+Deprecated schema fields remain only for lossless conversion, never readiness
+fallback. Legacy retirement takes precedence and converted writes clear the old
+fields. Certificates requires Active lifecycle and exact reservation/certificate
+pins without phase or Ready gates. Galactic binds cell in
+`New(client, namespace, cell)` instead of `CreateRequest.Cell`; durable Connect
+receipts still retain cell for revocation.
+
+Connect's endpoint and credential `state_migration_test.go` suites cover recovery,
+state conversion, field erasure and readiness. `endpoint_schema_test.go` covers
+the API schema. The implementation owner reports the full controller race suite
+with real Kubernetes 1.37 envtest, vet, native macOS/Linux builds and restricted
+exports passing against the published dependency. Actual Rust 1.98 H3/H2 pooling
+tests report two passed, none ignored. These remain loopback tests, not live
+OS/datapath qualification.
+
+Connect GitHub CI on this exact revision is pending at this evidence update.
+The Certificates owner reports exact-head CI success; integrated Infra pins and
+validation remain pending. No deployment or live qualification is established.
 
 ## Control-plane placement clarification (2026-11-20)
 
