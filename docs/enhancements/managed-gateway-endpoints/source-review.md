@@ -42,10 +42,12 @@ successful. Galactic's pinned revision has 26 successful checks and two skipped,
 with none pending or failing. The Certificates owner reports exact-head CI success.
 
 Infra `59a903eda8f9a307e2a680ff9684d813ba5ac6e8` pins these three revisions and
-reports clean-source validation passing. Its final GitHub CI is unresolved:
-`validate-workload-probes` failed while downloading the Kyverno chart with a
-connection reset, before workload validation; the owner is handling the retry.
-No deployment or live qualification is established.
+reports clean-source validation passing. Final GitHub CI on that exact head has
+49 successful checks, five expected skips and none pending or failing. The earlier
+chart-download failure is resolved. All four implementation repositories have
+reported final-head CI success. Qualified artifacts, frontend routing, trusted
+probes, live ACME/DNS and OS/datapath checks remain release gates. No deployment
+or live qualification is established.
 
 ## Control-plane placement clarification (2026-11-20)
 
