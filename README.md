@@ -199,7 +199,7 @@ component internals.
 | --- | --- |
 | `connect-plugin/commands` | Flat CLI commands and daemon HTTP requests |
 | `connect-plugin/internal/daemonservice` | Native service installation and lifecycle |
-| `connect-controller` | Connect APIs, project reconciliation, and managed gateway Workloads |
+| `connect-controller` | Connect APIs, project reconciliation, and shared managed endpoints (legacy gateway Workloads remain separate) |
 | `connect-lib/daemon` | Loopback API, authorization, durable intent, reconciliation, and diagnostics |
 | `connect-lib/transport` | iroh 1.0, HTTP/3 CONNECT, CONNECT-UDP, local CONNECT-IP, and peer access policy |
 | `connect-lib/network-helper` | Separate privileged service executable; no cloud credentials or Connector keys |

@@ -63,6 +63,9 @@ spec:
             properties:
               assignmentRef:
                 type: string
+              certificateNotAfter:
+                format: date-time
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -119,6 +122,10 @@ spec:
                   - type
                   type: object
                 type: array
+              hostname:
+                type: string
+              metro:
+                type: string
               observedGeneration:
                 format: int64
                 type: integer

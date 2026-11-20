@@ -78,7 +78,7 @@ func TestGatewayCreatesPlacementsAndKeepsBoundedStatus(t *testing.T) {
 	}, Status: connectv1alpha1.ConnectGatewayStatus{ClassRef: "legacy", WorkloadRef: "legacy-workload", EndpointID: "legacy-endpoint"}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&connectv1alpha1.ConnectGateway{}, &connectv1alpha1.ConnectGatewayPlacement{}).WithObjects(gateway).Build()
 	locations := []placementLocation{{Name: "dfw", Topology: map[string]string{"topology.datum.net/region": "us-central-1"}, Ready: true}, {Name: "iad", Topology: map[string]string{"topology.datum.net/region": "us-east-1"}, Ready: true}}
-	if err := reconcileManagedGatewayPlacements(ctx, c, gateway, locations); err != nil {
+	if err := reconcileManagedGatewayPlacements(ctx, c, gateway, locations, false); err != nil {
 		t.Fatal(err)
 	}
 	var placements connectv1alpha1.ConnectGatewayPlacementList
@@ -98,7 +98,7 @@ func TestGatewayCreatesPlacementsAndKeepsBoundedStatus(t *testing.T) {
 	if err := c.Get(ctx, clientKey(gateway), &current); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileManagedGatewayPlacements(ctx, c, &current, locations); err != nil {
+	if err := reconcileManagedGatewayPlacements(ctx, c, &current, locations, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Get(ctx, clientKey(gateway), &current); err != nil {
@@ -117,6 +117,26 @@ func TestGatewayCreatesPlacementsAndKeepsBoundedStatus(t *testing.T) {
 
 func clientKey(object metav1.Object) client.ObjectKey {
 	return client.ObjectKey{Namespace: object.GetNamespace(), Name: object.GetName()}
+}
+
+func TestManagedEndpointAvailabilityCountsMetros(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := connectv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	gateway := &connectv1alpha1.ConnectGateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "project"}, Spec: connectv1alpha1.ConnectGatewaySpec{Placement: &connectv1alpha1.ConnectGatewayPlacementPolicy{Availability: connectv1alpha1.ConnectGatewayAvailability{MinReady: 2}}}}
+	objects := []client.Object{gateway}
+	for _, location := range []string{"location-a", "location-b"} {
+		objects = append(objects, &connectv1alpha1.ConnectGatewayPlacement{ObjectMeta: metav1.ObjectMeta{Name: location, Namespace: "project"}, Spec: connectv1alpha1.ConnectGatewayPlacementSpec{GatewayRef: "gateway", LocationRef: location}, Status: connectv1alpha1.ConnectGatewayPlacementStatus{Metro: "dfw", AssignmentRef: "same-endpoint", Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "EndpointReady"}}}})
+	}
+	customer := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(gateway).WithObjects(objects...).Build()
+	if err := updateManagedEndpointStatus(ctx, customer, gateway, map[string]string{"location-a": "dfw", "location-b": "dfw"}); err != nil {
+		t.Fatal(err)
+	}
+	if gateway.Status.Matched != 1 || gateway.Status.Ready != 1 || meta.IsStatusConditionTrue(gateway.Status.Conditions, "Ready") {
+		t.Fatal("duplicate Locations satisfied multi-metro availability", gateway.Status)
+	}
 }
 
 func TestApplicablePoliciesComposeAdditively(t *testing.T) {

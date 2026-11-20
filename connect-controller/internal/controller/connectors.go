@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,9 +38,11 @@ import (
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	connectv1alpha1 "go.datum.net/connect-controller/api/v1alpha1"
+	"go.datum.net/connect-controller/internal/endpoints"
 )
 
 type ConnectReconciler struct {
+	Endpoints   *endpoints.Service
 	mgr         mcmanager.Manager
 	kind        string
 	classClient client.Client
@@ -78,7 +81,7 @@ func (r *ConnectReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		if item.name == "connectgateway" {
 			builder = builder.Owns(&connectv1alpha1.ConnectGatewayPlacement{})
 		}
-		if err := builder.Complete(&ConnectReconciler{mgr: mgr, kind: item.name, classClient: local.GetClient()}); err != nil {
+		if err := builder.Complete(&ConnectReconciler{mgr: mgr, kind: item.name, classClient: local.GetClient(), Endpoints: r.Endpoints}); err != nil {
 			return fmt.Errorf("register %s controller: %w", item.name, err)
 		}
 	}
@@ -177,9 +180,31 @@ func (r *ConnectReconciler) Reconcile(ctx context.Context, req mcreconcile.Reque
 			if listErr != nil {
 				return ctrl.Result{}, listErr
 			}
-			if err := reconcileManagedGatewayPlacements(ctx, c, &obj, locations); err != nil {
+			if err := reconcileManagedGatewayPlacements(ctx, c, &obj, locations, r.Endpoints != nil); err != nil {
 				logger.Error(err, "reconcile managed ConnectGateway placements")
 				return ctrl.Result{}, err
+			}
+			if r.Endpoints != nil {
+				if err := validateManagedGatewaySpec(obj.Spec); err != nil {
+					return ctrl.Result{}, nil
+				}
+				selector, err := metav1.LabelSelectorAsSelector(&obj.Spec.Placement.LocationSelector)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				metros := map[string]string{}
+				for _, location := range locations {
+					if selector.Matches(labels.Set(location.Topology)) {
+						metros[location.Name] = location.Topology[endpoints.MetroKey]
+					}
+				}
+				if err := r.Endpoints.Sync(ctx, c, string(req.ClusterName), &obj, metros); err != nil {
+					return ctrl.Result{}, err
+				}
+				if err := updateManagedEndpointStatus(ctx, c, &obj, metros); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
 		}

@@ -1,0 +1,200 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: connectendpoints.connect.datumapis.com
+spec:
+  group: connect.datumapis.com
+  names:
+    kind: ConnectEndpoint
+    listKind: ConnectEndpointList
+    plural: connectendpoints
+    singular: connectendpoint
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              assignment:
+                properties:
+                  cell:
+                    maxLength: 253
+                    type: string
+                  frontend:
+                    maxLength: 253
+                    type: string
+                  provider:
+                    maxLength: 253
+                    type: string
+                  vpcRef:
+                    properties:
+                      name:
+                        maxLength: 253
+                        type: string
+                      namespace:
+                        maxLength: 253
+                        type: string
+                      uid:
+                        maxLength: 253
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    - uid
+                    type: object
+                required:
+                - cell
+                - frontend
+                - provider
+                - vpcRef
+                type: object
+                x-kubernetes-validations:
+                - message: selected cell assignment is immutable
+                  rule: oldSelf.cell == '' || self == oldSelf
+              customerProject:
+                maxLength: 253
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: identity is immutable
+                  rule: self == oldSelf
+              customerProjectUID:
+                maxLength: 253
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: identity is immutable
+                  rule: self == oldSelf
+              gatewayName:
+                maxLength: 253
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: identity is immutable
+                  rule: self == oldSelf
+              gatewayNamespace:
+                maxLength: 253
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: identity is immutable
+                  rule: self == oldSelf
+              gatewayUID:
+                maxLength: 253
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: identity is immutable
+                  rule: self == oldSelf
+              hostname:
+                maxLength: 253
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: identity is immutable
+                  rule: self == oldSelf
+              lifecycle:
+                enum:
+                - Active
+                - Deleting
+                - Retired
+                type: string
+                x-kubernetes-validations:
+                - message: draining endpoint cannot reactivate
+                  rule: oldSelf != 'Deleting' || self != 'Active'
+              metro:
+                maxLength: 253
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: identity is immutable
+                  rule: self == oldSelf
+              networkUID:
+                maxLength: 253
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: identity is immutable
+                  rule: self == oldSelf
+            required:
+            - assignment
+            - customerProject
+            - customerProjectUID
+            - gatewayName
+            - gatewayNamespace
+            - gatewayUID
+            - hostname
+            - lifecycle
+            - metro
+            - networkUID
+            type: object
+          status:
+            properties:
+              activationRevision:
+                format: int64
+                type: integer
+              certificateRef:
+                properties:
+                  name:
+                    type: string
+                  uid:
+                    type: string
+                required:
+                - name
+                type: object
+              certificateRevision:
+                type: string
+              cleanupStep:
+                type: string
+              deliveredSecrets:
+                items:
+                  type: string
+                type: array
+              notAfter:
+                format: date-time
+                type: string
+              phase:
+                type: string
+              ready:
+                type: boolean
+              reason:
+                type: string
+              revision:
+                format: int64
+                type: integer
+              verifiedAt:
+                format: date-time
+                type: string
+              withdrawnAt:
+                format: date-time
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

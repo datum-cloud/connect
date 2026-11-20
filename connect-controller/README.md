@@ -4,6 +4,27 @@ This module defines the Connect-owned `connect.datumapis.com/v1alpha1` API and
 the Milo multi-cluster controller. The controller provisions VPC gateways and
 bindings; the Rust daemon and `datumctl` plugin consume the binding API.
 
+## Shared managed endpoints
+
+With `--managed-endpoints`, managed-network gateways are logical resources on
+existing Galactic capacity, not Compute Workloads. Locations in one metro share
+one stable hostname and pinned cell. The customer Project contains intent and
+status; an explicitly configured service-provider Project contains durable
+`ConnectEndpoint` reservations, DNS records, `TLSCertificate` requests and
+credential-free `ConnectGrant` cleanup receipts. TLS keys stay in Certificates,
+Karmada and the selected cell. The older gateway slice described below is a
+separate legacy contract.
+
+Install `config/components/managed-endpoints/crd` only in the service Project,
+not through customer API discovery. This feature is off by default. It requires
+operator-provisioned cells, VPC ledgers, shared DNS zone, separate kubeconfigs
+and a trusted external probe. Missing capacity, credentials, fresh provider
+acknowledgments or a probe keeps readiness false. Disabling new provisioning
+does not stop renewal or durable cleanup.
+
+See [implementation and integration contracts](../docs/enhancements/managed-gateway-endpoints/implementation.md)
+for configuration, exact schemas, dependency commits, tests and rollout gates.
+
 ## Resource ownership
 
 `ConnectorClass` is cluster-scoped platform configuration in the management
@@ -17,7 +38,7 @@ project resources and carry Milo's
 uses `go.miloapis.com/milo/pkg/multicluster-runtime/milo` and registers these
 project controllers with `WithEngageWithLocalCluster(false)`.
 
-The controller provisions the first single-project CONNECT-IP gateway slice:
+The legacy controller provisions the first single-project CONNECT-IP gateway slice:
 
 - ConnectorClass reports whether its transport configuration is valid.
 - Connector checks its hex public key and resolves its class from the

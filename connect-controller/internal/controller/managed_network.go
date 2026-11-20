@@ -144,6 +144,9 @@ func effectivePolicyRevision(policies []connectv1alpha1.ConnectConnectionPolicy,
 	var revisions []string
 	for i := range policies {
 		policy := &policies[i]
+		if !policy.DeletionTimestamp.IsZero() {
+			continue
+		}
 		if policy.Namespace != connector.Namespace {
 			continue
 		}
@@ -204,7 +207,7 @@ func listPlacementLocations(ctx context.Context, c client.Client) ([]placementLo
 
 // reconcileManagedGatewayPlacements is kept separate from provider assignment:
 // it owns only selector expansion and the bounded parent summary.
-func reconcileManagedGatewayPlacements(ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway, locations []placementLocation) error {
+func reconcileManagedGatewayPlacements(ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway, locations []placementLocation, deferSummary bool) error {
 	if err := validateManagedGatewaySpec(gateway.Spec); err != nil {
 		return updateManagedGatewayStatus(ctx, c, gateway, 0, 0, 0, false, err.Error())
 	}
@@ -252,7 +255,35 @@ func reconcileManagedGatewayPlacements(ctx context.Context, c client.Client, gat
 		}
 	}
 	count := int32(len(matched))
+	if deferSummary {
+		return nil
+	}
 	return updateManagedGatewayStatus(ctx, c, gateway, count, ready, count-ready, true, "selector resolved")
+}
+
+func updateManagedEndpointStatus(ctx context.Context, customer client.Client, gateway *connectv1alpha1.ConnectGateway, locations map[string]string) error {
+	metros := map[string]bool{}
+	for _, metro := range locations {
+		metros[metro] = false
+	}
+	var placements connectv1alpha1.ConnectGatewayPlacementList
+	if err := customer.List(ctx, &placements, client.InNamespace(gateway.Namespace)); err != nil {
+		return err
+	}
+	for _, placement := range placements.Items {
+		metro, selected := locations[placement.Spec.LocationRef]
+		if selected && placement.Spec.GatewayRef == gateway.Name && placement.DeletionTimestamp.IsZero() && placement.Status.Metro == metro && placement.Status.AssignmentRef != "" && meta.IsStatusConditionTrue(placement.Status.Conditions, "Ready") {
+			metros[metro] = true
+		}
+	}
+	var ready int32
+	for _, available := range metros {
+		if available {
+			ready++
+		}
+	}
+	matched := int32(len(metros))
+	return updateManagedGatewayStatus(ctx, customer, gateway, matched, ready, matched-ready, true, "selector resolved to distinct metro endpoints")
 }
 
 func updateManagedGatewayStatus(ctx context.Context, c client.Client, gateway *connectv1alpha1.ConnectGateway, matched, ready, unavailable int32, resolved bool, message string) error {

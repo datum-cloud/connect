@@ -39,6 +39,8 @@ func init() {
 }
 
 func main() {
+	var managedEndpoints endpointFlags
+	managedEndpoints.register()
 	var discoveryKubeconfig, projectKubeconfig, providerProject string
 	var internalServiceDiscovery bool
 	flag.StringVar(&discoveryKubeconfig, "discovery-kubeconfig", "", "kubeconfig for Milo project discovery (defaults to in-cluster credentials)")
@@ -111,14 +113,18 @@ func main() {
 		ctrl.Log.Error(err, "add readiness check")
 		os.Exit(1)
 	}
-	if err := (&controller.ConnectReconciler{}).SetupWithManager(mgr); err != nil {
-		ctrl.Log.Error(err, "setup Connect controllers")
-		os.Exit(1)
-	}
-
 	rootClient, err := client.New(discoveryConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		ctrl.Log.Error(err, "create Milo root client")
+		os.Exit(1)
+	}
+	endpointService, err := managedEndpoints.setup(mgr, rootClient, projectConfig)
+	if err != nil {
+		ctrl.Log.Error(err, "setup managed endpoints")
+		os.Exit(1)
+	}
+	if err := (&controller.ConnectReconciler{Endpoints: endpointService}).SetupWithManager(mgr); err != nil {
+		ctrl.Log.Error(err, "setup Connect controllers")
 		os.Exit(1)
 	}
 	providerProjectConfig, err := consumer.ProjectRestConfig(projectConfig, providerProject)

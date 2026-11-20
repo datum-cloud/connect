@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	connect "go.datum.net/connect-controller/api/v1alpha1"
 )
 
 const TransportType = "masque.connect.datum.net/v1"
@@ -50,6 +52,8 @@ func (d Descriptor) Redacted() Descriptor {
 }
 
 type Binding struct {
+	UID            string
+	Endpoint       *connect.ConnectEndpoint
 	Name           string
 	Connector      string
 	PolicyRevision string
@@ -129,11 +133,22 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusServiceUnavailable)
 		return
 	}
+	if binding.Endpoint != nil {
+		current, err := b.Resolver.Resolve(ctx, name)
+		if err != nil || current.UID != binding.UID || current.Connector != binding.Connector || current.PolicyRevision != binding.PolicyRevision || current.Endpoint == nil || current.Endpoint.UID != binding.Endpoint.UID || current.Endpoint.Status.ActivationRevision != binding.Endpoint.Status.ActivationRevision {
+			fail(http.StatusForbidden)
+			return
+		}
+	}
 	now := time.Now()
 	if b.Now != nil {
 		now = b.Now()
 	}
 	if issued.Authority == "" || issued.VPCSelector == "" || issued.Credential == "" || issued.ExpiresAt.Sub(now) <= 0 || issued.ExpiresAt.Sub(now) > 24*time.Hour || issued.ExpectedPrefix == "" {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	if binding.Endpoint != nil && (issued.Authority != binding.Endpoint.Spec.Hostname || issued.VPCSelector != binding.Endpoint.Spec.Assignment.VPC.Namespace+"/"+binding.Endpoint.Spec.Assignment.VPC.Name) {
 		fail(http.StatusServiceUnavailable)
 		return
 	}

@@ -1,0 +1,86 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: connectgrants.connect.datumapis.com
+spec:
+  group: connect.datumapis.com
+  names:
+    kind: ConnectGrant
+    listKind: ConnectGrantList
+    plural: connectgrants
+    singular: connectgrant
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              bindingName:
+                maxLength: 253
+                type: string
+              bindingUID:
+                maxLength: 253
+                type: string
+              cell:
+                maxLength: 253
+                type: string
+              connectorID:
+                maxLength: 253
+                type: string
+              endpointName:
+                maxLength: 253
+                type: string
+              endpointUID:
+                maxLength: 253
+                type: string
+              policyRevision:
+                maxLength: 253
+                type: string
+            required:
+            - bindingName
+            - bindingUID
+            - cell
+            - connectorID
+            - endpointName
+            - endpointUID
+            - policyRevision
+            type: object
+            x-kubernetes-validations:
+            - message: grant identity is immutable
+              rule: self == oldSelf
+          status:
+            properties:
+              retired:
+                type: boolean
+              retiring:
+                type: boolean
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
