@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="800" viewBox="0 0 960 800" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="1020" viewBox="0 0 960 1020" role="img" aria-labelledby="title description">
 <title id="title">Endpoint provisioning sequence</title><desc id="description">Connect reserves a hostname, requests DNS-01 issuance, publishes the required challenge CNAME, delivers the resulting certificate and registration, waits for listener application, then publishes routing DNS and verifies external connectivity before enabling the broker.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
 <style>text { font-family: Arial, Helvetica, sans-serif; fill: #172b4d; } .heading { font-size: 21px; font-weight: 700; } .label { font-size: 18px; } .detail { font-size: 17px; fill: #475569; } .line { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }</style>
-<rect width="960" height="800" fill="white"/>
+<rect width="960" height="1020" fill="white"/>
 <g aria-label="System lifelines" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 5">
 <path d="M 120 85 L 120 101"/>
 <path d="M 120 153 L 120 162"/>
@@ -32,7 +32,7 @@
 <path d="M 600 560 L 600 642"/>
 <path d="M 600 668 L 600 670"/>
 <path d="M 600 680 L 600 705"/>
-<path d="M 840 85 L 840 705"/>
+<path d="M 840 85 L 840 985"/>
 </g>
 <rect x="15" y="20" width="210" height="65" rx="10" fill="#eff6ff" stroke="#93b4df" stroke-width="1.5"/>
 <text x="120" y="47" class="heading" text-anchor="middle">Connect</text>
@@ -64,8 +64,15 @@
 <path d="M 840 555 L 120 555" class="line" stroke-dasharray="5 4"/>
 <text x="360.0" y="603" class="label" text-anchor="middle">Reconcile routing DNSRecordSet</text>
 <path d="M 120 615 L 600 615" class="line"/>
-<text x="480.0" y="663" class="label" text-anchor="middle">External TLS, transport, and VPC packet checks</text>
+<text x="480.0" y="663" class="label" text-anchor="middle">External DNS, TLS and H3/H2 checks (no network authorization)</text>
 <path d="M 120 675 L 840 675" class="line"/>
 <rect x="28" y="722" width="904" height="56" rx="10" fill="#f0fdf4" stroke="#96bda1" stroke-width="1.5"/>
-<text x="480" y="756" class="label" text-anchor="middle">Mark ready; broker returns this endpoint with an authorized cell-specific grant</text>
+<text x="480" y="756" class="label" text-anchor="middle">Endpoint ready; bindings still need explicit network policy and reachability</text>
+<path d="M 120 778 L 120 985" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 5"/>
+<text x="480" y="825" class="label" text-anchor="middle">Resolve named binding A and B; mint separate VPC-scoped grants</text>
+<path d="M 120 840 L 840 840" class="line"/>
+<text x="480" y="885" class="label" text-anchor="middle">Client opens one H3 or H2 connection; authenticates each stream</text>
+<path d="M 120 900 L 840 900" class="line"/>
+<text x="480" y="945" class="label" text-anchor="middle">Per-binding packet results; revoking A leaves B connected</text>
+<path d="M 840 960 L 120 960" class="line" stroke-dasharray="5 4"/>
 </svg>

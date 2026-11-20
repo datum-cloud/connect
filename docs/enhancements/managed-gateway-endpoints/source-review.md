@@ -8,6 +8,47 @@ document's evidence, not observations made during this review.
 
 ## Structural reference
 
+### November 20 shared-transport revision
+
+The updated design separates gateway endpoints from network bindings. The
+implementation remains in draft Connect PR #74, based on required prototype
+`73adbc35d08a3599bcd7075ec9e04e2144f8a750`, not main. Design PR #73 remains
+documentation-only on main. The historical November 18 evidence below does not
+describe the newer implementation.
+
+Published Connect implementation `6e2653ff93614c56a1590092f51a16cc8664db13`
+records the frozen contracts in `implementation.md` on its feature branch.
+Controller race tests with Kubernetes 1.37 envtest, native/Linux builds and both
+Kustomize exports pass. Rust daemon tests report 41 passed/1 opt-in ignored;
+successor tests report 39 passed/1 opt-in ignored. Run the physical-connection
+fixtures with `cd connect-lib && cargo test -p datum-connect-daemon pool_tests --lib`
+using Rust 1.98. Both protocols and separate security-context pools pass.
+
+Published Galactic dependency `ed8dddbeca8ccb1b38623de0a5f4f344ef0b0e27`
+(PR #1465) removes Network/VPC fields from endpoint registrations. Managed grant
+creation instead requires Network UID, binding UID and a UID-pinned VPC reference.
+`TestManagedEndpointMultiplexedAuthority` tests both protocols with one physical
+dial, independent revocation and VPC recreation, using the real authority and a
+fake packet backend. It is not operating-system datapath qualification.
+
+Certificates dependency `4cec00395b3647737685addd697e40f2e94d3214` (PR #83)
+preserves reservation-bound authorization and adds a binding-lifecycle regression.
+Its reservation check uses project/gateway/metro/hostname and request name/UID,
+not network identity. It proves certificate-service stability across binding
+changes, not a complete Connect integration.
+
+Connect's `galactic_masque::pool_tests` run its actual Rust client against TLS
+loopback servers. They count physical connections, open separately credentialed
+streams, deny selector/credential replay, revoke one stream, refresh credentials,
+and reconnect after transport failure. They use a test packet responder, not a
+live Galactic VPC. Controller tests separately pin per-binding identities and
+preserve the endpoint through Network deletion/recreation. Exact final Connect
+and Infra commits are recorded in the implementation PR and its contract log.
+
+Live DNS/ACME issuance, Karmada delivery, operating-system packet paths, credential
+frontend routing, external probes and qualified image/OCI digests remain release
+gates. No deployment is established by these local source tests.
+
 The structure and SVG style follow [Fleet’s machine-lifecycle enhancement](https://github.com/datum-cloud/fleet/blob/927035de2ea4ff9d1143ded85ece683cffd70200/docs/enhancements/machine-lifecycle/README.md).
 Its diagrams use white backgrounds, pale blue and green control-plane boundaries,
 rounded boxes, Arial text, and solid request / dashed response arrows. The two

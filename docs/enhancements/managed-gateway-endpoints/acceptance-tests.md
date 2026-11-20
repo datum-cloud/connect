@@ -1,7 +1,7 @@
 # Acceptance tests
 
-These are proposed release checks for the [design](README.md). This documentation
-change does not implement or run them.
+These are release checks for the [design](README.md). Local implementation tests
+cover parts of the contract; they do not replace deployed packet qualification.
 
 ## Setup
 
@@ -35,6 +35,31 @@ bearer credentials. A TLS handshake alone does not prove VPC connectivity.
   or the VPC selector. Test each transport, including multiple HTTP/2 requests
   sharing a connection.
 
+## Multiple networks on one connection
+
+- Create a gateway without `networkRef`. Bind two differently named Networks with
+  explicit `gatewayRef`, `connectorRef` and `networkRef`. Authorize both through
+  `ConnectConnectionPolicy.networkRefs`. Users supply no UIDs, cell IDs or VPC IDs.
+- For each H3 and H2 case, record one actual accepted QUIC/TLS connection identity
+  and two distinct CONNECT-IP stream IDs. Exchange packets on both simultaneously.
+  Merely opening two clients or sharing a pool object is not sufficient evidence.
+- A third network and a credential replay with a changed VPC selector are denied.
+  A gateway-only policy with no network list remains denied after migration.
+- Revoke one binding while the other transfers packets on the same connection.
+  Recreate the revoked binding and obtain a fresh independently scoped grant.
+- Delete and recreate one Network or VPC under the same name. Old grants and
+  bindings must not follow the replacement UID. Reapprove the replacement through
+  a new binding; shared DNS, certificate, listener and sibling remain unchanged.
+- Expire/refresh one stream credential without closing its sibling. Fail the
+  physical connection; both desired attachments independently reauthorize and
+  reconnect onto one replacement transport within the same security context.
+- Rotate the shared certificate, including a shorter-lived replacement. A new
+  TLS connection is needed to observe the new fingerprint; a preexisting TLS
+  session is not evidence of the replacement. Disable the endpoint and verify
+  all of its streams stop while another tenant remains usable.
+- Reject overlapping device-local routes. Separate server-side VPC streams do
+  not establish overlapping-network support on the client operating system.
+
 ## Certificates and listeners
 
 - DNS-01 uses the exact returned challenge CNAME and completes without an HTTP
@@ -57,7 +82,8 @@ bearer credentials. A TLS handshake alone does not prove VPC connectivity.
   names or grants; reject delayed updates from an older configuration.
 - Interrupt project API access, DNS, issuance, distribution, and cell access.
   Report the failing dependency and do not mistake an outage for deletion.
-- Change cells and verify that routing and newly issued grants agree. Do not
+- Remove selected-cell reachability for one network. That binding becomes
+  unavailable without moving the endpoint or interrupting other bindings. Do not
   claim transparent roaming or preserved allocations.
 - Revoke a binding or gateway while traffic is active. Measure admission denial,
   forwarding cutoff, and route withdrawal separately from DNS removal.
@@ -82,3 +108,8 @@ revocation deadlines, and recovery ownership before production.
 Connect, Galactic, certificates, and infra owners should record results for their
 boundaries, including skipped checks and environment limits. Unit tests and
 manifest rendering do not replace the end-to-end packet and cleanup checks.
+
+Keep three evidence sets separate: Rust client loopback tests with actual H3/H2
+connections, Galactic real-authority tests with a fake packet backend, and live
+DNS/ACME/Karmada/cell/operating-system packet tests. Record skipped checks and
+artifact digests. The first two do not qualify the last.
