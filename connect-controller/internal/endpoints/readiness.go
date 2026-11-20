@@ -19,8 +19,6 @@ import (
 
 type InstanceAck struct {
 	InstanceName               string      `json:"instanceName"`
-	InstanceUID                string      `json:"instanceUID"`
-	PodUID                     string      `json:"podUID"`
 	ObservedRevision           int64       `json:"observedRevision"`
 	AppliedRevision            int64       `json:"appliedRevision"`
 	AppliedCertificateRevision string      `json:"appliedCertificateRevision"`
@@ -38,12 +36,11 @@ func (d *KubernetesDriver) Applied(ctx context.Context, endpoint *connect.Connec
 	if err := cell.Get(ctx, client.ObjectKeyFromObject(registration), registration); err != nil {
 		return err
 	}
-	uid, _, _ := unstructured.NestedString(registration.Object, "spec", "endpointUID")
 	revision, _, _ := unstructured.NestedInt64(registration.Object, "spec", "revision")
-	if uid != string(endpoint.UID) || revision != endpoint.Status.Revision {
+	if revision != endpoint.Status.Revision || registration.GetDeletionTimestamp() != nil {
 		return fmt.Errorf("registration identity or revision not delivered")
 	}
-	for field, wanted := range map[string]string{"customerProjectUID": endpoint.Spec.CustomerProjectUID, "gatewayUID": endpoint.Spec.GatewayUID, "hostname": endpoint.Spec.Hostname, "cell": endpoint.Spec.Assignment.Cell, "provider": endpoint.Spec.Assignment.Provider, "metro": endpoint.Spec.Metro} {
+	for field, wanted := range map[string]string{"hostname": endpoint.Spec.Hostname, "cell": endpoint.Spec.Assignment.Cell, "provider": endpoint.Spec.Assignment.Provider, "metro": endpoint.Spec.Metro} {
 		actual, _, _ := unstructured.NestedString(registration.Object, "spec", field)
 		if actual != wanted {
 			return fmt.Errorf("registration scope differs")
@@ -89,7 +86,8 @@ func (d *KubernetesDriver) Applied(ctx context.Context, endpoint *connect.Connec
 		}
 		relevant++
 		podUID, _, _ := unstructured.NestedString(instance.Object, "spec", "podUID")
-		if podUID == "" || instance.GetUID() == "" || instance.GetName() != "ei-"+podUID {
+		created := instance.GetCreationTimestamp()
+		if podUID == "" || instance.GetUID() == "" || instance.GetName() != "ei-"+podUID || created.IsZero() || instance.GetDeletionTimestamp() != nil {
 			return fmt.Errorf("invalid provider incarnation")
 		}
 		lease := &coordinationv1.Lease{}
@@ -103,11 +101,14 @@ func (d *KubernetesDriver) Applied(ctx context.Context, endpoint *connect.Connec
 			}
 		}
 		now := d.Now()
+		if lease.Spec.AcquireTime == nil || lease.Spec.AcquireTime.IsZero() || lease.Spec.AcquireTime.After(now) || lease.DeletionTimestamp != nil {
+			return fmt.Errorf("provider lease incarnation is not established")
+		}
 		if !ownerMatches || lease.UID == "" || lease.Annotations["galactic.datumapis.com/edge-pod-uid"] != podUID || lease.Annotations["galactic.datumapis.com/edge-released"] == "true" || lease.Spec.RenewTime == nil || lease.Spec.LeaseDurationSeconds == nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" || lease.Spec.RenewTime.After(now) || !now.Before(lease.Spec.RenewTime.Add(time.Duration(*lease.Spec.LeaseDurationSeconds)*time.Second)) {
 			return fmt.Errorf("provider membership is not fresh")
 		}
 		ack, exists := acks[instance.GetName()]
-		if !exists || ack.InstanceUID != string(instance.GetUID()) || ack.PodUID != podUID || ack.LastHeartbeatTime.After(now) || now.Sub(ack.LastHeartbeatTime.Time) > 10*time.Second || ack.ObservedRevision != endpoint.Status.Revision || ack.AppliedRevision != endpoint.Status.Revision {
+		if !exists || !ack.LastHeartbeatTime.After(created.Time) || !ack.LastHeartbeatTime.After(lease.Spec.AcquireTime.Time) || ack.LastHeartbeatTime.After(now) || now.Sub(ack.LastHeartbeatTime.Time) > 10*time.Second || ack.ObservedRevision != endpoint.Status.Revision || ack.AppliedRevision != endpoint.Status.Revision {
 			return fmt.Errorf("provider has not acknowledged current registration")
 		}
 		if enabled {
@@ -125,23 +126,29 @@ func (d *KubernetesDriver) Applied(ctx context.Context, endpoint *connect.Connec
 }
 
 type ProbeReport struct {
-	EndpointUID         string    `json:"endpointUID"`
-	Revision            int64     `json:"revision"`
-	CertificateRevision string    `json:"certificateRevision"`
-	Cell                string    `json:"cell"`
-	CheckedAt           time.Time `json:"checkedAt"`
-	HTTP3               bool      `json:"h3"`
-	HTTP2               bool      `json:"h2"`
-	DNS                 bool      `json:"dns"`
+	EndpointRef         ProbeEndpointReference `json:"endpointRef"`
+	Hostname            string                 `json:"hostname"`
+	Revision            int64                  `json:"revision"`
+	CertificateRevision string                 `json:"certificateRevision"`
+	Cell                string                 `json:"cell"`
+	CheckedAt           time.Time              `json:"checkedAt"`
+	HTTP3               bool                   `json:"h3"`
+	HTTP2               bool                   `json:"h2"`
+	DNS                 bool                   `json:"dns"`
 }
 
-func HTTPProbe(baseURL string, httpClient *http.Client, now func() time.Time) (func(context.Context, *connect.ConnectEndpoint) error, error) {
+type ProbeEndpointReference struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+func HTTPProbe(baseURL, runtimeNamespace string, httpClient *http.Client, now func() time.Time) (func(context.Context, *connect.ConnectEndpoint) error, error) {
 	parsed, err := url.Parse(baseURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || runtimeNamespace == "" || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return nil, fmt.Errorf("probe URL must be trusted HTTPS endpoint")
 	}
 	return func(ctx context.Context, endpoint *connect.ConnectEndpoint) error {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/"+url.PathEscape(string(endpoint.UID)), nil)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/"+url.PathEscape(runtimeNamespace)+"/"+url.PathEscape(endpoint.Name), nil)
 		if err != nil {
 			return err
 		}
@@ -157,7 +164,7 @@ func HTTPProbe(baseURL string, httpClient *http.Client, now func() time.Time) (f
 		if err := json.NewDecoder(io.LimitReader(response.Body, 65536)).Decode(&report); err != nil {
 			return fmt.Errorf("invalid probe response")
 		}
-		if report.EndpointUID != string(endpoint.UID) || report.Revision != endpoint.Status.Revision || report.CertificateRevision != endpoint.Status.CertificateRevision || report.Cell != endpoint.Spec.Assignment.Cell || report.CheckedAt.After(now()) || now().Sub(report.CheckedAt) > 10*time.Second || !report.HTTP3 || !report.HTTP2 || !report.DNS {
+		if report.EndpointRef.Namespace != runtimeNamespace || report.EndpointRef.Name != endpoint.Name || report.Hostname != endpoint.Spec.Hostname || report.Revision != endpoint.Status.Revision || report.CertificateRevision != endpoint.Status.CertificateRevision || report.Cell != endpoint.Spec.Assignment.Cell || report.CheckedAt.After(now()) || now().Sub(report.CheckedAt) > 10*time.Second || !report.HTTP3 || !report.HTTP2 || !report.DNS {
 			return fmt.Errorf("external verification incomplete or stale")
 		}
 		return nil

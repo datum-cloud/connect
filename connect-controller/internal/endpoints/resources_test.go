@@ -21,8 +21,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func tlsFixture(t *testing.T, hostname string, now time.Time) (*corev1.Secret, string) {
@@ -87,7 +89,12 @@ func resourceClient(t *testing.T, objects ...client.Object) client.Client {
 	_ = coordinationv1.AddToScheme(scheme)
 	_ = connect.AddToScheme(scheme)
 	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: registrationGVK.Group, Version: registrationGVK.Version, Kind: "EdgeInstanceList"}, &unstructured.UnstructuredList{})
-	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&connect.ConnectEndpoint{}, &connect.ConnectGrant{}).WithObjects(objects...).Build()
+	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&connect.ConnectEndpoint{}, &connect.ConnectGrant{}).WithObjects(objects...).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, target client.WithWatch, resource client.Object, options ...client.CreateOption) error {
+		if resource.GetUID() == "" {
+			resource.SetUID(types.UID("created-" + resource.GetName()))
+		}
+		return target.Create(ctx, resource, options...)
+	}}).Build()
 }
 
 func TestExactDNS01AndSeparateKeyCustody(t *testing.T) {
@@ -164,6 +171,19 @@ func TestExactDNS01AndSeparateKeyCustody(t *testing.T) {
 	if err := karmada.Get(ctx, client.ObjectKeyFromObject(desired), desired); err != nil {
 		t.Fatal(err)
 	}
+	for _, field := range []string{"endpointUID", "customerProjectUID", "gatewayUID", "networkUID", "vpcRef"} {
+		if _, exists, err := unstructured.NestedFieldNoCopy(desired.Object, "spec", field); err != nil || exists {
+			t.Fatalf("removed registration field delivered: %s", field)
+		}
+	}
+	for _, resource := range []client.Object{desired, delivered, policy} {
+		if resource.GetLabels()[OwnerLabel] != "" || resource.GetAnnotations()["masque.galactic.datumapis.com/endpoint-uid"] != "" {
+			t.Fatal("identity UID leaked into distributed metadata")
+		}
+		if receipt := deliveryReceipt(endpoint, resource); receipt == nil || receipt.UID != string(resource.GetUID()) {
+			t.Fatal("distributed resource has no private incarnation receipt")
+		}
+	}
 	applied.Object["spec"] = desired.Object["spec"]
 	if err := cell.Update(ctx, applied); err != nil {
 		t.Fatal(err)
@@ -211,16 +231,18 @@ func TestExactDNS01AndSeparateKeyCustody(t *testing.T) {
 func membershipFixture(t *testing.T, endpoint *connect.ConnectEndpoint, now time.Time) (client.Client, *unstructured.Unstructured) {
 	t.Helper()
 	registration := object(registrationGVK, "masque", endpoint.Name)
-	registration.Object["spec"] = map[string]interface{}{"endpointUID": string(endpoint.UID), "revision": endpoint.Status.Revision, "customerProjectUID": endpoint.Spec.CustomerProjectUID, "gatewayUID": endpoint.Spec.GatewayUID, "hostname": endpoint.Spec.Hostname, "cell": endpoint.Spec.Assignment.Cell, "provider": endpoint.Spec.Assignment.Provider, "metro": endpoint.Spec.Metro, "enabled": true, "certificateRef": map[string]interface{}{"revision": endpoint.Status.CertificateRevision}}
+	registration.Object["spec"] = map[string]interface{}{"revision": endpoint.Status.Revision, "hostname": endpoint.Spec.Hostname, "cell": endpoint.Spec.Assignment.Cell, "provider": endpoint.Spec.Assignment.Provider, "metro": endpoint.Spec.Metro, "enabled": true, "certificateRef": map[string]interface{}{"revision": endpoint.Status.CertificateRevision}}
 	_ = unstructured.SetNestedField(registration.Object, SecretName(endpoint), "spec", "certificateRef", "name")
-	registration.Object["status"] = map[string]interface{}{"instances": []interface{}{map[string]interface{}{"instanceName": "ei-pod-a", "instanceUID": "instance-a", "podUID": "pod-a", "observedRevision": endpoint.Status.Revision, "appliedRevision": endpoint.Status.Revision, "appliedCertificateRevision": endpoint.Status.CertificateRevision, "state": "Applied", "forwardingStopped": false, "lastHeartbeatTime": now.Format(time.RFC3339)}}}
+	registration.Object["status"] = map[string]interface{}{"instances": []interface{}{map[string]interface{}{"instanceName": "ei-pod-a", "observedRevision": endpoint.Status.Revision, "appliedRevision": endpoint.Status.Revision, "appliedCertificateRevision": endpoint.Status.CertificateRevision, "state": "Applied", "forwardingStopped": false, "lastHeartbeatTime": now.Format(time.RFC3339)}}}
 	instance := object(schema.GroupVersionKind{Group: registrationGVK.Group, Version: registrationGVK.Version, Kind: "EdgeInstance"}, "masque", "ei-pod-a")
 	instance.SetUID("instance-a")
+	instance.SetCreationTimestamp(metav1.NewTime(now.Add(-time.Minute)))
 	instance.Object["spec"] = map[string]interface{}{"providerRef": map[string]interface{}{"name": "shared"}, "podUID": "pod-a"}
 	holder := "pod-a"
 	duration := int32(30)
 	renew := metav1.NewMicroTime(now)
-	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: instance.GetName(), Namespace: "masque", UID: "lease-a", Annotations: map[string]string{"galactic.datumapis.com/edge-pod-uid": "pod-a"}, OwnerReferences: []metav1.OwnerReference{{Kind: "EdgeInstance", UID: instance.GetUID()}}}, Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renew}}
+	acquired := metav1.NewMicroTime(now.Add(-30 * time.Second))
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: instance.GetName(), Namespace: "masque", UID: "lease-a", Annotations: map[string]string{"galactic.datumapis.com/edge-pod-uid": "pod-a"}, OwnerReferences: []metav1.OwnerReference{{Kind: "EdgeInstance", UID: instance.GetUID()}}}, Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renew, AcquireTime: &acquired}}
 	return resourceClient(t, registration, instance, lease), registration
 }
 
@@ -273,5 +295,68 @@ func TestReadinessUsesMembershipNotAckCount(t *testing.T) {
 	now = now.Add(11 * time.Second)
 	if err := driver.Applied(ctx, endpoint, false); err == nil {
 		t.Fatal("stale forwarding stop accepted")
+	}
+}
+
+func TestReadinessRejectsAcknowledgmentsFromPreviousIncarnation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, scenario := range []string{"recreated-instance", "reacquired-lease", "missing-acquire-time", "equal-acquire-time", "future-acquire-time", "missing-creation-time"} {
+		t.Run(scenario, func(t *testing.T) {
+			endpoint := endpointFixture()
+			endpoint.Status.Revision = 4
+			endpoint.Status.CertificateRevision = strings.Repeat("a", 64)
+			cell, registration := membershipFixture(t, endpoint, now)
+			driver := &KubernetesDriver{Cells: map[string]client.Client{"cell-a": cell}, RuntimeNamespace: "masque", Now: func() time.Time { return now }}
+			instance := object(schema.GroupVersionKind{Group: registrationGVK.Group, Version: registrationGVK.Version, Kind: "EdgeInstance"}, "masque", "ei-pod-a")
+			if err := cell.Get(ctx, client.ObjectKeyFromObject(instance), instance); err != nil {
+				t.Fatal(err)
+			}
+			lease := &coordinationv1.Lease{}
+			if err := cell.Get(ctx, client.ObjectKeyFromObject(instance), lease); err != nil {
+				t.Fatal(err)
+			}
+			entries, _, _ := unstructured.NestedSlice(registration.Object, "status", "instances")
+			entries[0].(map[string]interface{})["lastHeartbeatTime"] = now.Add(-2 * time.Second).Format(time.RFC3339)
+			_ = unstructured.SetNestedSlice(registration.Object, entries, "status", "instances")
+			if err := cell.Update(ctx, registration); err != nil {
+				t.Fatal(err)
+			}
+			switch scenario {
+			case "recreated-instance":
+				if err := cell.Delete(ctx, instance); err != nil {
+					t.Fatal(err)
+				}
+				instance.SetResourceVersion("")
+				instance.SetUID("new-instance")
+				instance.SetCreationTimestamp(metav1.NewTime(now.Add(-time.Second)))
+				if err := cell.Create(ctx, instance); err != nil {
+					t.Fatal(err)
+				}
+				lease.OwnerReferences[0].UID = instance.GetUID()
+			case "missing-creation-time":
+				instance.SetCreationTimestamp(metav1.Time{})
+				if err := cell.Update(ctx, instance); err != nil {
+					t.Fatal(err)
+				}
+			case "missing-acquire-time":
+				lease.Spec.AcquireTime = nil
+			case "equal-acquire-time":
+				acquired := metav1.NewMicroTime(now.Add(-2 * time.Second))
+				lease.Spec.AcquireTime = &acquired
+			case "future-acquire-time":
+				acquired := metav1.NewMicroTime(now.Add(time.Second))
+				lease.Spec.AcquireTime = &acquired
+			case "reacquired-lease":
+				acquired := metav1.NewMicroTime(now.Add(-time.Second))
+				lease.Spec.AcquireTime = &acquired
+			}
+			if err := cell.Update(ctx, lease); err != nil {
+				t.Fatal(err)
+			}
+			if err := driver.Applied(ctx, endpoint, true); err == nil {
+				t.Fatal("previous incarnation acknowledgment accepted")
+			}
+		})
 	}
 }

@@ -77,12 +77,22 @@ type ConnectEndpointStatus struct {
 	ActivationRevision  int64                        `json:"activationRevision,omitempty"`
 	CertificateRevision string                       `json:"certificateRevision,omitempty"`
 	DeliveredSecrets    []string                     `json:"deliveredSecrets,omitempty"`
+	DeliveryReceipts    []EndpointDeliveryReceipt    `json:"deliveryReceipts,omitempty"`
 	NotAfter            *metav1.Time                 `json:"notAfter,omitempty"`
 	Ready               bool                         `json:"ready,omitempty"`
 	Reason              string                       `json:"reason,omitempty"`
 	CleanupStep         string                       `json:"cleanupStep,omitempty"`
 	WithdrawnAt         *metav1.Time                 `json:"withdrawnAt,omitempty"`
 	VerifiedAt          *metav1.Time                 `json:"verifiedAt,omitempty"`
+}
+
+type EndpointDeliveryReceipt struct {
+	APIVersion    string `json:"apiVersion"`
+	Kind          string `json:"kind"`
+	Namespace     string `json:"namespace"`
+	Name          string `json:"name"`
+	UID           string `json:"uid"`
+	ContentDigest string `json:"contentDigest,omitempty"`
 }
 
 // +kubebuilder:object:root=true

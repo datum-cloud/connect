@@ -12,19 +12,21 @@ connector and network. Policies must explicitly list allowed `networkRefs`;
 an old policy without this list grants no managed network access. Gateway
 permission alone never authorizes a stream.
 
-`MASQUEEndpoint` drops `networkUID` and `vpcRef`. Its scope contains only
-`endpointUID`, `customerProjectUID`, `gatewayUID`, `cell`, `hostname`.
-Galactic managed CreateRequest requires separate `NetworkUID`, `BindingUID`
-and UID-pinned `VPCRef`. ConnectGrant durably pins `networkName`, `networkUID`,
-`vpcRef` and binding identity. Network recreation revokes only those grants.
-Certificates' reservation authorization, certificate revision, and applied
-instance status contracts are unchanged.
+The latest name-based contract removes all identity UID fields and customer
+project information from `MASQUEEndpoint`. Galactic's public CreateRequest takes
+`EndpointRef:{namespace,name}` and `VPC:{namespace,name}`, with no Network or
+Binding fields. Galactic resolves its own VPC incarnation internally. Connect
+retains private ConnectGrant network/binding/VPC pins and checks the local VPC
+before and after minting; recreation retires the credential rather than returning
+it. Source-project authorization stays in the authenticated Connect broker.
+Certificates' reservation authorization and certificate revision are unchanged.
+The new Galactic dependency and final-head CI remain pending for this revision.
 
 Operator JSON separates `capacity:[{metro,assignment:{cell,provider,frontend}}]`
 from `reachability:[{networkUID,cell,vpcRef:{namespace,name,uid}}]`.
 `cells` and `probeURL` retain their existing shape. A binding requires an exact
 reachability mapping in the already selected cell; no roaming is allowed.
-Endpoint probe fields are `endpointUID`, `revision`, `certificateRevision`,
+Endpoint probe fields are `endpointRef:{namespace,name}`, `hostname`, `revision`, `certificateRevision`,
 `cell`, `checkedAt`, `h3`, `h2`, `dns`; the old `vpc` boolean is removed.
 Network forwarding qualification is separate, per binding.
 
@@ -58,19 +60,23 @@ publish the certificate name, create the request, then bind its returned UID.
 Publish the exact `status.requiredDNSRecords` CNAME. Keys never enter Projects.
 
 Galactic agreed: namespaced `galactic.datumapis.com/v1alpha1 MASQUEEndpoint`
-spec contains `endpointUID`, `customerProjectUID`, `gatewayUID`,
-`metro`, `cell`, `provider`, `hostname`,
+spec contains `metro`, `cell`, `provider`, `hostname`,
 positive monotonic `revision`, `certificateRef:{name,revision}`, and `enabled`.
 Identity is immutable. Revision increases for certificate changes and disable.
 Certificate revision is leaf DER SHA256, never ordered by expiry.
-`status.instances[]` keys on `instanceName`, with `instanceUID`, `podUID`,
+`status.instances[]` keys on actual `instanceName`, with
 `observedRevision`, `appliedRevision`, `appliedCertificateRevision`,
 `state` (Applied/Disabled/Error), `forwardingStopped`, `lastHeartbeatTime`,
-and `message`. Provider durable fences retain endpoint UID and revision.
+and `message`. Provider durable fences use namespace plus canonical hostname,
+pin the registration name/cell/provider and retain revision/revocation tombstones.
+Neither metadata nor wire fields substitute hidden identity UID annotations.
 
 Relevant instances come from provider-matching EdgeInstances and their
 same-name, owner-UID-bound Leases, never the acknowledgment list. Check Lease
 renewal/duration/released state and acknowledgments no older than ten seconds.
+Each acknowledgment must be strictly after both instance creation and Lease
+acquireTime. Missing incarnation timestamps fail closed; no UID is copied into
+the acknowledgment. Existing internal Edge membership fields remain unchanged.
 Readiness requires all relevant instances, exact revisions, and fresh external
 DNS/TLS/H3/H2 probes. A Karmada delivery acknowledgment alone is insufficient.
 
@@ -89,9 +95,18 @@ owns a Project, shared zone, VPC or provider deployment.
 `status.revision` fences registration changes. `status.certificateRevision`
 tracks the desired leaf, `status.deliveredSecrets` records every versioned
 Secret name before delivery, and `status.verifiedAt` expires readiness after ten
-seconds. Secret names are `<endpoint-name>-<leaf-DER-sha256>`. Each carries
-`masque.galactic.datumapis.com/endpoint-uid` and
-`masque.galactic.datumapis.com/certificate-revision` annotations. Karmada policy
+seconds. Secret names are `<endpoint-name>-<leaf-DER-sha256>`. Each carries only
+the `masque.galactic.datumapis.com/certificate-revision` annotation. Distributed
+Secret, registration and policy objects have no endpoint UID label. Private
+`status.deliveryReceipts[]` stores `{apiVersion,kind,namespace,name,uid,contentDigest}`
+for cleanup preconditions. A content digest is saved before creation, with an
+empty UID until the returned incarnation is bound. Cleanup can recover a crash
+between those writes only if content still matches. The digest contains no key
+bytes. After an uncertain create, adoption requires
+exact desired registration/policy spec or versioned Secret bytes and revision;
+a recorded incarnation can never be replaced or silently adopted. Legacy
+identity-bearing deliveries require explicit migration, not automatic relabeling.
+Karmada policy
 selects the registration and all retained versions in exactly one cell. Previous
 versions are removed only after the replacement is applied and externally
 verified; actual cell absence is required before forgetting their names.
@@ -178,8 +193,10 @@ not renewal or cleanup. Configuration shape (all values operator supplied):
 }
 ```
 
-The probe GET path appends the endpoint UID. Its JSON report must contain exact
-`endpointUID`, `revision`, `certificateRevision`, `cell`, a `checkedAt` timestamp
+The probe GET path appends the URL-encoded runtime namespace and registration
+name as separate path segments. Its JSON report must contain exact
+`endpointRef:{namespace,name}` for the selected-cell MASQUEEndpoint, `hostname`,
+`revision`, `certificateRevision`, `cell`, a `checkedAt` timestamp
 no older than ten seconds, and `h3`, `h2`, `dns` all true. HTTPS trust comes
 from the controller's configured trust store. No probe service is bundled, no
 synthetic success is permitted, and omission fails closed.

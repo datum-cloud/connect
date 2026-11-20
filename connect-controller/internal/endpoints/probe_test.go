@@ -14,16 +14,16 @@ func TestProbeRequiresCurrentCompleteExternalEvidence(t *testing.T) {
 	endpoint := endpointFixture()
 	endpoint.Status.Revision = 4
 	endpoint.Status.CertificateRevision = "leaf-revision"
-	valid := ProbeReport{EndpointUID: string(endpoint.UID), Revision: 4, CertificateRevision: "leaf-revision", Cell: "cell-a", CheckedAt: now, HTTP3: true, HTTP2: true, DNS: true}
+	valid := ProbeReport{EndpointRef: ProbeEndpointReference{Namespace: "masque", Name: endpoint.Name}, Hostname: endpoint.Spec.Hostname, Revision: 4, CertificateRevision: "leaf-revision", Cell: "cell-a", CheckedAt: now, HTTP3: true, HTTP2: true, DNS: true}
 	report := valid
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/endpoints/"+string(endpoint.UID) {
+		if request.URL.Path != "/endpoints/masque/"+endpoint.Name {
 			t.Error("probe targeted wrong endpoint")
 		}
 		_ = json.NewEncoder(writer).Encode(report)
 	}))
 	defer server.Close()
-	probe, err := HTTPProbe(server.URL+"/endpoints", server.Client(), func() time.Time { return now })
+	probe, err := HTTPProbe(server.URL+"/endpoints", "masque", server.Client(), func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,9 @@ func TestProbeRequiresCurrentCompleteExternalEvidence(t *testing.T) {
 		"revision":    func(value *ProbeReport) { value.Revision-- },
 		"certificate": func(value *ProbeReport) { value.CertificateRevision = "old" },
 		"cell":        func(value *ProbeReport) { value.Cell = "other" },
-		"identity":    func(value *ProbeReport) { value.EndpointUID = "other" },
+		"identity":    func(value *ProbeReport) { value.EndpointRef.Name = "other" },
+		"namespace":   func(value *ProbeReport) { value.EndpointRef.Namespace = "other" },
+		"hostname":    func(value *ProbeReport) { value.Hostname = "other.example.test" },
 		"h3":          func(value *ProbeReport) { value.HTTP3 = false },
 		"h2":          func(value *ProbeReport) { value.HTTP2 = false },
 		"dns":         func(value *ProbeReport) { value.DNS = false },
@@ -49,7 +51,7 @@ func TestProbeRequiresCurrentCompleteExternalEvidence(t *testing.T) {
 			}
 		})
 	}
-	if _, err := HTTPProbe("http://untrusted.example.test", server.Client(), time.Now); err == nil {
+	if _, err := HTTPProbe("http://untrusted.example.test", "masque", server.Client(), time.Now); err == nil {
 		t.Fatal("plaintext probe accepted")
 	}
 }

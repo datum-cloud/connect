@@ -239,22 +239,9 @@ func (d *KubernetesDriver) Apply(ctx context.Context, endpoint *connect.ConnectE
 		if err != nil {
 			return err
 		}
-		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: d.RuntimeNamespace, Labels: map[string]string{OwnerLabel: string(endpoint.UID)}, Annotations: map[string]string{"masque.galactic.datumapis.com/endpoint-uid": string(endpoint.UID), "masque.galactic.datumapis.com/certificate-revision": endpoint.Status.CertificateRevision}}, Type: corev1.SecretTypeTLS, Data: map[string][]byte{corev1.TLSCertKey: stored.Data[corev1.TLSCertKey], corev1.TLSPrivateKeyKey: stored.Data[corev1.TLSPrivateKeyKey]}}
-		current := &corev1.Secret{}
-		if err := d.Karmada.Get(ctx, client.ObjectKeyFromObject(secret), current); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return err
-			}
-			if err := d.Karmada.Create(ctx, secret); err != nil {
-				return err
-			}
-		} else {
-			if !owned(endpoint, current) {
-				return fmt.Errorf("delivered Secret ownership mismatch")
-			}
-			if !reflect.DeepEqual(current.Data, secret.Data) {
-				return fmt.Errorf("immutable certificate delivery differs")
-			}
+		secret := &corev1.Secret{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}, ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: d.RuntimeNamespace, Annotations: map[string]string{"masque.galactic.datumapis.com/certificate-revision": endpoint.Status.CertificateRevision}}, Type: corev1.SecretTypeTLS, Data: map[string][]byte{corev1.TLSCertKey: stored.Data[corev1.TLSCertKey], corev1.TLSPrivateKeyKey: stored.Data[corev1.TLSPrivateKeyKey]}}
+		if err := d.ensureDeliverySecret(ctx, endpoint, secret); err != nil {
+			return err
 		}
 	}
 	registration := object(registrationGVK, d.RuntimeNamespace, endpoint.Name)
@@ -263,8 +250,8 @@ func (d *KubernetesDriver) Apply(ctx context.Context, endpoint *connect.ConnectE
 	if !enabled && certificateRevision == "" {
 		certificateRevision = strings.Repeat("0", 64)
 	}
-	registration.Object["spec"] = map[string]interface{}{"endpointUID": string(endpoint.UID), "customerProjectUID": endpoint.Spec.CustomerProjectUID, "gatewayUID": endpoint.Spec.GatewayUID, "metro": endpoint.Spec.Metro, "cell": assignment.Cell, "provider": assignment.Provider, "hostname": endpoint.Spec.Hostname, "revision": endpoint.Status.Revision, "certificateRef": map[string]interface{}{"name": secretName, "revision": certificateRevision}, "enabled": enabled}
-	if err := ensure(ctx, d.Karmada, endpoint, registration); err != nil {
+	registration.Object["spec"] = map[string]interface{}{"metro": endpoint.Spec.Metro, "cell": assignment.Cell, "provider": assignment.Provider, "hostname": endpoint.Spec.Hostname, "revision": endpoint.Status.Revision, "certificateRef": map[string]interface{}{"name": secretName, "revision": certificateRevision}, "enabled": enabled}
+	if err := d.ensureDelivery(ctx, endpoint, registration); err != nil {
 		return err
 	}
 	policy := object(policyGVK, d.RuntimeNamespace, endpoint.Name)
@@ -273,7 +260,7 @@ func (d *KubernetesDriver) Apply(ctx context.Context, endpoint *connect.ConnectE
 		selectors = append(selectors, map[string]interface{}{"apiVersion": "v1", "kind": "Secret", "name": name})
 	}
 	policy.Object["spec"] = map[string]interface{}{"resourceSelectors": selectors, "propagateDeps": false, "placement": map[string]interface{}{"clusterAffinity": map[string]interface{}{"clusterNames": []interface{}{assignment.Cell}}}}
-	return ensure(ctx, d.Karmada, endpoint, policy)
+	return d.ensureDelivery(ctx, endpoint, policy)
 }
 
 func SecretName(endpoint *connect.ConnectEndpoint) string {
@@ -304,8 +291,8 @@ func (d *KubernetesDriver) removeSecret(ctx context.Context, endpoint *connect.C
 	if cell == nil {
 		return false, fmt.Errorf("selected cell unavailable")
 	}
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: d.RuntimeNamespace, Name: name}}
-	done, err := remove(ctx, d.Karmada, endpoint, secret)
+	secret := &corev1.Secret{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}, ObjectMeta: metav1.ObjectMeta{Namespace: d.RuntimeNamespace, Name: name}}
+	done, err := d.removeDeliveryResource(ctx, endpoint, secret)
 	if err != nil || !done {
 		return false, err
 	}
@@ -326,7 +313,7 @@ func (d *KubernetesDriver) RemoveDelivery(ctx context.Context, endpoint *connect
 		return false, fmt.Errorf("selected cell unavailable")
 	}
 	for _, resource := range []client.Object{object(registrationGVK, d.RuntimeNamespace, endpoint.Name)} {
-		done, err := remove(ctx, d.Karmada, endpoint, resource)
+		done, err := d.removeDeliveryResource(ctx, endpoint, resource)
 		if err != nil || !done {
 			return false, err
 		}
@@ -343,7 +330,7 @@ func (d *KubernetesDriver) RemoveDelivery(ctx context.Context, endpoint *connect
 			return false, err
 		}
 	}
-	return remove(ctx, d.Karmada, endpoint, object(policyGVK, d.RuntimeNamespace, endpoint.Name))
+	return d.removeDeliveryResource(ctx, endpoint, object(policyGVK, d.RuntimeNamespace, endpoint.Name))
 }
 
 func (d *KubernetesDriver) RemoveCertificate(ctx context.Context, endpoint *connect.ConnectEndpoint) (bool, error) {

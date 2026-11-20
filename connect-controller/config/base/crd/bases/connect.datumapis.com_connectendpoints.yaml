@@ -147,6 +147,29 @@ spec:
                 items:
                   type: string
                 type: array
+              deliveryReceipts:
+                items:
+                  properties:
+                    apiVersion:
+                      type: string
+                    contentDigest:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    uid:
+                      type: string
+                  required:
+                  - apiVersion
+                  - kind
+                  - name
+                  - namespace
+                  - uid
+                  type: object
+                type: array
               notAfter:
                 format: date-time
                 type: string

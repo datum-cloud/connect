@@ -118,7 +118,7 @@ func (options endpointFlags) setup(mgr mcmanager.Manager, root client.Client, pr
 	})
 	driver := &endpoints.KubernetesDriver{Project: project, Certificates: certificates, Karmada: karmada, Cells: cells, CertificateNamespace: options.CertificateNamespace, RuntimeNamespace: options.RuntimeNamespace, Zone: options.Zone, Domain: options.Domain, Now: time.Now}
 	if config.ProbeURL != "" {
-		driver.ProbeEndpoint, err = endpoints.HTTPProbe(config.ProbeURL, &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, time.Now)
+		driver.ProbeEndpoint, err = endpoints.HTTPProbe(config.ProbeURL, options.RuntimeNamespace, &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, time.Now)
 		if err != nil {
 			return nil, err
 		}
