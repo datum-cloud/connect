@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="1420" viewBox="0 0 960 1420" role="img" aria-labelledby="title description">
+<title id="title">Project resources and dependent systems</title>
+<desc id="description">The customer project holds gateway intent. The Connect service-provider project holds endpoint records, TLSCertificate requests, DNSZone and DNSRecordSet resources. Certificates and DNS reconcile these project resources from outside the project. Issued keys remain in Certificates infrastructure and are delivered through Karmada to the selected cell control plane. Each cell/metro has its own control plane; placement stays in Connect.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
+<style>text { font-family: Arial, Helvetica, sans-serif; fill: #172b4d; } .heading { font-size: 21px; font-weight: 700; } .label { font-size: 18px; } .detail { font-size: 17px; fill: #475569; } .line { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }</style>
+
+
+<rect width="960" height="1420" fill="white"/>
+<rect x="50" y="30" width="330" height="120" rx="10" fill="#eff6ff" stroke="#93b4df" stroke-width="1.5"/>
+<text x="215" y="59" class="heading" text-anchor="middle">Customer Project</text>
+<text x="215" y="83" class="heading" text-anchor="middle">control plane</text>
+<text x="215" y="109" class="label" text-anchor="middle">Gateway, bindings, and policy</text>
+<text x="215" y="132" class="detail" text-anchor="middle">User intent and endpoint status</text>
+<rect x="20" y="225" width="400" height="495" rx="10" fill="#eff6ff" stroke="#93b4df" stroke-width="1.5"/>
+<text x="220" y="260" class="heading" text-anchor="middle">Connect service-provider</text>
+<text x="220" y="285" class="heading" text-anchor="middle">Project control plane</text>
+<text x="780" y="410" class="detail" text-anchor="middle">Dependent systems</text>
+<rect x="50" y="305" width="330" height="110" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="215" y="337" class="heading" text-anchor="middle">Endpoint lifecycle</text>
+<text x="215" y="370" class="label" text-anchor="middle">Reservations, cell assignments,</text>
+<text x="215" y="396" class="detail" text-anchor="middle">grant pins, readiness, cleanup</text>
+<rect x="50" y="440" width="330" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="215" y="474" class="heading" text-anchor="middle">TLSCertificate</text>
+<text x="215" y="504" class="detail" text-anchor="middle">Gateway hostname requests</text>
+<rect x="50" y="555" width="330" height="115" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="215" y="590" class="heading" text-anchor="middle">DNSZone + DNSRecordSet</text>
+<text x="215" y="622" class="label" text-anchor="middle">Managed Connect zone</text>
+<text x="215" y="649" class="detail" text-anchor="middle">Routing and challenge CNAMEs</text>
+<text x="215" y="699" class="detail" text-anchor="middle">Project resources, not private keys</text>
+<rect x="650" y="440" width="260" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="780" y="474" class="heading" text-anchor="middle">Certificates</text>
+<text x="780" y="504" class="detail" text-anchor="middle">Issuance and key custody</text>
+<rect x="650" y="555" width="260" height="115" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="780" y="595" class="heading" text-anchor="middle">DNS</text>
+<text x="780" y="627" class="detail" text-anchor="middle">Zone and record publication</text>
+<rect x="50" y="800" width="330" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="215" y="835" class="heading" text-anchor="middle">Karmada</text>
+<text x="215" y="865" class="detail" text-anchor="middle">Named registration + Secret</text>
+<rect x="20" y="1000" width="920" height="400" rx="10" fill="#f0fdf4" stroke="#96bda1" stroke-width="1.5"/>
+<text x="500" y="1035" class="heading" text-anchor="middle">Selected cell control plane</text>
+<rect x="50" y="1050" width="330" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="215" y="1085" class="heading" text-anchor="middle">Galactic</text>
+<text x="215" y="1114" class="detail" text-anchor="middle">Per-stream VPC authorization</text>
+<path d="M 215 150 L 215 225" class="line"/>
+<text x="235" y="192" class="detail" text-anchor="start">Resolve intent</text>
+<path d="M 380 485 L 650 485" class="line" marker-start="url(#arrow)"/>
+<text x="535" y="470" class="detail" text-anchor="middle">Reconcile / report status</text>
+<path d="M 380 615 L 650 615" class="line" marker-start="url(#arrow)"/>
+<text x="535" y="600" class="detail" text-anchor="middle">Reconcile / report status</text>
+<path d="M 215 720 L 215 800" class="line" marker-start="url(#arrow)"/>
+<text x="235" y="766" class="detail" text-anchor="start">Delivery intent / status</text>
+<path d="M 910 485 L 940 485 L 940 760 L 480 760 L 480 845 L 380 845" class="line"/>
+<text x="700" y="748" class="detail" text-anchor="middle">Issued Secret stays outside project</text>
+<path d="M 215 890 L 215 1050" class="line" marker-start="url(#arrow)"/>
+<text x="235" y="950" class="detail" text-anchor="start">Deliver / report applied</text>
+<rect x="650" y="800" width="260" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="780" y="835" class="heading" text-anchor="middle">Client</text>
+<text x="780" y="865" class="detail" text-anchor="middle">One security context</text>
+<rect x="650" y="1050" width="260" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="780" y="1085" class="heading" text-anchor="middle">Shared connection</text>
+<text x="780" y="1114" class="detail" text-anchor="middle">H3 QUIC or H2 TLS/TCP</text>
+<path d="M 780 890 L 780 1050" class="line"/>
+<text x="790" y="955" class="detail">Two streams</text>
+<path d="M 650 1095 L 380 1095" class="line"/>
+<rect x="430" y="1250" width="220" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="540" y="1284" class="heading" text-anchor="middle">VPC A</text>
+<text x="540" y="1314" class="detail" text-anchor="middle">Grant A, routes A</text>
+<rect x="700" y="1250" width="220" height="90" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="810" y="1284" class="heading" text-anchor="middle">VPC B</text>
+<text x="810" y="1314" class="detail" text-anchor="middle">Grant B, routes B</text>
+<path d="M 180 1140 L 180 1200 L 540 1200 L 540 1250" class="line"/>
+<text x="350" y="1225" class="detail" text-anchor="middle">Authenticated stream A</text>
+<path d="M 260 1140 L 260 1170 L 810 1170 L 810 1250" class="line"/>
+<text x="610" y="1160" class="detail" text-anchor="middle">Authenticated stream B</text>
+<text x="480" y="1380" class="detail" text-anchor="middle">Independent grants and /96 allocations; no cross-cell forwarding</text>
+</svg>

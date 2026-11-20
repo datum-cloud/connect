@@ -1,0 +1,41 @@
+name: documentation
+
+on:
+  push:
+    paths:
+      - 'docs/**'
+      - 'README.md'
+      - 'scripts/check-enhancement-docs.py'
+      - '.github/workflows/documentation.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'README.md'
+      - 'scripts/check-enhancement-docs.py'
+      - '.github/workflows/documentation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  enhancement-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Validate document links and SVG references
+        run: python3 scripts/check-enhancement-docs.py
+      - name: Install SVG renderer
+        run: sudo apt-get update && sudo apt-get install -y librsvg2-bin
+      - name: Render enhancement diagrams
+        run: |
+          mkdir -p /tmp/enhancement-diagrams
+          for diagram in docs/enhancements/managed-gateway-endpoints/diagrams/*.svg; do
+            rsvg-convert "$diagram" -o "/tmp/enhancement-diagrams/$(basename "$diagram" .svg).png"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: enhancement-diagrams
+          path: /tmp/enhancement-diagrams/*.png
+          if-no-files-found: error
