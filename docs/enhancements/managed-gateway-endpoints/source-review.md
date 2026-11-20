@@ -16,7 +16,7 @@ implementation remains in draft Connect PR #74, based on required prototype
 documentation-only on main. The historical November 18 evidence below does not
 describe the newer implementation.
 
-Published Connect implementation `10b848a10b7d226429cd03e6878052b296688e73`
+Published Connect implementation `82a2b6a520bde8edfa24c227c11f33396665e768`
 records the frozen contracts in `implementation.md` on its feature branch.
 Its opt-in runtime component exports static managed mounts, without enabling
 flags or permissions; Infrastructure selects it instead of a large inline patch.
@@ -26,18 +26,22 @@ successor tests report 39 passed/1 opt-in ignored. Run the physical-connection
 fixtures with `cd connect-lib && cargo test -p datum-connect-daemon pool_tests --lib`
 using Rust 1.98. Both protocols and separate security-context pools pass.
 
-Infrastructure `baab918a7fad312b2bd46829594c1671d69f5704` (PR #9647) pins that
-Connect revision and the dependencies below. Clean-source validation passes four
+Infrastructure `a6fac696422c407f5e146c95d41020b59d8a2af8` (PR #9647) qualified
+the previous Connect/Galactic revisions; its next source-pin update tracks the
+CI-only dependency correction below. Clean-source validation passed four
 CRD fixtures, 24 native workload resources and the opt-in mounts/token checks.
 Its patch-size guard passes without exceptions. Independently rerun Rust pooling
 and Galactic authority tests pass; these remain separate from live qualification.
 
-Published Galactic dependency `ed8dddbeca8ccb1b38623de0a5f4f344ef0b0e27`
+Published Galactic dependency `df3279afb62d05c82e964fcc7345cfeacf6fd3a8`
 (PR #1465) removes Network/VPC fields from endpoint registrations. Managed grant
 creation instead requires Network UID, binding UID and a UID-pinned VPC reference.
 `TestManagedEndpointMultiplexedAuthority` tests both protocols with one physical
 dial, independent revocation and VPC recreation, using the real authority and a
 fake packet backend. It is not operating-system datapath qualification.
+The final dependency correction changes API comments and the load-safe generated
+CRD export, not schemas or runtime contracts. Connect's race tests and build pass
+with that pin; GitHub CI must succeed on the updated heads before handoff.
 
 Certificates dependency `4cec00395b3647737685addd697e40f2e94d3214` (PR #83)
 preserves reservation-bound authorization and adds a binding-lifecycle regression.
