@@ -8,8 +8,10 @@ document's evidence, not observations made during this review.
 
 ## Control-plane placement clarification (2026-11-20)
 
-Connect `ef4be50315ee18b58003d01f4920c3a9fe6f0a5e` pins Galactic
-`87aaa9537653e9ae5a67d64ff062ad1c334dc8f5` without a local replacement.
+Connect `07b0023245cad1ad467463b9f61bc6f76373ddaf` pins Galactic
+`01462607e4f7d0e7471f21dbbd35a6479d284b34` without a local replacement.
+These supersede `ef4be503` / `87aaa953` only for an upstream CI package-mirror
+correction and its dependency pin; runtime and API behavior are unchanged.
 The published local `MASQUEEndpoint` spec has five fields: `hostname`, `provider`,
 `revision`, `certificateRef`, and `enabled`. Cell and metro remain in Connect's
 service-provider Project assignment. Distribution targets that cell, and
