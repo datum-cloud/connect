@@ -6,6 +6,10 @@ rust-version.workspace = true
 autobins = false
 build = "build.rs"
 
+[[example]]
+name = "managed-gateway-e2e"
+path = "../../tests/e2e/managed-gateways/live.rs"
+
 [[bin]]
 name = "datum-connectd"
 path = "src/main.rs"

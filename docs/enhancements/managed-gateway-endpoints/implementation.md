@@ -393,3 +393,18 @@ Final local Rust validation: daemon library 41 passed/1 ignored; successor clien
 39 passed/1 ignored (serial); both H3/H2 pooling tests and the helper's live-route
 overlap rejection test passed. The ignored tests are existing opt-in cases, not
 same-connection coverage. No live credentials, interfaces or deployments were used.
+
+## Staging enablement in progress
+
+Added a read-only mTLS endpoint probe executable to the controller image and
+explicit probe client trust flags. It performs real public DNS, fresh H2/H3 TLS,
+exact leaf digest and selected-control-plane replica verification, with before/
+after race checks. Local tests use real TLS/QUIC sockets but are not staging
+evidence. Full controller race/envtest, vet and Linux probe build pass locally.
+
+`tests/e2e/managed-gateways` owns the production Rust client packet qualification
+runner and coordination runbook. It has no cluster-write capability and requires
+real credential APIs and IPv6 responders; local checksum tests do not qualify
+staging. Infra remains the sole staging configuration writer. Public frontend,
+Project/DNS allocation, deployed probe/broker routes, artifact provenance and
+observed lifecycle runs remain pending; no staging success is claimed here.

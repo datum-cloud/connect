@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	"go.datum.net/connect-controller/internal/endpointprobe"
 	"go.datum.net/connect-controller/internal/endpoints"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,9 +34,15 @@ type endpointFlags struct {
 	CertificateNamespace  string
 	RuntimeNamespace      string
 	ConfigFile            string
+	ProbeCA               string
+	ProbeCertificate      string
+	ProbeKey              string
 }
 
 func (options *endpointFlags) register() {
+	flag.StringVar(&options.ProbeCA, "endpoint-probe-ca", "", "trusted probe serving CA")
+	flag.StringVar(&options.ProbeCertificate, "endpoint-probe-client-cert", "", "probe mTLS client certificate")
+	flag.StringVar(&options.ProbeKey, "endpoint-probe-client-key", "", "probe mTLS client key")
 	flag.StringVar(&options.CredentialAddress, "credential-listen-address", "", "optional TLS credential broker address")
 	flag.StringVar(&options.CredentialCertificate, "credential-tls-cert", "", "credential broker TLS certificate file")
 	flag.StringVar(&options.CredentialKey, "credential-tls-key", "", "credential broker TLS key file")
@@ -118,7 +125,11 @@ func (options endpointFlags) setup(mgr mcmanager.Manager, root client.Client, pr
 	})
 	driver := &endpoints.KubernetesDriver{Project: project, Certificates: certificates, Karmada: karmada, Cells: cells, CertificateNamespace: options.CertificateNamespace, RuntimeNamespace: options.RuntimeNamespace, Zone: options.Zone, Domain: options.Domain, Now: time.Now}
 	if config.ProbeURL != "" {
-		driver.ProbeEndpoint, err = endpoints.HTTPProbe(config.ProbeURL, options.RuntimeNamespace, &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, time.Now)
+		probeTLS, tlsErr := endpointprobe.ClientTLS(options.ProbeCA, options.ProbeCertificate, options.ProbeKey)
+		if tlsErr != nil {
+			return nil, tlsErr
+		}
+		driver.ProbeEndpoint, err = endpoints.HTTPProbe(config.ProbeURL, options.RuntimeNamespace, &http.Client{Transport: &http.Transport{TLSClientConfig: probeTLS}, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, time.Now)
 		if err != nil {
 			return nil, err
 		}
